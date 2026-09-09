@@ -18,12 +18,19 @@ from dataclasses import dataclass, field
 __all__ = ["RuleApplication", "RewriteResult", "UnsupportedDDL",
            "SCRUBBED_PROPERTIES", "build_create_schema", "build_create_table"]
 
-# Snowflake table properties with no Delta equivalent. Recorded, never emitted.
+# Real Snowflake table PROPERTIES with no Delta equivalent. A value here was a
+# deliberate source-side setting, so dropping it is a decision worth reporting.
 SCRUBBED_PROPERTIES = (
     "cluster_by", "retention_time", "change_tracking", "is_iceberg", "is_dynamic",
     "is_secure", "max_data_extension_time_in_days", "data_retention_time_in_days",
-    "owner", "rows", "bytes", "created_on",
 )
+
+# Observational SHOW metadata. Never emitted either, but it was never a property
+# to preserve, so listing it as "dropped" is misleading noise in the report.
+_INFORMATIONAL_METADATA = ("rows", "bytes", "created_on", "owner", "comment")
+
+# Values that mean "this property is not set" and so are not worth reporting.
+_UNSET = (None, "", "false", "FALSE", "N", "OFF", "null", "NULL")
 
 
 @dataclass(frozen=True)
@@ -107,7 +114,9 @@ def build_create_table(record: dict, target_fqn: str) -> RewriteResult:
             f'{c["COLUMN_NAME"]}: {c.get("DATA_TYPE")} -> {c["target_type"]}'))
 
     for prop, value in (record.get("source_metadata") or {}).items():
-        if prop in SCRUBBED_PROPERTIES and value not in (None, "", "false"):
+        if prop in _INFORMATIONAL_METADATA:
+            continue
+        if prop in SCRUBBED_PROPERTIES and value not in _UNSET:
             res.omitted_properties.append(f"{prop}={value}")
     if res.omitted_properties:
         res.rules_applied.append(RuleApplication(
