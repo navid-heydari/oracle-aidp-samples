@@ -31,3 +31,9 @@ __pycache__/
 venv/
 
 .pytest_cache/
+
+# The repo-root .gitignore has a `target/` rule for Rust/Maven build artifacts.
+# engine/target/ is SOURCE (the AIDP-target side of the pipeline), so re-include it.
+# The directory itself must be un-excluded before its contents can be.
+!engine/target/
+!engine/target/**
