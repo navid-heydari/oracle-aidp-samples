@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""snowmig -- Snowflake -> AIDP migrator CLI.
+
+Five subcommands, one per pipeline stage. Each reads the previous stage's JSON
+and writes its own plus a markdown report, so any stage can be re-run alone.
+
+  assess  -> inventory.json      + INVENTORY.md        (needs Snowflake)
+  deps    -> dependencies.json                          (needs Snowflake)
+  plan    -> plan.json           + MIGRATION_PLAN.md    (offline)
+  ddl     -> ddl_plan.json       + DDL_PLAN.md          (offline)
+  deploy  -> deploy_result.json  + DEPLOY.md            (dry-run offline;
+                                                         --execute needs AIDP)
+Exit codes: 0 ok | 1 error | 3 HALT (identifier-case or target-name collision)
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import pathlib
+import sys
+
+from plan.build import TargetCollision, build_plan
+from report.render import (
+    render_ddl_plan, render_deploy, render_inventory, render_plan,
+)
+from snowflake_source.conn import AuthError, build_connect_kwargs, connect, make_run_sql
+from snowflake_source.extract.catalog import build_inventory
+from snowflake_source.extract.dependencies import extract_dependencies
+from target.coords import MissingTarget, resolve_target
+from target.ddl import build_create_table
+from target.deploy import RefusedToExecute, deploy
+
+HALT = 3
+
+
+def _read(out_dir: pathlib.Path, name: str) -> dict:
+    path = out_dir / name
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{name} not found in {out_dir}. Run the earlier stage first.")
+    return json.loads(path.read_text())
+
+
+def _write(out_dir: pathlib.Path, name: str, payload) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if isinstance(payload, str):
+        (out_dir / name).write_text(payload)
+    else:
+        (out_dir / name).write_text(json.dumps(payload, indent=2, default=str))
+    print(f"  -> {out_dir / name}")
+
+
+def _run_sql_from_args(args):
+    kwargs = build_connect_kwargs(
+        args.auth, account=args.account, user=args.user, role=args.role,
+        warehouse=args.warehouse, key_path=args.key_path,
+        key_passphrase=args.key_passphrase, pat_path=args.pat_path,
+        password_path=args.password_path)
+    return make_run_sql(connect(**kwargs))
+
+
+def _assess_inventory(args) -> dict:
+    """Seam for tests: patched to avoid a live connection."""
+    return build_inventory(_run_sql_from_args(args), args.database or None)
+
+
+def cmd_assess(args) -> int:
+    out = pathlib.Path(args.out_dir)
+    inv = _assess_inventory(args)
+    _write(out, "inventory.json", inv)
+    _write(out, "INVENTORY.md", render_inventory(inv))
+    if inv.get("identifier_case_collisions"):
+        print("HALT: identifier-case collisions; see INVENTORY.md", file=sys.stderr)
+        return HALT
+    return 0
+
+
+def cmd_deps(args) -> int:
+    out = pathlib.Path(args.out_dir)
+    deps = extract_dependencies(_run_sql_from_args(args), _read(out, "inventory.json"))
+    _write(out, "dependencies.json", deps)
+    print(f'  lineage source: {deps["source_used"]}')
+    return 0
+
+
+def cmd_plan(args) -> int:
+    out = pathlib.Path(args.out_dir)
+    inv = _read(out, "inventory.json")
+    deps = _read(out, "dependencies.json")
+    user_map = (json.loads(pathlib.Path(args.layer_map).read_text())
+                if args.layer_map else None)
+    try:
+        built = build_plan(inv, deps, user_map=user_map,
+                           strategy=args.namespace_strategy)
+    except TargetCollision as exc:
+        print(f"HALT: {exc}", file=sys.stderr)
+        return HALT
+    _write(out, "plan.json", built)
+    _write(out, "MIGRATION_PLAN.md", render_plan(built))
+    return 0
+
+
+def cmd_ddl(args) -> int:
+    out = pathlib.Path(args.out_dir)
+    inv = _read(out, "inventory.json")
+    built = _read(out, "plan.json")
+    by_id = {r["source_identifier"]: r for r in inv["inventory"]}
+
+    statements, blocked = [], list(built.get("blocked", []))
+    for ident in built.get("clone_targets", []):
+        res = build_create_table(by_id[ident], built["target_names"][ident])
+        if res.blocked:
+            blocked.append({"source_identifier": ident, "reason": res.blocked_reason})
+            continue
+        statements.append({
+            "source_identifier": res.source_identifier,
+            "target_fqn": res.target_fqn, "sql": res.sql,
+            "rules_applied": [dataclasses.asdict(r) for r in res.rules_applied],
+            "warnings": res.warnings, "omitted_properties": res.omitted_properties})
+
+    payload = {"statements": statements, "blocked": blocked,
+               "namespace_strategy": built.get("namespace_strategy")}
+    _write(out, "ddl_plan.json", payload)
+    _write(out, "DDL_PLAN.md", render_ddl_plan(payload))
+    return 0
+
+
+def cmd_deploy(args) -> int:
+    out = pathlib.Path(args.out_dir)
+    ddl_plan = _read(out, "ddl_plan.json")
+    target, run_sql = None, None
+    if args.execute:
+        target = resolve_target(datalake_ocid=args.datalake_ocid,
+                                workspace=args.workspace,
+                                cluster_id=args.cluster_id, catalog=args.catalog)
+        from target.aidp_runner import make_aidp_run_sql
+        run_sql = make_aidp_run_sql(target)
+    result = deploy(ddl_plan, target=target, execute=args.execute, run_sql=run_sql,
+                    chunk_size=args.chunk_size)
+    _write(out, "deploy_result.json", result)
+    _write(out, "DEPLOY.md", render_deploy(result))
+    return 1 if result.get("failed") or result.get("chunk_errors") else 0
+
+
+def _add_snowflake_args(p) -> None:
+    p.add_argument("--account")
+    p.add_argument("--user")
+    p.add_argument("--role")
+    p.add_argument("--warehouse")
+    p.add_argument("--auth", default="keypair",
+                   choices=["keypair", "pat", "password", "externalbrowser"])
+    p.add_argument("--key-path")
+    p.add_argument("--key-passphrase")
+    p.add_argument("--pat-path")
+    p.add_argument("--password-path")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # --out-dir lives on a parent parser so it is accepted AFTER the subcommand,
+    # which is how every caller writes it: `snowmig plan --out-dir ...`.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--out-dir", default="snowmig_out")
+
+    ap = argparse.ArgumentParser(prog="snowmig", description=__doc__,
+                                 parents=[common])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("assess", parents=[common],
+                       help="read-only estate inventory")
+    _add_snowflake_args(a)
+    a.add_argument("--database", action="append",
+                   help="repeatable; omit to scan all non-system databases")
+    a.set_defaults(func=cmd_assess)
+
+    d = sub.add_parser("deps", parents=[common], help="dependency edges")
+    _add_snowflake_args(d)
+    d.set_defaults(func=cmd_deps)
+
+    p = sub.add_parser("plan", parents=[common], help="waves + medallion layout (offline)")
+    p.add_argument("--namespace-strategy", default="layer-catalog",
+                   choices=["layer-catalog", "preserve-source", "layer-flattened"])
+    p.add_argument("--layer-map", help="JSON file of explicit source->layer overrides")
+    p.set_defaults(func=cmd_plan)
+
+    g = sub.add_parser("ddl", parents=[common], help="generate target DDL (offline)")
+    g.set_defaults(func=cmd_ddl)
+
+    dep = sub.add_parser("deploy", parents=[common], help="dry-run by default")
+    dep.add_argument("--execute", action="store_true")
+    dep.add_argument("--datalake-ocid")
+    dep.add_argument("--workspace")
+    dep.add_argument("--cluster-id")
+    dep.add_argument("--catalog")
+    dep.add_argument("--chunk-size", type=int, default=25)
+    dep.set_defaults(func=cmd_deploy)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except (AuthError, MissingTarget, RefusedToExecute, FileNotFoundError,
+            ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
