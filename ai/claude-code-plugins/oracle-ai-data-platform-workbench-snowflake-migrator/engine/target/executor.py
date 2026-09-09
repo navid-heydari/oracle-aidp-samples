@@ -89,9 +89,49 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
                 f"{_endpoint(target)}/dataLakes/{target.datalake_ocid}/tables"
                 f"?catalogKey={target.catalog}&schemaKey={schema}"]
 
+    if operation == "upload_notebook":
+        path, local = kwargs["workspace_path"], kwargs["local_path"]
+        if backend == "aidp_cli":
+            return ["aidp", "workspace", "upload",
+                    "--datalake-id", target.datalake_ocid,
+                    "--workspace-id", target.workspace,
+                    "--path", path, "--file", local, "--output", "json"]
+        return ["oci", "raw-request", "--http-method", "PUT",
+                "--target-uri",
+                f"{_endpoint(target)}/dataLakes/{target.datalake_ocid}"
+                f"/notebook/workspaces/{target.workspace}/api/contents{path}",
+                "--request-body", f"file://{local}"]
+
+    if operation == "run_notebook":
+        path = kwargs["workspace_path"]
+        if backend == "aidp_cli":
+            return ["aidp", "notebook", "run",
+                    "--datalake-id", target.datalake_ocid,
+                    "--workspace-id", target.workspace,
+                    "--cluster-id", target.cluster_id,
+                    "--path", path, "--output", "json"]
+        return ["oci", "raw-request", "--http-method", "POST",
+                "--target-uri",
+                f"{_endpoint(target)}/dataLakes/{target.datalake_ocid}"
+                f"/workspaces/{target.workspace}/notebookRuns",
+                "--request-body",
+                json.dumps({"clusterId": target.cluster_id, "notebookPath": path})]
+
+    if operation == "run_status":
+        run_id = kwargs["run_id"]
+        if backend == "aidp_cli":
+            return ["aidp", "notebook", "run-status",
+                    "--datalake-id", target.datalake_ocid,
+                    "--run-id", run_id, "--output", "json"]
+        return ["oci", "raw-request", "--http-method", "GET",
+                "--target-uri",
+                f"{_endpoint(target)}/dataLakes/{target.datalake_ocid}"
+                f"/workspaces/{target.workspace}/notebookRuns/{run_id}"]
+
     raise ValueError(
         f"unknown operation {operation!r}; this executor deliberately supports "
-        "only 'sql' and 'list_tables' -- there is no drop or delete path")
+        "only 'sql', 'list_tables', 'upload_notebook', 'run_notebook' and "
+        "'run_status' -- there is no drop or delete path")
 
 
 def parse_cli_json(stdout: str) -> list[dict]:

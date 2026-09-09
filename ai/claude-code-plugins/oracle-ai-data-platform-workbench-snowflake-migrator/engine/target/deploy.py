@@ -62,6 +62,9 @@ def deploy(ddl_plan: dict, *, target=None, execute: bool = False,
         "out_of_scope_catalogs": sorted({
             _split_fqn(s["target_fqn"])[0] for s in out_of_scope}),
         "executed": 0, "verified": 0, "failed": [], "chunk_errors": [],
+        # Per-source-identifier lists so plan/status.py can report a status per
+        # object rather than only an aggregate count.
+        "attempted_targets": [], "verified_targets": [], "failed_targets": [],
     }
     if not execute:
         return out
@@ -83,6 +86,7 @@ def deploy(ddl_plan: dict, *, target=None, execute: bool = False,
     for start in range(0, len(statements), chunk_size):
         chunk = statements[start:start + chunk_size]
         batch = ";\n".join(s["sql"] for s in chunk)
+        out["attempted_targets"] += [s.get("source_identifier") for s in chunk]
         try:
             run_sql(batch)
             out["executed"] += len(chunk)
@@ -98,12 +102,15 @@ def deploy(ddl_plan: dict, *, target=None, execute: bool = False,
                     f"SHOW TABLES IN `{catalog}`.`{schema}` LIKE '{table}'")
                 if rows:
                     out["verified"] += 1
+                    out["verified_targets"].append(stmt.get("source_identifier"))
                 else:
+                    out["failed_targets"].append(stmt.get("source_identifier"))
                     out["failed"].append({
                         "source_identifier": stmt.get("source_identifier"),
                         "target_fqn": stmt["target_fqn"],
                         "reason": "not present after its chunk reported completion"})
             except Exception as exc:
+                out["failed_targets"].append(stmt.get("source_identifier"))
                 out["failed"].append({
                     "source_identifier": stmt.get("source_identifier"),
                     "target_fqn": stmt["target_fqn"],

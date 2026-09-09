@@ -105,3 +105,39 @@ def test_non_json_output_raises_rather_than_returning_empty():
 
 def test_json_object_without_data_key_is_wrapped():
     assert parse_cli_json('{"tableName": "T"}') == [{"tableName": "T"}]
+
+
+# --- notebook operations --------------------------------------------------
+
+@pytest.mark.parametrize("backend", ["aidp_cli", "oci_raw"])
+def test_upload_notebook_command_carries_both_paths(backend):
+    cmd = build_command(backend, "upload_notebook", TARGET,
+                        workspace_path="/Workspace/Shared/nb.ipynb",
+                        local_path="/tmp/nb.ipynb")
+    joined = " ".join(cmd)
+    assert "/Workspace/Shared/nb.ipynb" in joined
+    assert "/tmp/nb.ipynb" in joined
+
+
+@pytest.mark.parametrize("backend", ["aidp_cli", "oci_raw"])
+def test_run_notebook_command_names_the_cluster(backend):
+    cmd = build_command(backend, "run_notebook", TARGET,
+                        workspace_path="/Workspace/Shared/nb.ipynb")
+    assert "cl-1" in " ".join(cmd)
+
+
+@pytest.mark.parametrize("backend", ["aidp_cli", "oci_raw"])
+def test_run_status_command_carries_the_run_id(backend):
+    cmd = build_command(backend, "run_status", TARGET, run_id="run-42")
+    assert "run-42" in " ".join(cmd)
+
+
+def test_notebook_operations_contain_no_destructive_verb():
+    for backend in ("aidp_cli", "oci_raw"):
+        for op, kw in (("upload_notebook", {"workspace_path": "/p",
+                                            "local_path": "/l"}),
+                       ("run_notebook", {"workspace_path": "/p"}),
+                       ("run_status", {"run_id": "r"})):
+            joined = " ".join(build_command(backend, op, TARGET, **kw)).upper()
+            for verb in (" DROP ", " DELETE ", " TRUNCATE "):
+                assert verb not in joined

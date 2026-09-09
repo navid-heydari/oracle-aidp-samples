@@ -1,0 +1,134 @@
+"""Shallow-clone notebook generation. Pure: builds JSON, runs nothing."""
+import json
+
+import pytest
+
+from target.notebook import (
+    NOTEBOOK_NAME, build_notebook, notebook_workspace_path,
+)
+
+DDL = {"statements": [
+    {"source_identifier": "D.S.T", "object_type": "TABLE", "target_fqn": "D.S.T",
+     "sql": "CREATE TABLE IF NOT EXISTS `D`.`S`.`T` (`A` STRING)\nUSING DELTA"},
+    {"source_identifier": "D.S.V", "object_type": "VIEW", "target_fqn": "D.S.V",
+     "sql": "CREATE VIEW IF NOT EXISTS `D`.`S`.`V` AS SELECT A FROM D.S.T"}],
+    "blocked": [{"source_identifier": "D.S.J", "object_type": "TABLE",
+                 "reason": "PAYLOAD: VARIANT"}]}
+PLAN = {"bronze_mapping": "database -> Standard Catalog",
+        "catalogs_to_create": ["D"], "schemas_to_create": [["D", "S"]],
+        "waves": [["D.S.T"], ["D.S.V"]],
+        "summary": {"can_migrate": 2, "cannot_migrate": 1}}
+
+
+def nb():
+    return build_notebook(DDL, PLAN, catalog="D",
+                          source={"account": "DU58131", "region": "AWS_US_EAST_2"})
+
+
+# --- structure ------------------------------------------------------------
+
+def test_is_valid_ipynb_json():
+    doc = nb()
+    assert doc["nbformat"] == 4
+    assert doc["cells"]
+    json.dumps(doc)          # must be serialisable
+
+
+def test_first_cell_is_a_markdown_header_stating_no_data_moves():
+    first = nb()["cells"][0]
+    assert first["cell_type"] == "markdown"
+    text = "".join(first["source"]).lower()
+    assert "no data" in text
+    assert "empty" in text or "structure only" in text
+
+
+def test_header_states_source_and_destination():
+    text = "".join(nb()["cells"][0]["source"])
+    assert "DU58131" in text and "AWS_US_EAST_2" in text
+    assert "D" in text
+
+
+def test_only_python_and_markdown_cells():
+    for c in nb()["cells"]:
+        assert c["cell_type"] in ("code", "markdown")
+
+
+# --- content --------------------------------------------------------------
+
+def test_schemas_are_created_before_objects():
+    code = "\n".join("".join(c["source"]) for c in nb()["cells"]
+                     if c["cell_type"] == "code")
+    assert code.index("CREATE SCHEMA") < code.index("CREATE TABLE")
+
+
+def test_every_statement_is_embedded():
+    code = "\n".join("".join(c["source"]) for c in nb()["cells"]
+                     if c["cell_type"] == "code")
+    assert "CREATE TABLE IF NOT EXISTS" in code
+    assert "CREATE VIEW IF NOT EXISTS" in code
+
+
+def test_view_comes_after_its_table():
+    code = "\n".join("".join(c["source"]) for c in nb()["cells"]
+                     if c["cell_type"] == "code")
+    assert code.index("`D`.`S`.`T`") < code.index("`D`.`S`.`V`")
+
+
+def test_notebook_contains_no_data_movement_statement():
+    code = "\n".join("".join(c["source"]) for c in nb()["cells"]
+                     if c["cell_type"] == "code").upper()
+    for verb in ("INSERT ", "COPY INTO", "MERGE ", "UPDATE ", "DELETE ",
+                 "TRUNCATE", "DROP ", "AS SELECT *"):
+        assert verb not in code, verb
+
+
+def test_progress_is_printed_per_object_for_monitoring():
+    code = "\n".join("".join(c["source"]) for c in nb()["cells"]
+                     if c["cell_type"] == "code")
+    assert "print(" in code
+    assert "time" in code.lower(), "elapsed time per object enables monitoring"
+
+
+def test_a_verification_cell_probes_each_object():
+    code = "\n".join("".join(c["source"]) for c in nb()["cells"]
+                     if c["cell_type"] == "code")
+    assert "SHOW TABLES" in code or "SHOW VIEWS" in code
+
+
+def test_blocked_objects_are_listed_but_not_attempted():
+    doc = nb()
+    md = "\n".join("".join(c["source"]) for c in doc["cells"]
+                   if c["cell_type"] == "markdown")
+    code = "\n".join("".join(c["source"]) for c in doc["cells"]
+                     if c["cell_type"] == "code")
+    assert "D.S.J" in md and "VARIANT" in md
+    assert "D.S.J" not in code
+
+
+def test_only_the_requested_catalog_is_in_the_notebook():
+    ddl = json.loads(json.dumps(DDL))
+    ddl["statements"].append(
+        {"source_identifier": "OTHER.S.X", "object_type": "TABLE",
+         "target_fqn": "OTHER.S.X",
+         "sql": "CREATE TABLE IF NOT EXISTS `OTHER`.`S`.`X` (`A` STRING) USING DELTA"})
+    doc = build_notebook(ddl, PLAN, catalog="D", source={})
+    code = "\n".join("".join(c["source"]) for c in doc["cells"]
+                     if c["cell_type"] == "code")
+    assert "OTHER" not in code
+
+
+def test_empty_plan_for_a_catalog_raises_rather_than_writing_a_no_op():
+    with pytest.raises(ValueError, match="no statements"):
+        build_notebook(DDL, PLAN, catalog="NOPE", source={})
+
+
+# --- placement ------------------------------------------------------------
+
+def test_workspace_path_is_under_shared_and_names_the_catalog():
+    path = notebook_workspace_path("D")
+    assert path.startswith("/Workspace/Shared/")
+    assert "D" in path and path.endswith(".ipynb")
+
+
+def test_notebook_name_is_recognisable():
+    assert "snowmig" in NOTEBOOK_NAME and "shallow" in NOTEBOOK_NAME
