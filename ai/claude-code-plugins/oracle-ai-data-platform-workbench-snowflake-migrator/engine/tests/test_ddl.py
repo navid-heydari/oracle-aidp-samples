@@ -119,3 +119,33 @@ def test_create_schema_never_emits_comment():
 def test_target_fqn_must_be_three_part():
     with pytest.raises(ValueError, match="three-part"):
         build_create_table(record([col("A", "TEXT", "STRING")]), "bronze.ORDERS")
+
+
+@pytest.mark.parametrize("prop,value", [
+    ("rows", 42), ("bytes", 2048), ("created_on", "2026-09-09"),
+    ("owner", "ACCOUNTADMIN"),
+])
+def test_informational_metadata_is_not_reported_as_a_dropped_property(prop, value):
+    # These are SHOW observations, not source-side settings. Listing them as
+    # "dropped properties with no Delta equivalent" is misleading noise.
+    res = build_create_table(
+        record([col("A", "TEXT", "STRING")], source_metadata={prop: value}),
+        "bronze.S.T")
+    assert res.omitted_properties == []
+
+
+@pytest.mark.parametrize("value", [None, "", "N", "OFF", "false"])
+def test_unset_properties_are_not_reported(value):
+    res = build_create_table(
+        record([col("A", "TEXT", "STRING")],
+               source_metadata={"change_tracking": value}),
+        "bronze.S.T")
+    assert res.omitted_properties == []
+
+
+def test_a_set_property_is_still_reported():
+    res = build_create_table(
+        record([col("A", "TEXT", "STRING")],
+               source_metadata={"cluster_by": "(COUNTRY_CODE)", "rows": 5}),
+        "bronze.S.T")
+    assert res.omitted_properties == ["cluster_by=(COUNTRY_CODE)"]
