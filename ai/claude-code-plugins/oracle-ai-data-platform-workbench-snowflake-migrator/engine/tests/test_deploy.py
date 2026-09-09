@@ -107,3 +107,36 @@ def test_blocked_statements_are_never_executed():
     out = deploy(p, execute=True, target=TARGET, run_sql=rec)
     assert "BAD" not in " ".join(rec.calls)
     assert out["blocked_count"] == 1
+
+
+def multi_catalog_plan():
+    return {"statements": [
+        {"source_identifier": "D1.S.T", "target_fqn": "D1.S.T",
+         "sql": "CREATE TABLE IF NOT EXISTS `D1`.`S`.`T` (`A` STRING)\nUSING DELTA"},
+        {"source_identifier": "D2.S.U", "target_fqn": "D2.S.U",
+         "sql": "CREATE TABLE IF NOT EXISTS `D2`.`S`.`U` (`A` STRING)\nUSING DELTA"},
+    ], "blocked": []}
+
+
+def _target(catalog):
+    return resolve_target(datalake_ocid="ocid1.aidataplatform.oc1.iad.a",
+                          workspace="ws", cluster_id="cl", catalog=catalog)
+
+
+def test_only_the_confirmed_catalog_is_deployed():
+    # Bronze mirrors the source, so a multi-database estate spans catalogs.
+    # One confirmation must not fan out across all of them.
+    rec = Recorder()
+    out = deploy(multi_catalog_plan(), execute=True, target=_target("D1"),
+                 run_sql=rec)
+    assert out["statement_count"] == 1
+    assert out["catalog_in_scope"] == "D1"
+    assert out["out_of_scope_count"] == 1
+    assert out["out_of_scope_catalogs"] == ["D2"]
+    assert "`D2`" not in " ".join(rec.calls)
+
+
+def test_dry_run_reports_every_statement_regardless_of_catalog():
+    out = deploy(multi_catalog_plan(), run_sql=Recorder())
+    assert out["statement_count"] == 2
+    assert out["out_of_scope_count"] == 0

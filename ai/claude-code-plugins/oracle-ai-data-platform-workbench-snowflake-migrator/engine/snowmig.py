@@ -4,12 +4,17 @@
 Five subcommands, one per pipeline stage. Each reads the previous stage's JSON
 and writes its own plus a markdown report, so any stage can be re-run alone.
 
-  assess  -> inventory.json      + INVENTORY.md        (needs Snowflake)
-  deps    -> dependencies.json                          (needs Snowflake)
-  plan    -> plan.json           + MIGRATION_PLAN.md    (offline)
-  ddl     -> ddl_plan.json       + DDL_PLAN.md          (offline)
-  deploy  -> deploy_result.json  + DEPLOY.md            (dry-run offline;
-                                                         --execute needs AIDP)
+  assess  -> inventory.json      + INVENTORY.md            (needs Snowflake)
+  deps    -> dependencies.json                              (needs Snowflake)
+  plan    -> plan.json           + PLANNED_OBJECTS.md       (offline)
+  ddl     -> ddl_plan.json       + DDL_PLAN.md              (offline)
+  deploy  -> deploy_result.json  + SOFT_CLONE_SUMMARY.md    (dry-run offline;
+                                                             --execute needs AIDP)
+  compute -> compute.json        + COMPUTE_PROPOSAL.md      (needs Snowflake)
+
+Bronze mirrors the source: Snowflake database -> AIDP Standard Catalog, schema ->
+schema, table -> table, view -> view. Silver and Gold get disabled job stubs.
+
 Exit codes: 0 ok | 1 error | 3 HALT (identifier-case or target-name collision)
 """
 from __future__ import annotations
@@ -21,15 +26,24 @@ import pathlib
 import sys
 
 from plan.build import TargetCollision, build_plan
+from plan.restrictions import InvalidRestriction
 from report.render import (
-    render_ddl_plan, render_deploy, render_inventory, render_plan,
+    render_compute, render_ddl_plan, render_inventory, render_planned_objects,
+    render_soft_clone_summary,
 )
 from snowflake_source.conn import AuthError, build_connect_kwargs, connect, make_run_sql
 from snowflake_source.extract.catalog import build_inventory
 from snowflake_source.extract.dependencies import extract_dependencies
+from snowflake_source.extract.warehouses import extract_warehouses
+from sizing.warehouse_map import propose_all
 from target.coords import MissingTarget, resolve_target
-from target.ddl import build_create_table
+from target.ddl import build_create_table, build_create_view
 from target.deploy import RefusedToExecute, deploy
+from target.executor import NoBackendAvailable, detect_backend
+# Aliased: snowflake_source.conn also exports make_run_sql, and the
+# unqualified import shadowed it.
+from target.runner import BackendError
+from target.runner import make_run_sql as make_aidp_run_sql
 
 HALT = 3
 
@@ -88,16 +102,20 @@ def cmd_plan(args) -> int:
     out = pathlib.Path(args.out_dir)
     inv = _read(out, "inventory.json")
     deps = _read(out, "dependencies.json")
-    user_map = (json.loads(pathlib.Path(args.layer_map).read_text())
-                if args.layer_map else None)
+    restrictions = (json.loads(pathlib.Path(args.restrictions).read_text())
+                    if args.restrictions else None)
     try:
-        built = build_plan(inv, deps, user_map=user_map,
-                           strategy=args.namespace_strategy)
+        built = build_plan(inv, deps, restrictions=restrictions,
+                           bronze_catalog_prefix=args.bronze_catalog_prefix)
     except TargetCollision as exc:
         print(f"HALT: {exc}", file=sys.stderr)
         return HALT
     _write(out, "plan.json", built)
-    _write(out, "MIGRATION_PLAN.md", render_plan(built))
+    _write(out, "PLANNED_OBJECTS.md", render_planned_objects(built))
+    s = built["summary"]
+    print(f'  planned {s["can_migrate"]} object(s) '
+          f'({s["tables"]} table, {s["views"]} view); '
+          f'{s["cannot_migrate"]} cannot move')
     return 0
 
 
@@ -107,20 +125,35 @@ def cmd_ddl(args) -> int:
     built = _read(out, "plan.json")
     by_id = {r["source_identifier"]: r for r in inv["inventory"]}
 
-    statements, blocked = [], list(built.get("blocked", []))
-    for ident in built.get("clone_targets", []):
-        res = build_create_table(by_id[ident], built["target_names"][ident])
+    name_map = built.get("target_names", {})
+    # Wave order, so a view is always emitted after the tables it reads.
+    ordered = [i for wave in built.get("waves", []) for i in wave]
+    ordered += [i for i in built.get("clone_targets", []) if i not in ordered]
+
+    statements, blocked = [], []
+    for ident in ordered:
+        rec = by_id.get(ident)
+        if rec is None:
+            continue
+        builder = (build_create_view if rec.get("object_type") == "VIEW"
+                   else build_create_table)
+        res = (builder(rec, name_map[ident], name_map)
+               if rec.get("object_type") == "VIEW"
+               else builder(rec, name_map[ident]))
         if res.blocked:
-            blocked.append({"source_identifier": ident, "reason": res.blocked_reason})
+            blocked.append({"source_identifier": ident,
+                            "object_type": rec.get("object_type"),
+                            "reason": res.blocked_reason})
             continue
         statements.append({
             "source_identifier": res.source_identifier,
+            "object_type": rec.get("object_type"),
             "target_fqn": res.target_fqn, "sql": res.sql,
             "rules_applied": [dataclasses.asdict(r) for r in res.rules_applied],
             "warnings": res.warnings, "omitted_properties": res.omitted_properties})
 
     payload = {"statements": statements, "blocked": blocked,
-               "namespace_strategy": built.get("namespace_strategy")}
+               "bronze_catalog_prefix": built.get("bronze_catalog_prefix")}
     _write(out, "ddl_plan.json", payload)
     _write(out, "DDL_PLAN.md", render_ddl_plan(payload))
     return 0
@@ -129,18 +162,35 @@ def cmd_ddl(args) -> int:
 def cmd_deploy(args) -> int:
     out = pathlib.Path(args.out_dir)
     ddl_plan = _read(out, "ddl_plan.json")
+    built = _read(out, "plan.json")
     target, run_sql = None, None
     if args.execute:
         target = resolve_target(datalake_ocid=args.datalake_ocid,
                                 workspace=args.workspace,
                                 cluster_id=args.cluster_id, catalog=args.catalog)
-        from target.aidp_runner import make_aidp_run_sql
-        run_sql = make_aidp_run_sql(target)
+        backend = args.backend or detect_backend()
+        print(f"  backend: {backend}")
+        run_sql = make_aidp_run_sql(target, backend=backend)
     result = deploy(ddl_plan, target=target, execute=args.execute, run_sql=run_sql,
                     chunk_size=args.chunk_size)
     _write(out, "deploy_result.json", result)
-    _write(out, "DEPLOY.md", render_deploy(result))
+    _write(out, "SOFT_CLONE_SUMMARY.md", render_soft_clone_summary(built, result))
     return 1 if result.get("failed") or result.get("chunk_errors") else 0
+
+
+def cmd_compute(args) -> int:
+    out = pathlib.Path(args.out_dir)
+    warehouses = extract_warehouses(_run_sql_from_args(args))
+    _write(out, "warehouses.json", warehouses)
+    sizing = propose_all(warehouses["warehouses"],
+                         credit_price_usd=args.credit_price)
+    sizing["metering_source"] = warehouses["metering_source"]
+    sizing["metering_note"] = warehouses["metering_note"]
+    _write(out, "compute.json", sizing)
+    _write(out, "COMPUTE_PROPOSAL.md", render_compute(sizing))
+    print(f'  {warehouses["warehouse_count"]} warehouse(s), '
+          f'metering: {warehouses["metering_source"]}')
+    return 0
 
 
 def _add_snowflake_args(p) -> None:
@@ -178,9 +228,12 @@ def build_parser() -> argparse.ArgumentParser:
     d.set_defaults(func=cmd_deps)
 
     p = sub.add_parser("plan", parents=[common], help="waves + medallion layout (offline)")
-    p.add_argument("--namespace-strategy", default="layer-catalog",
-                   choices=["layer-catalog", "preserve-source", "layer-flattened"])
-    p.add_argument("--layer-map", help="JSON file of explicit source->layer overrides")
+    p.add_argument("--restrictions",
+                   help="JSON file of user restrictions (exclude_databases, "
+                        "max_rows, exclude_name_patterns, ...)")
+    p.add_argument("--bronze-catalog-prefix",
+                   help="use ONE bronze catalog with this name instead of "
+                        "catalog-per-database (default: mirror the source)")
     p.set_defaults(func=cmd_plan)
 
     g = sub.add_parser("ddl", parents=[common], help="generate target DDL (offline)")
@@ -193,7 +246,17 @@ def build_parser() -> argparse.ArgumentParser:
     dep.add_argument("--cluster-id")
     dep.add_argument("--catalog")
     dep.add_argument("--chunk-size", type=int, default=25)
+    dep.add_argument("--backend", choices=["aidp_cli", "oci_raw"],
+                     help="override backend detection")
     dep.set_defaults(func=cmd_deploy)
+
+    c = sub.add_parser("compute", parents=[common],
+                       help="warehouse -> AIDP cluster proposal")
+    _add_snowflake_args(c)
+    c.add_argument("--credit-price", type=float,
+                   help="USD per Snowflake credit; required for a cost model, "
+                        "never assumed")
+    c.set_defaults(func=cmd_compute)
     return ap
 
 
@@ -202,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except (AuthError, MissingTarget, RefusedToExecute, FileNotFoundError,
+            InvalidRestriction, NoBackendAvailable, BackendError,
             ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

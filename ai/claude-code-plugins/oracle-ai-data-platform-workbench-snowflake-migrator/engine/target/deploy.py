@@ -10,6 +10,12 @@ Two AIDP behaviours drive the shape of this module:
 A chunk error does not abort the run: the remaining chunks are attempted and the
 error is recorded, because a partial deployment that is accurately reported is
 more useful than an aborted one that is not.
+
+SCOPED TO ONE CATALOG PER RUN. Bronze mirrors the source, so a multi-database
+estate produces one AIDP Standard Catalog per Snowflake database. Rather than
+fan out across all of them from a single confirmation, a run deploys only the
+statements belonging to `target.catalog` and reports the rest as out of scope.
+Deploying a second catalog is a second explicit invocation.
 """
 from __future__ import annotations
 
@@ -33,8 +39,17 @@ def _split_fqn(target_fqn: str) -> tuple[str, str, str]:
 def deploy(ddl_plan: dict, *, target=None, execute: bool = False,
            run_sql: Callable[..., list[dict]] | None = None,
            chunk_size: int = 25) -> dict:
-    statements = [s for s in ddl_plan.get("statements", []) if s.get("sql")]
+    all_statements = [s for s in ddl_plan.get("statements", []) if s.get("sql")]
     blocked_count = len(ddl_plan.get("blocked", []))
+
+    # Scope to the confirmed catalog. Out-of-scope objects are reported, not run.
+    if target is not None:
+        scope = target.catalog.upper()
+        statements = [s for s in all_statements
+                      if _split_fqn(s["target_fqn"])[0].upper() == scope]
+        out_of_scope = [s for s in all_statements if s not in statements]
+    else:
+        statements, out_of_scope = all_statements, []
 
     out = {
         "ran_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -42,6 +57,10 @@ def deploy(ddl_plan: dict, *, target=None, execute: bool = False,
         "statements": statements,
         "statement_count": len(statements),
         "blocked_count": blocked_count,
+        "catalog_in_scope": target.catalog if target is not None else None,
+        "out_of_scope_count": len(out_of_scope),
+        "out_of_scope_catalogs": sorted({
+            _split_fqn(s["target_fqn"])[0] for s in out_of_scope}),
         "executed": 0, "verified": 0, "failed": [], "chunk_errors": [],
     }
     if not execute:

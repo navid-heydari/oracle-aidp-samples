@@ -1,82 +1,99 @@
-"""Medallion layer assignment and target namespace strategies. Pure.
+"""Medallion mapping. Pure functions, zero I/O.
 
-"Generic unless it was provided": a generic name heuristic decides the layer by
-default, and an explicitly-supplied mapping overrides it. An object that matches
-nothing falls back to BRONZE and is REPORTED as a fallback -- never silently
-assigned -- so the user can correct it before anything is created.
+BRONZE IS A MIRROR, NOT AN ASSIGNMENT. The required mapping is structural:
 
-Strategy is a parameter, not a structural commitment, so the naming decision is
-not a one-way door.
+    Snowflake database  ->  AIDP Standard Catalog
+    Snowflake schema    ->  AIDP schema
+    Snowflake table     ->  AIDP table
+    Snowflake view      ->  AIDP view
+
+So Bronze is an identity transform on the three-part name. AIDP supports
+three-level namespaces, so nothing has to be flattened and nothing can collide --
+which is why there is no layer-assignment heuristic here any more. An earlier
+design assigned each object a layer by name matching; that was wrong for this
+requirement and produced a `bronze.<schema>.<table>` shape that silently dropped
+the source database.
+
+SILVER AND GOLD ARE REQUIREMENT-DRIVEN. Their content depends on transformations
+nobody has specified yet, so this module does not invent any. It emits one job
+per layer per source schema, created but **never triggered**, as the place that
+logic will later live. Fabricating transformation SQL would ship logic no one
+asked for and no one can review.
 """
 from __future__ import annotations
 
 import collections
+import re
 
-__all__ = ["LAYERS", "STRATEGIES", "UnknownStrategy", "assign_layer",
-           "detect_target_collisions", "target_name"]
+__all__ = ["LAYERS", "UnknownStrategy", "bronze_target", "layer_jobs",
+           "detect_target_collisions"]
 
 LAYERS = ("BRONZE", "SILVER", "GOLD")
-STRATEGIES = ("layer-catalog", "preserve-source", "layer-flattened")
 
-# Order matters: GOLD and SILVER are checked before BRONZE so that a name like
-# "gold_staging" resolves to GOLD rather than matching BRONZE's "stg".
-_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("GOLD", ("gold", "mart", "dm_", "datamart", "reporting", "report")),
-    ("SILVER", ("silver", "curated", "clean", "conformed")),
-    ("BRONZE", ("bronze", "raw", "stg", "staging", "landing")),
-)
+_SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
 
 class UnknownStrategy(ValueError):
-    """Namespace strategy is not one of STRATEGIES."""
+    """An identifier or option is not usable as an AIDP catalog/schema name."""
 
 
-def _match(text: str) -> str | None:
-    low = text.lower()
-    for layer, needles in _RULES:
-        if any(n in low for n in needles):
-            return layer
-    return None
+def bronze_target(source_db: str, source_schema: str, object_name: str, *,
+                  catalog_prefix: str | None = None) -> str:
+    """Bronze target name for a source object.
 
+    Default (`catalog_prefix=None`) is the required 1:1 mirror:
+    `<database>.<schema>.<object>`, i.e. database becomes the Standard Catalog.
 
-def assign_layer(source_db: str, source_schema: str,
-                 user_map: dict[str, str] | None = None, *,
-                 source_identifier: str | None = None) -> tuple[str, str]:
-    if user_map:
-        candidates = []
-        if source_identifier:
-            candidates += [source_identifier, source_identifier.upper()]
-        candidates += [f"{source_db}.{source_schema}", source_db]
-        for cand in candidates:
-            if cand in user_map:
-                layer = user_map[cand].upper()
-                if layer not in LAYERS:
-                    raise ValueError(
-                        f"invalid layer {user_map[cand]!r} for {cand!r}; "
-                        f"expected one of {LAYERS}")
-                return layer, "user_provided"
-
-    for text in (source_db, source_schema):
-        hit = _match(text)
-        if hit:
-            return hit, "matched_rule"
-    return "BRONZE", "fallback"
-
-
-def target_name(source_db: str, source_schema: str, object_name: str,
-                layer: str, strategy: str) -> str:
-    if strategy not in STRATEGIES:
-        raise UnknownStrategy(
-            f"unknown namespace strategy {strategy!r}; expected {STRATEGIES}")
-    if strategy == "preserve-source":
+    `catalog_prefix` supports deployments that want ONE bronze catalog instead of
+    catalog-per-database; the source database is then folded into the schema name
+    so distinct databases still cannot merge.
+    """
+    for part in (source_db, source_schema, object_name):
+        if not part or not str(part).strip():
+            raise UnknownStrategy(f"empty name component in "
+                                  f"{source_db!r}.{source_schema!r}.{object_name!r}")
+    if catalog_prefix is None:
         return f"{source_db}.{source_schema}.{object_name}"
-    if strategy == "layer-catalog":
-        return f"{layer.lower()}.{source_schema}.{object_name}"
-    return f"{layer.lower()}.{source_db}_{source_schema}.{object_name}"
+    if not _SAFE_IDENT.match(catalog_prefix):
+        raise UnknownStrategy(
+            f"catalog_prefix {catalog_prefix!r} is not a valid identifier")
+    return f"{catalog_prefix}.{source_db}_{source_schema}.{object_name}"
+
+
+def layer_jobs(scopes: list[tuple[str, str]]) -> list[dict]:
+    """One SILVER and one GOLD job per (database, schema) scope.
+
+    Created, disabled, and never triggered. The body is an explicit placeholder:
+    what belongs there is a requirement, not something to guess.
+    """
+    jobs: list[dict] = []
+    for db, schema in scopes:
+        for layer in ("SILVER", "GOLD"):
+            jobs.append({
+                "name": f"{layer.lower()}_{db}_{schema}",
+                "layer": layer,
+                "source_database": db,
+                "source_schema": schema,
+                "reads_from": f"{db}.{schema}",
+                "enabled": False,
+                "schedule": None,
+                "trigger": "MANUAL_NEVER_TRIGGERED",
+                "body_status": "placeholder",
+                "body_note": (
+                    f"{layer} transformation logic is a requirement to be defined "
+                    "with the customer. This job is created as the place it will "
+                    "live; it is disabled and is never triggered by the migrator."),
+            })
+    return jobs
 
 
 def detect_target_collisions(mapping: dict[str, str]) -> dict[str, list[str]]:
-    """Two source objects mapping to one target name. Empty result means safe."""
+    """Two source objects mapping to one target name. Empty result means safe.
+
+    Bronze cannot collide by construction, but this still runs: a
+    `catalog_prefix` deployment, or a source estate with case-variant names, can
+    produce one. A collision halts rather than being resolved by guessing.
+    """
     buckets: dict[str, list[str]] = collections.defaultdict(list)
     for source, target in mapping.items():
         buckets[target.upper()].append(source)

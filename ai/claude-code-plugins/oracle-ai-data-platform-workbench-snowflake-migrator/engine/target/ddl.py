@@ -13,10 +13,16 @@ Two AIDP-specific behaviours are encoded here rather than rediscovered:
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
+from snowflake_source.dialect.views import (  # noqa: F401  (re-exported)
+    detect_unsupported_constructs, extract_view_body,
+)
+
 __all__ = ["RuleApplication", "RewriteResult", "UnsupportedDDL",
-           "SCRUBBED_PROPERTIES", "build_create_schema", "build_create_table"]
+           "SCRUBBED_PROPERTIES", "build_create_schema", "build_create_table",
+           "build_create_view"]
 
 # Real Snowflake table PROPERTIES with no Delta equivalent. A value here was a
 # deliberate source-side setting, so dropping it is a decision worth reporting.
@@ -139,4 +145,73 @@ def build_create_table(record: dict, target_fqn: str) -> RewriteResult:
         for w in record.get("warnings") or []:
             if w.startswith(c["COLUMN_NAME"] + ":") and w not in res.warnings:
                 res.warnings.append(w)
+    return res
+
+
+
+def build_create_view(record: dict, target_fqn: str,
+                      name_map: dict[str, str] | None = None) -> RewriteResult:
+    """Generate CREATE VIEW, or block with the reason it cannot be migrated."""
+    res = RewriteResult(record["source_identifier"], target_fqn, None)
+    res.rules_applied.append(RuleApplication(
+        "R01_TARGET_NAME", f'{record["source_identifier"]} -> {target_fqn}'))
+
+    meta = record.get("source_metadata") or {}
+    if str(meta.get("is_secure", "")).lower() in ("true", "y", "yes"):
+        res.blocked = True
+        res.blocked_reason = ("Snowflake secure view: its definition and row "
+                              "visibility rules have no Delta equivalent")
+        return res
+    if str(meta.get("is_materialized", "")).lower() in ("true", "y", "yes"):
+        res.blocked = True
+        res.blocked_reason = ("Snowflake materialized view: no AIDP equivalent; "
+                              "rebuild as a table plus a refresh job")
+        return res
+
+    ddl = record.get("view_ddl_get_ddl") or record.get("view_text_show")
+    if not ddl:
+        res.blocked = True
+        res.blocked_reason = ("no view SQL was captured during extraction; "
+                             "GET_DDL and SHOW VIEWS both returned nothing")
+        return res
+
+    try:
+        body = extract_view_body(ddl)
+    except ValueError as exc:
+        res.blocked = True
+        res.blocked_reason = str(exc)
+        return res
+
+    unsupported = detect_unsupported_constructs(body)
+    if unsupported:
+        res.blocked = True
+        res.blocked_reason = "Snowflake-only SQL: " + "; ".join(
+            f'{u["construct"]} ({u["reason"]})' for u in unsupported)
+        return res
+
+    rewritten, changed = body, []
+    for source_name, target_name in sorted((name_map or {}).items(),
+                                           key=lambda kv: -len(kv[0])):
+        if source_name != target_name and re.search(
+                re.escape(source_name), rewritten, re.IGNORECASE):
+            rewritten = re.sub(re.escape(source_name), target_name, rewritten,
+                               flags=re.IGNORECASE)
+            changed.append(f"{source_name} -> {target_name}")
+
+    if changed:
+        res.rules_applied.append(RuleApplication(
+            "R41_VIEW_REFS_REWRITTEN",
+            "rewrote object references: " + ", ".join(changed)))
+    else:
+        res.rules_applied.append(RuleApplication(
+            "R40_VIEW_REFS_IDENTITY",
+            "bronze mirrors the source 1:1, so object references are unchanged"))
+
+    res.rules_applied.append(RuleApplication(
+        "R42_VIEW_PORTABLE_SQL",
+        "no Snowflake-only construct detected; body carried over verbatim"))
+    res.warnings.append(
+        "View SQL was carried over without dialect translation. Verify its result "
+        "against the source before relying on it.")
+    res.sql = f"CREATE VIEW IF NOT EXISTS {_qualify(target_fqn)} AS\n{rewritten}"
     return res
