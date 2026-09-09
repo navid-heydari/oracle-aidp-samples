@@ -8,9 +8,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 SKILLS = ["snowflake-migrator-overview", "snowflake-migrator-bootstrap",
           "snowflake-assess-estate", "snowflake-migration-plan",
-          "snowflake-medallion-clone", "snowflake-compute-proposal"]
+          "snowflake-medallion-clone", "snowflake-compute-proposal",
+          "snowflake-smoke-test", "snowflake-clone-notebook"]
 COMMANDS = ["snowflake-assess", "snowflake-plan", "snowflake-soft-clone",
-            "snowflake-compute"]
+            "snowflake-compute", "snowflake-smoke", "snowflake-notebook"]
 
 
 def frontmatter(path: pathlib.Path) -> dict:
@@ -105,3 +106,25 @@ def test_no_skill_still_promises_tables_only():
     for name in SKILLS:
         text = (ROOT / "skills" / name / "SKILL.md").read_text().lower()
         assert "tables only" not in text, name
+
+
+def test_smoke_skill_warns_the_write_probe_leaves_a_schema():
+    text = (ROOT / "skills/snowflake-smoke-test/SKILL.md").read_text()
+    low = text.lower()
+    assert "write-probe" in low
+    assert "not remove" in low or "left behind" in low
+    assert "drop" in low, "must explain why it cannot clean up"
+
+
+def test_notebook_skill_says_execution_is_the_users_call():
+    text = (ROOT / "skills/snowflake-clone-notebook/SKILL.md").read_text()
+    low = text.lower()
+    assert "do not run it for them" in low
+    assert "empty" in low, "must say the tables arrive with no rows"
+    assert "workspace" in low and "not in a data catalog" in low
+
+
+def test_every_skill_that_can_write_states_the_no_data_guarantee():
+    for name in ("snowflake-medallion-clone", "snowflake-clone-notebook"):
+        low = (ROOT / "skills" / name / "SKILL.md").read_text().lower()
+        assert "no data" in low or "moves no data" in low or "copies no data" in low, name

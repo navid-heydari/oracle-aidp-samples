@@ -5,8 +5,11 @@ anything that halted or was skipped rather than burying it.
 """
 from __future__ import annotations
 
+from plan.status import assess_risk, migration_status
+
 __all__ = ["render_inventory", "render_ddl_plan", "render_planned_objects",
-           "render_soft_clone_summary", "render_compute"]
+           "render_soft_clone_summary", "render_compute", "render_summary",
+           "render_smoke"]
 
 
 def _bytes(n) -> str:
@@ -275,4 +278,125 @@ def render_compute(sizing: dict) -> str:
     if sizing.get("blocked"):
         out += ["## Warehouses with no proposal", ""]
         out += [f'- `{b["name"]}` — {b["reason"]}' for b in sizing["blocked"]]
+    return "\n".join(out).rstrip() + "\n"
+
+
+# ---------------------------------------------------------------------------
+# The migration summary: one row per object -- tables, views and jobs alike --
+# with row count, migration risk, and migration status. Plus a brief
+# source -> destination header.
+# ---------------------------------------------------------------------------
+
+def render_summary(plan: dict, inventory: dict, deployed: dict | None,
+                   target: dict | None) -> str:
+    session = (inventory or {}).get("session", {})
+    dbs = ", ".join((inventory or {}).get("databases_in_scope") or []) or "-"
+
+    out = ["# Migration summary", "", "## Source → destination", "",
+           "| | Source (Snowflake) | Destination (AIDP) |", "|---|---|---|"]
+    if target:
+        dest_id = target.get("datalake_ocid", "-")
+        dest_ws = target.get("workspace", "-")
+        dest_cl = target.get("cluster_id", "-")
+        dest_cat = target.get("catalog", "-")
+    else:
+        dest_id = dest_ws = dest_cl = dest_cat = "*not supplied*"
+    out += [f'| Account / DataLake | `{session.get("A", "-")}` | `{dest_id}` |',
+            f'| Region | `{session.get("R", "-")}` | *derived from the OCID* |',
+            f'| Role / workspace | `{session.get("ROLE", "-")}` | `{dest_ws}` |',
+            f'| Version / cluster | `{session.get("V", "-")}` | `{dest_cl}` |',
+            f'| Scope | {dbs} | catalog `{dest_cat}` |',
+            "",
+            f'Mapping: {plan.get("bronze_mapping")}.', ""]
+
+    rows: list[tuple[str, str, str, str, str, str]] = []
+
+    for c in plan.get("can_migrate") or []:
+        level, note = assess_risk(c)
+        status = migration_status(c["source_identifier"], deployed=deployed)
+        rows.append((c["source_identifier"], c["object_type"],
+                     "-" if c.get("rows") is None else f'{c["rows"]:,}',
+                     level, status, note))
+
+    for c in plan.get("cannot_migrate") or []:
+        level, note = assess_risk(c, blocked=True)
+        rows.append((c["source_identifier"], c.get("object_type") or "-", "-",
+                     level, "BLOCKED", note))
+
+    for j in plan.get("silver_gold_jobs") or []:
+        rows.append((j["name"], "JOB", "-", "LOW",
+                     migration_status(j["name"], deployed=deployed),
+                     f'{j["layer"]} job: {j["body_status"]} body, disabled and '
+                     "never triggered. Content is a requirement to define."))
+
+    out += ["## Objects", "",
+            "| Object | Type | Rows | Risk | Migration status | Notes |",
+            "|---|---|---:|---|---|---|"]
+    out += [f'| `{n}` | {t} | {r} | {lv} | {st} | {note} |'
+            for n, t, r, lv, st, note in sorted(rows, key=lambda x: (x[1], x[0]))]
+    out.append("")
+
+    status_counts: dict[str, int] = {}
+    for _, _, _, _, st, _ in rows:
+        status_counts[st] = status_counts.get(st, 0) + 1
+    risk_counts: dict[str, int] = {}
+    for _, _, _, lv, _, _ in rows:
+        risk_counts[lv] = risk_counts.get(lv, 0) + 1
+
+    out += ["## Roll-up", "",
+            "By migration status: "
+            + " · ".join(f"**{k}** {v}" for k, v in sorted(status_counts.items())),
+            "",
+            "By risk: "
+            + " · ".join(f"**{k}** {v}" for k, v in sorted(risk_counts.items())),
+            "",
+            "Status vocabulary: `NOT_YET_DONE` → `IN_PROGRESS` → `SHALLOW_CLONE` → "
+            "`DATA_CLONE` → `DONE`, or `BLOCKED`.", "",
+            "**`DATA_CLONE` and `DONE` are unreachable in this version: the plugin "
+            "copies structure only and moves no data.** Every object that reports "
+            "`SHALLOW_CLONE` exists in AIDP with its columns and zero rows.", ""]
+
+    if deployed and not deployed.get("dry_run"):
+        out += [f'Deployed against catalog '
+                f'`{deployed.get("catalog_in_scope")}`; '
+                f'{len(deployed.get("verified_targets") or [])} verified, '
+                f'{len(deployed.get("failed_targets") or [])} unverified.', ""]
+    elif deployed:
+        out += ["Last run was a **dry run** — nothing was created.", ""]
+    else:
+        out += ["No deployment has been attempted yet.", ""]
+    return "\n".join(out).rstrip() + "\n"
+
+
+def render_smoke(result: dict) -> str:
+    src, dest = result.get("source", {}), result.get("destination", {})
+    out = ["# Smoke test — connectivity and permissions", "",
+           f'Verdict: **{"PASS" if result.get("ok") else "FAIL"}**', "",
+           "## Source (Snowflake)", ""]
+    if not src.get("reachable"):
+        out += [f'**Unreachable.** {src.get("error", "")}', ""]
+    else:
+        out += [f'Connected as `{src.get("user")}` / role `{src.get("role")}` on '
+                f'account `{src.get("account")}` (`{src.get("region")}`)', "",
+                "| Check | Result | Detail |", "|---|---|---|"]
+        out += [f'| {c["name"]} | {"PASS" if c["ok"] else "FAIL"} | {c["detail"]} |'
+                for c in src.get("checks") or []]
+        out.append("")
+
+    out += ["## Destination (AIDP)", ""]
+    if dest.get("skipped"):
+        out += [f'**Skipped.** {dest.get("reason")}', ""]
+    else:
+        out += [f'Catalog `{dest.get("catalog")}` on cluster '
+                f'`{dest.get("cluster_id")}`', "",
+                "| Check | Result | Detail |", "|---|---|---|"]
+        out += [f'| {c["name"]} | {"PASS" if c["ok"] else "FAIL"} | {c["detail"]} |'
+                for c in dest.get("checks") or []]
+        out += ["",
+                f'Write access: **{"verified" if dest.get("write_verified") else "not verified"}** '
+                f'— {dest.get("write_note", "")}', ""]
+        if dest.get("left_behind"):
+            out += ["⚠️ Left behind by the write probe (this plugin never issues "
+                    "`DROP`, so remove these yourself): "
+                    + ", ".join(f'`{x}`' for x in dest["left_behind"]), ""]
     return "\n".join(out).rstrip() + "\n"

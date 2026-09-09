@@ -11,6 +11,9 @@ and writes its own plus a markdown report, so any stage can be re-run alone.
   deploy  -> deploy_result.json  + SOFT_CLONE_SUMMARY.md    (dry-run offline;
                                                              --execute needs AIDP)
   compute -> compute.json        + COMPUTE_PROPOSAL.md      (needs Snowflake)
+  smoke   -> smoke.json          + SMOKE_TEST.md            (source; dest if given)
+  notebook-> <nb>.ipynb          + NOTEBOOK.md              (offline; --upload writes)
+  summary -> SUMMARY.md                                     (offline)
 
 Bronze mirrors the source: Snowflake database -> AIDP Standard Catalog, schema ->
 schema, table -> table, view -> view. Silver and Gold get disabled job stubs.
@@ -27,9 +30,11 @@ import sys
 
 from plan.build import TargetCollision, build_plan
 from plan.restrictions import InvalidRestriction
+from plan.smoke import run_smoke
+from target.notebook import build_notebook, notebook_workspace_path
 from report.render import (
     render_compute, render_ddl_plan, render_inventory, render_planned_objects,
-    render_soft_clone_summary,
+    render_smoke, render_soft_clone_summary, render_summary,
 )
 from snowflake_source.conn import AuthError, build_connect_kwargs, connect, make_run_sql
 from snowflake_source.extract.catalog import build_inventory
@@ -39,7 +44,9 @@ from sizing.warehouse_map import propose_all
 from target.coords import MissingTarget, resolve_target
 from target.ddl import build_create_table, build_create_view
 from target.deploy import RefusedToExecute, deploy
-from target.executor import NoBackendAvailable, detect_backend
+from target.executor import (
+    NoBackendAvailable, build_command, detect_backend,
+)
 # Aliased: snowflake_source.conn also exports make_run_sql, and the
 # unqualified import shadowed it.
 from target.runner import BackendError
@@ -193,6 +200,120 @@ def cmd_compute(args) -> int:
     return 0
 
 
+def _optional_target(args):
+    """Resolve a target only if all four coordinates were supplied."""
+    if not all([args.datalake_ocid, args.workspace, args.cluster_id, args.catalog]):
+        return None
+    return resolve_target(datalake_ocid=args.datalake_ocid,
+                          workspace=args.workspace,
+                          cluster_id=args.cluster_id, catalog=args.catalog)
+
+
+def cmd_smoke(args) -> int:
+    out = pathlib.Path(args.out_dir)
+    target = _optional_target(args)
+    dest_run_sql = None
+    if target is not None:
+        backend = args.backend or detect_backend()
+        print(f"  destination backend: {backend}")
+        dest_run_sql = make_aidp_run_sql(target, backend=backend)
+    result = run_smoke(source_run_sql=_run_sql_from_args(args), target=target,
+                       dest_run_sql=dest_run_sql, write_probe=args.write_probe,
+                       database=(args.database or [None])[0]
+                       if getattr(args, "database", None) else None)
+    _write(out, "smoke.json", result)
+    _write(out, "SMOKE_TEST.md", render_smoke(result))
+    print(f'  verdict: {"PASS" if result["ok"] else "FAIL"}')
+    return 0 if result["ok"] else 1
+
+
+def cmd_notebook(args) -> int:
+    out = pathlib.Path(args.out_dir)
+    ddl_plan = _read(out, "ddl_plan.json")
+    built = _read(out, "plan.json")
+    inv = _read(out, "inventory.json")
+    session = inv.get("session", {})
+
+    catalog = args.catalog or (built.get("catalogs_to_create") or [None])[0]
+    if not catalog:
+        raise ValueError("no catalog to generate a notebook for")
+
+    doc = build_notebook(ddl_plan, built, catalog=catalog,
+                         source={"account": session.get("A"),
+                                 "region": session.get("R")})
+    local = out / f"snowmig_shallow_clone_{catalog}.ipynb"
+    _write(out, local.name, doc)
+    ws_path = notebook_workspace_path(catalog)
+
+    lines = [f"# Shallow-clone notebook for `{catalog}`", "",
+             f"Generated: `{local}`", f"Intended AIDP path: `{ws_path}`", "",
+             f'{doc["metadata"]["snowmig"]["statement_count"]} statement(s); '
+             f'{doc["metadata"]["snowmig"]["blocked_count"]} object(s) not '
+             "attempted.", "",
+             "**The notebook creates empty structure and moves no data.** It "
+             "prints progress per object so a long run stays visible, and "
+             "verifies each object individually at the end.", ""]
+
+    if not args.upload:
+        lines += ["Not uploaded. Re-run with `--upload` plus the AIDP target "
+                  "coordinates to place it in the workspace.", ""]
+        _write(out, "NOTEBOOK.md", "\n".join(lines))
+        print("  generated only; pass --upload to place it in AIDP")
+        return 0
+
+    target = _optional_target(args)
+    if target is None:
+        raise MissingTarget(
+            "--upload needs all four AIDP coordinates: --datalake-ocid, "
+            "--workspace, --cluster-id, --catalog. Ask the user for them.")
+    backend = args.backend or detect_backend()
+    cmd = build_command(backend, "upload_notebook", target,
+                        workspace_path=ws_path, local_path=str(local))
+    print(f"  backend: {backend}")
+    print(f'  command: {" ".join(cmd)}')
+    if args.dry_run:
+        lines += ["Upload was a **dry run**. The command above was not executed.",
+                  ""]
+        _write(out, "NOTEBOOK.md", "\n".join(lines))
+        return 0
+
+    import subprocess
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        print(f"error: upload failed: {(proc.stderr or '')[:400]}", file=sys.stderr)
+        return 1
+    lines += [f"Uploaded to `{ws_path}`.", "",
+              "**Ask the user before executing it.** Then run it from the AIDP "
+              "workspace, or via `aidp notebook run`.", ""]
+    _write(out, "NOTEBOOK.md", "\n".join(lines))
+    print(f"  uploaded to {ws_path}")
+    return 0
+
+
+def cmd_summary(args) -> int:
+    out = pathlib.Path(args.out_dir)
+    built = _read(out, "plan.json")
+    inv = _read(out, "inventory.json")
+    deployed = None
+    if (out / "deploy_result.json").is_file():
+        deployed = _read(out, "deploy_result.json")
+    target = _optional_target(args)
+    _write(out, "SUMMARY.md",
+           render_summary(built, inv,
+                          deployed,
+                          dataclasses.asdict(target) if target else None))
+    return 0
+
+
+def _add_target_args(p) -> None:
+    p.add_argument("--datalake-ocid")
+    p.add_argument("--workspace")
+    p.add_argument("--cluster-id")
+    p.add_argument("--catalog")
+    p.add_argument("--backend", choices=["aidp_cli", "oci_raw"],
+                   help="override backend detection")
+
+
 def _add_snowflake_args(p) -> None:
     p.add_argument("--account")
     p.add_argument("--user")
@@ -241,13 +362,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     dep = sub.add_parser("deploy", parents=[common], help="dry-run by default")
     dep.add_argument("--execute", action="store_true")
-    dep.add_argument("--datalake-ocid")
-    dep.add_argument("--workspace")
-    dep.add_argument("--cluster-id")
-    dep.add_argument("--catalog")
+    _add_target_args(dep)
     dep.add_argument("--chunk-size", type=int, default=25)
-    dep.add_argument("--backend", choices=["aidp_cli", "oci_raw"],
-                     help="override backend detection")
     dep.set_defaults(func=cmd_deploy)
 
     c = sub.add_parser("compute", parents=[common],
@@ -257,6 +373,32 @@ def build_parser() -> argparse.ArgumentParser:
                    help="USD per Snowflake credit; required for a cost model, "
                         "never assumed")
     c.set_defaults(func=cmd_compute)
+
+    sm = sub.add_parser("smoke", parents=[common],
+                        help="connectivity + permission check on both ends")
+    _add_snowflake_args(sm)
+    _add_target_args(sm)
+    sm.add_argument("--database", action="append",
+                    help="database to probe INFORMATION_SCHEMA in; auto-picked "
+                         "from the first non-system database otherwise")
+    sm.add_argument("--write-probe", action="store_true",
+                    help="prove destination WRITE by creating a probe schema; it "
+                         "is NOT dropped afterwards")
+    sm.set_defaults(func=cmd_smoke)
+
+    nb = sub.add_parser("notebook", parents=[common],
+                        help="generate the shallow-clone notebook; --upload places "
+                             "it in the AIDP workspace")
+    _add_target_args(nb)
+    nb.add_argument("--upload", action="store_true")
+    nb.add_argument("--dry-run", action="store_true",
+                    help="with --upload, print the command without running it")
+    nb.set_defaults(func=cmd_notebook)
+
+    su = sub.add_parser("summary", parents=[common],
+                        help="migration summary table: rows, risk, status")
+    _add_target_args(su)
+    su.set_defaults(func=cmd_summary)
     return ap
 
 

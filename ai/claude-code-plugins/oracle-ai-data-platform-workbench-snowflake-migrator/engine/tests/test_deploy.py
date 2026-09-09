@@ -140,3 +140,29 @@ def test_dry_run_reports_every_statement_regardless_of_catalog():
     out = deploy(multi_catalog_plan(), run_sql=Recorder())
     assert out["statement_count"] == 2
     assert out["out_of_scope_count"] == 0
+
+
+def test_per_target_lists_are_emitted_for_status_reporting():
+    rec = Recorder(existing={"T0"})
+    out = deploy(plan(2), execute=True, target=TARGET, run_sql=rec, chunk_size=2)
+    assert out["attempted_targets"] == ["D.S.T0", "D.S.T1"]
+    assert out["verified_targets"] == ["D.S.T0"]
+    assert out["failed_targets"] == ["D.S.T1"]
+
+
+def test_dry_run_leaves_the_target_lists_empty():
+    out = deploy(plan(2), run_sql=Recorder())
+    assert out["attempted_targets"] == []
+    assert out["verified_targets"] == []
+
+
+def test_no_generated_or_executed_statement_moves_data():
+    # The plugin must not move a byte. Nothing it runs may be DML.
+    rec = Recorder()
+    deploy(plan(3), execute=True, target=TARGET, run_sql=rec, chunk_size=2)
+    for call in rec.calls:
+        upper = " " + " ".join(call.split()).upper() + " "
+        for verb in (" INSERT ", " COPY INTO ", " MERGE ", " UPDATE ",
+                     " DELETE ", " TRUNCATE ", " DROP ", " UNLOAD ",
+                     " CREATE TABLE AS ", " AS SELECT "):
+            assert verb not in upper, f"{verb.strip()} in: {call[:120]}"
