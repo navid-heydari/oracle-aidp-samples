@@ -12,22 +12,30 @@ re-runnable on its own.
 |---|---|---|
 | 0 | `snowflake-migrator-bootstrap` | verified Snowflake auth |
 | 1 | `snowflake-assess-estate` | `inventory.json` + `INVENTORY.md` |
-| 2 | `snowflake-migration-plan` | `dependencies.json`, `plan.json` + `MIGRATION_PLAN.md` |
-| 3 | `snowflake-medallion-clone` | `ddl_plan.json` + `DDL_PLAN.md`, then optional deploy |
+| 2 | `snowflake-migration-plan` | `plan.json` + **`PLANNED_OBJECTS.md`** |
+| 3 | `snowflake-medallion-clone` | `ddl_plan.json` + `DDL_PLAN.md`, then **`SOFT_CLONE_SUMMARY.md`** |
+| — | `snowflake-compute-proposal` | `compute.json` + `COMPUTE_PROPOSAL.md` (independent) |
+
+The two reports the plugin exists to produce are **`PLANNED_OBJECTS.md`** (what
+is planned to move, and what cannot with reasons) and **`SOFT_CLONE_SUMMARY.md`**
+(what the shallow clone actually created).
 
 ## Routing
 
 - "what's in this Snowflake account", "list the tables", "how big are they" → stage 1
 - "what order would we migrate in", "what depends on what", "show me a plan" → stage 2
-- "create the medallion structure", "clone the schema", "soft clone" → stage 3
+- "create the medallion structure", "clone the schema", "soft clone", "shallow clone" → stage 3
+- "compute sizing", "warehouse equivalent", "what will it cost", "credits" → `snowflake-compute-proposal`
 - auth or connection errors from any stage → stage 0
 
 ## Rules that apply to every stage
 
 1. **Read-only against Snowflake.** Only `SHOW`, `SELECT`, `DESCRIBE`, `GET_DDL`.
    Never DDL or DML against the source.
-2. **MVP-1 moves no data and translates no views.** It creates *empty* Delta
-   tables. If the user expects rows to arrive, say so plainly before running.
+2. **The clone copies structure, not data.** It creates schemas, tables and views
+   with no rows. If the user expects data to arrive, say so plainly before running.
+   Views ARE migrated, but only when their SQL is portable; a Snowflake-only
+   construct blocks the view with the construct named.
 3. **AIDP target coordinates are never stored and never guessed.** There is no
    config file and no environment default. Ask the user for the DataLake OCID,
    workspace, cluster and catalog in the turn you need them.
@@ -40,6 +48,11 @@ re-runnable on its own.
 6. **A halt is a halt.** Exit code 3 means an identifier-case or target-name
    collision. Show the collisions and stop; do not pick a winner.
 
+7. **Bronze mirrors the source.** Snowflake database → AIDP Standard Catalog,
+   schema → schema, table → table, view → view. Silver and Gold are
+   requirement-driven: the plan emits disabled job stubs for them and the
+   migrator never triggers them.
+
 ## Engine
 
 All stages call one CLI:
@@ -47,3 +60,9 @@ All stages call one CLI:
 ```bash
 python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py <stage> --out-dir <dir> [...]
 ```
+
+Stages: `assess` · `deps` · `plan` · `ddl` · `deploy` · `compute`.
+
+AIDP writes go through the `aidp` CLI when installed, otherwise `oci
+raw-request`. The engine prints which backend it chose, and fails loudly if
+neither CLI is present rather than guessing a transport.

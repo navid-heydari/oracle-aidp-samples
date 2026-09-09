@@ -1,6 +1,6 @@
 ---
 name: snowflake-migration-plan
-description: Build a high-level Snowflake to AIDP migration plan and present it for approval. Derives a dependency graph from ACCOUNT_USAGE.OBJECT_DEPENDENCIES or, where that privilege is unavailable, by parsing view DDL; orders objects into topological waves so dependencies land first; proposes a medallion bronze/silver/gold assignment; and reports cycles, blocked objects and unsupported features. Use after an estate assessment, or when the user asks in what order to migrate, what depends on what, or wants to see the migration plan.
+description: Build a high-level Snowflake to AIDP migration plan and present it for approval. States which objects can migrate and which cannot with a brief reason for each, applies user-supplied restrictions such as excluded databases or size caps, derives dependency order so views follow their base tables, and lists the Silver and Gold job stubs. Use after an estate assessment, or when the user asks what can be migrated, in what order, why something is excluded, or wants to see the migration plan.
 ---
 
 # Stage 2 — dependencies and plan
@@ -11,35 +11,76 @@ Two commands. The first needs Snowflake; the second is offline.
 python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py deps \
   --account <...> --user <...> --auth <...> [--key-path ...] --out-dir ./snowmig_out
 
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py plan \
-  --out-dir ./snowmig_out [--namespace-strategy layer-catalog] [--layer-map map.json]
+python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py plan --out-dir ./snowmig_out \
+  [--restrictions restrictions.json] [--bronze-catalog-prefix bronze]
 ```
+
+`PLANNED_OBJECTS.md` is the report to walk the user through. It is the answer to
+"what are the objects planned to move".
+
+## The bronze mapping is structural, not a choice
+
+```
+Snowflake database  ->  AIDP Standard Catalog
+Snowflake schema    ->  AIDP schema
+Snowflake table     ->  AIDP table
+Snowflake view      ->  AIDP view
+```
+
+Bronze mirrors the source 1:1, so target names equal source names and nothing is
+flattened. `--bronze-catalog-prefix` is the only variation: it puts everything in
+one catalog and folds the database into the schema name, for deployments that
+want a single bronze catalog.
+
+## Can and cannot, with reasons
+
+Every inventoried object lands in exactly one of `can_migrate` or
+`cannot_migrate`. Read the reasons out — they are the point of the report.
+Categories:
+
+| Category | Means |
+|---|---|
+| `restriction` | The user's own restriction excluded it. Name which one |
+| `unmapped_type` | A column type has no Delta equivalent, e.g. `VARIANT`, `GEOGRAPHY` |
+| `snowflake_only_sql` | A view uses `QUALIFY`, `LATERAL FLATTEN`, `IFF`, `::`, … |
+| `unsupported_object` | Secure view, materialized view |
+| `no_definition` / `unparseable_sql` | The view SQL could not be read or parsed |
+
+## Restrictions — ask for them, do not invent them
+
+`--restrictions` takes a JSON file. Ask the user what they want to exclude before
+running; do not guess a scope.
+
+```json
+{
+  "exclude_databases": ["SNOWFLAKE_LEARNING_DB"],
+  "exclude_schemas": ["STAGE"],
+  "exclude_object_types": ["VIEW"],
+  "exclude_name_patterns": ["^TMP_", "_BAK$"],
+  "exclude_objects": ["DB.SCHEMA.SCRATCH"],
+  "max_rows": 100000000,
+  "max_bytes": 1099511627776
+}
+```
+
+`include_*` variants act as allowlists. An unrecognised key is an error, not an
+ignored line — a typo would otherwise apply nothing while appearing to work.
 
 ## Lineage provenance matters — state it
 
-`deps` prints its source. Report which one:
+`deps` prints its source:
 
 - `account_usage` — authoritative lineage across all object types
 - `parsed_ddl` — the `ACCOUNT_USAGE` grant was unavailable, so edges come from
-  parsing view DDL. **View→object edges only.** Tell the user the graph is
-  partial and why; do not present it as complete lineage.
+  parsing view DDL. **View→object edges only.** Say the graph is partial; do not
+  present it as complete lineage.
 
-## Namespace strategy
+## Present, do not just run
 
-Default `layer-catalog` → `bronze.<schema>.<table>`. It drops the source database,
-so two databases sharing `schema.table` collide — the run halts with exit 3 if
-that happens. Offer `preserve-source` (`<db>.<schema>.<table>`, never collides) or
-`layer-flattened` (`bronze.<db>_<schema>.<table>`) when it does.
+1. The can/cannot split and every reason.
+2. **Catalogs the user must create or confirm as INTERNAL** before stage 3.
+3. The waves — views follow their base tables.
+4. Cycles, if any: they need a human decision, not a broken edge.
+5. The Silver/Gold job stubs: created, disabled, never triggered.
 
-## Present for approval, do not just run
-
-Walk the user through `MIGRATION_PLAN.md`:
-
-1. the waves, and why the order is what it is
-2. **`fallback_assignments`** — objects no naming rule matched, defaulted to
-   BRONZE. These are the ones most likely wrong. Ask before accepting them; a
-   `--layer-map` JSON of `{"SOURCE": "SILVER"}` overrides.
-3. cycles, blocked objects, unsupported features
-4. that `clone_targets` is tables only
-
-Get explicit agreement on the layer assignment before stage 3.
+Exit 3 means a target-name collision — show it and stop.
