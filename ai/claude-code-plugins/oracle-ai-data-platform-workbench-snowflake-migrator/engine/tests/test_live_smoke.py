@@ -67,8 +67,17 @@ def test_deps_and_plan(out):
     assert main(["plan", "--out-dir", str(out)]) == 0
     plan = json.loads((out / "plan.json").read_text())
     assert plan["waves"], "at least one wave expected"
-    assert plan["clone_targets"], "tables should be clone targets"
-    assert all(u["feature"] == "VIEW" for u in plan["unsupported"])
+    assert plan["clone_targets"], "objects should be clone targets"
+    # Bronze mirrors the source, so the target name equals the source name.
+    for ident, target in plan["target_names"].items():
+        assert target == ident, (ident, target)
+    assert plan["catalogs_to_create"] == [DB]
+    # Every inventoried object lands in exactly one verdict.
+    ids = ([c["source_identifier"] for c in plan["can_migrate"]]
+           + [c["source_identifier"] for c in plan["cannot_migrate"]])
+    assert len(ids) == len(set(ids)) == plan["summary"]["objects_inventoried"]
+    for c in plan["cannot_migrate"]:
+        assert c["category"] and c["reason"], c
 
 
 def test_view_lands_after_its_base_tables(out):
@@ -82,14 +91,48 @@ def test_view_lands_after_its_base_tables(out):
             assert wave_of[edge["to"]] < wave_of[edge["from"]], edge
 
 
-def test_ddl_generates_delta_tables_and_no_replace(out):
+def test_ddl_generates_delta_tables_and_views_and_no_replace(out):
     assert main(["ddl", "--out-dir", str(out)]) == 0
     ddl = json.loads((out / "ddl_plan.json").read_text())
     assert ddl["statements"]
+    kinds = {s["object_type"] for s in ddl["statements"]}
+    assert "TABLE" in kinds
     for st in ddl["statements"]:
-        assert "USING DELTA" in st["sql"]
         assert "IF NOT EXISTS" in st["sql"]
         assert "OR REPLACE" not in st["sql"]
+        if st["object_type"] == "TABLE":
+            assert "USING DELTA" in st["sql"]
+        else:
+            assert st["sql"].startswith("CREATE VIEW IF NOT EXISTS")
+
+
+def test_the_view_is_emitted_after_its_base_tables(out):
+    ddl = json.loads((out / "ddl_plan.json").read_text())
+    kinds = [s["object_type"] for s in ddl["statements"]]
+    if "VIEW" not in kinds:
+        pytest.skip("estate has no migratable view")
+    assert kinds.index("VIEW") > max(
+        i for i, k in enumerate(kinds) if k == "TABLE")
+
+
+def test_silver_and_gold_jobs_are_planned_but_disabled(out):
+    plan = json.loads((out / "plan.json").read_text())
+    jobs = plan["silver_gold_jobs"]
+    assert jobs, "one silver + one gold job per migratable schema"
+    assert all(j["enabled"] is False for j in jobs)
+    assert all(j["trigger"] == "MANUAL_NEVER_TRIGGERED" for j in jobs)
+
+
+def test_compute_proposal_maps_warehouses_to_clusters(out):
+    assert main(["compute", "--out-dir", str(out)] + auth_args()) == 0
+    sizing = json.loads((out / "compute.json").read_text())
+    assert sizing["warehouse_count"] >= 1
+    assert sizing["proposals"], "at least one cluster proposal"
+    for p in sizing["proposals"]:
+        assert p["worker_count"] >= 1
+        assert p["shape_confirmation_required"] is True
+    # No credit price was passed, so no cost model may be asserted.
+    assert sizing["cost_model"] is None
 
 
 def test_deploy_dry_run_creates_nothing(out):

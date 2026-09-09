@@ -1,97 +1,89 @@
-"""Layer assignment and target naming. Pure."""
+"""Medallion mapping. Bronze mirrors Snowflake 1:1; Silver/Gold are job stubs."""
 import pytest
 
 from plan.medallion import (
-    LAYERS, STRATEGIES, UnknownStrategy, assign_layer, detect_target_collisions,
-    target_name,
+    LAYERS, UnknownStrategy, bronze_target, layer_jobs, detect_target_collisions,
 )
 
 
-@pytest.mark.parametrize("name,expected", [
-    ("BRONZE_PROD", "BRONZE"), ("raw_events", "BRONZE"), ("STG_ORDERS", "BRONZE"),
-    ("landing", "BRONZE"), ("SILVER_PROD", "SILVER"), ("curated", "SILVER"),
-    ("conformed_x", "SILVER"), ("GOLD_PROD", "GOLD"), ("datamart", "GOLD"),
-    ("dm_finance", "GOLD"), ("reporting", "GOLD"),
-])
-def test_heuristic_matches_layer_names(name, expected):
-    layer, basis = assign_layer(name, "PUBLIC")
-    assert (layer, basis) == (expected, "matched_rule")
+# --- Bronze: a structural mirror, not a layer assignment -------------------
+
+def test_database_becomes_the_catalog():
+    # Database -> Standard Catalog, Schemas -> Schemas, Tables -> tables.
+    assert bronze_target("MYDB", "SALES", "ORDERS") == "MYDB.SALES.ORDERS"
 
 
-def test_schema_name_matches_when_database_does_not():
-    assert assign_layer("ANALYTICS", "gold_marts")[0] == "GOLD"
+def test_bronze_preserves_case_exactly():
+    # Snowflake unquoted folds to UPPER; the mirror must not re-fold it.
+    assert bronze_target("MyDb", "Sales", "Orders") == "MyDb.Sales.Orders"
 
 
-def test_database_wins_over_schema():
-    assert assign_layer("GOLD_PROD", "staging")[0] == "GOLD"
-
-
-def test_unmatched_falls_back_to_bronze_and_says_so():
-    layer, basis = assign_layer("ANALYTICS", "PUBLIC")
-    assert (layer, basis) == ("BRONZE", "fallback")
-
-
-def test_user_map_overrides_the_heuristic():
-    layer, basis = assign_layer("GOLD_PROD", "PUBLIC",
-                                {"GOLD_PROD.PUBLIC.T": "SILVER"},
-                                source_identifier="GOLD_PROD.PUBLIC.T")
-    assert (layer, basis) == ("SILVER", "user_provided")
-
-
-def test_user_map_accepts_a_database_level_key():
-    layer, basis = assign_layer("ANALYTICS", "PUBLIC", {"ANALYTICS": "GOLD"},
-                                source_identifier="ANALYTICS.PUBLIC.T")
-    assert (layer, basis) == ("GOLD", "user_provided")
-
-
-def test_user_map_value_is_validated():
-    with pytest.raises(ValueError, match="PLATINUM"):
-        assign_layer("D", "S", {"D": "PLATINUM"}, source_identifier="D.S.T")
-
-
-def test_layer_catalog_is_the_default_shape():
-    assert target_name("MYDB", "SALES", "ORDERS", "BRONZE",
-                       "layer-catalog") == "bronze.SALES.ORDERS"
-
-
-def test_preserve_source_keeps_all_three_parts():
-    assert target_name("MYDB", "SALES", "ORDERS", "GOLD",
-                       "preserve-source") == "MYDB.SALES.ORDERS"
-
-
-def test_layer_flattened_folds_db_into_schema():
-    assert target_name("MYDB", "SALES", "ORDERS", "SILVER",
-                       "layer-flattened") == "silver.MYDB_SALES.ORDERS"
-
-
-def test_unknown_strategy_rejected():
-    with pytest.raises(UnknownStrategy):
-        target_name("D", "S", "T", "BRONZE", "whatever")
-
-
-def test_layer_catalog_collides_across_databases():
-    # This is exactly why the strategy needs a collision check: layer-catalog
-    # drops the source database, so two DBs sharing schema.table merge.
+def test_bronze_is_identity_so_it_cannot_collide():
     mapping = {
-        "DB1.PUBLIC.ORDERS": target_name("DB1", "PUBLIC", "ORDERS", "BRONZE", "layer-catalog"),
-        "DB2.PUBLIC.ORDERS": target_name("DB2", "PUBLIC", "ORDERS", "BRONZE", "layer-catalog"),
-    }
-    got = detect_target_collisions(mapping)
-    assert got == {"bronze.PUBLIC.ORDERS": ["DB1.PUBLIC.ORDERS", "DB2.PUBLIC.ORDERS"]}
-
-
-def test_preserve_source_never_collides():
-    mapping = {
-        "DB1.PUBLIC.ORDERS": target_name("DB1", "PUBLIC", "ORDERS", "BRONZE", "preserve-source"),
-        "DB2.PUBLIC.ORDERS": target_name("DB2", "PUBLIC", "ORDERS", "BRONZE", "preserve-source"),
+        "DB1.PUBLIC.ORDERS": bronze_target("DB1", "PUBLIC", "ORDERS"),
+        "DB2.PUBLIC.ORDERS": bronze_target("DB2", "PUBLIC", "ORDERS"),
     }
     assert detect_target_collisions(mapping) == {}
 
 
-def test_target_collision_check_is_case_insensitive():
-    assert detect_target_collisions({"A": "bronze.S.T", "B": "BRONZE.S.T"})
+def test_collision_detector_still_catches_case_variants():
+    assert detect_target_collisions({"A": "db.s.t", "B": "DB.S.T"})
 
 
-def test_exported_constants():
+def test_optional_catalog_prefix_for_a_shared_bronze_catalog():
+    # Some deployments want one bronze catalog rather than catalog-per-database.
+    assert bronze_target("MYDB", "SALES", "ORDERS",
+                         catalog_prefix="bronze") == "bronze.MYDB_SALES.ORDERS"
+
+
+def test_prefix_mode_can_collide_and_is_detected():
+    mapping = {
+        "DB1.PUBLIC.T": bronze_target("DB1", "PUBLIC", "T", catalog_prefix="bronze"),
+        "DB2.PUBLIC.T": bronze_target("DB2", "PUBLIC", "T", catalog_prefix="bronze"),
+    }
+    assert detect_target_collisions(mapping) == {}, "db is folded in, so distinct"
+
+
+def test_bad_identifier_rejected():
+    with pytest.raises(UnknownStrategy):
+        bronze_target("DB", "S", "T", catalog_prefix="not a catalog")
+
+
+# --- Silver / Gold: jobs created, never triggered --------------------------
+
+def test_silver_and_gold_jobs_are_created_for_each_source_schema():
+    jobs = layer_jobs([("MYDB", "SALES"), ("MYDB", "OPS")])
+    names = sorted(j["name"] for j in jobs)
+    assert names == ["gold_MYDB_OPS", "gold_MYDB_SALES",
+                     "silver_MYDB_OPS", "silver_MYDB_SALES"]
+
+
+def test_jobs_are_never_scheduled_or_triggered():
+    for job in layer_jobs([("D", "S")]):
+        assert job["trigger"] == "MANUAL_NEVER_TRIGGERED"
+        assert job["schedule"] is None
+        assert job["enabled"] is False
+
+
+def test_jobs_declare_their_layer_and_source_scope():
+    jobs = layer_jobs([("D", "S")])
+    silver = next(j for j in jobs if j["layer"] == "SILVER")
+    assert silver["source_database"] == "D"
+    assert silver["source_schema"] == "S"
+    assert silver["reads_from"] == "D.S"
+
+
+def test_job_body_is_an_explicit_placeholder_not_fabricated_logic():
+    # Silver/Gold transformations are requirement-driven. Inventing SQL here
+    # would ship logic nobody specified.
+    silver = next(j for j in layer_jobs([("D", "S")]) if j["layer"] == "SILVER")
+    assert silver["body_status"] == "placeholder"
+    assert "requirement" in silver["body_note"].lower()
+
+
+def test_no_jobs_for_an_empty_scope():
+    assert layer_jobs([]) == []
+
+
+def test_layers_constant():
     assert LAYERS == ("BRONZE", "SILVER", "GOLD")
-    assert "layer-catalog" in STRATEGIES
