@@ -8,8 +8,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 SKILLS = ["snowflake-migrator-overview", "snowflake-migrator-bootstrap",
           "snowflake-assess-estate", "snowflake-migration-plan",
-          "snowflake-medallion-clone"]
-COMMANDS = ["snowflake-assess", "snowflake-plan", "snowflake-soft-clone"]
+          "snowflake-medallion-clone", "snowflake-compute-proposal"]
+COMMANDS = ["snowflake-assess", "snowflake-plan", "snowflake-soft-clone",
+            "snowflake-compute"]
 
 
 def frontmatter(path: pathlib.Path) -> dict:
@@ -72,3 +73,35 @@ def test_type_mapping_reference_covers_the_blocked_types():
     text = (ROOT / "references/type-mapping.md").read_text()
     for t in ["NUMBER", "TIMESTAMP_NTZ", "VARIANT", "GEOGRAPHY"]:
         assert t in text
+
+
+def test_reference_documents_the_object_and_view_mapping():
+    text = (ROOT / "references/type-mapping.md").read_text()
+    assert "Standard Catalog" in text
+    for construct in ["QUALIFY", "LATERAL FLATTEN", "LISTAGG", "DATEADD"]:
+        assert construct in text, construct
+    assert "secure view" in text.lower()
+
+
+def test_plan_skill_documents_the_cannot_migrate_categories():
+    text = (ROOT / "skills/snowflake-migration-plan/SKILL.md").read_text()
+    for category in ["restriction", "unmapped_type", "snowflake_only_sql",
+                     "unsupported_object"]:
+        assert category in text, category
+    assert "restrictions" in text.lower()
+
+
+def test_clone_skill_documents_one_catalog_per_run_and_cli_backends():
+    text = (ROOT / "skills/snowflake-medallion-clone/SKILL.md").read_text()
+    low = text.lower()
+    assert "one catalog per run" in low
+    assert "aidp" in low and "oci" in low
+    assert "empty" in low, "must say the cloned objects hold no data"
+    assert "silver" in low and "never triggered" in low
+
+
+def test_no_skill_still_promises_tables_only():
+    # Views came into scope; a stale "tables only" line would mislead.
+    for name in SKILLS:
+        text = (ROOT / "skills" / name / "SKILL.md").read_text().lower()
+        assert "tables only" not in text, name
