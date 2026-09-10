@@ -82,5 +82,42 @@ ignored line — a typo would otherwise apply nothing while appearing to work.
 3. The waves — views follow their base tables.
 4. Cycles, if any: they need a human decision, not a broken edge.
 5. The Silver/Gold job stubs: created, disabled, never triggered.
+6. **The data-movement architecture options — always.**
 
 Exit 3 means a target-name collision — show it and stop.
+
+## The architecture options are not optional reading
+
+`PLANNED_OBJECTS.md` ends with all five. Do not skip past them because this MVP
+moves no data: the user needs to know which architecture they are heading toward
+*before* structure lands, because it decides whether the destination is an
+INTERNAL catalog they will fill, an EXTERNAL catalog they will read through, or
+both.
+
+| | Moves bytes | Handles |
+|---|---|---|
+| `A1` unload → object storage → managed Delta | yes | historic bulk, cutover |
+| `A2` federate through an EXTERNAL catalog | no | read without copy |
+| `A3` redirect ingestion (Fivetran / Kafka) | yes | ongoing incremental, cutover |
+| `A4` Iceberg interop — share storage | no | read without copy, ongoing |
+| `A5` hybrid waves | yes | all four |
+
+State whether one has been chosen. If not, say the architecture is **undecided**
+and put the five in front of the user.
+
+**If the user has no preference**, the honest recommendation is `A2` first — it
+moves nothing, needs the least building, and lets results be validated against
+the source before anything is copied — with `A1` for whatever usage data later
+shows is worth making resident. Say clearly that this is a recommendation, not a
+decision: it belongs to the customer because it drives cost, wall-clock and
+whether a later migration can run unattended.
+
+Record a choice with:
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py data-options --out-dir ./snowmig_out \
+  --choose A2_FEDERATE_EXTERNAL_CATALOG --chosen-by <name> --rationale "<why>"
+```
+
+A rationale is mandatory. Recording executes nothing — **none of the five is
+implemented**, and `execute_transfer()` refuses by design.

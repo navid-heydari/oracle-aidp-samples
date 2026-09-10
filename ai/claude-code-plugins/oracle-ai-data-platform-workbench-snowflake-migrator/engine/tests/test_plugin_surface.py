@@ -183,3 +183,30 @@ def test_data_movement_reference_offers_at_least_three_options():
     for o in OPTIONS:
         assert o["id"] in text, o["id"]
     assert "moves no bytes" in text.lower()
+
+
+def test_overview_requires_the_options_to_be_presented_always():
+    text = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text()
+    flat = " ".join(text.lower().split())
+    assert "always present the data-movement architecture options" in flat
+    assert "undecided" in flat
+    assert "none of the five is implemented" in flat
+
+
+def test_plan_skill_lists_all_five_options_with_a_stated_recommendation():
+    text = (ROOT / "skills/snowflake-migration-plan/SKILL.md").read_text()
+    for opt in ("`A1`", "`A2`", "`A3`", "`A4`", "`A5`"):
+        assert opt in text, opt
+    # Collapse whitespace: markdown line wrapping must not break a prose check.
+    flat = " ".join(text.lower().split())
+    assert "recommendation, not a decision" in flat
+    assert "undecided" in flat
+    assert "none of the five is implemented" in flat
+
+
+def test_reference_carries_the_capability_matrix_and_build_notes():
+    text = (ROOT / "references/data-movement-options.md").read_text()
+    assert "Capability matrix" in text
+    assert "What each option would take to build" in text
+    for cap in ("historic_bulk", "ongoing_incremental", "read_without_copy"):
+        assert cap in text, cap

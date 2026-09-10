@@ -62,6 +62,7 @@ says what happens if it is wrong. Reviewed 2026-09-09.
 | E2 | Migration Assessment is the current phase | Only Preparation and Executive Demo carry `[DONE]`. Unconfirmed |
 | E3 | Rappi's region is unresolved | Three answers exist: the deck's diagram says Ashburn, a note says Oregon, and the test account is Ohio. **No cost or transfer estimate should be produced until this is settled** |
 | E4 | Data movement is a later phase | See `references/data-movement-options.md`. Five options are presented; none is implemented |
+| E5 | The architecture choice belongs to the customer | The options are surfaced in **every** plan and summary, and no default is applied. If the user expresses no preference, `A2` (federate first) is offered as a stated *recommendation*, never as a silent default |
 
 ## Outstanding items that block real use
 

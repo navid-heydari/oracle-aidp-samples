@@ -119,15 +119,25 @@ def cmd_plan(args) -> int:
     deps = _read(out, "dependencies.json")
     restrictions = (json.loads(pathlib.Path(args.restrictions).read_text())
                     if args.restrictions else None)
+    # A recorded architecture choice, if the data-options stage has been run.
+    choice = None
+    if (out / "data_options.json").is_file():
+        choice = _read(out, "data_options.json").get("choice")
     try:
         built = build_plan(inv, deps, restrictions=restrictions,
-                           bronze_catalog_prefix=args.bronze_catalog_prefix)
+                           bronze_catalog_prefix=args.bronze_catalog_prefix,
+                           architecture_choice=choice)
     except TargetCollision as exc:
         print(f"HALT: {exc}", file=sys.stderr)
         return HALT
     _write(out, "plan.json", built)
     _write(out, "PLANNED_OBJECTS.md", render_planned_objects(built))
     s = built["summary"]
+    from plan.data_movement import architecture_decision
+    decision = architecture_decision(built.get("architecture_choice"))
+    print("  architecture: "
+          + (decision["chosen"]["id"] if decision["decided"]
+             else f'UNDECIDED — {len(decision["options"])} options presented'))
     print(f'  planned {s["can_migrate"]} object(s) '
           f'({s["tables"]} table, {s["views"]} view); '
           f'{s["cannot_migrate"]} cannot move')

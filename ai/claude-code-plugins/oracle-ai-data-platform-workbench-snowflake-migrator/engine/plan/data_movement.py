@@ -14,8 +14,14 @@ from __future__ import annotations
 
 import datetime
 
-__all__ = ["OPTIONS", "NotImplementedInMvp", "execute_transfer", "options_for",
+__all__ = ["OPTIONS", "NotImplementedInMvp", "architecture_decision",
+           "capability_matrix", "execute_transfer", "options_for",
            "record_choice"]
+
+# What each option is FOR. A future MVP picks an option by capability, so these
+# are the axes: which of them a path actually covers.
+CAPABILITIES = ("historic_bulk", "ongoing_incremental", "read_without_copy",
+                "cutover")
 
 
 class NotImplementedInMvp(NotImplementedError):
@@ -54,6 +60,14 @@ OPTIONS: tuple[dict, ...] = (
             "precision (never yet measured)",
             "transfer throughput actually achievable into OCI Object Storage",
         ],
+        "handles": ["historic_bulk", "cutover"],
+        "implementation_notes": [
+            "An unload driver: per-table COPY INTO @stage as Parquet, chunked by partition or by a key range, resumable per chunk.",
+            "A transfer step into OCI Object Storage -- rclone, OCI CLI bulk-upload, or storage replication -- with throughput measured, not assumed.",
+            "A landing step: Spark reads the Parquet and writes managed Delta, then registers the table durably rather than relying on CTAS auto-registration.",
+            "A reconciliation harness: exact row counts and exact-decimal column sums compared against the source. Float tolerance is wrong for money.",
+            "Cross-process throttling and 429 handling on the OCI side.",
+        ],
     },
     {
         "id": "A2_FEDERATE_EXTERNAL_CATALOG",
@@ -86,6 +100,12 @@ OPTIONS: tuple[dict, ...] = (
             "whether the target AIDP version's Snowflake connector supports the "
             "auth the customer can grant",
         ],
+        "handles": ["read_without_copy"],
+        "implementation_notes": [
+            "Register Snowflake as an EXTERNAL catalog and confirm the auth mode the customer can grant is supported by the target AIDP version.",
+            "Measure pushdown: which predicates and aggregations reach Snowflake, and which pull rows across the wire.",
+            "No transfer code at all -- this is the option that needs the least building and the most measurement.",
+        ],
     },
     {
         "id": "A3_REDIRECT_INGESTION",
@@ -115,6 +135,13 @@ OPTIONS: tuple[dict, ...] = (
             "Fivetran Oracle-destination Beta limits at the customer's ingest rate",
             "whether OCI Streaming's SASL_SSL is compatible with Fivetran's Kafka "
             "destination",
+        ],
+        "handles": ["ongoing_incremental", "cutover"],
+        "implementation_notes": [
+            "Decide the Fivetran path: Oracle destination (Beta) into ADW/ALH, or the Kafka destination into OCI Streaming.",
+            "If Kafka: a Spark consumer that lands to Delta, plus offset management and exactly-once semantics -- we would own the sink.",
+            "If Oracle destination: confirm Beta volume and object-type coverage at the customer's real ingest rate.",
+            "A per-domain switchover runbook, since ingestion is redirected domain by domain, not all at once.",
         ],
     },
     {
@@ -146,6 +173,13 @@ OPTIONS: tuple[dict, ...] = (
             "whether the target AIDP version can read Iceberg from the "
             "customer's storage account",
         ],
+        "handles": ["read_without_copy", "ongoing_incremental"],
+        "implementation_notes": [
+            "Survey what share of the estate is already Iceberg versus native FDN.",
+            "For native tables, a conversion step in Snowflake -- which is itself a full rewrite of the data, so it is not free.",
+            "Register the Iceberg catalog in AIDP and confirm the target version can read from the customer's storage account.",
+            "Decide who owns compaction and snapshot expiry once two engines read the same files.",
+        ],
     },
     {
         "id": "A5_HYBRID_WAVES",
@@ -172,6 +206,13 @@ OPTIONS: tuple[dict, ...] = (
         "unknowns": [
             "everything A1, A2 and A3 do not yet know, plus how long a coexistence "
             "window the business will accept",
+        ],
+        "handles": ["historic_bulk", "ongoing_incremental", "read_without_copy", "cutover"],
+        "implementation_notes": [
+            "Everything A1, A2 and A3 require, plus the wave planner that decides which objects take which path.",
+            "A usage profile to drive that decision, which needs ACCOUNT_USAGE.",
+            "Lineage that spans both systems for the duration of the coexistence window.",
+            "A governance model for the moving boundary: what is authoritative where, and when that changes.",
         ],
     },
 )
@@ -211,6 +252,66 @@ def record_choice(option_id: str, *, chosen_by: str, rationale: str) -> dict:
         "next_step": ("Retire the unknowns above with a hand-run spike on one "
                       "representative table before any tooling is built. This "
                       "plugin does not implement data movement."),
+    }
+
+
+def capability_matrix() -> dict:
+    """Which option covers which capability. The axis a future MVP selects on."""
+    return {
+        "capabilities": list(CAPABILITIES),
+        "options": {o["id"]: list(o["handles"]) for o in OPTIONS},
+        "note": ("No single option covers every capability except A5, which is a "
+                 "composition of the others. Expect to combine rather than pick."),
+    }
+
+
+def architecture_decision(recorded_choice: dict | None) -> dict:
+    """The current architecture decision state, with the options ALWAYS attached.
+
+    The options are returned whether or not a choice exists: before one, because
+    the user has to choose; after one, because the alternatives are what make the
+    choice reviewable.
+    """
+    options = [
+        {"id": o["id"], "name": o["name"], "catalog_type": o["catalog_type"],
+         "moves_bytes": o["moves_bytes"], "handles": list(o["handles"]),
+         "etl": o["etl"], "unknowns": list(o["unknowns"]),
+         "implementation_notes": list(o["implementation_notes"])}
+        for o in OPTIONS]
+
+    if not recorded_choice:
+        return {
+            "decided": False, "chosen": None, "options": options,
+            "unknowns_outstanding": [],
+            "statement": ("No architecture has been chosen for moving data. This "
+                          "plugin moves no bytes, so nothing is blocked today -- "
+                          "but the choice drives cost, wall-clock and whether a "
+                          "later migration can run unattended, so it belongs to "
+                          "the customer rather than to whoever builds first."),
+        }
+
+    option_id = recorded_choice.get("option_id")
+    option = _BY_ID.get(option_id)
+    if option is None:
+        return {
+            "decided": False, "chosen": None, "options": options,
+            "unknowns_outstanding": [],
+            "statement": (f"A choice was recorded for {option_id!r}, which is not "
+                          "a known option. Treating the architecture as undecided "
+                          "rather than guessing what was meant."),
+        }
+    return {
+        "decided": True,
+        "chosen": {"id": option["id"], "name": option["name"],
+                   "chosen_by": recorded_choice.get("chosen_by"),
+                   "rationale": recorded_choice.get("rationale"),
+                   "executed": bool(recorded_choice.get("executed"))},
+        "options": options,
+        "unknowns_outstanding": list(option["unknowns"]),
+        "statement": (f'Architecture chosen: {option["name"]} '
+                      f'({option["id"]}). Recorded only -- this plugin executes '
+                      "no transfer. The unknowns below must be retired by a "
+                      "hand-run spike before any of it is built."),
     }
 
 

@@ -55,7 +55,19 @@ is planned to move, and what cannot with reasons) and **`SOFT_CLONE_SUMMARY.md`*
 6. **A halt is a halt.** Exit code 3 means an identifier-case or target-name
    collision. Show the collisions and stop; do not pick a winner.
 
-7. **Bronze mirrors the source.** Snowflake database → AIDP Standard Catalog,
+7. **Always present the data-movement architecture options.** Every plan and
+   summary carries them, and you must walk the user through them rather than
+   letting the section pass unread — even when they asked for something else,
+   even when no destination was supplied, and even when they gave no instruction
+   about architecture at all. There are five (`A1`–`A5`), covering internal and
+   external catalogs, object storage, Fivetran and Kafka, and Iceberg interop.
+   If nothing has been chosen, say so plainly: the architecture is **undecided**,
+   and the choice drives cost, wall-clock and whether a later migration can run
+   unattended. Record a choice with `snowmig data-options --choose <id>
+   --rationale "..."`. **None of the five is implemented** — recording a choice
+   executes nothing.
+
+8. **Bronze mirrors the source.** Snowflake database → AIDP Standard Catalog,
    schema → schema, table → table, view → view. Silver and Gold are
    requirement-driven: the plan emits disabled job stubs for them and the
    migrator never triggers them.

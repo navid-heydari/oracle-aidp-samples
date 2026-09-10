@@ -66,7 +66,8 @@ def _view_verdict(rec: dict) -> tuple[bool, str, str]:
 
 def build_plan(inventory: dict, dependencies: dict, *,
                restrictions: dict | None = None,
-               bronze_catalog_prefix: str | None = None) -> dict:
+               bronze_catalog_prefix: str | None = None,
+               architecture_choice: dict | None = None) -> dict:
     records = inventory.get("inventory", [])
 
     kept, restricted = apply_restrictions(records, restrictions)
@@ -142,6 +143,9 @@ def build_plan(inventory: dict, dependencies: dict, *,
         "silver_gold_jobs": layer_jobs(scopes),
         "dependency_source": dependencies.get("source_used"),
         "dependency_coverage_note": dependencies.get("coverage_note"),
+        # Carried so every report can state the architecture decision. None means
+        # undecided, which the reports say out loud rather than defaulting.
+        "architecture_choice": architecture_choice,
         "summary": {
             "objects_inventoried": len(records),
             "can_migrate": len(can),
