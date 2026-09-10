@@ -241,6 +241,17 @@ travel** (on Snowflake those are independent and automatic), and **`OPTIMIZE`
 increases storage until `VACUUM` runs**. Full mapping and the planned work:
 `references/maintenance-and-layout.md`, `ACTION-ITEMS.md`.
 
+## Where this stands
+
+One real migration has run end to end against a live AIDP DataLake: seven
+objects created and read back, six verified exactly and one reporting derived
+type drift. The Snowflake side and the target **catalog CRUD** transport are
+live-verified; the SQL transport is dead (404) and the notebook upload path
+has never executed.
+
+**`GAPS.md` is the ranked list of what is left**, including the two questions
+that need Oracle rather than code.
+
 ## Known limitation
 
 The `deploy --execute` path has **never run against a live AIDP deployment** —
