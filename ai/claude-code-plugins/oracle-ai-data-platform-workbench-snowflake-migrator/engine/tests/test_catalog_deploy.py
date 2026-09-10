@@ -444,3 +444,93 @@ def test_a_full_type_string_from_the_server_still_compares_equal():
     out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=FullType(),
                          retry_delays=(), verify_delays=())
     assert out["verified"] == 1, out["mismatches"]
+
+
+# ==========================================================================
+# A VIEW's column types are DERIVED by the target engine, not declared by us.
+#
+# Verified live: RAPPI_ORDER_360_VW was created correctly with all 17 columns,
+# and three aggregate columns came back with different types --
+#   ITEM_COUNT           decimal(18,0) -> bigint
+#   TOTAL_ITEM_QUANTITY  decimal(22,0) -> decimal(20,0)
+#   ITEM_TOTAL_AMOUNT    decimal(30,2) -> decimal(28,2)
+# because Snowflake reports a view's DECLARED output types while AIDP
+# re-derives them from the SQL.
+#
+# That is a fidelity finding worth reporting loudly -- decimal(22,0) to
+# decimal(20,0) is a narrowing -- but it is NOT "someone else's object that we
+# left alone", which is what a table mismatch means. The two must not be
+# reported as the same thing.
+# ==========================================================================
+
+def _view_plan(found_types):
+    return {"statements": [
+        {"source_identifier": "DB.PUBLIC.V", "object_type": "VIEW",
+         "target_fqn": "lake.DB.V", "sql": "", "view_text": "select 1 as a",
+         "expected_columns": [{"name": "N", "type": "DECIMAL(22,0)"}]}],
+        "blocked": []}, found_types
+
+
+class DerivedTypes(Folding):
+    def __init__(self, found):
+        super().__init__()
+        self.found = found
+
+    def __call__(self, operation, **kw):
+        if operation in ("get_table", "get_view"):
+            self.ops.append((operation, kw))
+            return {"key": "v", "viewFields": self.found,
+                    "tableFields": self.found}
+        return super().__call__(operation, **kw)
+
+
+def test_a_view_whose_types_were_re_derived_is_not_called_uncloned():
+    plan, _ = _view_plan(None)
+    call = DerivedTypes([{"fieldName": "n", "fieldType": "decimal(20,0)"}])
+    out = deploy_catalog(plan, target=TARGET, execute=True, call=call,
+                         retry_delays=(), verify_delays=())
+    assert out["mismatched_targets"] == [], \
+        "the view WAS created; it is not someone else's object"
+    assert out["derived_type_drift_targets"] == ["DB.PUBLIC.V"]
+    drift = out["derived_type_drift"][0]
+    assert "derive" in drift["reason"].lower()
+    assert "NOT been cloned" not in drift["reason"]
+
+
+def test_the_drift_names_the_columns_and_both_types():
+    plan, _ = _view_plan(None)
+    call = DerivedTypes([{"fieldName": "n", "fieldType": "decimal(20,0)"}])
+    out = deploy_catalog(plan, target=TARGET, execute=True, call=call,
+                         retry_delays=(), verify_delays=())
+    reason = out["derived_type_drift"][0]["reason"]
+    assert "N" in reason and "DECIMAL(22,0)" in reason.upper()
+    assert "DECIMAL(20,0)" in reason.upper()
+
+
+def test_a_narrowing_is_called_out_as_an_overflow_risk():
+    plan, _ = _view_plan(None)
+    call = DerivedTypes([{"fieldName": "n", "fieldType": "decimal(20,0)"}])
+    out = deploy_catalog(plan, target=TARGET, execute=True, call=call,
+                         retry_delays=(), verify_delays=())
+    assert "narrow" in out["derived_type_drift"][0]["reason"].lower()
+
+
+def test_a_view_with_missing_or_extra_columns_is_still_a_mismatch():
+    # Column DRIFT is derivation. A different column LIST is not.
+    plan, _ = _view_plan(None)
+    call = DerivedTypes([{"fieldName": "somethingelse",
+                          "fieldType": "decimal(22,0)"}])
+    out = deploy_catalog(plan, target=TARGET, execute=True, call=call,
+                         retry_delays=(), verify_delays=())
+    assert out["mismatched_targets"] == ["DB.PUBLIC.V"]
+    assert out["derived_type_drift_targets"] == []
+
+
+def test_a_table_type_difference_is_still_a_hard_mismatch():
+    # Tables are created FROM our field list, so a type difference there means
+    # the object is not ours.
+    call = DerivedTypes([{"fieldName": "A", "fieldType": "int"}])
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
+                         retry_delays=(), verify_delays=())
+    assert out["mismatched_targets"] == ["DB.PUBLIC.T0"]
+    assert out["derived_type_drift_targets"] == []

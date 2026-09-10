@@ -8,6 +8,31 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [0.13.1] — 2026-09-10
+
+### Added
+
+- **`derived_type_drift`** — a view that was created with every planned column
+  in order, but whose column *types* the target computed from the SQL rather
+  than taking the declared ones. Reported separately from a mismatch, because
+  the two mean opposite things: a table mismatch means the object is **not
+  ours** and was left alone; drift means the object **is ours** and the engine
+  disagreed about a type. The old wording ("left as it was found and has NOT
+  been cloned") was simply wrong for the second case.
+  - Narrowings are called out as an overflow risk.
+
+Found live on `RAPPI_ORDER_360_VW`, created correctly with all 17 columns:
+
+| Column | Snowflake declares | AIDP derived |
+|---|---|---|
+| `ITEM_COUNT` | `decimal(18,0)` | `bigint` |
+| `TOTAL_ITEM_QUANTITY` | `decimal(22,0)` | **`decimal(20,0)`** |
+| `ITEM_TOTAL_AMOUNT` | `decimal(30,2)` | **`decimal(28,2)`** |
+
+All three are aggregates (`COUNT`, `SUM`). Snowflake reports a view's declared
+output types; the target derives its own. The two narrowings are a real
+fidelity risk worth checking before anything depends on those columns.
+
 ## [0.13.0] — 2026-09-10
 
 **First objects actually created on AIDP.** Six tables landed as managed Delta
