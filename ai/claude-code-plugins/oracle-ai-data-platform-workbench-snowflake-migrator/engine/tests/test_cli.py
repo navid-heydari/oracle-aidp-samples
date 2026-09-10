@@ -291,3 +291,77 @@ def test_plan_picks_up_a_recorded_architecture_choice(tmp_path, capsys):
     md = (tmp_path / "PLANNED_OBJECTS.md").read_text()
     assert "federate first" in md
     assert "✅" in md, "the chosen option is marked in the table"
+
+
+def test_data_options_records_a_deferral(tmp_path, capsys):
+    rc = main(["data-options", "--out-dir", str(tmp_path),
+               "--choose", "A6_CUSTOMER_DEFINED", "--chosen-by", "navid",
+               "--rationale", "platform team decides next month"])
+    assert rc == 0
+    assert "DEFERRED" in capsys.readouterr().out
+    choice = json.loads((tmp_path / "data_options.json").read_text())["choice"]
+    assert choice["deferred"] is True and choice["custom_architecture"] is None
+
+
+def test_data_options_records_a_customer_architecture_verbatim(tmp_path):
+    desc = tmp_path / "arch.md"
+    desc.write_text("Debezium off Snowflake into OCI Streaming, then Iceberg.\n")
+    rc = main(["data-options", "--out-dir", str(tmp_path),
+               "--choose", "A6_CUSTOMER_DEFINED", "--chosen-by", "navid",
+               "--rationale", "their team already runs this",
+               "--custom-name", "Kafka CDC into Iceberg",
+               "--custom-description-file", str(desc)])
+    assert rc == 0
+    choice = json.loads((tmp_path / "data_options.json").read_text())["choice"]
+    assert choice["custom_architecture"]["name"] == "Kafka CDC into Iceberg"
+    assert "Debezium" in choice["custom_architecture"]["description"]
+    assert choice["deferred"] is False
+
+
+def test_a_custom_architecture_needs_both_flags(tmp_path, capsys):
+    rc = main(["data-options", "--out-dir", str(tmp_path),
+               "--choose", "A6_CUSTOMER_DEFINED", "--chosen-by", "x",
+               "--rationale", "y", "--custom-name", "N"])
+    assert rc == 1
+    assert "custom-description-file" in capsys.readouterr().err
+
+
+def test_a_deferral_flows_into_the_plan_reports(tmp_path):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["data-options", "--out-dir", str(tmp_path),
+          "--choose", "A6_CUSTOMER_DEFINED", "--chosen-by", "navid",
+          "--rationale", "decide later"])
+    main(["plan", "--out-dir", str(tmp_path)])
+    md = (tmp_path / "PLANNED_OBJECTS.md").read_text()
+    assert "deliberately deferred" in md.lower()
+    assert "A6_CUSTOMER_DEFINED" in md
+    assert "does not have to be one of the others" in md
+
+
+def test_plan_stdout_distinguishes_deferred_from_undecided(tmp_path, capsys):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    assert "UNDECIDED" in capsys.readouterr().out
+
+    main(["data-options", "--out-dir", str(tmp_path),
+          "--choose", "A6_CUSTOMER_DEFINED", "--chosen-by", "n",
+          "--rationale", "later"])
+    main(["plan", "--out-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert "DEFERRED by the customer — not a gap" in out
+    assert "UNDECIDED" not in out
+
+
+def test_plan_stdout_names_a_custom_architecture(tmp_path, capsys):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    (tmp_path / "a.md").write_text("their design")
+    main(["data-options", "--out-dir", str(tmp_path),
+          "--choose", "A6_CUSTOMER_DEFINED", "--chosen-by", "n",
+          "--rationale", "r", "--custom-name", "Their Pattern",
+          "--custom-description-file", str(tmp_path / "a.md")])
+    main(["plan", "--out-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert "Their Pattern" in out and "not assessed" in out

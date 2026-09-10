@@ -14,9 +14,14 @@ from __future__ import annotations
 
 import datetime
 
-__all__ = ["OPTIONS", "NotImplementedInMvp", "architecture_decision",
-           "capability_matrix", "execute_transfer", "options_for",
-           "record_choice"]
+__all__ = ["OPTIONS", "CUSTOMER_DEFINED_ID", "NotImplementedInMvp",
+           "architecture_decision", "capability_matrix", "execute_transfer",
+           "options_for", "record_choice"]
+
+# The open slot. A customer may want an architecture that is not in this list,
+# or may not have decided yet -- both are legitimate answers, not errors, and
+# neither is forced into one of A1-A5.
+CUSTOMER_DEFINED_ID = "A6_CUSTOMER_DEFINED"
 
 # What each option is FOR. A future MVP picks an option by capability, so these
 # are the axes: which of them a path actually covers.
@@ -215,6 +220,43 @@ OPTIONS: tuple[dict, ...] = (
             "A governance model for the moving boundary: what is authoritative where, and when that changes.",
         ],
     },
+    {
+        "id": CUSTOMER_DEFINED_ID,
+        "name": "Customer-defined — something not listed here, or not decided yet",
+        "catalog_type": "TBD",
+        "phase": ("historic", "ongoing"),
+        "moves_bytes": None,          # unknown until described. Not assumed.
+        "handles": [],                # unknown until described. Not assumed.
+        "etl": ("Whatever the customer's platform team specifies. This option "
+                "exists so that 'none of the above' and 'not yet decided' are "
+                "first-class answers rather than gaps in a form"),
+        "pros": [
+            "matches what the customer actually needs rather than what we "
+            "happened to enumerate",
+            "lets the decision wait until the people who own it are in the room, "
+            "without blocking the read-only assessment",
+            "their platform team may already have a pattern, tooling and "
+            "operational experience that beats anything proposed here",
+        ],
+        "cons": [
+            "nothing can be planned, sequenced or costed until it is described",
+            "this plugin cannot assess it, so none of the trade-offs or unknowns "
+            "listed against A1-A5 transfer to it",
+        ],
+        "unknowns": [
+            "everything -- by definition. Once described, the unknowns become "
+            "whatever that design implies, and this plugin has not evaluated them",
+        ],
+        "implementation_notes": [
+            "Capture the customer's design verbatim first: name, description, and "
+            "who owns it. Do not paraphrase it into one of A1-A5.",
+            "Then assess it on the same axes used here -- does it move bytes, "
+            "which capabilities does it cover, what does it need to exist -- and "
+            "add it to this catalogue if it is reusable.",
+            "Until it is described there is nothing to build, and saying so is "
+            "more useful than proposing a substitute.",
+        ],
+    },
 )
 
 _PHASES = ("historic", "ongoing")
@@ -230,8 +272,18 @@ def options_for(phase: str) -> list[dict]:
     return [o for o in OPTIONS if phase in o["phase"]]
 
 
-def record_choice(option_id: str, *, chosen_by: str, rationale: str) -> dict:
-    """Record which option the customer picked. Records only -- acts on nothing."""
+def record_choice(option_id: str, *, chosen_by: str, rationale: str,
+                  custom_architecture: dict | None = None) -> dict:
+    """Record which option the customer picked. Records only -- acts on nothing.
+
+    `custom_architecture` belongs to A6_CUSTOMER_DEFINED only, and is recorded
+    VERBATIM. It is never paraphrased into one of A1-A5, because a customer
+    design filed under someone else's option looks like an assessed variant of it
+    and is not.
+
+    A6 with no `custom_architecture` is a DEFERRAL: a deliberate "not yet", which
+    is different from never having been asked.
+    """
     if option_id not in _BY_ID:
         raise ValueError(f"unknown option {option_id!r}; expected one of "
                          f"{sorted(_BY_ID)}")
@@ -240,18 +292,41 @@ def record_choice(option_id: str, *, chosen_by: str, rationale: str) -> dict:
             "a rationale is required: this choice drives cost, wall-clock and "
             "whether the migration can run unattended, so an unexplained pick is "
             "not a decision")
+
+    if custom_architecture is not None:
+        if option_id != CUSTOMER_DEFINED_ID:
+            raise ValueError(
+                f"a custom architecture belongs to {CUSTOMER_DEFINED_ID}, not to "
+                f"{option_id}. Filing a customer design under a listed option "
+                "would present it as an assessed variant of that option, which it "
+                "is not.")
+        name = (custom_architecture.get("name") or "").strip()
+        description = (custom_architecture.get("description") or "").strip()
+        if not name or not description:
+            raise ValueError(
+                "a custom architecture needs a name and a description; there is "
+                "nothing to record otherwise")
+        custom_architecture = {"name": name, "description": description}
+
     option = _BY_ID[option_id]
+    deferred = option_id == CUSTOMER_DEFINED_ID and custom_architecture is None
     return {
         "option_id": option_id,
         "option_name": option["name"],
         "chosen_by": chosen_by,
         "rationale": rationale,
+        "custom_architecture": custom_architecture,
+        "deferred": deferred,
         "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "executed": False,
         "unknowns_outstanding": list(option["unknowns"]),
-        "next_step": ("Retire the unknowns above with a hand-run spike on one "
-                      "representative table before any tooling is built. This "
-                      "plugin does not implement data movement."),
+        "next_step": (
+            "Describe the intended architecture when the customer is ready. "
+            "Nothing here blocks the read-only assessment or the shallow clone."
+            if deferred else
+            "Retire the unknowns above with a hand-run spike on one "
+            "representative table before any tooling is built. This plugin does "
+            "not implement data movement."),
     }
 
 
@@ -281,8 +356,8 @@ def architecture_decision(recorded_choice: dict | None) -> dict:
 
     if not recorded_choice:
         return {
-            "decided": False, "chosen": None, "options": options,
-            "unknowns_outstanding": [],
+            "decided": False, "deferred": False, "chosen": None,
+            "options": options, "unknowns_outstanding": [],
             "statement": ("No architecture has been chosen for moving data. This "
                           "plugin moves no bytes, so nothing is blocked today -- "
                           "but the choice drives cost, wall-clock and whether a "
@@ -294,18 +369,51 @@ def architecture_decision(recorded_choice: dict | None) -> dict:
     option = _BY_ID.get(option_id)
     if option is None:
         return {
-            "decided": False, "chosen": None, "options": options,
-            "unknowns_outstanding": [],
+            "decided": False, "deferred": False, "chosen": None,
+            "options": options, "unknowns_outstanding": [],
             "statement": (f"A choice was recorded for {option_id!r}, which is not "
                           "a known option. Treating the architecture as undecided "
                           "rather than guessing what was meant."),
         }
+
+    custom = recorded_choice.get("custom_architecture")
+    if option_id == CUSTOMER_DEFINED_ID and not custom:
+        return {
+            "decided": False, "deferred": True, "chosen": None,
+            "options": options, "unknowns_outstanding": [],
+            "statement": (
+                "The architecture is **deliberately deferred**: the customer will "
+                f'specify it later (recorded by {recorded_choice.get("chosen_by")}: '
+                f'{recorded_choice.get("rationale")}). That is a valid answer and '
+                "blocks nothing here -- the assessment, the plan and the shallow "
+                "clone all proceed. The options below stay on the table, and the "
+                "eventual design need not be one of them."),
+        }
+
+    chosen = {"id": option["id"], "name": option["name"],
+              "chosen_by": recorded_choice.get("chosen_by"),
+              "rationale": recorded_choice.get("rationale"),
+              "executed": bool(recorded_choice.get("executed")),
+              "custom_architecture": custom,
+              "mapped_to": None}
+
+    if option_id == CUSTOMER_DEFINED_ID:
+        return {
+            "decided": True, "deferred": False, "chosen": chosen,
+            "options": options,
+            "unknowns_outstanding": [
+                "everything: this plugin does not assess a customer-supplied "
+                "architecture, so none of the trade-offs or unknowns listed "
+                "against A1-A5 apply to it"],
+            "statement": (
+                f'Architecture chosen: **{custom["name"]}** -- the customer\'s own '
+                "design, recorded verbatim and NOT mapped to any listed option. "
+                "This plugin does not assess it: no trade-off, cost or unknown "
+                "listed against A1-A5 transfers to it. Nothing is executed."),
+        }
+
     return {
-        "decided": True,
-        "chosen": {"id": option["id"], "name": option["name"],
-                   "chosen_by": recorded_choice.get("chosen_by"),
-                   "rationale": recorded_choice.get("rationale"),
-                   "executed": bool(recorded_choice.get("executed"))},
+        "decided": True, "deferred": False, "chosen": chosen,
         "options": options,
         "unknowns_outstanding": list(option["unknowns"]),
         "statement": (f'Architecture chosen: {option["name"]} '
@@ -317,6 +425,12 @@ def architecture_decision(recorded_choice: dict | None) -> dict:
 
 def execute_transfer(option_id: str, **_kwargs):
     """Always refuses. Data movement is out of scope for this plugin."""
+    if option_id == CUSTOMER_DEFINED_ID:
+        raise NotImplementedInMvp(
+            f"{option_id}: there is nothing to execute. Describe the intended "
+            "architecture first -- this plugin has not assessed it and will not "
+            "substitute one of its own options for it. It moves no bytes either "
+            "way.")
     option = _BY_ID.get(option_id)
     unknowns = option["unknowns"] if option else [
         "the source region, and whether NUMBER(p,s) survives a round trip"]

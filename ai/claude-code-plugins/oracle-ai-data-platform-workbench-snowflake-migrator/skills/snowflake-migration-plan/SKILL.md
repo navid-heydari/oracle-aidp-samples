@@ -101,9 +101,29 @@ both.
 | `A3` redirect ingestion (Fivetran / Kafka) | yes | ongoing incremental, cutover |
 | `A4` Iceberg interop — share storage | no | read without copy, ongoing |
 | `A5` hybrid waves | yes | all four |
+| `A6` **customer-defined — or not decided yet** | *unknown* | *unknown until described* |
 
 State whether one has been chosen. If not, say the architecture is **undecided**
-and put the five in front of the user.
+and put all six in front of the user.
+
+**`A6` is a real answer, not a fallback.** The customer may already have a
+pattern their platform team runs, and it may be better than anything here. They
+may also simply not have decided. Either way, record `A6` with their reasoning
+rather than pressing them toward `A1`–`A5`. Nothing in the assessment, the plan
+or the shallow clone depends on the answer.
+
+When they do describe a design — including one not listed here — record it
+verbatim:
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py data-options --out-dir ./snowmig_out \
+  --choose A6_CUSTOMER_DEFINED --chosen-by <name> --rationale "<why>" \
+  --custom-name "<their name for it>" --custom-description-file <file>
+```
+
+It is recorded as-is and **never mapped** to one of ours. Say plainly that this
+plugin has not assessed it, so none of the trade-offs or unknowns listed against
+`A1`–`A5` transfer to it.
 
 **If the user has no preference**, the honest recommendation is `A2` first — it
 moves nothing, needs the least building, and lets results be validated against
@@ -119,5 +139,5 @@ python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py data-options --out-dir ./snowmig
   --choose A2_FEDERATE_EXTERNAL_CATALOG --chosen-by <name> --rationale "<why>"
 ```
 
-A rationale is mandatory. Recording executes nothing — **none of the five is
+A rationale is mandatory. Recording executes nothing — **none of the six is
 implemented**, and `execute_transfer()` refuses by design.

@@ -468,10 +468,21 @@ def architecture_section(plan: dict) -> list[str]:
         chosen = decision["chosen"]
         executed = ("yes" if chosen["executed"]
                     else "no — this plugin executes nothing")
-        out += [f'- Chosen: **{chosen["id"]}** — {chosen["name"]}',
-                f'- By: {chosen["chosen_by"]}',
-                f'- Because: {chosen["rationale"]}',
-                f'- Executed: **{executed}**', ""]
+        custom = chosen.get("custom_architecture")
+        if custom:
+            out += ["### The customer's own architecture", "",
+                    f'**{custom["name"]}**', "", custom["description"], "",
+                    f'- Recorded by: {chosen["chosen_by"]}',
+                    f'- Because: {chosen["rationale"]}',
+                    f'- Executed: **{executed}**', "",
+                    "Recorded verbatim and **not mapped** to any option below. "
+                    "This plugin has not assessed it, so none of the trade-offs, "
+                    "costs or unknowns listed against `A1`–`A5` apply to it.", ""]
+        else:
+            out += [f'- Chosen: **{chosen["id"]}** — {chosen["name"]}',
+                    f'- By: {chosen["chosen_by"]}',
+                    f'- Because: {chosen["rationale"]}',
+                    f'- Executed: **{executed}**', ""]
         if decision["unknowns_outstanding"]:
             out += ["Outstanding unknowns for that choice:", ""]
             out += [f"- {u}" for u in decision["unknowns_outstanding"]] + [""]
@@ -481,10 +492,14 @@ def architecture_section(plan: dict) -> list[str]:
     for o in decision["options"]:
         marker = " ✅" if (decision["decided"]
                           and o["id"] == decision["chosen"]["id"]) else ""
+        moves = {True: "yes", False: "no", None: "*unknown*"}[o["moves_bytes"]]
+        handles = ", ".join(o["handles"]) or "*unknown until described*"
         out.append(f'| **{o["id"]}**{marker} — {o["name"]} | {o["catalog_type"]} '
-                   f'| {"yes" if o["moves_bytes"] else "no"} '
-                   f'| {", ".join(o["handles"])} |')
+                   f'| {moves} | {handles} |')
     out += ["",
+            "`A6_CUSTOMER_DEFINED` is the open slot: **the eventual design does "
+            "not have to be one of the others**, and \"not decided yet\" is a "
+            "valid answer that blocks nothing here.", "",
             "Full trade-offs, open unknowns and what each option would take to "
             "build: `references/data-movement-options.md`, or run "
             "`snowmig data-options`.", ""]
