@@ -8,6 +8,26 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [0.15.1] — 2026-09-10
+
+### Fixed
+
+- The diagnosis probe is now **named in the result whether or not its delete
+  took**. Deletes are asynchronous like creates, so cleanup is best-effort —
+  and an object the plugin created must never be silently abandoned in a
+  customer's catalog. Observed live: a probe survived its own delete call.
+
+### Verified live
+
+Both of this release's features, against a deliberately poisoned schema:
+
+- **5 of 5 failed objects correctly diagnosed as burned names**, with the
+  right remedy — *"A NOVEL name in lake.test_db_20260908_1529 was created
+  successfully, so the schema and your request are both fine and this NAME IS
+  BURNED … Retry into a FRESH SCHEMA."*
+- The smoke test **PASSES** on the catalog API, write probe included, with
+  nothing left behind.
+
 ## [0.15.0] — 2026-09-10
 
 ### Fixed

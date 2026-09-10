@@ -142,7 +142,8 @@ def _is_narrowing(declared: str, derived: str) -> bool:
     return False
 
 
-def _diagnose_never_appeared(call, catalog: str, schema_key: str) -> bool:
+def _diagnose_never_appeared(call, catalog: str, schema_key: str,
+                             probes: list | None = None) -> bool:
     """Is this schema refusing OUR names, or refusing everything?
 
     A failed create permanently poisons that name in that schema -- every
@@ -166,12 +167,21 @@ def _diagnose_never_appeared(call, catalog: str, schema_key: str) -> bool:
         return False
 
     landed = _resolve_object(call, catalog, schema_key, probe, False) is not None
+    deleted = False
     if landed:
         try:
             call("delete_table", catalog=catalog,
                  schema=schema_key.split(".", 1)[-1], table=probe)
+            deleted = True
         except Exception:
-            pass          # best effort; the name is recorded in the report
+            deleted = False
+    if probes is not None:
+        probes.append({"name": probe, "schema": schema_key,
+                       "created": landed, "deleted": deleted,
+                       "note": ("removed" if deleted else
+                                "NOT removed — deletes are asynchronous and "
+                                "best-effort; remove it manually if it is "
+                                "still there")})
     return landed
 
 
@@ -239,6 +249,10 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         "derived_type_drift_targets": [], "derived_type_drift": [],
         # Names the target has permanently burned. See P1 in ACTION-ITEMS.md.
         "poisoned_names": [],
+        # Objects the diagnosis created. Deletes are async, so cleanup is
+        # best-effort and the name is reported either way rather than left
+        # silently behind in someone's catalog.
+        "diagnosis_probes": [],
         "unverified_structure_targets": [], "unverified_structure": [],
         "failed": [],
     }
@@ -375,7 +389,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
             # Once per schema: the answer is a property of the schema.
             if diagnose and schema_key not in diagnosed:
                 diagnosed[schema_key] = _diagnose_never_appeared(
-                    call, catalog, schema_key)
+                    call, catalog, schema_key, out["diagnosis_probes"])
             verdict = diagnosed.get(schema_key)
 
             if verdict is True:
