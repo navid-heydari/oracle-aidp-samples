@@ -5,7 +5,7 @@ anything that halted or was skipped rather than burying it.
 """
 from __future__ import annotations
 
-from plan.data_movement import architecture_decision
+from plan.data_movement import MAINTENANCE_TRAPS, architecture_decision
 from plan.status import assess_risk, migration_status
 
 __all__ = ["render_inventory", "render_ddl_plan", "render_planned_objects",
@@ -585,16 +585,47 @@ def architecture_section(plan: dict) -> list[str]:
             out += ["Outstanding unknowns for that choice:", ""]
             out += [f"- {u}" for u in decision["unknowns_outstanding"]] + [""]
 
-    out += ["| Option | Catalog | Moves bytes | Handles |",
-            "|---|---|---|---|"]
+    out += ["| Option | Catalog | Moves bytes | Maintenance owner | Handles |",
+            "|---|---|---|---|---|"]
     for o in decision["options"]:
         marker = " ✅" if (decision["decided"]
                           and o["id"] == decision["chosen"]["id"]) else ""
         moves = {True: "yes", False: "no", None: "*unknown*"}[o["moves_bytes"]]
         handles = ", ".join(o["handles"]) or "*unknown until described*"
+        owner = (o.get("maintenance_ownership") or {}).get("owner")
+        owns = {"customer": "**you**", "snowflake": "Snowflake",
+                "shared": "whoever writes", "both": "**both**",
+                None: "*unknown*"}.get(owner, str(owner))
         out.append(f'| **{o["id"]}**{marker} — {o["name"]} | {o["catalog_type"]} '
-                   f'| {moves} | {handles} |')
+                   f'| {moves} | {owns} | {handles} |')
     out += ["",
+            "**The maintenance column is a real operating cost, not a "
+            "footnote.** Snowflake maintains layout and reclaims storage in "
+            "the background; AIDP has `OPTIMIZE`, `VACUUM`, `ZORDER BY` and "
+            "liquid clustering and runs none of them for you. So the choice "
+            "below decides *who inherits that work* — federating leaves it "
+            "with Snowflake, landing Delta tables transfers it to you on day "
+            "one.", "",
+            "### What each choice does to maintenance", ""]
+    for o in decision["options"]:
+        own = o.get("maintenance_ownership") or {}
+        applies = own.get("traps_apply")
+        if applies is None:
+            which = "unknown until the design is described"
+        elif not applies:
+            which = "**none of the Delta traps apply**"
+        else:
+            which = f"all {len(applies)} Delta traps below apply"
+        out.append(f'- **{o["id"]}** — {own.get("note", "")} ({which}.)')
+    out += ["", "### The three traps", "",
+            "Each is something a Snowflake customer has never had to think "
+            "about, because Snowflake did it for them.", ""]
+    for i, trap in enumerate(MAINTENANCE_TRAPS, 1):
+        out.append(f'{i}. **{trap["trap"]}** {trap["consequence"]}')
+    out += ["",
+            "Measured state for this estate — clustering keys, reclustering "
+            "credits, churn and retention overrides — is in `MAINTENANCE.md`. "
+            "This plugin proposes no cadence and applies nothing.", "",
             "`A6_CUSTOMER_DEFINED` is the open slot: **the eventual design does "
             "not have to be one of the others**, and \"not decided yet\" is a "
             "valid answer that blocks nothing here.", "",
@@ -602,3 +633,123 @@ def architecture_section(plan: dict) -> list[str]:
             "build: `references/data-movement-options.md`, or run "
             "`snowmig data-options`.", ""]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Maintenance and layout (item M2).
+#
+# Snowflake maintains layout and reclaims storage in the background; AIDP has
+# the equivalents and runs none of them. This report exists so that difference
+# is a decision on the table rather than something discovered in month three.
+# ---------------------------------------------------------------------------
+
+def _fmt(value, suffix: str = "") -> str:
+    if value is None:
+        return "*not measured*"
+    if isinstance(value, float):
+        return f"{value:,.2f}{suffix}"
+    if isinstance(value, int):
+        return f"{value:,}{suffix}"
+    return f"{value}{suffix}"
+
+
+def render_maintenance(maint: dict) -> str:
+    tables = maint.get("tables") or []
+    flagged = [t for t in tables if t.get("signals")]
+    acct = maint.get("account_usage") or {}
+    ret = (maint.get("retention") or {}).get("account") or {}
+
+    out = ["# Maintenance and layout", "",
+           "Snowflake exposes **no `OPTIMIZE` and no `VACUUM`** — it maintains "
+           "layout through Automatic Clustering and reclaims storage in the "
+           "background. AIDP has `OPTIMIZE`, `VACUUM`, `ZORDER BY` and liquid "
+           "clustering, and **runs none of them for you**.",
+           "",
+           "Nothing is lost in the migration. The *responsibility* moves. This "
+           "report records what the source does today; **it proposes no "
+           "cadence and applies nothing** — that needs the customer's recovery "
+           "requirements and query patterns.", "",
+           f'Source Time Travel default: **{_fmt(ret.get("data_retention_time_in_days"))} '
+           f'day(s)** (set at: {ret.get("set_at", "unknown")}); '
+           f'max data extension: {_fmt(ret.get("max_data_extension_time_in_days"))} day(s).',
+           ""]
+
+    if not acct.get("readable", True):
+        out += ["> **`ACCOUNT_USAGE` was not readable**, so reclustering credits "
+                "and DML churn are **not measured** — that is not the same as "
+                "zero, and the difference decides whether clustering matters "
+                f'here. Reason: `{acct.get("note", "unknown")}`.', ""]
+
+    if not flagged:
+        out += ["## Nothing flagged", "",
+                f"{len(tables)} table(s) examined; **no maintenance or layout "
+                "signal found**. No clustering keys, no Search Optimization, no "
+                "change tracking, no table-level retention overrides"
+                + (" and no measured churn above the threshold."
+                   if acct.get("readable", True)
+                   else ", and churn could not be measured."), "",
+                "That is a real finding, not an empty section: a lift-and-shift "
+                "of this estate inherits no maintenance obligation beyond the "
+                "AIDP defaults.", ""]
+    else:
+        out += [f"## {len(flagged)} of {len(tables)} table(s) need a "
+                "maintenance decision — **none applied**", "",
+                "| Table | Cluster key | Auto-cluster | Recluster credits | "
+                "Rows rewritten | Retention (days) |",
+                "|---|---|---|---:|---:|---|"]
+        for t in flagged:
+            rec, churn = t["reclustering"], t["dml_churn"]
+            retention = _fmt(t.get("retention_days"))
+            if t.get("retention_set_at") == "table":
+                retention += f' *(table override; schema default ' \
+                             f'{_fmt(t.get("retention_inherited_value"))})*'
+            out.append(
+                f'| `{t["source_identifier"]}` | `{t["cluster_by"] or "—"}` | '
+                f'{"ON" if t["automatic_clustering"] else "off"} | '
+                f'{_fmt(rec.get("credits")) if rec.get("measured") else "*not measured*"} | '
+                f'{_fmt(churn.get("rows_rewritten")) if churn.get("measured") else "*not measured*"} | '
+                f'{retention} |')
+        out.append("")
+
+        out += ["### What each signal will require on AIDP", ""]
+        for t in flagged:
+            out.append(f'**`{t["source_identifier"]}`**')
+            out.append("")
+            for s in t["signals"]:
+                equivalent = s.get("aidp_equivalent") or "**no equivalent**"
+                out.append(f'- {s["signal"]} — {s["detail"]}. '
+                           f'AIDP: {equivalent}; requires {s["aidp_requires"]}.')
+            out.append("")
+
+    out += ["## Three things to settle before anyone commits", "",
+            "1. **On Delta, `VACUUM` is what bounds time travel.** On Snowflake "
+            "retention and storage reclamation are independent and automatic. A "
+            "customer used to reclaiming storage freely will delete their own "
+            "recovery window.",
+            "2. **`OPTIMIZE` increases storage until `VACUUM` runs.** It leaves "
+            "the old files behind until retention expires, so compaction without "
+            "reclamation is a cost regression.",
+            "3. **Nothing runs itself.** Every `OPTIMIZE`/`VACUUM` is a "
+            "scheduled AIDP Job — new operational surface the customer did not "
+            "have on Snowflake.", ""]
+
+    gaps = maint.get("no_equivalent") or []
+    if gaps:
+        out += ["## Capabilities with no AIDP equivalent", "",
+                "Named here because each is otherwise discovered at the worst "
+                "possible moment.", ""]
+        for g in gaps:
+            out += [f'**{g["capability"]}** — {g["snowflake"]}',
+                    "", f'No equivalent: {g["impact"]}', ""]
+
+    if maint.get("unreadable"):
+        out += ["## Could not be read", ""]
+        out += [f"- {n}" for n in maint["unreadable"]] + [""]
+
+    probing = ("on" if maint.get("table_parameters_probed") else
+               "off — inferred from effective values, to avoid one query per table")
+    out += ["---", "",
+            f'History window: {maint.get("history_days")} day(s). '
+            f'Per-table parameter probing: {probing}.',
+            "", "Planned work to close this gap: `ACTION-ITEMS.md` (M3–M8)."]
+    return "\n".join(out) + "\n"

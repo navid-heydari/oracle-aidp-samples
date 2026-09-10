@@ -10,6 +10,7 @@ re-runnable on its own.
 
 | Stage | Skill | Produces |
 |---|---|---|
+| — | `snowflake-migration-plan` (maintenance) | `MAINTENANCE.md` — clustering, retention and churn, and who inherits `OPTIMIZE`/`VACUUM` |
 | 0 | `snowflake-migrator-bootstrap` | verified Snowflake auth |
 | 1 | `snowflake-assess-estate` | `inventory.json` + `INVENTORY.md` |
 | 2 | `snowflake-migration-plan` | `plan.json` + **`PLANNED_OBJECTS.md`** |
@@ -98,3 +99,15 @@ Stages: `assess` · `deps` · `plan` · `ddl` · `deploy` · `compute`.
 AIDP writes go through the `aidp` CLI when installed, otherwise `oci
 raw-request`. The engine prints which backend it chose, and fails loudly if
 neither CLI is present rather than guessing a transport.
+
+## One thing to raise even when nobody asks
+
+Snowflake exposes **no `OPTIMIZE` and no `VACUUM`** — it maintains layout and
+reclaims storage in the background. AIDP has both, plus `ZORDER BY` and liquid
+clustering, and **runs none of them for you**. Nothing is lost in the
+migration; the *responsibility* moves.
+
+Run `snowmig maintenance` after `assess` and read `MAINTENANCE.md`. Which
+architecture the customer picks decides who inherits that work — federating
+leaves it with Snowflake, landing Delta tables transfers it on day one — so it
+belongs in the architecture conversation, not after it.

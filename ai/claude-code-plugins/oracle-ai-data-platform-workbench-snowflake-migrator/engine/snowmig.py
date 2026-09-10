@@ -37,6 +37,7 @@ from plan.data_movement import options_for, record_choice
 from plan.smoke import run_smoke
 from target.notebook import build_notebook, notebook_workspace_path
 from report.render import (
+    render_maintenance,
     render_compute, render_ddl_plan, render_inventory, render_planned_objects,
     render_data_options, render_smoke, render_soft_clone_summary,
     render_summary,
@@ -47,6 +48,7 @@ from snowflake_source.conn import (
 )
 from snowflake_source.extract.catalog import (
     ROW_COUNT_MODES, build_inventory)
+from snowflake_source.extract.maintenance import build_maintenance
 from snowflake_source.dialect.types import (
     GEOSPATIAL_MODES, SEMI_STRUCTURED_MODES)
 from snowflake_source.extract.dependencies import extract_dependencies
@@ -117,6 +119,25 @@ def cmd_deps(args) -> int:
     deps = extract_dependencies(_run_sql_from_args(args), _read(out, "inventory.json"))
     _write(out, "dependencies.json", deps)
     print(f'  lineage source: {deps["source_used"]}')
+    return 0
+
+
+def cmd_maintenance(args) -> int:
+    """Snowflake maintenance/layout state. Reports; proposes nothing."""
+    out = pathlib.Path(args.out_dir)
+    inv = _read(out, "inventory.json")
+    maint = build_maintenance(
+        _run_sql_from_args(args), inv,
+        history_days=args.history_days,
+        probe_table_parameters=args.probe_table_parameters)
+    _write(out, "maintenance.json", maint)
+    _write(out, "MAINTENANCE.md", render_maintenance(maint))
+    flagged = maint["objects_with_signals"]
+    print(f'  {flagged} of {len(maint["tables"])} table(s) need a maintenance '
+          f'decision; none applied')
+    if not maint["account_usage"].get("readable", True):
+        print("  ACCOUNT_USAGE unreadable: reclustering and churn NOT measured "
+              "(not zero)", file=sys.stderr)
     return 0
 
 
@@ -440,6 +461,18 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("deps", parents=[common], help="dependency edges")
     _add_snowflake_args(d)
     d.set_defaults(func=cmd_deps)
+
+    mt = sub.add_parser("maintenance", parents=[common],
+                        help="maintenance/layout state (needs Snowflake)")
+    _add_snowflake_args(mt)
+    mt.add_argument("--history-days", type=int, default=30,
+                    help="ACCOUNT_USAGE window for reclustering credits and "
+                         "DML churn (default 30)")
+    mt.add_argument("--probe-table-parameters", action="store_true",
+                    help="one SHOW PARAMETERS per table. Exact, but thousands "
+                         "of round trips on a real estate; off by default, "
+                         "where the level is inferred from effective values")
+    mt.set_defaults(func=cmd_maintenance)
 
     p = sub.add_parser("plan", parents=[common], help="waves + medallion layout (offline)")
     p.add_argument("--restrictions",

@@ -1,6 +1,6 @@
 """The two headline reports: what is planned to move, and what got created."""
 from report.render import (
-    render_ddl_plan,
+    render_ddl_plan, render_maintenance,
     render_compute, render_planned_objects, render_soft_clone_summary,
 )
 
@@ -219,3 +219,82 @@ def test_ddl_plan_reports_deferred_maintenance_settings():
     assert "ZORDER" in md
     # And it must say plainly that nothing was applied.
     assert "not applied" in md.lower()
+
+
+# --------------------------------------------------------------------------
+# The maintenance report (M2).
+# --------------------------------------------------------------------------
+
+def _maint(**over):
+    base = {
+        "probed_at": "2026-09-10T00:00:00+00:00", "history_days": 30,
+        "table_parameters_probed": False,
+        "retention": {"account": {"data_retention_time_in_days": 1,
+                                  "max_data_extension_time_in_days": 14,
+                                  "set_at": "default"},
+                      "databases": {"DB": 1}, "schemas": {"DB.PUBLIC": 1}},
+        "account_usage": {"readable": True, "note": "summarised over 30 day(s)"},
+        "tables": [], "objects_with_signals": 0,
+        "no_equivalent": [{"capability": "Fail-safe", "snowflake": "7 days",
+                           "impact": "No AIDP equivalent"}],
+        "unreadable": [],
+    }
+    base.update(over)
+    return base
+
+
+def _mt(**over):
+    base = {"source_identifier": "DB.PUBLIC.ORDERS", "cluster_by": "(ORDER_DATE)",
+            "clustered": True, "automatic_clustering": True,
+            "change_tracking": False, "search_optimization": False,
+            "search_optimization_bytes": None, "retention_days": 7,
+            "retention_set_at": "table", "retention_inherited_value": 1,
+            "rows": 4_000_000, "bytes": 10**9,
+            "reclustering": {"measured": True, "events": 12, "credits": 34.5,
+                             "bytes_reclustered": 1, "rows_reclustered": 1},
+            "dml_churn": {"measured": True, "rows_added": 10, "rows_removed": 5,
+                          "rows_updated": 5, "rows_rewritten": 10, "windows": 30},
+            "signals": [{"signal": "clustering key in use", "detail": "d",
+                         "aidp_equivalent": "liquid clustering",
+                         "aidp_requires": "a scheduled job"}]}
+    base.update(over)
+    return base
+
+
+def test_maintenance_report_lists_tables_with_signals():
+    md = render_maintenance(_maint(tables=[_mt()], objects_with_signals=1))
+    assert "DB.PUBLIC.ORDERS" in md
+    assert "clustering key in use" in md
+    assert "scheduled job" in md
+
+
+def test_maintenance_report_states_nothing_was_applied():
+    md = render_maintenance(_maint(tables=[_mt()])).lower()
+    assert "applies nothing" in md, "the report must say it changed nothing"
+    assert "none applied" in md
+    assert "proposes no cadence" in md
+
+
+def test_unmeasured_history_is_never_shown_as_zero():
+    md = render_maintenance(_maint(
+        account_usage={"readable": False, "note": "Insufficient privileges"},
+        tables=[_mt(reclustering={"measured": False, "events": None,
+                                  "credits": None, "bytes_reclustered": None,
+                                  "rows_reclustered": None})]))
+    assert "not measured" in md.lower()
+    assert "Insufficient privileges" in md
+    # The credits column must not read as a real zero.
+    assert "| 0 " not in md
+
+
+def test_capabilities_with_no_equivalent_are_named():
+    md = render_maintenance(_maint())
+    assert "Fail-safe" in md
+    assert "No equivalent" in md or "no equivalent" in md
+
+
+def test_a_clean_estate_says_so_rather_than_rendering_an_empty_table():
+    md = render_maintenance(_maint(tables=[_mt(
+        clustered=False, cluster_by="", automatic_clustering=False,
+        retention_set_at="inherited", signals=[])], objects_with_signals=0))
+    assert "no maintenance" in md.lower() or "nothing" in md.lower()

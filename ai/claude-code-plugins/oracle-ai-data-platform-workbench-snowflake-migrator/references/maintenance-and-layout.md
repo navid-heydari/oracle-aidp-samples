@@ -106,7 +106,16 @@ OSS Delta honours it. They are Spark settings, not a foreign platform.)*
 
 ## What this plugin does today
 
-**Reports the gap; applies nothing.** Source settings with a real AIDP
+**Measures the source, reports the gap, applies nothing.** `snowmig
+maintenance` writes `maintenance.json` + `MAINTENANCE.md`: clustering keys,
+`automatic_clustering`, Search Optimization, `change_tracking`, the retention
+cascade with per-table effective values, and reclustering credits plus DML
+churn from `ACCOUNT_USAGE` — degrading to *"not measured"* rather than zero
+when the grant is absent.
+
+Each data-movement option also declares who inherits the maintenance work and
+which of the four traps above apply to it, so the choice is made with that cost
+visible. Source settings with a real AIDP
 equivalent — `cluster_by`, `retention_time`, `data_retention_time_in_days`,
 `change_tracking` — are surfaced per object in the DDL plan under
 *"Maintenance and layout — decisions, NOT applied"*, with the equivalent named,

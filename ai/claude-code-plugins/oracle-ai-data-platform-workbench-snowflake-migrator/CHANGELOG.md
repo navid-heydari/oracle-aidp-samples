@@ -8,6 +8,37 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [0.9.0] — 2026-09-10
+
+### Added
+
+- **`snowmig maintenance`** (item M2) — Snowflake maintenance and layout state
+  as first-class inventory: clustering keys and `automatic_clustering`, Search
+  Optimization, `change_tracking`, the Time Travel retention cascade across
+  account/database/schema with per-table effective values, and reclustering
+  credits plus DML churn from `ACCOUNT_USAGE`. Emits `maintenance.json` and
+  `MAINTENANCE.md`, with a per-table list of signals naming what each will
+  require on AIDP. **Reports; proposes nothing** — enforced by a test that
+  rejects statement-shaped output.
+- Capabilities with **no AIDP equivalent** named explicitly (item M7):
+  Fail-safe, Search Optimization Service, and
+  `MAX_DATA_EXTENSION_TIME_IN_DAYS`.
+- **Maintenance ownership is now part of the architecture choice.** Every
+  data-movement option states who inherits `OPTIMIZE`/`VACUUM` and which of
+  the three Delta traps apply to it — federating leaves the work with
+  Snowflake, landing Delta tables transfers it on day one, hybrid means both
+  regimes at once, and a customer-defined design makes no claim. The three
+  traps travel with the options in every plan and summary.
+- The inventory now captures every maintenance-relevant `SHOW TABLES` column,
+  which was free and was the missing input to all of the above.
+
+### Fixed
+
+- `architecture_decision()` projects a fixed field set and dropped
+  `maintenance_ownership` on the way through, so every rendered row read
+  "*unknown*" while unit tests reading `OPTIONS` directly all passed. Now
+  carried through, with a test that asserts against the **rendered table**.
+
 ## [0.8.0] — 2026-09-10
 
 ### Added

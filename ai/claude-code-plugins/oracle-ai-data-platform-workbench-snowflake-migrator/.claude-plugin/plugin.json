@@ -1,6 +1,6 @@
 {
   "name": "oracle-ai-data-platform-workbench-snowflake-migrator",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Assess a Snowflake estate and migrate its structure onto Oracle AI Data Platform. Inventories tables and views with row counts and column types, says what can and cannot migrate and why, then shallow-clones the structure into a Bronze layer mirroring the source 1:1 - database to Standard Catalog, schema to schema, table to table, view to view - with disabled Silver and Gold stubs, plus a warehouse-to-Spark sizing proposal. Structure only: copies no data. Strictly read-only against Snowflake, enforced at the transport; dry-run by default against AIDP via the aidp or oci CLI. Presents the data-movement architecture options rather than choosing one.",
   "homepage": "https://github.com/oracle-samples/oracle-aidp-samples/tree/main/ai/claude-code-plugins/oracle-ai-data-platform-workbench-snowflake-migrator",
   "repository": "https://github.com/oracle-samples/oracle-aidp-samples",
@@ -51,6 +51,11 @@
     "zorder",
     "liquid-clustering",
     "time-travel",
-    "table-maintenance"
+    "table-maintenance",
+    "maintenance-assessment",
+    "clustering",
+    "search-optimization",
+    "fail-safe",
+    "account-usage"
   ]
 }

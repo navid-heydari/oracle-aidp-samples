@@ -2,8 +2,10 @@
 import pytest
 
 from plan.data_movement import (
-    OPTIONS, NotImplementedInMvp, execute_transfer, options_for, record_choice,
+    CUSTOMER_DEFINED_ID, MAINTENANCE_TRAPS, OPTIONS, NotImplementedInMvp,
+    execute_transfer, options_for, record_choice,
 )
+from report.render import architecture_section
 
 
 def test_at_least_three_options_offered():
@@ -89,3 +91,109 @@ def test_execution_is_refused_for_every_option():
 def test_the_refusal_says_what_would_have_to_be_settled_first():
     with pytest.raises(NotImplementedInMvp, match="region"):
         execute_transfer("A1_UNLOAD_OBJECT_STORAGE")
+
+
+# ==========================================================================
+# Maintenance ownership is an architecture consequence, not a footnote.
+#
+# Whether the customer inherits OPTIMIZE/VACUUM depends entirely on which
+# option they pick: federating leaves the data in Snowflake, which keeps
+# maintaining it; landing Delta tables transfers the obligation on day one.
+# Presenting the options without saying so hides a real operating cost.
+# ==========================================================================
+
+def test_every_option_states_who_owns_maintenance():
+    for o in OPTIONS:
+        assert o.get("maintenance_ownership"), f'{o["id"]} does not say'
+
+
+def test_federating_leaves_maintenance_with_snowflake():
+    a2 = next(o for o in OPTIONS if o["id"] == "A2_FEDERATE_EXTERNAL_CATALOG")
+    owner = a2["maintenance_ownership"]
+    assert owner["owner"] == "snowflake"
+    # None of the Delta traps bite data that never became a Delta table.
+    assert owner["traps_apply"] == []
+
+
+def test_landing_delta_tables_transfers_every_trap():
+    a1 = next(o for o in OPTIONS if o["id"] == "A1_UNLOAD_OBJECT_STORAGE")
+    owner = a1["maintenance_ownership"]
+    assert owner["owner"] == "customer"
+    assert set(owner["traps_apply"]) == {t["id"] for t in MAINTENANCE_TRAPS}
+
+
+def test_streaming_ingestion_is_flagged_as_the_worst_churn_case():
+    a3 = next(o for o in OPTIONS if o["id"] == "A3_REDIRECT_INGESTION")
+    assert a3["maintenance_ownership"]["owner"] == "customer"
+    assert "churn" in a3["maintenance_ownership"]["note"].lower() \
+        or "small file" in a3["maintenance_ownership"]["note"].lower()
+
+
+def test_hybrid_means_two_regimes_at_once():
+    a5 = next(o for o in OPTIONS if o["id"] == "A5_HYBRID_WAVES")
+    assert a5["maintenance_ownership"]["owner"] == "both"
+
+
+def test_a_customer_defined_architecture_makes_no_maintenance_claim():
+    a6 = next(o for o in OPTIONS if o["id"] == CUSTOMER_DEFINED_ID)
+    owner = a6["maintenance_ownership"]
+    assert owner["owner"] is None, "unknown until they describe it"
+    assert owner["traps_apply"] is None
+
+
+def test_only_the_customer_defined_option_may_leave_ownership_unknown():
+    unknown = [o["id"] for o in OPTIONS
+               if o["maintenance_ownership"]["owner"] is None]
+    assert unknown == [CUSTOMER_DEFINED_ID]
+
+
+def test_the_three_traps_are_declared_with_ids_and_consequences():
+    assert len(MAINTENANCE_TRAPS) == 3
+    for trap in MAINTENANCE_TRAPS:
+        assert trap["id"] and trap["trap"] and trap["consequence"]
+    text = " ".join(t["trap"] + t["consequence"] for t in MAINTENANCE_TRAPS).lower()
+    assert "time travel" in text          # VACUUM bounds it
+    assert "storage" in text              # OPTIMIZE grows it until VACUUM
+    assert "schedul" in text              # nothing runs itself
+
+
+def test_the_architecture_section_always_carries_the_traps():
+    # The options are always presented; the maintenance consequence must
+    # travel with them rather than living in a reference file.
+    section = architecture_section({})   # no choice recorded
+    text = "\n".join(section) if isinstance(section, list) else str(section)
+    low = text.lower()
+    assert "maintenance" in low
+    for trap in MAINTENANCE_TRAPS:
+        assert trap["trap"].split(".")[0].lower()[:25] in low
+
+
+def test_the_rendered_table_shows_the_real_owner_per_option():
+    """Guards the projection, not just the source data.
+
+    `architecture_decision()` projects a fixed field set, and the first version
+    of this feature dropped `maintenance_ownership` on the way through -- so
+    every row rendered "*unknown*" while the unit tests, which read OPTIONS
+    directly, all passed.
+    """
+    text = "\n".join(architecture_section({}))
+    row = [ln for ln in text.split("\n")
+           if "A2_FEDERATE_EXTERNAL_CATALOG" in ln and ln.startswith("|")][0]
+    assert "Snowflake" in row, f"A2 must show Snowflake as owner: {row}"
+    row = [ln for ln in text.split("\n")
+           if "A1_UNLOAD_OBJECT_STORAGE" in ln and ln.startswith("|")][0]
+    assert "you" in row, f"A1 must show the customer as owner: {row}"
+    # And nothing but A6 may render as unknown.
+    unknown_rows = [ln for ln in text.split("\n")
+                    if ln.startswith("| **A") and "*unknown*" in ln
+                    and "Maintenance" not in ln]
+    assert all("A6_CUSTOMER_DEFINED" in ln for ln in unknown_rows), unknown_rows
+
+
+def test_the_rendered_per_option_note_is_not_empty():
+    text = "\n".join(architecture_section({}))
+    section = text.split("### What each choice does to maintenance")[1]
+    for line in section.split("### The three traps")[0].strip().split("\n"):
+        if line.startswith("- **A"):
+            body = line.split("—", 1)[1]
+            assert len(body.strip(" .()")) > 40, f"empty note: {line}"
