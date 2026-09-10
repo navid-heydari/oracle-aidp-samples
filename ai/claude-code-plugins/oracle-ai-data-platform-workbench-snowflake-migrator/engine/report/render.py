@@ -294,20 +294,26 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
 
     out = ["# Migration summary", "", "## Source → destination", "",
            "| | Source (Snowflake) | Destination (AIDP) |", "|---|---|---|"]
+    unset = "*not supplied*"
     if target:
-        dest_id = target.get("datalake_ocid", "-")
-        dest_ws = target.get("workspace", "-")
-        dest_cl = target.get("cluster_id", "-")
-        dest_cat = target.get("catalog", "-")
+        dest_id = target.get("datalake_ocid", unset)
+        dest_ws = target.get("workspace", unset)
+        dest_cl = target.get("cluster_id", unset)
+        dest_cat = target.get("catalog", unset)
+        dest_region = "*derived from the OCID*"
     else:
-        dest_id = dest_ws = dest_cl = dest_cat = "*not supplied*"
+        dest_id = dest_ws = dest_cl = dest_cat = dest_region = unset
     out += [f'| Account / DataLake | `{session.get("A", "-")}` | `{dest_id}` |',
-            f'| Region | `{session.get("R", "-")}` | *derived from the OCID* |',
+            f'| Region | `{session.get("R", "-")}` | {dest_region} |',
             f'| Role / workspace | `{session.get("ROLE", "-")}` | `{dest_ws}` |',
             f'| Version / cluster | `{session.get("V", "-")}` | `{dest_cl}` |',
-            f'| Scope | {dbs} | catalog `{dest_cat}` |',
-            "",
-            f'Mapping: {plan.get("bronze_mapping")}.', ""]
+            f'| Scope | {dbs} | catalog `{dest_cat}` |', ""]
+    if not target:
+        out += ["**No destination was supplied, so none is assumed.** The target "
+                "names below are derived from the SOURCE (bronze mirrors it 1:1); "
+                "they do not imply that any AIDP catalog, workspace or cluster "
+                "exists.", ""]
+    out += [f'Mapping: {plan.get("bronze_mapping")}.', ""]
 
     rows: list[tuple[str, str, str, str, str, str]] = []
 

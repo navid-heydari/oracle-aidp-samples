@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import re
 
+from .translate import translate_sql
+
 __all__ = ["UNSUPPORTED_CONSTRUCTS", "detect_unsupported_constructs",
-           "extract_view_body"]
+           "extract_view_body", "translate_view_body"]
 
 # construct -> (regex, brief reason)
 UNSUPPORTED_CONSTRUCTS: dict[str, tuple[str, str]] = {
@@ -50,12 +52,18 @@ UNSUPPORTED_CONSTRUCTS: dict[str, tuple[str, str]] = {
     "PIVOT/UNPIVOT": (r"\b(?:UN)?PIVOT\s*\(", "Spark syntax differs materially"),
 }
 
+# The optional column list after the view name contains ONLY identifiers, quotes,
+# commas and whitespace -- never a paren or an operator. That restriction is the
+# whole point: an earlier version matched the first `) as` ANYWHERE, so a body
+# like `select IFF(a, 'y', 'n') AS f` had its `) AS` mistaken for the end of the
+# header and the body was silently truncated to `f, ...`. Truncated-but-valid SQL
+# is the worst failure mode available here, because it still runs.
 _VIEW_HEADER_WITH_COLS = re.compile(
     r"(?is)^\s*create\s+(?:or\s+replace\s+)?(?:secure\s+)?(?:recursive\s+)?"
-    r"view\s+.*?\)\s*as\s+(.*)$")
+    r"view\s+[\w$\".]+\s*\(\s*[\w$\"',\s]*\)\s*as\s+(.*)$")
 _VIEW_HEADER_BARE = re.compile(
     r"(?is)^\s*create\s+(?:or\s+replace\s+)?(?:secure\s+)?(?:recursive\s+)?"
-    r"view\s+\S+\s+as\s+(.*)$")
+    r"view\s+[\w$\".]+\s+as\s+(.*)$")
 
 
 def extract_view_body(ddl: str) -> str:
@@ -69,12 +77,24 @@ def extract_view_body(ddl: str) -> str:
     raise ValueError("could not locate a view body in the supplied DDL")
 
 
+def translate_view_body(body: str):
+    """Translate what can be translated; report what cannot.
+
+    Delegates to the dialect translator so the planner and the DDL generator
+    cannot disagree about whether a view is migratable.
+    """
+    return translate_sql(body)
+
+
 def detect_unsupported_constructs(body: str) -> list[dict]:
-    """Snowflake-only constructs present in a view body, each with a brief reason."""
-    found = []
-    for construct, (pattern, reason) in UNSUPPORTED_CONSTRUCTS.items():
-        if re.search(pattern, body, re.IGNORECASE):
-            found.append({"construct": construct, "reason": reason})
-    return found
+    """Constructs that BLOCK migration -- i.e. cannot be translated exactly.
+
+    A construct the translator handles exactly is no longer a blocker, so this
+    reports only the residue. Anything listed here needs statement-level
+    restructuring or a design decision, not a substitution.
+    """
+    result = translate_sql(body)
+    return [{"construct": u["construct"], "reason": u["detail"],
+             "rule_id": u["rule_id"]} for u in result.unsupported]
 
 

@@ -205,3 +205,38 @@ def test_run_sql_from_args_builds_a_snowflake_callable(tmp_path, monkeypatch):
          "--auth", "keypair", "--key-path", "/k"])
     assert snowmig._run_sql_from_args(args) == "CALLABLE"
     assert captured["kw"] == {"account": "a"}
+
+
+def _plan_with_two_catalogs(tmp_path):
+    inv = json.loads(json.dumps(INV))
+    second = json.loads(json.dumps(inv["inventory"][0]))
+    second.update(source_identifier="D2.PUBLIC.ORDERS", source_database="D2")
+    inv["inventory"].append(second)
+    write(tmp_path, "inventory.json", inv)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    main(["ddl", "--out-dir", str(tmp_path)])
+
+
+def test_notebook_refuses_to_pick_a_catalog_when_the_plan_spans_several(
+        tmp_path, capsys):
+    _plan_with_two_catalogs(tmp_path)
+    rc = main(["notebook", "--out-dir", str(tmp_path)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "pass --catalog" in err
+    assert "not assumed" in err
+
+
+def test_notebook_accepts_an_explicit_catalog_choice(tmp_path):
+    _plan_with_two_catalogs(tmp_path)
+    assert main(["notebook", "--out-dir", str(tmp_path), "--catalog", "D2"]) == 0
+    assert (tmp_path / "snowmig_shallow_clone_D2.ipynb").is_file()
+
+
+def test_notebook_needs_no_catalog_flag_when_there_is_only_one(tmp_path):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    main(["ddl", "--out-dir", str(tmp_path)])
+    assert main(["notebook", "--out-dir", str(tmp_path)]) == 0

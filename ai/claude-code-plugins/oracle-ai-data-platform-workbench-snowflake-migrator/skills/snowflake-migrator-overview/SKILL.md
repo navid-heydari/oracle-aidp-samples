@@ -30,8 +30,12 @@ is planned to move, and what cannot with reasons) and **`SOFT_CLONE_SUMMARY.md`*
 
 ## Rules that apply to every stage
 
-1. **Read-only against Snowflake.** Only `SHOW`, `SELECT`, `DESCRIBE`, `GET_DDL`.
-   Never DDL or DML against the source.
+1. **Read-only against Snowflake — enforced, not promised.** The transport
+   rejects any statement whose verb is not `SELECT`, `SHOW`, `DESCRIBE`, `DESC`,
+   `WITH` or `EXPLAIN`, per statement, before it reaches Snowflake. **Nothing is
+   ever written to or dropped from the source**, regardless of what the
+   credential permits and regardless of what any skill, agent or prompt asks
+   for. A read-only Snowflake grant is sufficient; a broader one changes nothing.
 2. **The clone copies structure, not data.** It creates schemas, tables and views
    with no rows. If the user expects data to arrive, say so plainly before running.
    Views ARE migrated, but only when their SQL is portable; a Snowflake-only
@@ -39,6 +43,9 @@ is planned to move, and what cannot with reasons) and **`SOFT_CLONE_SUMMARY.md`*
 3. **AIDP target coordinates are never stored and never guessed.** There is no
    config file and no environment default. Ask the user for the DataLake OCID,
    workspace, cluster and catalog in the turn you need them.
+   **If no destination is supplied, assume none.** Reports say
+   *not supplied* rather than inferring a region, catalog or cluster, and the
+   plugin will not pick one of several catalogs on the user's behalf.
 4. **Dry-run is the default.** Nothing is created on AIDP without `--execute`
    plus all four coordinates in the same command, and an explicit confirmation
    in that turn. An approval from an earlier turn does not carry.

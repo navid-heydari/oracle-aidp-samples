@@ -15,11 +15,19 @@ PACKAGES = [
     "report",
 ]
 
-# Fork modules that MUST survive the prune -- the OCI transport layer.
+# Modules that must exist. The engine is now entirely first-party: the fork's
+# OCI transport was removed once the aidp/oci CLI backends replaced it.
 KEPT = [
-    "target/aidp_executor.py",
-    "target/cluster_session.py",
-    "target/cluster_lifecycle.py",
+    "snowmig.py",
+    "snowflake_source/conn.py",
+    "snowflake_source/dialect/types.py",
+    "snowflake_source/dialect/views.py",
+    "snowflake_source/extract/catalog.py",
+    "plan/build.py",
+    "target/executor.py",
+    "target/runner.py",
+    "target/notebook.py",
+    "report/render.py",
 ]
 
 # Dead weight for MVP-1: no notebook migration, no data movement, no dbutils.
@@ -35,6 +43,12 @@ PRUNED = [
     "schemas",
     "run_migration.sh",
     "setup.py",
+    # The asyncio Jupyter-WebSocket transport. Dead once the aidp/oci CLI
+    # backends replaced it; kept nothing that referenced it.
+    "target/aidp_executor.py",
+    "target/cluster_session.py",
+    "target/cluster_lifecycle.py",
+    "target/aidp_runner.py",
 ]
 
 
@@ -56,3 +70,17 @@ def test_dead_weight_pruned(rel):
 def test_corpus_relocated():
     assert (ENGINE / "snowflake_source/corpus/00_rappi_setup.sql").is_file()
     assert (ENGINE / "snowflake_source/corpus/validate.py").is_file()
+
+
+def test_no_websocket_transport_remains():
+    """The WebSocket/asyncio path is gone, not merely unused.
+
+    Leaving it in place implied a live transport that nothing called, and it was
+    the only code that could execute arbitrary Python on a cluster.
+    """
+    for path in ENGINE.rglob("*.py"):
+        if "corpus" in path.parts or "tests" in path.parts:
+            continue
+        text = path.read_text()
+        for token in ("websocket", "asyncio", "wss://"):
+            assert token not in text.lower(), f"{path.name} still mentions {token}"

@@ -128,3 +128,25 @@ def test_every_skill_that_can_write_states_the_no_data_guarantee():
     for name in ("snowflake-medallion-clone", "snowflake-clone-notebook"):
         low = (ROOT / "skills" / name / "SKILL.md").read_text().lower()
         assert "no data" in low or "moves no data" in low or "copies no data" in low, name
+
+
+def test_dialect_translation_reference_reports_honest_coverage():
+    import sys
+    sys.path.insert(0, str(ROOT / "engine"))
+    from snowflake_source.dialect.translate import coverage
+
+    text = (ROOT / "references/dialect-translation.md").read_text()
+    c = coverage()
+    assert f"Implemented ({c['implemented']})" in text
+    assert f"({c['declared']})" in text
+    for rule_id in c["implemented_rule_ids"] + c["declared_rule_ids"]:
+        assert rule_id in text, rule_id
+    assert "never approximate" in text.lower()
+
+
+def test_overview_states_the_source_read_only_guarantee_as_enforced():
+    text = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text()
+    low = text.lower()
+    assert "enforced" in low
+    assert "ever written to or dropped from the source" in low
+    assert "assume none" in low, "no destination means no assumption"

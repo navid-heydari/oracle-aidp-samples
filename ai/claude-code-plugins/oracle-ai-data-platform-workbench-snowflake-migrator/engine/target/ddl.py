@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass, field
 
 from snowflake_source.dialect.views import (  # noqa: F401  (re-exported)
-    detect_unsupported_constructs, extract_view_body,
+    detect_unsupported_constructs, extract_view_body, translate_view_body,
 )
 
 __all__ = ["RuleApplication", "RewriteResult", "UnsupportedDDL",
@@ -182,14 +182,18 @@ def build_create_view(record: dict, target_fqn: str,
         res.blocked_reason = str(exc)
         return res
 
-    unsupported = detect_unsupported_constructs(body)
-    if unsupported:
+    translated = translate_view_body(body)
+    if translated.unsupported:
         res.blocked = True
         res.blocked_reason = "Snowflake-only SQL: " + "; ".join(
-            f'{u["construct"]} ({u["reason"]})' for u in unsupported)
+            f'{u["construct"]} ({u["detail"]})' for u in translated.unsupported)
         return res
 
-    rewritten, changed = body, []
+    for applied in translated.applied:
+        res.rules_applied.append(RuleApplication(
+            applied["rule_id"], f'{applied["construct"]}: {applied["detail"]}'))
+
+    rewritten, changed = translated.sql, []
     for source_name, target_name in sorted((name_map or {}).items(),
                                            key=lambda kv: -len(kv[0])):
         if source_name != target_name and re.search(
@@ -207,11 +211,21 @@ def build_create_view(record: dict, target_fqn: str,
             "R40_VIEW_REFS_IDENTITY",
             "bronze mirrors the source 1:1, so object references are unchanged"))
 
-    res.rules_applied.append(RuleApplication(
-        "R42_VIEW_PORTABLE_SQL",
-        "no Snowflake-only construct detected; body carried over verbatim"))
-    res.warnings.append(
-        "View SQL was carried over without dialect translation. Verify its result "
-        "against the source before relying on it.")
+    if translated.applied:
+        res.rules_applied.append(RuleApplication(
+            "R43_VIEW_DIALECT_TRANSLATED",
+            f"{len(translated.applied)} dialect rule(s) applied; every one is an "
+            "exact rewrite"))
+        res.warnings.append(
+            f"View SQL was dialect-translated by "
+            f"{len(translated.applied)} exact rule(s). Verify its result against "
+            "the source before relying on it.")
+    else:
+        res.rules_applied.append(RuleApplication(
+            "R42_VIEW_PORTABLE_SQL",
+            "no Snowflake-only construct present; body carried over verbatim"))
+        res.warnings.append(
+            "View SQL was carried over unchanged. Verify its result against the "
+            "source before relying on it.")
     res.sql = f"CREATE VIEW IF NOT EXISTS {_qualify(target_fqn)} AS\n{rewritten}"
     return res

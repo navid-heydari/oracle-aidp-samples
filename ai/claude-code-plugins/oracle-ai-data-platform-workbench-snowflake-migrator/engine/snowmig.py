@@ -234,9 +234,20 @@ def cmd_notebook(args) -> int:
     inv = _read(out, "inventory.json")
     session = inv.get("session", {})
 
-    catalog = args.catalog or (built.get("catalogs_to_create") or [None])[0]
-    if not catalog:
+    # Do not pick a catalog on the user's behalf when there is a choice. One
+    # notebook per catalog, and which one is a decision, not a default.
+    candidates = built.get("catalogs_to_create") or []
+    if args.catalog:
+        catalog = args.catalog
+    elif len(candidates) == 1:
+        catalog = candidates[0]
+    elif not candidates:
         raise ValueError("no catalog to generate a notebook for")
+    else:
+        raise ValueError(
+            "the plan spans " + str(len(candidates)) + " catalogs ("
+            + ", ".join(candidates) + "); pass --catalog to choose one. One "
+            "notebook per catalog, and the choice is not assumed.")
 
     doc = build_notebook(ddl_plan, built, catalog=catalog,
                          source={"account": session.get("A"),
