@@ -3,6 +3,7 @@ import pytest
 
 from target.ddl import (
     RewriteResult, SCRUBBED_PROPERTIES, build_create_schema, build_create_table,
+    quote_spark_string,
 )
 
 
@@ -50,9 +51,12 @@ def test_columns_ordered_by_ordinal_position():
 
 
 def test_column_comment_emitted_and_escaped():
+    # Backslash, not doubling. This test previously asserted `'it''s fine'`,
+    # which Spark reads as two adjacent literals and concatenates -- so the
+    # comment silently became "its fine".
     res = build_create_table(
         record([col("A", "TEXT", "STRING", comment="it's fine")]), "bronze.S.T")
-    assert "COMMENT 'it''s fine'" in res.sql
+    assert r"COMMENT 'it\'s fine'" in res.sql
 
 
 def test_rules_recorded_with_ids():
@@ -149,3 +153,35 @@ def test_a_set_property_is_still_reported():
                source_metadata={"cluster_by": "(COUNTRY_CODE)", "rows": 5}),
         "bronze.S.T")
     assert res.omitted_properties == ["cluster_by=(COUNTRY_CODE)"]
+
+
+# ==========================================================================
+# Spark string literals escape with a BACKSLASH, not by doubling.
+#
+# Found by parsing generated DDL with a real Spark parser. `'it''s fine'` is
+# not an escaped quote in Spark -- it is two adjacent literals, which Spark
+# concatenates. A column comment of "Customer's orders" therefore became
+# "Customers orders", silently, or failed to parse depending on position.
+# ==========================================================================
+
+def test_spark_string_escapes_with_a_backslash():
+    assert quote_spark_string("it's fine") == r"'it\'s fine'"
+
+
+def test_spark_string_escapes_backslashes_first():
+    assert quote_spark_string(r"a\b") == r"'a\\b'"
+
+
+def test_spark_string_leaves_plain_text_alone():
+    assert quote_spark_string("plain") == "'plain'"
+
+
+def test_a_column_comment_with_an_apostrophe_is_backslash_escaped():
+    rec = {"source_identifier": "DB.SC.T", "object_type": "TABLE",
+           "source_metadata": {},
+           "columns": [{"COLUMN_NAME": "A", "target_type": "STRING",
+                        "ORDINAL_POSITION": 1, "IS_NULLABLE": "YES",
+                        "DATA_TYPE": "TEXT", "COMMENT": "Customer's orders"}]}
+    sql = build_create_table(rec, "CAT.SC.T").sql
+    assert r"\'" in sql
+    assert "''" not in sql, "doubling is two literals in Spark, not an escape"

@@ -142,11 +142,16 @@ def _verify_object(run_sql, stmt: dict) -> tuple[str, str]:
 
 
 def _like_literal(name: str) -> str:
-    """Escape LIKE wildcards. `_` matches any character and is in most names."""
+    """Escape LIKE wildcards for a Spark LIKE pattern body.
+
+    `_` matches any single character and is in most real table names, so an
+    unescaped probe matches names other than the one asked for. The quote is
+    backslash-escaped, not doubled: doubling is two literals in Spark.
+    """
     return (name.replace("\\", "\\\\")
                 .replace("%", "\\%")
                 .replace("_", "\\_")
-                .replace("'", "''"))
+                .replace("'", "\\'"))
 
 
 class RefusedToExecute(RuntimeError):

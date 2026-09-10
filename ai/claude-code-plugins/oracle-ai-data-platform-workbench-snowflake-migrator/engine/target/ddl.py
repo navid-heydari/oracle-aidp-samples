@@ -22,7 +22,7 @@ from snowflake_source.dialect.views import (  # noqa: F401  (re-exported)
 )
 
 __all__ = ["RuleApplication", "RewriteResult", "UnsupportedDDL",
-           "SCRUBBED_PROPERTIES", "build_create_schema", "quote_backtick", "build_create_table",
+           "SCRUBBED_PROPERTIES", "build_create_schema", "quote_backtick", "quote_spark_string", "build_create_table",
            "build_create_view"]
 
 # Real Snowflake table PROPERTIES with no Delta equivalent. A value here was a
@@ -71,6 +71,19 @@ class UnsupportedDDL(Exception):
 def quote_backtick(identifier: str) -> str:
     """A backtick-quoted Spark identifier, with embedded backticks doubled."""
     return "`" + identifier.replace("`", "``") + "`"
+
+
+def quote_spark_string(value: str) -> str:
+    """A single-quoted Spark string literal, escaped the way Spark expects.
+
+    Spark escapes with a BACKSLASH. Doubling the quote -- correct in Snowflake
+    and in standard SQL -- is not an escape here: Spark reads `\'it\'\'s\'` as
+    two adjacent literals and concatenates them, so a comment of "Customer's
+    orders" silently became "Customers orders". Backslash first, so an escape
+    we add is not itself re-escaped.
+    """
+    escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
+    return "'" + escaped + "'"
 
 
 _q = quote_backtick
@@ -122,7 +135,7 @@ def build_create_table(record: dict, target_fqn: str) -> RewriteResult:
         if str(c.get("IS_NULLABLE", "YES")).upper() == "NO":
             piece += " NOT NULL"
         if c.get("COMMENT"):
-            piece += " COMMENT '" + str(c["COMMENT"]).replace("'", "''") + "'"
+            piece += " COMMENT " + quote_spark_string(c["COMMENT"])
         lines.append(piece)
         res.rules_applied.append(RuleApplication(
             "R03_TYPE_MAP",
