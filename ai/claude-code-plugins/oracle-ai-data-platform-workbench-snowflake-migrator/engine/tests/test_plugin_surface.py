@@ -10,7 +10,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 SKILLS = ["snowflake-migrator-overview", "snowflake-migrator-bootstrap",
           "snowflake-assess-estate", "snowflake-migration-plan",
           "snowflake-medallion-clone", "snowflake-compute-proposal",
-          "snowflake-smoke-test", "snowflake-clone-notebook"]
+          "snowflake-smoke-test", "snowflake-clone-notebook",
+          "snowflake-stage-board"]
 COMMANDS = ["snowflake-assess", "snowflake-plan", "snowflake-soft-clone",
             "snowflake-compute", "snowflake-smoke", "snowflake-notebook"]
 

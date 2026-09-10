@@ -8,7 +8,7 @@ from __future__ import annotations
 from plan.data_movement import MAINTENANCE_TRAPS, architecture_decision
 from plan.status import assess_risk, migration_status
 
-__all__ = ["render_preflight", "render_census", "census_scope",
+__all__ = ["render_stages", "render_preflight", "render_census", "census_scope",
            "render_maintenance",
            "render_security",
            "render_inventory", "render_ddl_plan", "render_planned_objects",
@@ -1047,4 +1047,45 @@ def render_preflight(plan: dict, *, source: dict | None = None,
     out += ["---", "",
             "Nothing above has been executed. `deploy --execute` with the "
             "target coordinates is what applies it."]
+    return "\n".join(out) + "\n"
+
+
+def render_stages(board: dict) -> str:
+    """The stage board as a table. Read the run before executing it."""
+    rows = board.get("stages") or []
+    out = ["# Stages — what runs, what has run, what it found", "",
+           f'Artifacts read from `{board.get("out_dir")}`. This board makes no '
+           f'decisions and touches nothing.', "",
+           "**Every stage is read-only except `deploy`,** which is the only one "
+           "that creates anything — and it is a dry run unless `--execute` is "
+           "passed with the target coordinates.", "",
+           "| Stage | Needs | Status | What it found |", "|---|---|---|---|"]
+    for r in rows:
+        mark = " ⚠️" if r.get("attention") else ""
+        writes = " **(writes)**" if r.get("writes") else ""
+        out.append(f'| `{r["stage"]}`{writes} | {r["needs"]} | '
+                   f'{r["status"]}{mark} | {r["found"]} |')
+    out.append("")
+
+    attention = board.get("needs_attention") or []
+    if attention:
+        out += ["## Needs attention", "",
+                "These stages found something, or could not look. A stage that "
+                "**could not look is flagged, never shown as clean** — "
+                "\"0 found\" and \"we could not read it\" are opposite "
+                "findings.", ""]
+        for r in rows:
+            if r.get("attention"):
+                out.append(f'- **`{r["stage"]}`** — {r["found"]}')
+        out.append("")
+
+    if board.get("next_stage"):
+        out += [f'## Next: `{board["next_stage"]}`', "",
+                next(f'{r["purpose"]}' for r in rows
+                     if r["stage"] == board["next_stage"]), ""]
+    else:
+        out += ["## Every stage has run", ""]
+
+    out += ["---", "", "Purposes:", ""]
+    out += [f'- `{r["stage"]}` — {r["purpose"]}' for r in rows]
     return "\n".join(out) + "\n"

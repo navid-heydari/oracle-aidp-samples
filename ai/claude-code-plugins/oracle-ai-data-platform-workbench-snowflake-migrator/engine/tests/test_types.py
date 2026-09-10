@@ -147,3 +147,40 @@ def test_integer_to_decimal_is_noted_but_does_not_raise_risk():
 
 def test_number_with_a_scale_gets_no_integer_note():
     assert map_type("NUMBER", precision=10, scale=2).note is None
+
+
+# ==========================================================================
+# TIMESTAMP_NTZ is a TRANSLATION decision, so it belongs here.
+#
+# It was first handled in the catalog transport, which was the wrong place:
+# the translator owns what a Snowflake type becomes, and the transport should
+# only ever refuse what it genuinely cannot express. Deciding it here means
+# the PLAN shows the type that will really be created.
+# ==========================================================================
+
+def test_timestamp_ntz_is_preserved_by_default():
+    m = map_type("TIMESTAMP_NTZ")
+    assert m.spark_type == "TIMESTAMP_NTZ"
+    assert m.warning is None
+
+
+def test_timestamp_ntz_can_be_downgraded_by_the_translator():
+    m = map_type("TIMESTAMP_NTZ", timestamp_ntz="timestamp")
+    assert m.spark_type == "TIMESTAMP"
+    assert "timezone" in m.warning.lower()
+    assert "session" in m.warning.lower()
+
+
+def test_the_downgrade_says_why_it_was_needed():
+    m = map_type("TIMESTAMP_NTZ", timestamp_ntz="timestamp")
+    assert "catalog" in m.warning.lower() or "target" in m.warning.lower()
+
+
+def test_an_unknown_timestamp_mode_is_refused():
+    with pytest.raises(ValueError):
+        map_type("TIMESTAMP_NTZ", timestamp_ntz="maybe")
+
+
+def test_the_mode_does_not_touch_other_timestamp_types():
+    for t in ("TIMESTAMP", "TIMESTAMP_LTZ", "TIMESTAMP_TZ"):
+        assert map_type(t, timestamp_ntz="timestamp").spark_type == "TIMESTAMP"
