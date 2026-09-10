@@ -306,3 +306,20 @@ def test_the_stale_mvp1_view_verdict_is_gone():
     assert "risk_level" not in rec
     assert "MVP-1" not in str(rec)
     assert "Databricks" not in str(rec)
+
+
+def test_maintenance_columns_are_captured_from_show_output():
+    # These are free -- SHOW TABLES already returns them -- and they are the
+    # whole input to the maintenance assessment (M2). Missing them meant the
+    # maintenance question could not be asked at all.
+    fake = FakeSql(_base_responses(
+        tables=[{"name": "T", "rows": 1, "cluster_by": "(A)",
+                 "automatic_clustering": "ON", "change_tracking": "ON",
+                 "search_optimization": "ON", "search_optimization_bytes": 4096,
+                 "retention_time": 7, "is_external": "N", "is_hybrid": "N"}],
+        columns=[]))
+    meta = build_inventory(fake, row_counts="none")["inventory"][0]["source_metadata"]
+    for key in ("cluster_by", "automatic_clustering", "change_tracking",
+                "search_optimization", "search_optimization_bytes",
+                "retention_time"):
+        assert key in meta, f"{key} not captured from SHOW"

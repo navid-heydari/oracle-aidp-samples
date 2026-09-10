@@ -183,6 +183,19 @@ reclaims storage in the background. AIDP has `OPTIMIZE`, `VACUUM`, `ZORDER BY`
 and liquid clustering, and **runs none of them for you**. The capability
 survives the migration; the *responsibility* moves.
 
+`snowmig maintenance` (after `assess`) measures what the source actually does
+— clustering keys, `automatic_clustering`, Search Optimization,
+`change_tracking`, the retention cascade, and reclustering credits plus DML
+churn from `ACCOUNT_USAGE` — and writes `MAINTENANCE.md`. An unreadable
+`ACCOUNT_USAGE` reports **not measured**, never zero: those two lead to
+opposite decisions. The retention *level* is inferred from effective values
+rather than probed per table, so the stage costs a handful of queries;
+`--probe-table-parameters` opts into the exact path.
+
+Every data-movement option also states **who inherits `OPTIMIZE`/`VACUUM`** and
+which traps apply to it, because that is decided by the architecture rather than
+discovered afterwards.
+
 This plugin reports the gap per object and applies nothing — no maintenance
 DDL is generated, enforced by test. Source settings with a real equivalent
 (`cluster_by`, `retention_time`, `change_tracking`) appear in the DDL plan under

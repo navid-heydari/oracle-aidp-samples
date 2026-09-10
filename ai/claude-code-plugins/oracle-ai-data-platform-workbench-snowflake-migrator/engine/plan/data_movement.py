@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import datetime
 
-__all__ = ["OPTIONS", "CUSTOMER_DEFINED_ID", "NotImplementedInMvp",
+__all__ = [
+    "MAINTENANCE_TRAPS","OPTIONS", "CUSTOMER_DEFINED_ID", "NotImplementedInMvp",
            "architecture_decision", "capability_matrix", "execute_transfer",
            "options_for", "record_choice"]
 
@@ -25,6 +26,34 @@ CUSTOMER_DEFINED_ID = "A6_CUSTOMER_DEFINED"
 
 # What each option is FOR. A future MVP picks an option by capability, so these
 # are the axes: which of them a path actually covers.
+# Delta maintenance behaviours a Snowflake customer has never had to think
+# about, because Snowflake did it for them. Which of these bite depends on the
+# architecture chosen below, so they travel WITH the options rather than living
+# in a reference file nobody opens.
+MAINTENANCE_TRAPS: tuple[dict, ...] = (
+    {"id": "T_VACUUM_BOUNDS_TIME_TRAVEL",
+     "trap": "On Delta, VACUUM is what bounds time travel.",
+     "consequence": "On Snowflake, retention and storage reclamation are "
+                    "independent and automatic. On Delta they are the same "
+                    "knob, so a customer used to reclaiming storage freely "
+                    "will delete their own recovery window. Snowflake's 7-day "
+                    "Fail-safe has no equivalent to fall back on."},
+    {"id": "T_OPTIMIZE_GROWS_STORAGE",
+     "trap": "OPTIMIZE increases storage until VACUUM runs.",
+     "consequence": "It writes compacted files and leaves the originals as "
+                    "tombstones until retention expires. Scheduling "
+                    "compaction without reclamation is a cost regression, not "
+                    "a win."},
+    {"id": "T_NOTHING_RUNS_ITSELF",
+     "trap": "Nothing runs itself; every OPTIMIZE and VACUUM is a scheduled job.",
+     "consequence": "AIDP has no managed predictive-optimization service. "
+                    "Maintenance becomes a pipeline the customer owns, "
+                    "monitors and pays for -- operational surface that simply "
+                    "did not exist for them on Snowflake."},
+)
+
+_ALL_TRAPS = [t["id"] for t in MAINTENANCE_TRAPS]
+
 CAPABILITIES = ("historic_bulk", "ongoing_incremental", "read_without_copy",
                 "cutover")
 
@@ -36,6 +65,9 @@ class NotImplementedInMvp(NotImplementedError):
 OPTIONS: tuple[dict, ...] = (
     {
         "id": "A1_UNLOAD_OBJECT_STORAGE",
+        "maintenance_ownership": {
+            "owner": 'customer', "traps_apply": _ALL_TRAPS,
+            "note": 'Every table lands as managed Delta, so the whole maintenance obligation transfers on day one. Budget for a compaction and reclamation job alongside the migration, not after it.'},
         "name": "Bulk unload to object storage, land as managed Delta",
         "catalog_type": "INTERNAL",
         "phase": ("historic",),
@@ -76,6 +108,9 @@ OPTIONS: tuple[dict, ...] = (
     },
     {
         "id": "A2_FEDERATE_EXTERNAL_CATALOG",
+        "maintenance_ownership": {
+            "owner": 'snowflake', "traps_apply": [],
+            "note": 'The data never becomes a Delta table, so no Delta maintenance applies and none of the traps bite. Snowflake keeps maintaining layout -- and keeps billing for it. The trade is that Delta features (time travel on the target, ZORDER, CDF) are equally unavailable.'},
         "name": "Federate: read Snowflake in place through an EXTERNAL catalog",
         "catalog_type": "EXTERNAL",
         "phase": ("historic", "ongoing"),
@@ -114,6 +149,9 @@ OPTIONS: tuple[dict, ...] = (
     },
     {
         "id": "A3_REDIRECT_INGESTION",
+        "maintenance_ownership": {
+            "owner": 'customer', "traps_apply": _ALL_TRAPS,
+            "note": 'The highest-churn case, and the one where compaction matters most: streaming and CDC writers produce many small files, which is exactly what OPTIMIZE exists for. Prefer preventing them at write time (optimizeWrite / AQE coalesce) over compacting after -- on OCI Object Storage a small-file write burst can also draw HTTP 429.'},
         "name": "Redirect ingestion at the source (Fivetran and pipelines)",
         "catalog_type": "BOTH",
         "phase": ("ongoing",),
@@ -151,6 +189,9 @@ OPTIONS: tuple[dict, ...] = (
     },
     {
         "id": "A4_ICEBERG_INTEROP",
+        "maintenance_ownership": {
+            "owner": 'shared', "traps_apply": _ALL_TRAPS,
+            "note": 'Whoever WRITES the Iceberg tables owns their maintenance. If Snowflake writes them it compacts them; if AIDP writes them the obligation is yours. Iceberg has its own vocabulary for this -- compaction and expire-snapshots rather than OPTIMIZE and VACUUM -- so the traps apply with different command names, and snapshot expiry is what bounds time travel.'},
         "name": "Iceberg interop: share storage instead of copying",
         "catalog_type": "EXTERNAL",
         "phase": ("historic", "ongoing"),
@@ -188,6 +229,9 @@ OPTIONS: tuple[dict, ...] = (
     },
     {
         "id": "A5_HYBRID_WAVES",
+        "maintenance_ownership": {
+            "owner": 'both', "traps_apply": _ALL_TRAPS,
+            "note": "Two maintenance regimes running at once for the length of the transition: Snowflake maintaining what has not moved, and a scheduled AIDP job maintaining what has. Plan for the operational cost of both, and for the fact that a table's regime changes the day it migrates."},
         "name": "Hybrid: federate first, copy selectively, redirect forward",
         "catalog_type": "BOTH",
         "phase": ("historic", "ongoing"),
@@ -222,6 +266,14 @@ OPTIONS: tuple[dict, ...] = (
     },
     {
         "id": CUSTOMER_DEFINED_ID,
+        # Unknown until they describe it. An architecture we have not assessed
+        # has no maintenance model we can state.
+        "maintenance_ownership": {
+            "owner": None, "traps_apply": None,
+            "note": "Unknown until the design is described. Whether the Delta "
+                    "maintenance traps apply depends on whether the design "
+                    "lands Delta tables at all, and this plugin has not "
+                    "assessed it."},
         "name": "Customer-defined — something not listed here, or not decided yet",
         "catalog_type": "TBD",
         "phase": ("historic", "ongoing"),
@@ -350,6 +402,10 @@ def architecture_decision(recorded_choice: dict | None) -> dict:
     options = [
         {"id": o["id"], "name": o["name"], "catalog_type": o["catalog_type"],
          "moves_bytes": o["moves_bytes"], "handles": list(o["handles"]),
+         # Carried through the projection deliberately: which architecture is
+         # chosen decides who inherits OPTIMIZE/VACUUM, and that is a cost the
+         # customer must see while choosing, not afterwards.
+         "maintenance_ownership": dict(o["maintenance_ownership"]),
          "etl": o["etl"], "unknowns": list(o["unknowns"]),
          "implementation_notes": list(o["implementation_notes"])}
         for o in OPTIONS]

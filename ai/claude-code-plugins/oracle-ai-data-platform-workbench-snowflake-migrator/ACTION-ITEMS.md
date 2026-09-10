@@ -13,12 +13,12 @@ plugin tells them what to schedule.
 | # | Item | Effort | Blocked by |
 |---|---|---|---|
 | M1 | Report the gap instead of mislabelling it | — | **done** |
-| M2 | Extract maintenance state as first-class inventory | S | — |
+| M2 | Extract maintenance state as first-class inventory | S | **done** |
 | M3 | Propose a per-table maintenance plan | M | M2 |
 | M4 | Emit a disabled maintenance job | M | M3 |
-| M5 | Time-travel parity statement | S | M2 |
+| M5 | Time-travel parity statement | S | M2 done — unblocked |
 | M6 | Cost comparison: clustering credits vs OPTIMIZE job | M | M2, live AIDP |
-| M7 | Name the two capabilities with no equivalent | S | — |
+| M7 | Name the capabilities with no equivalent | S | **done** |
 | M8 | Verify the maintenance DDL on a live AIDP | S | AIDP environment |
 
 ---
@@ -32,7 +32,7 @@ equivalent"*. All four **do** have AIDP equivalents. Now split into
 `DEFERRED_EQUIVALENT_PROPERTIES` (equivalent named, not applied), surfaced in
 the DDL plan and raising risk to MEDIUM.
 
-## M2 — Extract maintenance state as first-class inventory
+## M2 — Extract maintenance state as first-class inventory ✅ done
 
 **Why:** the plan cannot propose a cadence it cannot see, and today the
 extractor only picks these up incidentally from `SHOW TABLES`.
@@ -54,6 +54,30 @@ zero.
 **Done when:** a `maintenance.json` artifact records the above per table, with
 the source level for each cascading setting, and says explicitly which parts
 were unreadable.
+
+**Delivered.** `engine/snowflake_source/extract/maintenance.py`, the
+`snowmig maintenance` stage, `maintenance.json` + `MAINTENANCE.md`. Captures
+clustering keys and `automatic_clustering`, Search Optimization (with bytes),
+`change_tracking`, the retention cascade at account/database/schema level with
+per-table effective values, reclustering credits and DML churn from
+`ACCOUNT_USAGE`, and a per-table list of *signals* naming what each will
+require on AIDP.
+
+Two decisions worth keeping:
+
+- **"Not measured" is never rendered as zero.** An unreadable `ACCOUNT_USAGE`
+  reports `measured: False` with null counts, because "0 reclustering credits"
+  and "we could not look" lead to opposite decisions. Verified by test.
+- **The retention level is inferred, not probed.** `SHOW TABLES` already
+  carries each table's effective retention, so the cascade costs one account
+  query plus one per database and schema — not one `SHOW PARAMETERS` per
+  table, which would be thousands of round trips on a real estate.
+  `--probe-table-parameters` opts into the exact path.
+
+Live on the test account: 0 of 6 tables flagged (nothing clustered, no Search
+Optimization, retention inherited at 1 day), `ACCOUNT_USAGE` readable, real DML
+churn measured. A clean estate now says so explicitly rather than rendering an
+empty section.
 
 ## M3 — Propose a per-table maintenance plan
 
@@ -91,6 +115,11 @@ that enabling it is the customer's action.
 
 ## M5 — Time-travel parity statement
 
+*(M2 delivered its input: the retention cascade and per-table effective values
+are now captured, and a table-level override is already reported as a signal.
+What is still missing is the explicit source-window vs target-window
+comparison.)*
+
 **Why:** the trap most likely to cause data loss. On Snowflake, retention and
 storage reclamation are independent and automatic; on Delta, `VACUUM` is what
 bounds time travel. A customer used to reclaiming storage freely will delete
@@ -112,7 +141,7 @@ time, and nobody has priced the swap.
 existing compute proposal rather than a separate report. Needs a live AIDP run
 to calibrate, so keep the estimate labelled as an estimate.
 
-## M7 — Name the two capabilities with no equivalent
+## M7 — Name the capabilities with no equivalent ✅ done
 
 Short and worth doing early, because both are things a customer discovers at
 the worst moment:
@@ -125,6 +154,11 @@ the worst moment:
 
 **Done when:** both appear in the assessment output as named gaps, not as
 absences the reader has to notice.
+
+**Delivered.** `NO_AIDP_EQUIVALENT` in the maintenance extractor, rendered in
+`MAINTENANCE.md` under *"Capabilities with no AIDP equivalent"*. Three, not
+two — `MAX_DATA_EXTENSION_TIME_IN_DAYS` belongs with them, since Delta
+retention is a single duration with no automatic extension.
 
 ## M8 — Verify on a live AIDP
 

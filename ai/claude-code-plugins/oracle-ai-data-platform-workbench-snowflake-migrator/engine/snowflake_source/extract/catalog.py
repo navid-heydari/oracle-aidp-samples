@@ -41,9 +41,18 @@ ROW_COUNT_MODES = ("metadata", "exact", "none")
 # Snowflake truncates SHOW at 10k rows. Page just under it.
 SHOW_PAGE_SIZE = 10_000
 
-_META_KEYS = ("rows", "bytes", "created_on", "comment", "cluster_by", "is_dynamic",
-              "is_iceberg", "is_secure", "is_materialized", "owner",
-              "change_tracking", "retention_time")
+# Everything SHOW already hands us that we might need later. Free to capture,
+# and the maintenance/layout group is the entire input to the maintenance
+# assessment -- without it that question cannot even be asked.
+_META_KEYS = ("rows", "bytes", "created_on", "comment", "owner",
+              # layout and maintenance
+              "cluster_by", "automatic_clustering", "change_tracking",
+              "retention_time", "search_optimization",
+              "search_optimization_bytes", "search_optimization_progress",
+              # table kind, which changes what maintenance even applies
+              "is_dynamic", "is_iceberg", "is_secure", "is_materialized",
+              "is_external", "is_hybrid", "is_event", "is_immutable",
+              "enable_schema_evolution")
 
 # Deliberately NOT called exact. Snowflake maintains this count and it agrees
 # with COUNT(*) for a settled standard table, but it can lag very recent DML
