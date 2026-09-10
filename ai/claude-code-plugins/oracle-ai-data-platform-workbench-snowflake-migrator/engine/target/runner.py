@@ -51,3 +51,34 @@ def make_run_sql(target, *, backend: str,
         return parse_cli_json(getattr(result, "stdout", ""))
 
     return (run_sql, planned) if dry_run else run_sql
+
+
+def make_call(target, *, backend: str, run_process=None):
+    """A `call(operation, **kwargs) -> dict` for the catalog CRUD transport.
+
+    Separate from `make_run_sql` because the catalog API is not SQL: it takes
+    an operation plus a JSON body and returns one object, not rows.
+    """
+    from .executor import build_command, parse_cli_json
+
+    runner = run_process or _default_run_process
+
+    def call(operation: str, **kwargs) -> dict:
+        cmd = build_command(backend, operation, target, **kwargs)
+        printable = [c if len(c) < 200 else c[:200] + "…<truncated>" for c in cmd]
+        print("  $ " + " ".join(printable))
+        proc = runner(cmd)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"{operation} failed (exit {proc.returncode}): "
+                f"{(proc.stderr or proc.stdout or '')[:300]}")
+        rows = parse_cli_json(proc.stdout)
+        # A list operation returns a COLLECTION; a create/get returns ONE
+        # object. Collapsing both to rows[0] made key resolution see a single
+        # schema instead of the list, so every read-back failed while the
+        # objects had in fact been created.
+        if operation.startswith("list_"):
+            return {"items": rows}
+        return rows[0] if rows else {}
+
+    return call

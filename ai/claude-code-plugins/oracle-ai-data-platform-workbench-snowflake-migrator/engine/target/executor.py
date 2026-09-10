@@ -105,6 +105,64 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
                             "catalog": target.catalog,
                             "statement": sql})]
 
+    # --- catalog CRUD: the working transport for a structure-only clone ---
+    if operation in ("create_schema", "create_table", "create_view"):
+        relation = {"create_schema": "schemas", "create_table": "tables",
+                    "create_view": "views"}[operation]
+        body = json.dumps(kwargs["body"])
+        if backend == "aidp_cli":
+            return ["aidp", "schema",
+                    {"create_schema": "create", "create_table": "create-table",
+                     "create_view": "create-view"}[operation],
+                    "--datalake-id", target.datalake_ocid,
+                    "--from-json", body, "--output", "json"]
+        return ["oci", "raw-request", "--http-method", "POST",
+                "--target-uri", f"{_endpoint(target)}/dataLakes/"
+                                f"{target.datalake_ocid}/{relation}",
+                "--request-body", body]
+
+    if operation == "list_schemas":
+        if backend == "aidp_cli":
+            return ["aidp", "schema", "list", "--datalake-id",
+                    target.datalake_ocid, "--catalog-key", target.catalog,
+                    "--output", "json"]
+        return ["oci", "raw-request", "--http-method", "GET",
+                "--target-uri", f"{_endpoint(target)}/dataLakes/"
+                                f"{target.datalake_ocid}/schemas"
+                                f"?catalogKey={target.catalog}"]
+
+    if operation in ("list_tables_in", "list_views_in"):
+        relation = "tables" if operation == "list_tables_in" else "views"
+        # Fully qualified: a bare schemaKey returns 400 InvalidParameter.
+        schema = kwargs["schema"]
+        qualified = (schema if schema.startswith(f'{kwargs["catalog"]}.')
+                     else f'{kwargs["catalog"]}.{schema}')
+        if backend == "aidp_cli":
+            return ["aidp", "schema",
+                    "list-tables" if relation == "tables" else "list-views",
+                    "--datalake-id", target.datalake_ocid,
+                    "--catalog-key", kwargs["catalog"],
+                    "--schema-key", qualified, "--output", "json"]
+        return ["oci", "raw-request", "--http-method", "GET",
+                "--target-uri", f"{_endpoint(target)}/dataLakes/"
+                                f"{target.datalake_ocid}/{relation}"
+                                f'?catalogKey={kwargs["catalog"]}'
+                                f"&schemaKey={qualified}"]
+
+    if operation in ("get_table", "get_view"):
+        relation = "tables" if operation == "get_table" else "views"
+        name = kwargs.get("table") or kwargs.get("view")
+        # Objects are addressed by their fully-qualified KEY.
+        key = f'{kwargs["catalog"]}.{kwargs["schema"]}.{name}'
+        if backend == "aidp_cli":
+            return ["aidp", "schema",
+                    "get-table" if operation == "get_table" else "get-view",
+                    "--datalake-id", target.datalake_ocid,
+                    "--key", key, "--output", "json"]
+        return ["oci", "raw-request", "--http-method", "GET",
+                "--target-uri", f"{_endpoint(target)}/dataLakes/"
+                                f"{target.datalake_ocid}/{relation}/{key}"]
+
     if operation == "list_tables":
         schema = kwargs["schema"]
         if backend == "aidp_cli":
@@ -113,10 +171,14 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
                     "--catalog", target.catalog,
                     "--schema", schema,
                     "--output", "json"]
+        # schemaKey must be FULLY QUALIFIED. A bare schema returns 400
+        # InvalidParameter -- verified live.
+        qualified = (schema if schema.startswith(f"{target.catalog}.")
+                     else f"{target.catalog}.{schema}")
         return ["oci", "raw-request", "--http-method", "GET",
                 "--target-uri",
                 f"{_endpoint(target)}/dataLakes/{target.datalake_ocid}/tables"
-                f"?catalogKey={target.catalog}&schemaKey={schema}"]
+                f"?catalogKey={target.catalog}&schemaKey={qualified}"]
 
     if operation == "upload_notebook":
         path, local = kwargs["workspace_path"], kwargs["local_path"]

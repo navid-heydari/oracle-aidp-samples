@@ -31,13 +31,15 @@ import pathlib
 import sys
 
 from plan.build import TargetCollision, build_plan
+from plan.medallion import SCHEMA_STYLES
 from plan.restrictions import InvalidRestriction
 from plan.data_movement import OPTIONS as DATA_OPTIONS
 from plan.data_movement import options_for, record_choice
 from plan.smoke import run_smoke
 from target.notebook import build_notebook, notebook_workspace_path
 from report.render import (
-    render_census, render_maintenance, render_security,
+    render_census, render_maintenance, render_preflight,
+    render_security,
     render_compute, render_ddl_plan, render_inventory, render_planned_objects,
     render_data_options, render_smoke, render_soft_clone_summary,
     render_summary,
@@ -58,6 +60,7 @@ from snowflake_source.extract.warehouses import extract_warehouses
 from sizing.warehouse_map import propose_all
 from target.coords import MissingTarget, resolve_target
 from target.ddl import build_create_table, build_create_view
+from target.catalog_deploy import deploy_catalog
 from target.deploy import RefusedToExecute, deploy
 from target.executor import (
     NoBackendAvailable, build_command, detect_backend,
@@ -65,6 +68,7 @@ from target.executor import (
 # Aliased: snowflake_source.conn also exports make_run_sql, and the
 # unqualified import shadowed it.
 from target.runner import BackendError
+from target.runner import make_call
 from target.runner import make_run_sql as make_aidp_run_sql
 
 HALT = 3
@@ -194,6 +198,7 @@ def cmd_plan(args) -> int:
     try:
         built = build_plan(inv, deps, restrictions=restrictions,
                            bronze_catalog_prefix=args.bronze_catalog_prefix,
+        bronze_schema_style=args.bronze_schema_style,
                            architecture_choice=choice)
     except TargetCollision as exc:
         print(f"HALT: {exc}", file=sys.stderr)
@@ -220,6 +225,15 @@ def cmd_plan(args) -> int:
           f'({s["tables"]} table, {s["views"]} view); '
           f'{s["cannot_migrate"]} cannot move')
     return 0
+
+
+def _view_text(sql: str | None) -> str:
+    """The SELECT body of a generated CREATE VIEW, for the catalog API."""
+    from snowflake_source.dialect.views import extract_view_body
+    try:
+        return extract_view_body(sql or "")
+    except ValueError:
+        return ""
 
 
 def cmd_ddl(args) -> int:
@@ -258,7 +272,11 @@ def cmd_ddl(args) -> int:
             "expected_columns": res.expected_columns,
             # Source settings with an AIDP equivalent that this version does
             # not apply. Reported, never silently invented.
-            "deferred_properties": res.deferred_properties})
+            "deferred_properties": res.deferred_properties,
+            # The catalog API takes a view's body as a field, not as CREATE
+            # VIEW text, so it is carried separately.
+            **({"view_text": _view_text(res.sql)}
+               if rec.get("object_type") == "VIEW" else {})})
 
     payload = {"statements": statements, "blocked": blocked,
                "bronze_catalog_prefix": built.get("bronze_catalog_prefix")}
@@ -271,19 +289,47 @@ def cmd_deploy(args) -> int:
     out = pathlib.Path(args.out_dir)
     ddl_plan = _read(out, "ddl_plan.json")
     built = _read(out, "plan.json")
-    target, run_sql = None, None
+    inv = _read(out, "inventory.json") if (out / "inventory.json").exists() else {}
+    target = None
     if args.execute:
         target = resolve_target(datalake_ocid=args.datalake_ocid,
                                 workspace=args.workspace,
                                 cluster_id=args.cluster_id, catalog=args.catalog)
         backend = args.backend or detect_backend()
-        print(f"  backend: {backend}")
-        run_sql = make_aidp_run_sql(target, backend=backend)
-    result = deploy(ddl_plan, target=target, execute=args.execute, run_sql=run_sql,
-                    chunk_size=args.chunk_size)
+        print(f"  backend: {backend} · transport: {args.transport}")
+
+    # Pre-flight FIRST, always: both ends are known here and nothing has been
+    # created yet. Written and echoed so it cannot be skipped.
+    preflight = render_preflight(
+        built,
+        source=({"account": (inv.get("session") or {}).get("A"),
+                 "region": (inv.get("session") or {}).get("R"),
+                 "role": (inv.get("session") or {}).get("ROLE"),
+                 "databases": inv.get("databases_in_scope")} if inv else None),
+        target=(dataclasses.asdict(target) if target is not None else None))
+    _write(out, "PREFLIGHT.md", preflight)
+    print()
+    for line in preflight.splitlines():
+        print(f"  {line}" if line else "")
+    print()
+
+    if args.transport == "catalog_api":
+        # The working transport. `POST .../sql/execute` returns 404, and a
+        # structure-only clone needs no Spark cluster anyway.
+        call = (make_call(target, backend=args.backend or detect_backend())
+                if args.execute else None)
+        result = deploy_catalog(
+            ddl_plan, target=target, execute=args.execute, call=call,
+            timestamp_ntz_as_timestamp=(args.timestamp_ntz == "timestamp"))
+    else:
+        run_sql = (make_aidp_run_sql(target, backend=args.backend or detect_backend())
+                   if args.execute else None)
+        result = deploy(ddl_plan, target=target, execute=args.execute,
+                        run_sql=run_sql, chunk_size=args.chunk_size)
     _write(out, "deploy_result.json", result)
     _write(out, "SOFT_CLONE_SUMMARY.md", render_soft_clone_summary(built, result))
-    return 1 if result.get("failed") or result.get("chunk_errors") else 0
+    return 1 if result.get("failed") or result.get("chunk_errors") \
+        or result.get("mismatched_targets") else 0
 
 
 def cmd_compute(args) -> int:
@@ -535,6 +581,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--restrictions",
                    help="JSON file of user restrictions (exclude_databases, "
                         "max_rows, exclude_name_patterns, ...)")
+    p.add_argument("--bronze-schema-style", choices=list(SCHEMA_STYLES),
+                   default="db_schema",
+                   help="with --bronze-catalog-prefix: db_schema (default) "
+                        "names the target schema DB_SCHEMA so two same-named "
+                        "schemas cannot merge; db names it after the Snowflake "
+                        "database alone, giving <prefix>.<database>.<table>")
     p.add_argument("--bronze-catalog-prefix",
                    help="use ONE bronze catalog with this name instead of "
                         "catalog-per-database (default: mirror the source)")
@@ -545,6 +597,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     dep = sub.add_parser("deploy", parents=[common], help="dry-run by default")
     dep.add_argument("--execute", action="store_true")
+    dep.add_argument("--timestamp-ntz", choices=["block", "timestamp"],
+                     default="block",
+                     help="the catalog API accepts `timestamp` but NOT "
+                          "`timestamp_ntz` -- a POST carrying it returns 202 "
+                          "and then fails silently. block (default): refuse "
+                          "the object and say why. timestamp: downgrade it, "
+                          "accepting that Spark timestamp is "
+                          "session-timezone-dependent")
+    dep.add_argument("--transport", choices=["catalog_api", "sql"],
+                     default="catalog_api",
+                     help="catalog_api (default): create schemas/tables/views "
+                          "through the catalog CRUD API. Needs no Spark "
+                          "cluster. sql: the SQL path -- POST .../sql/execute "
+                          "returns 404 on a live DataLake, so it is kept only "
+                          "for a backend where SQL does work")
     _add_target_args(dep)
     dep.add_argument("--chunk-size", type=int, default=25)
     dep.set_defaults(func=cmd_deploy)

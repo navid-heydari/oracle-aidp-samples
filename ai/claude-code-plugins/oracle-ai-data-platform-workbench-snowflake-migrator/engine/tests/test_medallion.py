@@ -10,12 +10,12 @@ from plan.medallion import (
 
 def test_database_becomes_the_catalog():
     # Database -> Standard Catalog, Schemas -> Schemas, Tables -> tables.
-    assert bronze_target("MYDB", "SALES", "ORDERS") == "MYDB.SALES.ORDERS"
+    assert bronze_target("MYDB", "SALES", "ORDERS") == "mydb.sales.orders"
 
 
 def test_bronze_preserves_case_exactly():
     # Snowflake unquoted folds to UPPER; the mirror must not re-fold it.
-    assert bronze_target("MyDb", "Sales", "Orders") == "MyDb.Sales.Orders"
+    assert bronze_target("MyDb", "Sales", "Orders") == "mydb.sales.orders"
 
 
 def test_bronze_is_identity_so_it_cannot_collide():
@@ -33,7 +33,7 @@ def test_collision_detector_still_catches_case_variants():
 def test_optional_catalog_prefix_for_a_shared_bronze_catalog():
     # Some deployments want one bronze catalog rather than catalog-per-database.
     assert bronze_target("MYDB", "SALES", "ORDERS",
-                         catalog_prefix="bronze") == "bronze.MYDB_SALES.ORDERS"
+                         catalog_prefix="bronze") == "bronze.mydb_sales.orders"
 
 
 def test_prefix_mode_can_collide_and_is_detected():
@@ -87,3 +87,86 @@ def test_no_jobs_for_an_empty_scope():
 
 def test_layers_constant():
     assert LAYERS == ("BRONZE", "SILVER", "GOLD")
+
+
+# ==========================================================================
+# Schema naming style. The default concatenates DB_SCHEMA to keep two
+# same-named schemas apart inside one catalog; `db` style names the target
+# schema after the Snowflake database alone, which is what a 1:1
+# "lake.<snowflake database>.<table>" layout asks for.
+# ==========================================================================
+
+def test_db_style_names_the_schema_after_the_database():
+    assert bronze_target("TEST_DB", "PUBLIC", "ORDERS", catalog_prefix="lake",
+                         schema_style="db") == "lake.test_db.orders"
+
+
+def test_default_style_is_unchanged():
+    assert bronze_target("TEST_DB", "PUBLIC", "ORDERS",
+                         catalog_prefix="lake") == "lake.test_db_public.orders"
+
+
+def test_table_names_are_preserved_apart_from_case_in_both_styles():
+    # AIDP folds case, so the name is carried over character-for-character
+    # EXCEPT its case. Nothing else about it is rewritten.
+    for style in ("db", "db_schema"):
+        target = bronze_target("D", "S", "Weird_Name$1", catalog_prefix="lake",
+                               schema_style=style)
+        assert target.endswith(".weird_name$1")
+        assert bronze_target("D", "S", "Weird_Name$1", catalog_prefix="lake",
+                             schema_style=style,
+                             fold_case=False).endswith(".Weird_Name$1")
+
+
+def test_db_style_collides_when_two_schemas_share_a_table_name():
+    # The reason the default concatenates. Allowed, but the collision must be
+    # CAUGHT rather than silently merging two different tables.
+    a = bronze_target("D", "PUBLIC", "ORDERS", catalog_prefix="lake",
+                      schema_style="db")
+    b = bronze_target("D", "STAGING", "ORDERS", catalog_prefix="lake",
+                      schema_style="db")
+    assert a == b, "this is the hazard the collision detector exists for"
+    collisions = detect_target_collisions({"D.PUBLIC.ORDERS": a,
+                                           "D.STAGING.ORDERS": b})
+    assert collisions, "a two-into-one mapping must be reported"
+
+
+def test_an_unknown_style_is_refused():
+    with pytest.raises(ValueError):
+        bronze_target("D", "S", "T", catalog_prefix="lake", schema_style="guess")
+
+
+# ==========================================================================
+# AIDP lower-cases identifiers (verified live). The PLAN must therefore show
+# the name the destination will really use, not the name we asked for.
+# ==========================================================================
+
+def test_target_names_are_folded_to_lower_case_by_default():
+    assert bronze_target("TEST_DB", "PUBLIC", "ORDER_ITEMS",
+                         catalog_prefix="lake", schema_style="db") == \
+        "lake.test_db.order_items"
+
+
+def test_folding_applies_without_a_prefix_too():
+    assert bronze_target("TEST_DB", "PUBLIC", "ORDERS") == \
+        "test_db.public.orders"
+
+
+def test_folding_can_be_turned_off():
+    assert bronze_target("TEST_DB", "PUBLIC", "ORDERS", fold_case=False) == \
+        "TEST_DB.PUBLIC.ORDERS"
+
+
+def test_the_catalog_prefix_is_folded_as_well():
+    assert bronze_target("D", "S", "T", catalog_prefix="Lake",
+                         schema_style="db") == "lake.d.t"
+
+
+def test_two_source_names_differing_only_by_case_collide_after_folding():
+    # THE hazard folding creates, and the reason detect_target_collisions
+    # exists: Snowflake keeps ORDERS and "orders" apart, AIDP cannot.
+    a = bronze_target("D", "S", "ORDERS")
+    b = bronze_target("D", "S", "orders")
+    assert a == b
+    collisions = detect_target_collisions({"D.S.ORDERS": a, "D.S.orders": b})
+    assert collisions, "folding two distinct tables into one must HALT"

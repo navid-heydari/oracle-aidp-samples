@@ -67,6 +67,7 @@ def _view_verdict(rec: dict) -> tuple[bool, str, str]:
 def build_plan(inventory: dict, dependencies: dict, *,
                restrictions: dict | None = None,
                bronze_catalog_prefix: str | None = None,
+               bronze_schema_style: str = "db_schema",
                architecture_choice: dict | None = None) -> dict:
     records = inventory.get("inventory", [])
 
@@ -85,7 +86,8 @@ def build_plan(inventory: dict, dependencies: dict, *,
         ident = rec["source_identifier"]
         db, schema, name = ident.split(".", 2)
         targets[ident] = bronze_target(db, schema, name,
-                                       catalog_prefix=bronze_catalog_prefix)
+                                       catalog_prefix=bronze_catalog_prefix,
+                                       schema_style=bronze_schema_style)
 
         if rec.get("compatibility_status") == "blocked":
             cannot.append({
@@ -129,6 +131,7 @@ def build_plan(inventory: dict, dependencies: dict, *,
     return {
         "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "bronze_catalog_prefix": bronze_catalog_prefix,
+        "bronze_schema_style": bronze_schema_style,
         "bronze_mapping": ("Snowflake database -> AIDP Standard Catalog, "
                            "schema -> schema, table -> table, view -> view"),
         "waves": waved["waves"],
