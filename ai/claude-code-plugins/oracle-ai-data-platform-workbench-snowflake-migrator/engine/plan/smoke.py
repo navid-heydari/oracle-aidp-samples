@@ -34,7 +34,7 @@ def _like_literal(name: str) -> str:
     return (name.replace("\\", "\\\\")
                 .replace("%", "\\%")
                 .replace("_", "\\_")
-                .replace("'", "''"))
+                .replace("'", "\\'"))
 
 # Excluded when auto-picking a database to probe: their INFORMATION_SCHEMA is
 # not representative of the customer's own objects.

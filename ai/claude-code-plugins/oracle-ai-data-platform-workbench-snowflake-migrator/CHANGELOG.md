@@ -8,6 +8,24 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [0.7.1] — 2026-09-09
+
+### Fixed
+
+- **Spark string literals were escaped by doubling the quote**, which is
+  correct in Snowflake and in standard SQL but is *not an escape in Spark* —
+  Spark reads `'it''s'` as two adjacent literals and concatenates them. A
+  column comment of `Customer's orders` therefore arrived as
+  `Customers orders`. Spark escapes with a backslash. Fixed in the column
+  `COMMENT`, in both `LIKE` existence probes, and in the generated notebook.
+
+### Added
+
+- `tests/test_generated_sql_parses.py` — parses the generated Spark DDL with a
+  real Spark-dialect parser (`sqlglot`, dev-only). This is what found the
+  escaping bug above: 675 hand-written assertions had accepted it, because the
+  expectations and the implementation shared an author.
+
 ## [0.7.0] — 2026-09-09
 
 **Correctness and cost pass.** Findings from a self-review, addressed in the

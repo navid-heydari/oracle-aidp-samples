@@ -60,7 +60,8 @@ _VERIFY_BODY = r"""
 # unescaped probe matches names other than the one asked for.
 def _like(name):
     out = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return out.replace("'", "''")
+    # Backslash, not doubling: '' is two adjacent literals in Spark.
+    return out.replace("'", "\\'")
 
 
 def _name_of(row):
