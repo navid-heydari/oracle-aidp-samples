@@ -1,5 +1,5 @@
+# Runtime dependencies. Kept minimal on purpose: the AIDP side goes through the
+# `aidp` / `oci` CLI, so no OCI SDK is needed, and there is no HTTP client and
+# no WebSocket in this plugin.
 snowflake-connector-python>=4.7.0
 cryptography>=42.0.0
-oci>=2.130.0
-requests>=2.31.0
-websocket-client>=1.6.0

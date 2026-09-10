@@ -1,8 +1,9 @@
 """Spark/Delta DDL generation. Pure functions, zero I/O.
 
 Every transformation is attributable to a named rule, and every dropped property
-is recorded. This audit shape is carried over from the Databricks migrator's
-catalog_ddl_rewriter.py, which is the one part of it worth keeping.
+is recorded. A migration is reviewable only if each change to a schema can be
+traced to the rule that made it, so the audit trail is part of the output rather
+than a debugging aid.
 
 Two AIDP-specific behaviours are encoded here rather than rediscovered:
   * CREATE SCHEMA ... COMMENT silently fails to persist -- specifically when the
@@ -21,7 +22,7 @@ from snowflake_source.dialect.views import (  # noqa: F401  (re-exported)
 )
 
 __all__ = ["RuleApplication", "RewriteResult", "UnsupportedDDL",
-           "SCRUBBED_PROPERTIES", "build_create_schema", "build_create_table",
+           "SCRUBBED_PROPERTIES", "build_create_schema", "quote_backtick", "build_create_table",
            "build_create_view"]
 
 # Real Snowflake table PROPERTIES with no Delta equivalent. A value here was a
@@ -55,6 +56,10 @@ class RewriteResult:
     omitted_properties: list[str] = field(default_factory=list)
     blocked: bool = False
     blocked_reason: str | None = None
+    # The columns this statement intends to create, in order. Carried so that
+    # deployment can verify the STRUCTURE that arrived rather than only that
+    # something with the right name exists.
+    expected_columns: list[dict] = field(default_factory=list)
 
 
 class UnsupportedDDL(Exception):
@@ -63,8 +68,12 @@ class UnsupportedDDL(Exception):
         super().__init__(f"{rule_id}: {message}")
 
 
-def _q(identifier: str) -> str:
+def quote_backtick(identifier: str) -> str:
+    """A backtick-quoted Spark identifier, with embedded backticks doubled."""
     return "`" + identifier.replace("`", "``") + "`"
+
+
+_q = quote_backtick
 
 
 def _qualify(fqn: str) -> str:
@@ -140,6 +149,8 @@ def build_create_table(record: dict, target_fqn: str) -> RewriteResult:
         "R30_USING_DELTA", "explicit USING DELTA so format is not cluster-default"))
     res.sql = (f"CREATE TABLE IF NOT EXISTS {qualified} (\n"
                + ",\n".join(lines) + "\n)\nUSING DELTA")
+    res.expected_columns = [{"name": c["COLUMN_NAME"], "type": c["target_type"]}
+                            for c in columns]
 
     for c in columns:
         for w in record.get("warnings") or []:
@@ -228,4 +239,9 @@ def build_create_view(record: dict, target_fqn: str,
             "View SQL was carried over unchanged. Verify its result against the "
             "source before relying on it.")
     res.sql = f"CREATE VIEW IF NOT EXISTS {_qualify(target_fqn)} AS\n{rewritten}"
+    res.expected_columns = [
+        {"name": c["COLUMN_NAME"], "type": c["target_type"]}
+        for c in sorted(record.get("columns") or [],
+                        key=lambda c: c.get("ORDINAL_POSITION") or 0)
+        if c.get("target_type")]
     return res

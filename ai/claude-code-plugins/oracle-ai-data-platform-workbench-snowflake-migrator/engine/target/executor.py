@@ -25,8 +25,15 @@ from typing import Callable
 
 from .coords import region_from_ocid
 
-__all__ = ["NoBackendAvailable", "BACKENDS", "build_command", "detect_backend",
-           "parse_cli_json"]
+__all__ = ["NoBackendAvailable", "StatementTooLarge", "BACKENDS",
+           "build_command", "detect_backend", "parse_cli_json",
+           "MAX_ARGV_STATEMENT"]
+
+# SQL is passed as one argv element. A single argument is capped well below
+# ARG_MAX (128KB on Linux, 256KB on macOS), and exceeding it produces a bare
+# E2BIG from the kernel with no hint about what to do. Refuse earlier, and say
+# which knob fixes it.
+MAX_ARGV_STATEMENT = 100_000
 
 BACKENDS = ("aidp_cli", "oci_raw")
 
@@ -35,6 +42,10 @@ _API_VERSION = "20240831"
 
 class NoBackendAvailable(RuntimeError):
     """Neither the aidp CLI nor the oci CLI is installed."""
+
+
+class StatementTooLarge(ValueError):
+    """The SQL will not fit in a single command-line argument."""
 
 
 def detect_backend(*, which: Callable[[str], str | None] = shutil.which) -> str:
@@ -59,6 +70,12 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
 
     if operation == "sql":
         sql = kwargs["sql"]
+        if len(sql.encode()) > MAX_ARGV_STATEMENT:
+            raise StatementTooLarge(
+                f"the batch is {len(sql.encode()):,} bytes, over the "
+                f"{MAX_ARGV_STATEMENT:,}-byte limit for one command-line "
+                f"argument. Lower --chunk-size and re-run; the deployment is "
+                f"chunked precisely so this is adjustable.")
         if backend == "aidp_cli":
             return ["aidp", "sql", "execute",
                     "--datalake-id", target.datalake_ocid,

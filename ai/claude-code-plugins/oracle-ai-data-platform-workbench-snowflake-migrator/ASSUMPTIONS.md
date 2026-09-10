@@ -33,6 +33,10 @@ says what happens if it is wrong. Reviewed 2026-09-09.
 | B5 | `SHOW TABLES … LIKE` verifies existence on AIDP | If unsupported, verification silently reports 0. **Unverified** |
 | B6 | Notebooks belong in the workspace filesystem | Placed at `/Workspace/Shared/…`. Catalogs hold tables and views, not notebooks |
 
+| B8 | `SHOW`'s `rows` column is exact for a settled standard table | Live-verified against all six corpus tables, where it matched `COUNT(*)` exactly. **Not** verified generally: it can lag very recent DML and is not maintained for external tables, which is why reports label it `show_metadata` and never call it verified |
+| B9 | `SHOW ... LIMIT n FROM '<name>'` resumes *after* that name, in name order | This is how the inventory pages past the 10k `SHOW` cap. If the semantics were inclusive, an object would be listed twice; if unordered, paging would miss objects. Worth confirming on a >10k estate — the corpus is far too small to exercise it |
+| B10 | The `LIKE` escape character is backslash | Used to escape `_` and `%` when probing for an exact name. Snowflake and Spark both default to backslash |
+
 ## C. Assumptions in the mapping
 
 | # | Assumption | If wrong |
@@ -44,6 +48,8 @@ says what happens if it is wrong. Reviewed 2026-09-09.
 | C5 | A view body with no Snowflake-only construct runs unchanged on Spark | Plausible but unproven — no view has been executed on AIDP. Every generated view carries a warning to verify against the source |
 | C6 | The 6 implemented dialect rules are exact | Reviewed, not executed. `LISTAGG` refuses `WITHIN GROUP` and `::` refuses expression operands rather than guessing |
 | C7 | Snowflake PK/FK/UNIQUE need not be emitted | Neither engine enforces them. They are captured and reported |
+| C8 | `VARIANT`/`OBJECT`/`ARRAY` as `STRING` is a deferral, not a mapping | Offered only via `--semi-structured string`, never by default. Nothing on the target can address a field inside the text, so any query using Snowflake path syntax stops working until a typed design is agreed |
+| C9 | `TIME` → `STRING` is acceptable with a warning | Spark has no `TIME` type. The value survives; ordering, comparison and time arithmetic become string operations, so it is warned rather than silent |
 
 ## D. Assumptions in the plan and reports
 
@@ -53,6 +59,10 @@ says what happens if it is wrong. Reviewed 2026-09-09.
 | D2 | Risk levels are meaningful | Derived from observable facts (view, dropped properties, timezone warnings, row count), not judgement. Adjust the thresholds if they mislead |
 | D3 | `DATA_CLONE` and `DONE` stay unreachable | They are, by construction. No code path can report that data moved |
 | D4 | One catalog per deploy is safer than fanning out | A multi-database estate spans catalogs; one approval must not authorise all of them |
+| D5 | `DESCRIBE TABLE` / `DESCRIBE VIEW` on AIDP returns `col_name` and `data_type` | **Unverified.** This is what structure verification reads. Several spellings are accepted and an unrecognised shape is reported as "structure unverified" rather than guessed at — but if AIDP answers differently, nothing will verify and everything will land as `IN_PROGRESS` |
+| D6 | `SHOW TABLES` / `SHOW VIEWS` on AIDP carries the name in `tableName` / `viewName` | **Unverified**, same treatment: four spellings accepted, and rows with no recognisable name column are reported, never assumed |
+| D7 | Comparing column name, type and order is a sufficient structure check | It does not compare nullability, comments or column-level metadata. A difference in those would report as verified |
+| D8 | `DROP SCHEMA` is permitted at the destination | Used only by `smoke --write-probe`, on exactly one constant schema name, never `CASCADE`, and skipped if the schema pre-existed. The no-`DROP` rule is a **source** guarantee and does not extend to AIDP |
 
 ## E. Assumptions about the engagement
 

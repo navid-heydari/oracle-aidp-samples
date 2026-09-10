@@ -23,10 +23,19 @@ def migration_status(identifier: str, *, deployed: dict | None,
         return "BLOCKED"
     if not deployed or deployed.get("dry_run"):
         return "NOT_YET_DONE"
+    if identifier in set(deployed.get("mismatched_targets") or []):
+        # Present in AIDP, but not the object we planned -- and the DDL is
+        # CREATE IF NOT EXISTS, so it was left exactly as it was found. This is
+        # BLOCKED, not cloned: something else owns that name.
+        return "BLOCKED"
     if identifier in set(deployed.get("verified_targets") or []):
         # Structure only. DATA_CLONE/DONE are never returned here: this plugin
         # copies no rows, and claiming otherwise would be a false report.
         return "SHALLOW_CLONE"
+    if identifier in set(deployed.get("unverified_structure_targets") or []):
+        # It exists, but its columns were never compared, so "cloned" is not a
+        # claim we have earned.
+        return "IN_PROGRESS"
     if identifier in set(deployed.get("attempted_targets") or []):
         return "IN_PROGRESS"
     return "NOT_YET_DONE"
@@ -42,9 +51,14 @@ def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
     level = "LOW"
 
     if obj.get("object_type") == "VIEW":
-        level = "MEDIUM"
-        notes.append("view SQL is carried over without dialect translation; "
-                     "verify its result against the source")
+        # HIGH, not MEDIUM: an untranslated or mistranslated view CREATES
+        # SUCCESSFULLY and then returns wrong numbers. A loud failure would be
+        # safer than this, so it gets the higher level.
+        level = "HIGH"
+        notes.append("view SQL is carried over without full dialect "
+                     "translation; it will create successfully even if the "
+                     "semantics differ, so verify its result against the "
+                     "source before anyone relies on it")
 
     omitted = obj.get("omitted_properties") or []
     if omitted:

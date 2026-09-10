@@ -47,7 +47,15 @@ Without `--execute` this is a dry run and creates nothing.
    rather than trying.
 5. **Report `verified`, never `executed`.** A batch can report success while
    statements inside it failed, so every object is probed individually. The honest
-   number is `verified/total`.
+   number is `verified/total`. `verified` means the object exists **with the
+   planned column list**, checked by `DESCRIBE` — not merely that something of
+   that name is there.
+5b. **Two outcomes are not successes, and must be read out.** *Structure
+   differs* means the name already belonged to an object with different
+   columns; the DDL is `CREATE IF NOT EXISTS`, so it was left exactly as found
+   and has **not** been cloned. Resolve the collision before re-running — do
+   not describe it as migrated. *Structure not verified* means it exists but
+   its columns could not be compared, so no clone claim has been earned.
 6. **Say the objects are empty.** This is a structural clone: schemas, tables and
    views with no rows. Data movement is a later phase.
 7. **No `CREATE OR REPLACE`, no `DROP`.** Existing objects are left alone; a 409

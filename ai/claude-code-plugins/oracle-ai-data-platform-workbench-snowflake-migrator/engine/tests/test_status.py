@@ -76,11 +76,12 @@ def test_blocked_object_is_high_risk_with_the_reason():
     assert "VARIANT" in note
 
 
-def test_view_is_medium_risk_for_untranslated_sql():
-    level, note = assess_risk(can(kind="VIEW"))
-    assert level == "MEDIUM"
-    assert "dialect" in note.lower() or "verify" in note.lower()
-
+def test_view_is_high_risk_for_untranslated_sql():
+    # Raised from MEDIUM: an untranslated view creates successfully and then
+    # returns wrong numbers, which is worse than a loud failure.
+    level, note = assess_risk({"object_type": "VIEW"})
+    assert level == "HIGH"
+    assert "translation" in note
 
 def test_dropped_properties_raise_risk_to_medium():
     level, note = assess_risk(can(omitted=["cluster_by=(C)"]))
@@ -109,3 +110,39 @@ def test_note_is_always_a_sentence_not_empty():
     for obj in (can(), can(kind="VIEW"), can(rows=10**9)):
         _, note = assess_risk(obj)
         assert note and len(note) > 15
+
+
+# --------------------------------------------------------------------------
+# A structure mismatch must not read as a clone (issue #2).
+# --------------------------------------------------------------------------
+
+def test_a_mismatched_object_is_blocked_not_shallow_clone():
+    # The object exists in AIDP but is not the one we planned, and IF NOT
+    # EXISTS means we left it alone. Reporting SHALLOW_CLONE would claim we
+    # cloned someone else's table.
+    deployed = {"dry_run": False, "attempted_targets": ["A"],
+                "verified_targets": [], "mismatched_targets": ["A"],
+                "unverified_structure_targets": [], "failed_targets": []}
+    assert migration_status("A", deployed=deployed) == "BLOCKED"
+
+
+def test_an_unverified_structure_is_in_progress_not_shallow_clone():
+    deployed = {"dry_run": False, "attempted_targets": ["A"],
+                "verified_targets": [], "mismatched_targets": [],
+                "unverified_structure_targets": ["A"], "failed_targets": []}
+    assert migration_status("A", deployed=deployed) == "IN_PROGRESS"
+
+
+def test_verified_is_still_shallow_clone():
+    deployed = {"dry_run": False, "attempted_targets": ["A"],
+                "verified_targets": ["A"], "mismatched_targets": [],
+                "unverified_structure_targets": [], "failed_targets": []}
+    assert migration_status("A", deployed=deployed) == "SHALLOW_CLONE"
+
+
+def test_an_untranslated_view_is_high_risk_not_medium():
+    # An untranslated view CREATES SUCCESSFULLY and then returns wrong
+    # numbers. That is worse than an object that fails loudly.
+    level, note = assess_risk({"object_type": "VIEW"})
+    assert level == "HIGH"
+    assert "wrong" in note.lower() or "verify" in note.lower()

@@ -132,3 +132,80 @@ def test_workspace_path_is_under_shared_and_names_the_catalog():
 
 def test_notebook_name_is_recognisable():
     assert "snowmig" in NOTEBOOK_NAME and "shallow" in NOTEBOOK_NAME
+
+
+# --------------------------------------------------------------------------
+# The notebook's verify cell has the same obligation as deploy (issue #2).
+# --------------------------------------------------------------------------
+
+def _verify_source(nb):
+    for cell in nb["cells"]:
+        src = "".join(cell.get("source", []))
+        if "_expected = [" in src:
+            return src
+    raise AssertionError("no verify cell in the notebook")
+
+
+def test_verify_cell_escapes_like_wildcards():
+    nb = build_notebook(
+        {"statements": [{"source_identifier": "D.S.ORDER_ITEMS",
+                         "object_type": "TABLE",
+                         "target_fqn": "CAT.S.ORDER_ITEMS",
+                         "expected_columns": [{"name": "A", "type": "STRING"}],
+                         "sql": "CREATE TABLE IF NOT EXISTS `CAT`.`S`.`ORDER_ITEMS` (`A` STRING)"}],
+         "blocked": []},
+        {"waves": [["D.S.ORDER_ITEMS"]]}, catalog="CAT", source={})
+    src = _verify_source(nb)
+    assert "_like" in src, "the probe must escape `_` and `%` before LIKE"
+
+
+def test_verify_cell_compares_the_returned_name_exactly():
+    nb = build_notebook(
+        {"statements": [{"source_identifier": "D.S.T", "object_type": "TABLE",
+                         "target_fqn": "CAT.S.T",
+                         "expected_columns": [{"name": "A", "type": "STRING"}],
+                         "sql": "CREATE TABLE IF NOT EXISTS `CAT`.`S`.`T` (`A` STRING)"}],
+         "blocked": []},
+        {"waves": [["D.S.T"]]}, catalog="CAT", source={})
+    src = _verify_source(nb)
+    # `if _rows:` is not enough -- the row's name must equal the target's.
+    assert "_rows else" not in src
+    assert ".upper() ==" in src or "_name.upper()" in src
+
+
+def test_verify_cell_compares_columns_not_only_existence():
+    nb = build_notebook(
+        {"statements": [{"source_identifier": "D.S.T", "object_type": "TABLE",
+                         "target_fqn": "CAT.S.T",
+                         "expected_columns": [{"name": "A", "type": "STRING"}],
+                         "sql": "CREATE TABLE IF NOT EXISTS `CAT`.`S`.`T` (`A` STRING)"}],
+         "blocked": []},
+        {"waves": [["D.S.T"]]}, catalog="CAT", source={})
+    src = _verify_source(nb)
+    assert "DESCRIBE" in src
+    assert "_mismatched" in src
+
+
+def test_every_generated_code_cell_is_valid_python():
+    # 650 unit tests passed while the verify cell contained a broken escape,
+    # because nothing ever compiled the thing we ship. The notebook is the
+    # deliverable the user executes, so its cells must at least parse.
+    nb = build_notebook(
+        {"statements": [
+            {"source_identifier": "D.S.ORDER_ITEMS", "object_type": "TABLE",
+             "target_fqn": "CAT.S.ORDER_ITEMS",
+             "expected_columns": [{"name": "A", "type": "STRING"}],
+             "sql": "CREATE TABLE IF NOT EXISTS `CAT`.`S`.`ORDER_ITEMS` (`A` STRING)"},
+            {"source_identifier": "D.S.V", "object_type": "VIEW",
+             "target_fqn": "CAT.S.V",
+             "expected_columns": [{"name": "A", "type": "STRING"}],
+             "sql": "CREATE VIEW IF NOT EXISTS `CAT`.`S`.`V` AS SELECT 1"}],
+         "blocked": [{"source_identifier": "D.S.B", "object_type": "TABLE",
+                      "reason": "VARIANT column"}]},
+        {"waves": [["D.S.ORDER_ITEMS"], ["D.S.V"]]}, catalog="CAT",
+        source={"account": "ACC"})
+    code_cells = [c for c in nb["cells"] if c["cell_type"] == "code"]
+    assert code_cells
+    for i, cell in enumerate(code_cells):
+        src = "".join(cell["source"])
+        compile(src, f"<cell {i}>", "exec")

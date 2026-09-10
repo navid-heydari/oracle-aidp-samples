@@ -26,14 +26,20 @@ which, so a failure points at one end rather than "it doesn't work".
 | AIDP | read the target catalog (`SHOW SCHEMAS`) | the four coordinates |
 | AIDP | **write** — creates a probe schema | `--write-probe` |
 
-## The write probe leaves something behind — say so
+## The write probe writes — say so before you pass the flag
 
-Proving write means actually writing, and this plugin never issues `DROP`. So
-`--write-probe` creates `snowmig_permission_probe` in the target catalog and
-**does not remove it**. The report names it under "left behind".
+Proving write means actually writing. `--write-probe` creates a schema named
+`snowmig_permission_probe` in the target catalog, confirms it is visible, then
+**drops that one schema again**. Never `CASCADE`, and it skips the drop if the
+schema was already there — a schema it did not create is not its to remove.
 
-It is off by default for that reason. Tell the user what it will create and that
-they will need to delete it, before you pass the flag.
+The no-`DROP` rule is a **source** guarantee: nothing is ever written to or
+dropped from Snowflake. It does not extend to AIDP, which is where this plugin
+legitimately creates objects.
+
+It is still off by default, because it writes. Tell the user what it will create
+before you pass the flag. If cleanup fails, the report names what was left under
+"left behind" — pass that on.
 
 ## If the destination is skipped
 

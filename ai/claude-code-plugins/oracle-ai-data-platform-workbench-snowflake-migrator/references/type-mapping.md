@@ -13,9 +13,9 @@ getting its scale wrong does not raise — it silently changes values.
 | `TEXT`, `VARCHAR(n)`, `CHAR` | `STRING` | Declared length is not enforced by Delta; recorded |
 | `BOOLEAN`, `DATE`, `BINARY` | `BOOLEAN`, `DATE`, `BINARY` | Direct |
 | `FLOAT`, `DOUBLE`, `REAL` | `DOUBLE` | |
-| `TIME` | `STRING` | No direct Spark equivalent |
-| `VARIANT`, `OBJECT`, `ARRAY` | **blocked** | Semi-structured; needs an explicit struct/map/array design |
-| `GEOGRAPHY`, `GEOMETRY` | **blocked** | No target type |
+| `TIME` | `STRING` | No Spark TIME type. **Warned**, not silent: ordering, comparison and time arithmetic become string operations |
+| `VARIANT`, `OBJECT`, `ARRAY` | **blocked** by default; `STRING` with `--semi-structured string` | Semi-structured; needs an explicit struct/map/array design |
+| `GEOGRAPHY`, `GEOMETRY` | **blocked** by default; `STRING` with `--geospatial string` | No spatial target type |
 | anything else | **blocked** | Unmapped types are never approximated |
 
 ## Properties dropped
@@ -73,3 +73,38 @@ equivalent) and **materialized views** (rebuild as a table plus a refresh job).
 | Table | Table (managed Delta) |
 | View | View |
 | Warehouse | Spark compute cluster — see the compute proposal |
+
+
+## Integer columns become `DECIMAL(38,0)`
+
+Every Snowflake integer alias — `INT`, `INTEGER`, `BIGINT`, `SMALLINT`,
+`TINYINT`, `BYTEINT` — *is* `NUMBER(38,0)`, so `DECIMAL(38,0)` is the faithful
+mapping and `BIGINT` would silently narrow the declared range. Fidelity was
+chosen over familiarity.
+
+Expect it to surprise people: Spark schemas normally show `BIGINT` for an ID
+column, and downstream casts and joins will see `DECIMAL`. It is reported as an
+informational **note**, not a warning, precisely so it does not inflate every
+table's risk level — a warning on every integer column would drown the warnings
+that matter.
+
+## The two escape hatches
+
+Default-deny is right for a type whose target shape is a design decision. But
+default-deny with *no alternative* is not a usable tool: one `VARIANT` column
+blocks its entire table, and a real Snowflake estate — order payloads, event
+bodies, API responses — is full of them.
+
+| Flag | Default | What the non-default does |
+|---|---|---|
+| `--semi-structured` | `block` | `string`: carry the JSON as text, with a warning on every affected column |
+| `--geospatial` | `block` | `string`: carry the value as text, with no spatial type, index or predicate support |
+
+They are **separate flags on purpose**. Deciding to carry JSON as text is not
+the same decision as carrying a geography as text, and one switch for both would
+force a customer to accept a call they were not asked about.
+
+Neither hatch solves anything — both defer. With `--semi-structured string`
+nothing on the target can address a field inside the value, and any query using
+Snowflake path syntax stops working until a struct/map design is agreed. Say
+that when you use it.

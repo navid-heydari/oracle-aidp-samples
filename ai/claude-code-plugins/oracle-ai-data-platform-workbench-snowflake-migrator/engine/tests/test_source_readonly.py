@@ -1,6 +1,7 @@
 """The Snowflake transport refuses to write, whatever the credential allows."""
 import pytest
 
+from snowflake_source import conn
 from snowflake_source.conn import READ_ONLY_VERBS, SourceWriteRefused, make_run_sql
 
 
@@ -107,3 +108,51 @@ def test_empty_statement_refused(run_sql):
 def test_allowlist_is_read_verbs_only():
     assert READ_ONLY_VERBS == ("SELECT", "SHOW", "DESCRIBE", "DESC", "WITH",
                                "EXPLAIN")
+
+
+# --------------------------------------------------------------------------
+# Scanner-backed guard (issue #18). The guard used to regex out comments and
+# str.split(";"), which cannot tell code from the inside of a literal.
+# --------------------------------------------------------------------------
+
+def test_semicolon_inside_a_literal_is_one_read_not_a_smuggled_write():
+    # Correctly parsed this is a single SELECT whose projection contains the
+    # text "drop table t". The old splitter saw a second statement starting
+    # with DROP. Both answers refuse a write; only one of them is right, and
+    # the wrong one refuses legitimate reads.
+    conn.assert_read_only("select 'a;drop table t' as note")
+
+
+def test_comment_marker_inside_a_literal_does_not_blind_the_guard():
+    # A naive `--[^\n]*` strip removes the rest of the line, which could hide
+    # a real statement separator from the guard.
+    conn.assert_read_only("select 'x -- y' as note")
+    with pytest.raises(conn.SourceWriteRefused):
+        conn.assert_read_only("select 'x -- y' as note; drop table t")
+
+
+def test_statement_that_is_only_a_literal_has_no_verb_and_is_refused():
+    with pytest.raises(conn.SourceWriteRefused) as exc:
+        conn.assert_read_only("'drop table t'")
+    assert "no leading SQL keyword" in str(exc.value)
+
+
+def test_quoted_identifier_containing_a_write_verb_is_still_a_read():
+    conn.assert_read_only('select 1 as "drop table t"')
+
+
+def test_write_hidden_behind_a_block_comment_is_refused():
+    with pytest.raises(conn.SourceWriteRefused):
+        conn.assert_read_only("/* select */ delete from t")
+
+
+def test_unscannable_sql_fails_closed():
+    # An unterminated literal means we cannot know where statements end, so
+    # the guard must refuse rather than let it through.
+    with pytest.raises(conn.SourceWriteRefused) as exc:
+        conn.assert_read_only("select 'oops")
+    assert "could not be scanned" in str(exc.value)
+
+
+def test_dollar_quoted_body_cannot_smuggle_a_write():
+    conn.assert_read_only("select $$ ; drop table t $$ as body")

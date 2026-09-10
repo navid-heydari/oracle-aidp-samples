@@ -224,3 +224,31 @@ def test_no_skill_pushes_the_user_to_pick_from_the_listed_options():
     flat = " ".join((ROOT / "skills/snowflake-migration-plan/SKILL.md")
                     .read_text().lower().split())
     assert "real answer, not a fallback" in flat
+
+
+def test_no_shipped_file_mentions_the_forked_source_platform():
+    """This is a Snowflake migrator. Nothing shipped should say otherwise.
+
+    The plugin began as a copy of a sibling plugin's layout, and three
+    inherited files still described it -- PRIVACY.md named the wrong plugin and
+    the wrong data flows, NOTICE named the wrong plugin and author, and the
+    changelog documented files that do not exist here.
+
+    Test files are exempt: several of them assert the ABSENCE of that scaffold
+    and must be able to name what they are excluding.
+    """
+    root = pathlib.Path(__file__).resolve().parents[2]
+    banned = ("databricks", "dbutils", "dbfs")
+    offenders = []
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix not in (".md", ".py", ".json", ".txt", ".sql"):
+            continue
+        rel = path.relative_to(root)
+        parts = set(rel.parts)
+        if "tests" in parts or "__pycache__" in parts or ".pytest_cache" in parts:
+            continue
+        low = path.read_text(errors="ignore").lower()
+        hits = [b for b in banned if b in low]
+        if hits:
+            offenders.append(f"{rel}: {hits}")
+    assert not offenders, "shipped files still reference the forked platform:\n" + "\n".join(offenders)

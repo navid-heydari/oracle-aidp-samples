@@ -160,3 +160,42 @@ def test_compute_report_lists_warehouses_and_proposals():
     assert "confirm" in md.lower()
     assert "ODD" in md and "Nano" in md
     assert "credit price" in md.lower()
+
+
+# --------------------------------------------------------------------------
+# Mismatch and unverified structure must be visible, not folded into
+# "verified" or "failed" (issue #2).
+# --------------------------------------------------------------------------
+
+def test_soft_clone_summary_reports_a_structure_mismatch_prominently():
+    res = {"dry_run": False, "statement_count": 2, "executed": 2, "verified": 1,
+           "catalog_in_scope": "CAT",
+           "failed": [], "chunk_errors": [],
+           "mismatches": [{"source_identifier": "D.S.T", "target_fqn": "CAT.S.T",
+                           "reason": "position 1: planned ID DECIMAL(38,0), "
+                                     "found ID STRING"}],
+           "unverified_structure": []}
+    md = render_soft_clone_summary({"can_migrate": []}, res)
+    assert "Structure differs" in md
+    assert "CAT.S.T" in md
+    assert "not been cloned" in md.lower() or "left as found" in md.lower()
+
+
+def test_soft_clone_summary_reports_unverified_structure_separately():
+    res = {"dry_run": False, "statement_count": 1, "executed": 1, "verified": 0,
+           "catalog_in_scope": "CAT", "failed": [], "chunk_errors": [],
+           "mismatches": [],
+           "unverified_structure": [
+               {"source_identifier": "D.S.T", "target_fqn": "CAT.S.T",
+                "reason": "exists, but its structure could not be read"}]}
+    md = render_soft_clone_summary({"can_migrate": []}, res)
+    assert "Structure not verified" in md
+    assert "CAT.S.T" in md
+
+
+def test_verified_wording_says_structure_not_just_existence():
+    res = {"dry_run": False, "statement_count": 1, "executed": 1, "verified": 1,
+           "catalog_in_scope": "CAT", "failed": [], "chunk_errors": [],
+           "mismatches": [], "unverified_structure": []}
+    md = render_soft_clone_summary({"can_migrate": []}, res)
+    assert "column" in md.lower()

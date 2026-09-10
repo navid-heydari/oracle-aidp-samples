@@ -38,8 +38,16 @@ def test_assess_finds_tables_and_views(out):
     assert inv["counts_by_type"].get("TABLE", 0) >= 1
     assert inv["counts_by_type"].get("VIEW", 0) >= 1
     assert inv["extraction_notes"] == []
-    # Exact counts, not SHOW estimates.
-    assert all(r["row_count_exact"] is not None for r in inv["inventory"])
+    # Default mode is `metadata`: tables carry Snowflake's maintained count,
+    # views carry none, because counting a view means executing it.
+    assert inv["row_count_mode"] == "metadata"
+    for r in inv["inventory"]:
+        if r["object_type"] == "TABLE":
+            assert r["row_count_exact"] is not None
+            assert r["row_count_source"] == "show_metadata"
+        else:
+            assert r["row_count_source"] == "not_counted"
+            assert r["row_count_note"]
 
 
 def test_decimal_columns_map_with_precision(out):

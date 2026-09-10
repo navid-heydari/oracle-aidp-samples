@@ -98,7 +98,7 @@ One owner per path. A PR touching a path you do not own is rejected on sight.
 | Week | Dates | A — Target & Platform | B — Source & Translation | Gate / deliverable |
 |---|---|---|---|---|
 | **W4** | Oct 05–09 | Begin `aidp_migration_core/` extraction: `executor`, `cluster_session`, `cluster_lifecycle`, `throttle/`. Run the 18 tests before *and* after each step. Decide the 3 questionable copied skills. | `dialect/types.py` — `NUMBER(p,s)`→`DECIMAL(p,s)` from `INFORMATION_SCHEMA`, **never inferred**; `VARIANT`/`OBJECT`/`ARRAY`; `TIMESTAMP_NTZ/_LTZ/_TZ`; `GEOGRAPHY` → no target. | Type map reviewed against the Gate-1 finding, not against docs. |
-| **W5** | Oct 12–16 | Port MAXWELL `catalog.ts::publishTable` → `core/publish.py`: `assertWritableCatalog` → `inferFields` → register → poll async op → INSERT → `confirmPublish`. I/O injected so it unit-tests with no cluster. | `dialect/ddl_rules.py` on the rewriter's `RuleApplication`/`RewriteResult`/`UnsupportedDDL` audit architecture. Replace the property list (`CLUSTER BY`, `DATA_RETENTION_TIME_IN_DAYS`, `CHANGE_TRACKING`, tags, policies). | Durable publish lands a table visible **cross-session** — the defect the Databricks migrator has. |
+| **W5** | Oct 12–16 | Port MAXWELL `catalog.ts::publishTable` → `core/publish.py`: `assertWritableCatalog` → `inferFields` → register → poll async op → INSERT → `confirmPublish`. I/O injected so it unit-tests with no cluster. | `dialect/ddl_rules.py` on the rewriter's `RuleApplication`/`RewriteResult`/`UnsupportedDDL` audit architecture. Replace the property list (`CLUSTER BY`, `DATA_RETENTION_TIME_IN_DAYS`, `CHANGE_TRACKING`, tags, policies). | Durable publish lands a table visible **cross-session** — the defect the upstream sibling migrator has. |
 | **W6** | Oct 19–23 | Extract the **write-redirect sandbox** from `job_migrate.py:1682-2500` into `core/sandbox/`. Extract `orchestrate/registry.py` (resume) + `report.py`. | `dialect/expressions.py` — `QUALIFY` → subquery + `WHERE`; `DATEADD`/`DATEDIFF` as a **signature table with unit normalisation**, not name substitution; `IFF`, `DECODE`, `TRY_CAST`, `LISTAGG`, `GENERATOR`, `SEQ4`, `::`, `LATERAL FLATTEN`, `MERGE` differences. | Sandbox provably rewrites only the **exec** copy. |
 | **W7** | Oct 26–30 | `eval/` — port MAXWELL `agent-eval`: ground-truth differential diff, pure predicates, **fixture replay for $0 CI on every PR**, no silent passes. | **`snowflake-assess-estate` + `snowflake-compat-report` skills** — productise what W1–W3 did by hand, so the assessment is repeatable for the next customer. | The assessment becomes a reusable asset, not a one-off document. |
 | **W8** | Nov 02–06 | `orchestrate/verify.py` — checks 1, 2, 3a and **3b (Spark driver-log scrape — do not drop this)**. Then wire check 4 to the parity diff: same query on Snowflake and AIDP, **per-column tolerance, exact-decimal for money**. | `translate/view.py` — **the hardest component, zero prior art.** Parse early, deploy last, topologically. Preserve original SQL alongside generated SQL; per-transformation conversion report. | Parity diff replaces the LLM judge. Migration has a ground truth by definition. |
@@ -135,7 +135,7 @@ Marked **[NEW]** or **[CHANGED]** where the deck moved it from v1.
 | R9 | **[NEW] Orchestrator is Airflow (Astronomer), not AIDP workflows** | `clone_workflow.py` reuse is wrong; task/DAG translation targets the wrong system | **A** | W11 | Emit Airflow DAGs. Confirm the Astronomer deployment model early |
 | R10 | **Identifier case collision.** Unquoted folds UPPER, quoted preserves and is case-sensitive; Spark folds lower. At 200k tables there will be real hits | Two source objects silently merge into one target. Data loss, no error | **B** | W3 | Capture `identifier_case_form` at extraction. **Detector halts rather than guesses** |
 | R11 | **Silent DDL loss.** AIDP discards per-statement DDL on session close, and a batch reports success while individual statements failed | "Migrated" schemas that are not there | **A** | W9 | One WebSocket context (chunk 25) **and** per-statement existence probe |
-| R12 | **`aidp_migration_core` extraction breaks working code.** The reusable 85% and Databricks 15% interleave inside a 9,614-line file | Regressions in the one part already debugged against a live cluster | **A** | W6 | Run the 18 fork-base tests before *and* after each step. That is what they are for |
+| R12 | **`aidp_migration_core` extraction breaks working code.** The source-neutral and source-specific parts interleave inside a single large file | Regressions in the one part already debugged against a live cluster | **A** | W6 | Run the 18 fork-base tests before *and* after each step. That is what they are for |
 | R13 | **No offline test story inherited** — this fork ships 0 test suites | Every change needs a live cluster; iteration collapses | **A** | W7 | Fixture replay in CI, same corpus and assertions as live, only the injected provider differs |
 | R14 | **Unsupported features silently approximated.** In an adjacent system an unknown dialect string fell through to DuckDB *and reported DuckDB* | Wrong results presented as correct. Worst failure class here | **B** | continuous | Unmapped type/property/construct → **error**, never a default. `blocked` or `requires_manual_design`, resolution named |
 | R15 | **GA `20260430` surface absent in the target deployment** | Durable publish unavailable; back to racing the metastore on implicit CTAS | **A** | W0 | Probe live. Fallback: explicit registration + `INSERT OVERWRITE` + in-session `count(*)` as the authoritative confirm |
@@ -144,7 +144,7 @@ Marked **[NEW]** or **[CHANGED]** where the deck moved it from v1.
 | R18 | **Append-mode replay duplicates rows.** The resume registry does not idempotency-check appends | Silent duplication on resume after interruption | **A** | W10 | Detect append semantics and refuse to blind-replay |
 | R19 | **[NEW] QA and DEV environments are in scope**, not just PROD | Scope is larger than the inventory implies; dev/prod parity is a deliverable, not an afterthought | **B** | W3 | Inventory all three environments separately in D1 |
 | R20 | **Two-person bus factor.** Each half has one person who understands it | One absence stalls a half indefinitely | joint | continuous | Gate findings are written, not verbal. The Friday audit doubles as a 10-minute cross-brief |
-| R21 | **Duplicate effort with the upstream Databricks migrator.** The `aidp_migration_core` extraction benefits both | Fork drift; the same work done twice in two repos | **A** | W4 | Find the owner. If actively maintained, propose the extraction upstream instead of forking |
+| R21 | **Duplicate effort with the upstream sibling migrator.** The `aidp_migration_core` extraction benefits both | Fork drift; the same work done twice in two repos | **A** | W4 | Find the owner. If actively maintained, propose the extraction upstream instead of forking |
 
 ---
 
@@ -169,7 +169,7 @@ Per-file detail in `PORTING-STATUS.md`. This is the schedule view.
 | **[NEW] Orchestration targets AIDP workflows, not Airflow** | Medium | A | W11 |
 | **[CHANGED] Masking → redaction-view generation** | Medium | A | W9 |
 | No identifier case-folding policy | Medium (correctness) | B | W3 |
-| 20 of 21 `aidp_compat/` modules are dead weight (no `dbutils` in Snowflake) | Medium | B | W6 |
+| 20 of 21 `aidp_compat/` modules are dead weight (their source-specific shims have no Snowflake analogue) | Medium | B | W6 |
 | 4 spec'd skills missing: `assess-estate`, `compat-report`, `migrate-views`, `reconcile` | Medium | B (3) / A (1) | W7, W7, W9, W9 |
 | Ingest phase never existed upstream — Phase 0 not implemented | Medium | B | W1 |
 | **[NEW] QA/DEV environments unscoped** | Medium | B | W3 |
@@ -195,7 +195,7 @@ replication · Snowflake role and grant replication · automatic migration of st
 procs, UDFs, Tasks, Streams, Snowpipe, Dynamic Tables · automatic policy translation ·
 full data migration without a user-approved wave.
 
-**Honest scope note.** The Databricks migrator is ~32k lines of Python for a migration
+**Honest scope note.** The upstream sibling migrator is ~32k lines of Python for a migration
 that is *mostly metadata* between two Spark dialects. Rappi is 200k tables, 3 PB, 82
 warehouses, an incomplete medallion refactor, and an ingestion tool that cannot reach
 the destination. **D1 is achievable in 3 weeks; D2 is achievable by Dec 04. A migrated
