@@ -76,10 +76,12 @@ def test_deps_and_plan(out):
     plan = json.loads((out / "plan.json").read_text())
     assert plan["waves"], "at least one wave expected"
     assert plan["clone_targets"], "objects should be clone targets"
-    # Bronze mirrors the source, so the target name equals the source name.
+    # Bronze mirrors the source, so the target name equals the source name --
+    # except in CASE. AIDP lower-cases identifiers (verified live), so the plan
+    # carries the folded name, which is what the destination will really use.
     for ident, target in plan["target_names"].items():
-        assert target == ident, (ident, target)
-    assert plan["catalogs_to_create"] == [DB]
+        assert target == ident.lower(), (ident, target)
+    assert plan["catalogs_to_create"] == [DB.lower()]
     # Every inventoried object lands in exactly one verdict.
     ids = ([c["source_identifier"] for c in plan["can_migrate"]]
            + [c["source_identifier"] for c in plan["cannot_migrate"]])

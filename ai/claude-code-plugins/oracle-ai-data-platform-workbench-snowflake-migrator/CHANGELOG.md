@@ -8,6 +8,22 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [0.14.0] — 2026-09-10
+
+### Added
+
+- **`GAPS.md`** — the single ranked list of what is left, what is proven, and
+  which questions need Oracle or the customer rather than code.
+
+### Changed
+
+- `ASSUMPTIONS.md` reconciled with the live run. Five assumptions moved from
+  *unverified* to **live-verified** (catalog `GET` field shapes, key
+  qualification, case folding, async-create-with-no-waiter, poisoned names,
+  derived view types), and two `DESCRIBE`/`SHOW` assumptions are marked
+  superseded — structure is verified through the catalog API now, not SQL.
+- Fixed a live test that still expected un-folded target names.
+
 ## [0.13.1] — 2026-09-10
 
 ### Added
