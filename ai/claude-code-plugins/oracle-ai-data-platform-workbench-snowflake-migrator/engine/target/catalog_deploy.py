@@ -69,6 +69,7 @@ import datetime
 from typing import Callable
 
 import time
+import uuid
 
 from .catalog_api import (
     build_schema_body, build_table_body, build_view_body)
@@ -141,6 +142,39 @@ def _is_narrowing(declared: str, derived: str) -> bool:
     return False
 
 
+def _diagnose_never_appeared(call, catalog: str, schema_key: str) -> bool:
+    """Is this schema refusing OUR names, or refusing everything?
+
+    A failed create permanently poisons that name in that schema -- every
+    later create returns 202 and is silently dropped, and DELETE does not
+    recover it. That is indistinguishable from a bad request UNLESS you try a
+    name that has never failed here: if a NOVEL name lands, the schema is
+    fine and the planned names are burned.
+
+    Returns True when a novel name succeeds (so the planned names are
+    poisoned). Runs at most once per schema, and cleans up after itself with
+    a name that is unique per run -- a fixed probe name would burn itself on
+    its first failure.
+    """
+    probe = f"snowmig_probe_{uuid.uuid4().hex[:8]}"
+    try:
+        call("create_table", catalog=catalog, schema=schema_key.split(".", 1)[-1],
+             table=probe,
+             body=build_table_body(catalog, schema_key.split(".", 1)[-1], probe,
+                                   [{"name": "probe", "type": "STRING"}]))
+    except Exception:
+        return False
+
+    landed = _resolve_object(call, catalog, schema_key, probe, False) is not None
+    if landed:
+        try:
+            call("delete_table", catalog=catalog,
+                 schema=schema_key.split(".", 1)[-1], table=probe)
+        except Exception:
+            pass          # best effort; the name is recorded in the report
+    return landed
+
+
 def _is_conflict(exc: Exception) -> bool:
     text = str(exc)
     return "409" in text or "ongoing" in text.lower()
@@ -170,6 +204,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                    retry_delays: tuple[float, ...] = (2.0, 5.0, 10.0),
                    verify_delays: tuple[float, ...] = (3.0, 5.0, 10.0, 15.0),
                    schema_wait: tuple[float, ...] = (3.0, 5.0, 10.0),
+                   diagnose: bool = True,
                    timestamp_ntz_as_timestamp: bool = False) -> dict:
     all_statements = [s for s in ddl_plan.get("statements", [])]
 
@@ -202,6 +237,8 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         # A view we DID create, whose column types the engine re-derived.
         # Distinct from a mismatch: the object is ours, the types are not.
         "derived_type_drift_targets": [], "derived_type_drift": [],
+        # Names the target has permanently burned. See P1 in ACTION-ITEMS.md.
+        "poisoned_names": [],
         "unverified_structure_targets": [], "unverified_structure": [],
         "failed": [],
     }
@@ -262,6 +299,10 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 f"then silently dropped.")
         resolved[requested] = (str(found.get("key")) if found else requested)
     out["resolved_schema_keys"] = dict(resolved)
+
+    # One diagnosis per schema: whether a name is burned is a property of the
+    # schema, not of each object, and the probe itself writes.
+    diagnosed: dict[str, bool] = {}
 
     # 2. tables first, then views: a view's fields reference its base tables
     ordered = ([s for s in statements if s.get("object_type") != "VIEW"]
@@ -327,13 +368,41 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
             if attempt < len(verify_delays):
                 time.sleep(verify_delays[attempt])
         if listed is None:
+            base = (f"the create returned 202 Accepted but no object matching "
+                    f"{schema_key}.{name} ever appeared, and the asynchronous "
+                    f"create reported nothing. ")
+            # Ask the schema whether it is refusing OUR name or everything.
+            # Once per schema: the answer is a property of the schema.
+            if diagnose and schema_key not in diagnosed:
+                diagnosed[schema_key] = _diagnose_never_appeared(
+                    call, catalog, schema_key)
+            verdict = diagnosed.get(schema_key)
+
+            if verdict is True:
+                out["poisoned_names"].append(stmt["target_fqn"])
+                reason = base + (
+                    f"A NOVEL name in {schema_key} was created successfully, "
+                    f"so the schema and your request are both fine and this "
+                    f"NAME IS BURNED: a create that failed here once is "
+                    f"refused for ever after, and DELETE does not recover it. "
+                    f"Retry into a FRESH SCHEMA -- re-running into this one "
+                    f"will keep returning 202 and keep creating nothing.")
+            elif verdict is False:
+                reason = base + (
+                    "A novel name in the same schema failed too, so this is "
+                    "not a burned name: suspect the request itself (an "
+                    "unsupported field type is the usual cause) or the "
+                    "permissions on this catalog.")
+            else:
+                reason = base + (
+                    "Most often an unsupported field type. Re-run with "
+                    "diagnosis enabled to tell a burned name from a bad "
+                    "request.")
+
             out["failed_targets"].append(ident)
             out["failed"].append({
                 "source_identifier": ident, "target_fqn": stmt["target_fqn"],
-                "reason": f"the create returned 202 Accepted but no object "
-                          f"matching {schema_key}.{name} ever appeared. The "
-                          f"asynchronous create failed and reported nothing "
-                          f"-- most often an unsupported field type."})
+                "reason": reason})
             continue
 
         if not columns:

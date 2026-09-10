@@ -8,6 +8,32 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [0.15.0] — 2026-09-10
+
+### Fixed
+
+- **The smoke test reported FAIL against a working destination.** Its
+  destination half still posted to `.../sql/execute`, which returns 404, so
+  anyone running the pipeline in order stopped there — *before* reaching the
+  transport that works. A false FAIL costs as much as a false PASS. It now runs
+  on the catalog API: `list_schemas` for read, and a write probe that creates a
+  schema, confirms it is **visible** (creates are async and can fail silently)
+  and deletes it again. Live: PASS, nothing left behind.
+  - The probe name is unique per run. A fixed name would burn itself the first
+    time it failed, and stay burned.
+  - The report no longer names a cluster for the destination — the catalog API
+    needs none, which is the point.
+
+### Added
+
+- **Poisoned-name diagnosis** (P1). When an object never appears, the plugin
+  creates one throwaway object with a novel name in the same schema — once per
+  schema, not per object — and reads the answer. A novel name that lands means
+  the planned names are **burned**, and the report says so and says to retry
+  into a fresh schema. A novel name that also fails means it is *not* a burned
+  name, and points at the request or the permissions instead. `--no-diagnose`
+  turns it off, since the probe writes.
+
 ## [0.14.0] — 2026-09-10
 
 ### Added

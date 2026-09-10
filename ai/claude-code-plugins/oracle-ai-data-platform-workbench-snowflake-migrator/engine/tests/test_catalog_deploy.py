@@ -534,3 +534,99 @@ def test_a_table_type_difference_is_still_a_hard_mismatch():
                          retry_delays=(), verify_delays=())
     assert out["mismatched_targets"] == ["DB.PUBLIC.T0"]
     assert out["derived_type_drift_targets"] == []
+
+
+# ==========================================================================
+# Tell the user WHY nothing appeared (P1).
+#
+# A failed async create permanently poisons that name in that schema: every
+# later create returns 202 and is silently dropped, and DELETE does not
+# recover it. The signature is distinguishable -- a NOVEL name in the same
+# schema succeeds -- so the plugin probes once and says which situation the
+# user is in, instead of leaving them hunting a body problem that is not
+# there.
+# ==========================================================================
+
+class NeverAppears(Folding):
+    """Creates are accepted; the planned name never shows up.
+
+    `probe_works` decides whether a novel name in the same schema succeeds,
+    which is exactly what separates a poisoned name from a broken request.
+    """
+
+    def __init__(self, *, probe_works=True):
+        super().__init__()
+        self.probe_works = probe_works
+
+    def __call__(self, operation, **kw):
+        if operation == "create_table":
+            name = kw.get("table") or ""
+            self.ops.append((operation, kw))
+            if name.startswith("snowmig_probe_") and self.probe_works:
+                key = f'{kw["catalog"]}.{kw["schema"]}.{name}'.lower()
+                # The real API returns the FULL key, not a bare name.
+                self.tables[key] = {"key": key, "tableFields": []}
+            return {}
+        return super().__call__(operation, **kw)
+
+
+def test_a_poisoned_name_is_named_as_such():
+    call = NeverAppears(probe_works=True)
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
+                         retry_delays=(), verify_delays=())
+    reason = out["failed"][0]["reason"]
+    assert "poison" in reason.lower() or "burned" in reason.lower()
+    assert "fresh schema" in reason.lower() or "new schema" in reason.lower()
+    assert out["poisoned_names"] == ["lake.DB.T0"]
+
+
+def test_when_a_novel_name_also_fails_the_diagnosis_is_different():
+    call = NeverAppears(probe_works=False)
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
+                         retry_delays=(), verify_delays=())
+    reason = out["failed"][0]["reason"]
+    assert "poison" not in reason.lower()
+    assert out["poisoned_names"] == []
+    # A novel name failing too points at the request or the permissions.
+    assert "request" in reason.lower() or "permission" in reason.lower()
+
+
+def test_the_probe_uses_a_unique_name_and_is_cleaned_up():
+    call = NeverAppears(probe_works=True)
+    deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
+                   retry_delays=(), verify_delays=())
+    probes = [kw.get("table") for op, kw in call.ops
+              if op == "create_table" and str(kw.get("table", "")).startswith(
+                  "snowmig_probe_")]
+    assert len(probes) == 1
+    assert len(set(probes)) == 1
+    # It must delete what it made -- and a fixed name would itself get burned.
+    assert any(op == "delete_table" for op, _ in call.ops)
+
+
+def test_the_probe_runs_once_per_schema_not_once_per_object():
+    call = NeverAppears(probe_works=True)
+    deploy_catalog(_plan(4), target=TARGET, execute=True, call=call,
+                   retry_delays=(), verify_delays=())
+    probes = [kw for op, kw in call.ops
+              if op == "create_table" and str(kw.get("table", "")).startswith(
+                  "snowmig_probe_")]
+    assert len(probes) == 1, "one diagnosis per schema is enough"
+    assert len(call.ops) < 40, "the diagnosis must not multiply the work"
+
+
+def test_the_probe_can_be_disabled():
+    call = NeverAppears(probe_works=True)
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
+                         retry_delays=(), verify_delays=(), diagnose=False)
+    assert not any(str(kw.get("table", "")).startswith("snowmig_probe_")
+                   for _, kw in call.ops)
+    assert out["poisoned_names"] == []
+
+
+def test_a_successful_run_never_probes():
+    f = Folding()
+    deploy_catalog(_plan(2), target=TARGET, execute=True, call=f,
+                   retry_delays=(), verify_delays=())
+    assert not any(str(kw.get("table", "")).startswith("snowmig_probe_")
+                   for _, kw in f.ops), "nothing failed, so nothing to diagnose"

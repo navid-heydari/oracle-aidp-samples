@@ -268,6 +268,19 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
                 for m in res["mismatches"]]
         out.append("")
 
+    if res.get("poisoned_names"):
+        out += ["## These names are burned — retry into a FRESH schema", "",
+                "A create that failed here once is refused for ever after: "
+                "every later attempt returns `202 Accepted` and silently "
+                "creates nothing, and `DELETE` does not recover the name. "
+                "This was confirmed for this run — a **novel** name in the "
+                "same schema was created successfully, so neither the request "
+                "nor the catalog is at fault.", "",
+                "**Re-running into this schema will not work.** Change the "
+                "target schema and run again.", ""]
+        out += [f'- `{n}`' for n in res["poisoned_names"]]
+        out.append("")
+
     if res.get("derived_type_drift"):
         out += ["## Created, but the target derived different column types", "",
                 "These views **were created** with every planned column, in "
@@ -516,8 +529,10 @@ def render_smoke(result: dict) -> str:
     if dest.get("skipped"):
         out += [f'**Skipped.** {dest.get("reason")}', ""]
     else:
-        out += [f'Catalog `{dest.get("catalog")}` on cluster '
-                f'`{dest.get("cluster_id")}`', "",
+        # No cluster is named: the catalog API needs none, which is one of
+        # its advantages over the SQL path.
+        out += [f'Catalog `{dest.get("catalog")}` — checked through the '
+                f'catalog API, which needs no Spark cluster', "",
                 "| Check | Result | Detail |", "|---|---|---|"]
         out += [f'| {c["name"]} | {"PASS" if c["ok"] else "FAIL"} | {c["detail"]} |'
                 for c in dest.get("checks") or []]

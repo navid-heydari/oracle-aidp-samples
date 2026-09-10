@@ -23,9 +23,21 @@ result of the others.
 """
 from __future__ import annotations
 
+import uuid
+
 __all__ = ["PROBE_SCHEMA", "run_smoke"]
 
 PROBE_SCHEMA = "snowmig_permission_probe"
+
+
+def _probe_schema_name() -> str:
+    """A fresh probe name per run.
+
+    A failed create permanently poisons that name in the schema -- verified
+    live, and DELETE does not recover it -- so a fixed probe name would be
+    unusable ever after the first failure.
+    """
+    return f"{PROBE_SCHEMA}_{uuid.uuid4().hex[:8]}"
 
 
 def _like_literal(name: str) -> str:
@@ -49,7 +61,7 @@ def _check(name: str, fn) -> dict:
         return {"name": name, "ok": False, "detail": str(exc)[:300]}
 
 
-def run_smoke(*, source_run_sql, target=None, dest_run_sql=None,
+def run_smoke(*, source_run_sql, target=None, dest_call=None,
               write_probe: bool = False, database: str | None = None) -> dict:
     source: dict = {"reachable": False, "checks": []}
     try:
@@ -88,7 +100,7 @@ def run_smoke(*, source_run_sql, target=None, dest_run_sql=None,
     ]
 
     destination: dict
-    if target is None or dest_run_sql is None:
+    if target is None or dest_call is None:
         destination = {
             "skipped": True,
             "reason": ("AIDP target coordinates were not supplied, so the "
@@ -97,11 +109,15 @@ def run_smoke(*, source_run_sql, target=None, dest_run_sql=None,
             "write_note": "not verified: no target supplied", "left_behind": []}
     else:
         destination = {"skipped": False, "checks": [], "write_verified": False,
-                       "left_behind": [],
-                       "catalog": target.catalog, "cluster_id": target.cluster_id}
+                       "left_behind": [], "catalog": target.catalog,
+                       "cluster": target.cluster_id}
+
+        # Read: list the catalog's schemas through the CATALOG API. The SQL
+        # endpoint returns 404, so using it reported FAIL against a
+        # destination that works.
         destination["checks"].append(_check(
             "read target catalog",
-            lambda: f'{len(dest_run_sql(f"SHOW SCHEMAS IN `{target.catalog}`"))} '
+            lambda: f'{len(dest_call("list_schemas", catalog=target.catalog).get("items") or [])} '
                     "schema(s) visible"))
 
         if not write_probe:
@@ -109,64 +125,67 @@ def run_smoke(*, source_run_sql, target=None, dest_run_sql=None,
                 "not verified: the write probe is opt-in because it writes. It "
                 "creates one schema and removes it again. Re-run with "
                 "--write-probe to prove write access.")
+        elif not destination["checks"][0]["ok"]:
+            destination["write_note"] = (
+                "not attempted: the catalog could not be read, so a write "
+                "probe would only restate the same failure.")
         else:
-            probe_fqn = f"{target.catalog}.{PROBE_SCHEMA}"
-            pre_existing = False
+            probe = _probe_schema_name()
+            probe_fqn = f"{target.catalog}.{probe}"
+            created = False
             try:
-                # Already there? Then it is not ours to remove afterwards.
-                pre_existing = bool(dest_run_sql(
-                    f"SHOW SCHEMAS IN `{target.catalog}` "
-                    f"LIKE '{_like_literal(PROBE_SCHEMA)}'"))
-                dest_run_sql(f"CREATE SCHEMA IF NOT EXISTS "
-                             f"`{target.catalog}`.`{PROBE_SCHEMA}`")
-                visible = dest_run_sql(
-                    f"SHOW SCHEMAS IN `{target.catalog}` "
-                    f"LIKE '{_like_literal(PROBE_SCHEMA)}'")
+                dest_call("create_schema", catalog=target.catalog, schema=probe,
+                          body={"displayName": probe,
+                                "catalogName": target.catalog,
+                                "description": "snowmig write probe"})
+                created = True
+            except Exception as exc:
+                destination["write_note"] = f"not verified: {str(exc)[:200]}"
+                destination["checks"].append(
+                    {"name": "write probe schema", "ok": False,
+                     "detail": str(exc)[:200]})
+
+            if created:
+                # Creates are asynchronous and can fail silently, so the call
+                # returning is not the claim -- visibility is.
+                try:
+                    items = dest_call(
+                        "list_schemas", catalog=target.catalog).get("items") or []
+                    visible = any(str(i.get("key", "")).lower()
+                                  .endswith("." + probe.lower()) for i in items)
+                except Exception:
+                    visible = False
+
                 if visible:
                     destination["write_verified"] = True
                     destination["checks"].append(
                         {"name": "write probe schema", "ok": True,
                          "detail": f"{probe_fqn} created and visible"})
-                    if pre_existing:
-                        destination["left_behind"] = []
-                        destination["write_note"] = (
-                            f"verified: {probe_fqn} was already present, so it "
-                            f"was left alone rather than removed.")
-                    else:
-                        # Exactly one constant schema, never CASCADE.
-                        try:
-                            dest_run_sql(
-                                f"DROP SCHEMA IF EXISTS "
-                                f"`{target.catalog}`.`{PROBE_SCHEMA}`")
-                            destination["left_behind"] = []
-                            destination["write_note"] = (
-                                f"verified: created {probe_fqn} and cleaned up "
-                                f"after itself. Nothing was left behind.")
-                            destination["checks"].append(
-                                {"name": "write probe cleanup", "ok": True,
-                                 "detail": f"{probe_fqn} dropped"})
-                        except Exception as exc:
-                            destination["left_behind"] = [probe_fqn]
-                            destination["write_note"] = (
-                                f"verified write, but cleanup failed "
-                                f"({str(exc)[:120]}). {probe_fqn} still exists — "
-                                f"remove it manually.")
-                            destination["checks"].append(
-                                {"name": "write probe cleanup", "ok": False,
-                                 "detail": str(exc)[:200]})
                 else:
                     destination["write_note"] = (
-                        "not verified: the CREATE returned without error but the "
-                        "schema is not visible, so write is unproven")
+                        f"not verified: the create returned but {probe_fqn} is "
+                        f"not visible, so write is unproven. Creates are "
+                        f"asynchronous and can fail without reporting it.")
                     destination["checks"].append(
                         {"name": "write probe schema", "ok": False,
                          "detail": "created without error but not visible"})
-            except Exception as exc:
-                destination["write_note"] = (
-                    f"not verified: {str(exc)[:200]}")
-                destination["checks"].append(
-                    {"name": "write probe schema", "ok": False,
-                     "detail": str(exc)[:200]})
+
+                try:
+                    dest_call("delete_schema", catalog=target.catalog,
+                              schema=probe)
+                    if destination["write_verified"]:
+                        destination["write_note"] = (
+                            f"verified: created {probe_fqn} and cleaned up "
+                            f"after itself. Nothing was left behind.")
+                except Exception as exc:
+                    destination["left_behind"] = [probe_fqn]
+                    destination["write_note"] = (
+                        f"write probe finished, but cleanup failed "
+                        f"({str(exc)[:120]}). {probe_fqn} still exists — "
+                        f"remove it manually.")
+                    destination["checks"].append(
+                        {"name": "write probe cleanup", "ok": False,
+                         "detail": str(exc)[:200]})
 
     all_checks = source["checks"] + destination.get("checks", [])
     return {"ok": bool(all_checks) and all(c["ok"] for c in all_checks),

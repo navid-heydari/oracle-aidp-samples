@@ -332,7 +332,8 @@ def cmd_deploy(args) -> int:
         call = (make_call(target, backend=args.backend or detect_backend())
                 if args.execute else None)
         result = deploy_catalog(ddl_plan, target=target,
-                                execute=args.execute, call=call)
+                                execute=args.execute, call=call,
+                                diagnose=not args.no_diagnose)
     else:
         run_sql = (make_aidp_run_sql(target, backend=args.backend or detect_backend())
                    if args.execute else None)
@@ -371,13 +372,15 @@ def _optional_target(args):
 def cmd_smoke(args) -> int:
     out = pathlib.Path(args.out_dir)
     target = _optional_target(args)
-    dest_run_sql = None
+    dest_call = None
     if target is not None:
         backend = args.backend or detect_backend()
         print(f"  destination backend: {backend}")
-        dest_run_sql = make_aidp_run_sql(target, backend=backend)
+        # The catalog API, not SQL: `POST .../sql/execute` returns 404, so a
+        # SQL-based check reported FAIL against a working destination.
+        dest_call = make_call(target, backend=backend)
     result = run_smoke(source_run_sql=_run_sql_from_args(args), target=target,
-                       dest_run_sql=dest_run_sql, write_probe=args.write_probe,
+                       dest_call=dest_call, write_probe=args.write_probe,
                        database=(args.database or [None])[0]
                        if getattr(args, "database", None) else None)
     _write(out, "smoke.json", result)
@@ -620,6 +623,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     dep = sub.add_parser("deploy", parents=[common], help="dry-run by default")
     dep.add_argument("--execute", action="store_true")
+    dep.add_argument("--no-diagnose", action="store_true",
+                     help="skip the one-per-schema probe that distinguishes a "
+                          "permanently burned object name from a bad request. "
+                          "The probe writes (and cleans up), so it can be "
+                          "turned off")
     dep.add_argument("--transport", choices=["catalog_api", "sql"],
                      default="catalog_api",
                      help="catalog_api (default): create schemas/tables/views "

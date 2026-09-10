@@ -216,7 +216,7 @@ that feeds it.
 | T2 | Check the HTTP status on every backend response | S | **done** |
 | T3 | Fix `list_tables` to send a fully-qualified `schemaKey` | S | **done** |
 | T4 | `timestamp_ntz` is silently rejected by the catalog API | S | **done — explicit decision** |
-| T5 | Ask Oracle whether `timestamp_ntz` support is planned | S | open — needs Oracle |
+| T5 | Ask Oracle whether `timestamp_ntz` support is planned | S | **PARKED (TBD)** — Oracle |
 
 ## T1 — the transport question
 
@@ -341,7 +341,7 @@ The only recovery found is **a different schema**.
 |---|---|---|---|
 | P1 | Detect the poisoned-name signature and say so | S | open |
 | P2 | Offer a `--target-suffix` / fresh-schema retry path | S | open |
-| P3 | Ask Oracle whether this is intended, and how to clear a name | S | needs Oracle |
+| P3 | Ask Oracle whether this is intended, and how to clear a name | S | **PARKED (TBD)** — Oracle |
 
 **P1** is the important one. The signature is unmistakable — create returns
 202, the object never appears, and a create with a novel name in the same
@@ -354,3 +354,36 @@ true but sends the reader hunting for a body problem that is not there.
 name permanently, and if so what clears it? Until that is answered, the
 practical guidance for any real migration is: **if a run fails, retry into a
 new schema, not the same one.**
+
+
+---
+
+# Parked — TBD, do not re-raise
+
+Recorded so they are not lost, and deliberately **not** blocking. None of the
+ranked work waits on these, and they should not be surfaced in reports or
+raised in conversation until the phase that needs them arrives.
+
+## JDBC — parked to the byte-movement phase
+
+Whether AIDP reads Snowflake over JDBC, or this plugin uses JDBC in place of
+`snowflake-connector-python`, is a question about **moving bytes**, not about
+cloning structure. It belongs in the generated notebook when that phase
+arrives: expressed there, it is visible to the user before it runs, auditable
+afterwards, and reviewable by whoever picks the work up.
+
+The structure clone needs none of it. The Python connector stays, and it is
+live-verified.
+
+**Do not raise this again until byte movement is in scope.**
+
+## Oracle-side questions — parked pending an answer
+
+| # | Question | Workaround in the meantime |
+|---|---|---|
+| P3 | Does a failed create permanently reserve the name, and what clears it? | Retry into a fresh schema. The plugin detects the signature and says so |
+| T5 | Is `timestamp_ntz` support planned on the catalog API? | `assess --timestamp-ntz timestamp`, which records the timezone caveat on the field |
+| — | Is view column-type derivation documented? | The plugin reports drift per column and flags narrowings |
+
+Each has a working path around it, which is why none of them blocks. They are
+worth asking when there is an Oracle contact to ask, not worth waiting on.
