@@ -212,9 +212,11 @@ that feeds it.
 
 | # | Item | Effort | Status |
 |---|---|---|---|
-| T1 | Choose and implement a working DDL transport | M | **blocking `deploy --execute`** |
+| T1 | Choose and implement a working DDL transport | M | **done — catalog REST API** |
 | T2 | Check the HTTP status on every backend response | S | **done** |
-| T3 | Fix `list_tables` to send a fully-qualified `schemaKey` | S | open |
+| T3 | Fix `list_tables` to send a fully-qualified `schemaKey` | S | **done** |
+| T4 | `timestamp_ntz` is silently rejected by the catalog API | S | **done — explicit decision** |
+| T5 | Ask Oracle whether `timestamp_ntz` support is planned | S | open — needs Oracle |
 
 ## T1 — the transport question
 
@@ -245,3 +247,57 @@ and the command shapes are recorded as verified rather than assumed.
 `GET /tables?catalogKey=lake&schemaKey=default` returns **400
 InvalidParameter**; `schemaKey=lake.default` returns 200. `build_command`'s
 `list_tables` sends the bare schema, so it would 400 on every call.
+
+
+---
+
+# What the first live migration taught us (2026-09-10)
+
+Five behaviours, none of them documented, every one of which broke the run.
+All are now handled and covered by tests.
+
+**1. `oci raw-request` exits 0 on an HTTP error.** The status is in the response
+*body*. The plugin was reading a 404 error object as one row of data, and the
+smoke test reported PASS against an endpoint that does not exist. Fixed: any
+non-2xx status raises.
+
+**2. AIDP lower-cases identifiers.** A schema created as
+`TEST_DB_20260908_1529` is stored as `test_db_20260908_1529`. Every
+`schemaKey` and read-back key built from the requested case was wrong, so all
+seven objects reported failed while the schema had in fact been created. Fixed
+twice over: the PLAN now folds target names so the reports show the name the
+destination will really use, and the deploy path additionally RESOLVES keys from
+the server rather than assuming them.
+
+This also makes the case-collision detector load-bearing rather than
+theoretical: Snowflake keeps `ORDERS` and `"orders"` apart and AIDP cannot, so
+two such tables now halt the run instead of silently merging.
+
+**3. A list response is a collection; a create response is one object.**
+Collapsing both to `rows[0]` meant key resolution saw a single schema instead
+of the list and found no match. Fixed.
+
+**4. Creation is ASYNCHRONOUS and can fail SILENTLY.** `POST /tables` returns
+**202 Accepted with an empty body**. The object appears seconds later — or
+never, if the async work fails, and when it fails *nothing reports it*. Six
+tables once returned 202 and not one of them existed. Fixed: the read-back
+polls with a bounded backoff, and an object that never appears is a failure
+whose reason says exactly that.
+
+This is the strongest possible argument for the read-back-and-compare design.
+A plugin that trusted the create's return code would have reported a clean
+seven-object migration into an empty schema.
+
+**5. `timestamp_ntz` is not a valid catalog `fieldType`.** It is the *only*
+standard type rejected — `timestamp`, `date`, `boolean`, `binary`, `double`,
+`bigint`, `int` and `float` all work. A POST carrying it returns 202 and then
+fails silently, which is how it hid. This collides with a deliberate fidelity
+choice (Snowflake `TIMESTAMP_NTZ` maps to Spark `TIMESTAMP_NTZ` because bare
+`TIMESTAMP` is session-timezone-dependent), so it is now an explicit decision:
+`--timestamp-ntz block` (default) refuses the object and names the column;
+`--timestamp-ntz timestamp` downgrades it and records the timezone caveat on
+the field description.
+
+**T5 is the open question for Oracle:** is `timestamp_ntz` support planned on
+the catalog API? Until it is, every Snowflake estate with a timezone-naive
+timestamp — which is most of them — has to accept the downgrade or wait.

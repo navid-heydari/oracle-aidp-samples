@@ -8,7 +8,8 @@ from __future__ import annotations
 from plan.data_movement import MAINTENANCE_TRAPS, architecture_decision
 from plan.status import assess_risk, migration_status
 
-__all__ = ["render_census", "census_scope", "render_maintenance",
+__all__ = ["render_preflight", "render_census", "census_scope",
+           "render_maintenance",
            "render_security",
            "render_inventory", "render_ddl_plan", "render_planned_objects",
            "render_soft_clone_summary", "render_compute", "render_summary",
@@ -946,4 +947,104 @@ def render_security(sec: dict) -> str:
            "AIDP has no masking API; the equivalent is a restricted view plus "
            "ontology sensitivity classification granted per role, which is a "
            "design decision rather than a translation."]
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight: what WOULD happen, stated before the first write.
+#
+# Required behaviour, not a convenience. Once both ends are known and before
+# anything is created, every source -> destination mapping is on the page. A
+# migration that begins without the user having seen this is one they did not
+# actually approve.
+# ---------------------------------------------------------------------------
+
+def render_preflight(plan: dict, *, source: dict | None = None,
+                     target: dict | None = None) -> str:
+    s = plan.get("summary") or {}
+    can = plan.get("can_migrate") or []
+    cannot = plan.get("cannot_migrate") or []
+    schemas = plan.get("schemas_to_create") or []
+    catalogs = plan.get("catalogs_to_create") or []
+    jobs = plan.get("silver_gold_jobs") or []
+    src = source or {}
+
+    out = ["# Pre-flight — what this migration would do", ""]
+
+    if target is None:
+        out += ["> **No AIDP target was supplied, so nothing will be created.** "
+                "Everything below is what *would* happen once the datalake "
+                "OCID, workspace, cluster and catalog are given.", ""]
+    else:
+        out += ["Read this before approving. Nothing has been created yet.", ""]
+
+    out += ["## Source → destination", "",
+            "| | Source (Snowflake) | Destination (AIDP) |", "|---|---|---|"]
+    unset = "*not supplied*"
+    out += [
+        f'| Account / DataLake | `{src.get("account", unset)}` | '
+        f'`{(target or {}).get("datalake_ocid", unset)}` |',
+        f'| Region | `{src.get("region", unset)}` | *derived from the OCID* |',
+        f'| Role / workspace | `{src.get("role", unset)}` | '
+        f'`{(target or {}).get("workspace", unset)}` |',
+        f'| Scope / catalog | {", ".join(src.get("databases") or []) or unset} | '
+        f'`{(target or {}).get("catalog", unset)}` |', ""]
+
+    out += ["## Naming", "",
+            "**Destination names are lower-cased.** AIDP folds identifiers, so "
+            "a schema created as `TEST_DB` is stored as `test_db`. The targets "
+            "below are the names the destination will really use — planning the "
+            "unfolded name would show you something that then silently "
+            "differs.", "",
+            "Two source objects whose names differ only by case therefore fold "
+            "into one, and the run **halts** rather than merging them.", ""]
+
+    out += [f'## {len(can)} object(s) that would be created', ""]
+    if can:
+        out += ["| Source | | Destination | Type | Rows | Cols |",
+                "|---|---|---|---|---:|---:|"]
+        for c in can:
+            rows = c.get("rows")
+            out.append(
+                f'| `{c["source_identifier"]}` | → | `{c["target"]}` | '
+                f'{c.get("object_type", "?")} | '
+                f'{rows if rows is not None else "—"} | '
+                f'{c.get("columns", "—")} |')
+        out.append("")
+
+    if catalogs or schemas:
+        parts = []
+        if catalogs:
+            parts.append(f'{len(catalogs)} catalog(s): '
+                         + ", ".join(f"`{c}`" for c in catalogs))
+        if schemas:
+            parts.append(f'{len(schemas)} schema(s): '
+                         + ", ".join(f"`{a}.{b}`" for a, b in schemas))
+        out += ["## Structure that would be created first", "",
+                " · ".join(parts), ""]
+
+    out += ["## What would NOT happen", "",
+            "- **No data moves.** Every table arrives with its columns and "
+            "**zero rows**. This is a structural clone.",
+            "- **Nothing is written to Snowflake.** The source is **read-only**, "
+            "enforced at the transport, whatever the credential allows.",
+            "- **Nothing existing is replaced or dropped.** An object that "
+            "already exists with a different structure is reported and left "
+            "exactly as found.", ""]
+    if jobs:
+        out.append(f"- **{len(jobs)} Silver/Gold job stub(s)** are defined, "
+                   f"disabled and **never triggered**. Their bodies are a "
+                   f"requirement still to define.")
+        out.append("")
+
+    if cannot:
+        out += [f'## {len(cannot)} object(s) that would NOT be created', "",
+                "| Object | Type | Why |", "|---|---|---|"]
+        out += [f'| `{c["source_identifier"]}` | {c.get("object_type", "?")} | '
+                f'{c.get("reason", "?")} |' for c in cannot]
+        out.append("")
+
+    out += ["---", "",
+            "Nothing above has been executed. `deploy --execute` with the "
+            "target coordinates is what applies it."]
     return "\n".join(out) + "\n"

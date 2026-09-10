@@ -1,8 +1,10 @@
 """run_sql over the CLI backends. The subprocess call is injected."""
+import json
+import types
 import pytest
 
 from target.coords import resolve_target
-from target.runner import BackendError, make_run_sql
+from target.runner import make_call, BackendError, make_run_sql
 
 TARGET = resolve_target(datalake_ocid="ocid1.aidataplatform.oc1.iad.a",
                         workspace="w", cluster_id="c", catalog="MYDB")
@@ -64,3 +66,57 @@ def test_dry_run_records_commands_without_running_them():
     assert run_sql("CREATE SCHEMA s") == []
     assert proc.commands == [], "dry run must not invoke the backend"
     assert "CREATE SCHEMA s" in planned[0]
+
+
+# --------------------------------------------------------------------------
+# A list operation returns a COLLECTION, a create/get returns ONE object.
+# Returning rows[0] for both meant key resolution saw a single schema instead
+# of the list, could not find its match, and every read-back failed while the
+# objects had in fact been created.
+# --------------------------------------------------------------------------
+
+def _target():
+    return resolve_target(datalake_ocid="ocid1.aidataplatform.oc1.iad.a",
+                          workspace="ws", cluster_id="cl", catalog="lake")
+
+
+def test_a_list_operation_returns_every_row_under_items():
+    def fake(cmd):
+        return types.SimpleNamespace(
+            returncode=0, stdout=json.dumps({"data": {"items": [
+                {"key": "lake.a"}, {"key": "lake.b"}]}}), stderr="")
+
+    call = make_call(_target(), backend="oci_raw", run_process=fake)
+    out = call("list_schemas", catalog="lake")
+    assert [i["key"] for i in out["items"]] == ["lake.a", "lake.b"]
+
+
+def test_an_empty_list_operation_returns_an_empty_items_list():
+    def fake(cmd):
+        return types.SimpleNamespace(
+            returncode=0, stdout=json.dumps({"data": {"items": []}}), stderr="")
+
+    call = make_call(_target(), backend="oci_raw", run_process=fake)
+    assert call("list_tables_in", catalog="lake", schema="lake.s") == {"items": []}
+
+
+def test_a_single_object_operation_returns_that_object():
+    def fake(cmd):
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"data": {"key": "lake.s.t",
+                                        "displayName": "t"}}), stderr="")
+
+    call = make_call(_target(), backend="oci_raw", run_process=fake)
+    out = call("create_table", catalog="lake", schema="s", table="t",
+               body={"displayName": "t"})
+    assert out["key"] == "lake.s.t"
+
+
+def test_a_nonzero_exit_raises():
+    def fake(cmd):
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    call = make_call(_target(), backend="oci_raw", run_process=fake)
+    with pytest.raises(RuntimeError):
+        call("list_schemas", catalog="lake")

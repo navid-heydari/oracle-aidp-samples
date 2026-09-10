@@ -23,20 +23,21 @@ def rec(ident, kind="TABLE", rows=10, status="supported", blocked=(), ddl=None):
 
 def test_bronze_target_mirrors_the_source_three_part_name():
     plan = build_plan({"inventory": [rec("MYDB.SALES.ORDERS")]}, {"edges": []})
-    assert plan["target_names"]["MYDB.SALES.ORDERS"] == "MYDB.SALES.ORDERS"
+    # AIDP folds identifiers, so the PLANNED target is the folded name.
+    assert plan["target_names"]["MYDB.SALES.ORDERS"] == "mydb.sales.orders"
 
 
 def test_catalogs_and_schemas_to_create_are_derived():
     inv = {"inventory": [rec("D1.S1.A"), rec("D1.S2.B"), rec("D2.S1.C")]}
     plan = build_plan(inv, {"edges": []})
-    assert plan["catalogs_to_create"] == ["D1", "D2"]
-    assert plan["schemas_to_create"] == [["D1", "S1"], ["D1", "S2"], ["D2", "S1"]]
+    assert plan["catalogs_to_create"] == ["d1", "d2"]
+    assert plan["schemas_to_create"] == [["d1", "s1"], ["d1", "s2"], ["d2", "s1"]]
 
 
 def test_catalog_prefix_mode_recorded():
     plan = build_plan({"inventory": [rec("D.S.T")]}, {"edges": []},
                       bronze_catalog_prefix="bronze")
-    assert plan["target_names"]["D.S.T"] == "bronze.D_S.T"
+    assert plan["target_names"]["D.S.T"] == "bronze.d_s.t"
     assert plan["bronze_catalog_prefix"] == "bronze"
 
 
@@ -79,7 +80,7 @@ def test_unmapped_column_type_cannot_migrate():
 def test_can_migrate_entries_carry_the_target_and_type():
     plan = build_plan({"inventory": [rec("D.S.T")]}, {"edges": []})
     c = plan["can_migrate"][0]
-    assert c["target"] == "D.S.T" and c["object_type"] == "TABLE"
+    assert c["target"] == "d.s.t" and c["object_type"] == "TABLE"
 
 
 def test_every_object_appears_in_exactly_one_of_can_or_cannot():

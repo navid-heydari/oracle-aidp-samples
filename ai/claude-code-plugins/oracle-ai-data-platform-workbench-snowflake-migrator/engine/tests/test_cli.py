@@ -39,8 +39,8 @@ def test_plan_bronze_mirrors_the_source_by_default(tmp_path):
     write(tmp_path, "dependencies.json", DEPS)
     main(["plan", "--out-dir", str(tmp_path)])
     plan = json.loads((tmp_path / "plan.json").read_text())
-    assert plan["target_names"]["D.PUBLIC.ORDERS"] == "D.PUBLIC.ORDERS"
-    assert plan["catalogs_to_create"] == ["D"]
+    assert plan["target_names"]["D.PUBLIC.ORDERS"] == "d.public.orders"
+    assert plan["catalogs_to_create"] == ["d"]
 
 
 def test_plan_honours_the_bronze_catalog_prefix(tmp_path):
@@ -48,7 +48,7 @@ def test_plan_honours_the_bronze_catalog_prefix(tmp_path):
     write(tmp_path, "dependencies.json", DEPS)
     main(["plan", "--out-dir", str(tmp_path), "--bronze-catalog-prefix", "bronze"])
     plan = json.loads((tmp_path / "plan.json").read_text())
-    assert plan["target_names"]["D.PUBLIC.ORDERS"] == "bronze.D_PUBLIC.ORDERS"
+    assert plan["target_names"]["D.PUBLIC.ORDERS"] == "bronze.d_public.orders"
 
 
 def test_plan_applies_a_restrictions_file(tmp_path):
@@ -84,7 +84,7 @@ def test_separate_databases_no_longer_collide_under_the_bronze_mirror(tmp_path):
     write(tmp_path, "dependencies.json", DEPS)
     assert main(["plan", "--out-dir", str(tmp_path)]) == 0
     plan = json.loads((tmp_path / "plan.json").read_text())
-    assert sorted(plan["catalogs_to_create"]) == ["D", "D2"]
+    assert sorted(plan["catalogs_to_create"]) == ["d", "d2"]
 
 
 def test_plan_exits_3_on_a_case_variant_collision(tmp_path):

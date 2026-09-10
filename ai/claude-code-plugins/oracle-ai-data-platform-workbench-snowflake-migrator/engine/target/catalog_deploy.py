@@ -1,0 +1,286 @@
+"""Deploy structure through the AIDP catalog API. I/O injected as `call`.
+
+The SQL transport cannot be used: `POST /workspaces/<ws>/sql/execute` returns
+404 against a live DataLake. This path creates schemas, then tables, then
+views through the catalog CRUD API instead, which needs no Spark cluster and
+has no session to lose DDL to.
+
+Shape of the run:
+  1. create each distinct schema once
+  2. create tables, then views -- a view's fields reference its base tables
+  3. READ EACH OBJECT BACK and compare its field list to the plan
+
+Step 3 is the point. As with the SQL path, "the create returned 200" is not the
+claim; "the planned columns are there" is. A create that fails because the
+object already exists is NOT a failure -- the read-back decides, because an
+object that already matches the plan is indistinguishable from one we made.
+
+TWO BEHAVIOURS LEARNED FROM A LIVE RUN, both of which broke the first attempt:
+
+  * AIDP LOWER-CASES IDENTIFIERS. A schema created as `TEST_DB_20260908_1529`
+    comes back as `lake.test_db_20260908_1529`. Every `schemaKey` and every
+    read-back key built from the REQUESTED case was wrong, and all seven
+    objects reported failed while the schema had in fact been created. So keys
+    are RESOLVED from the server by listing and matching case-insensitively,
+    never assumed. Field names fold too, so field comparison is
+    case-insensitive -- a case fold is not a structure mismatch.
+
+  * CREATION IS ASYNCHRONOUS AND CAN FAIL SILENTLY. POST returns 202 Accepted
+    with an empty body; the object appears seconds later, or never if the async
+    work fails -- and when it fails NOTHING reports it. So the read-back polls
+    with a bounded backoff, and an object that never appears is a failure whose
+    reason says exactly that. This is why "the create returned 2xx" cannot be
+    the claim: six tables once returned 202 and not one of them existed.
+
+  * SCHEMA CREATION IS ASYNCHRONOUS. Creating a table immediately afterwards
+    can return 409 Conflict "ongoing operation", so a 409 is retried with a
+    bounded backoff rather than reported as a failure. The retry is still
+    recorded, because a run that needed three attempts is worth knowing about.
+
+`call(operation, **kwargs)` is injected so every decision here is unit-tested
+with no environment.
+"""
+from __future__ import annotations
+
+import datetime
+from typing import Callable
+
+import time
+
+from .catalog_api import (
+    build_schema_body, build_table_body, build_view_body)
+
+__all__ = ["deploy_catalog", "RefusedToExecute"]
+
+
+class RefusedToExecute(RuntimeError):
+    """Execution was requested without the arguments that make it safe."""
+
+
+def _split(fqn: str) -> tuple[str, str, str]:
+    catalog, schema, name = fqn.split(".", 2)
+    return catalog, schema, name
+
+
+def _norm(field_type, precision=None, scale=None) -> str:
+    """Compare field types ignoring case and precision formatting."""
+    base = str(field_type or "").strip().lower()
+    if base == "decimal" and precision is not None:
+        return f"decimal({int(precision)},{int(scale or 0)})"
+    return base
+
+
+def _resolve_schema_key(call, catalog: str, schema: str) -> str | None:
+    """The key the SERVER uses for this schema, case as stored."""
+    wanted = f"{catalog}.{schema}".lower()
+    try:
+        payload = call("list_schemas", catalog=catalog)
+    except Exception:
+        return None
+    for item in payload.get("items") or []:
+        key = str(item.get("key") or "")
+        if key.lower() == wanted:
+            return key
+    return None
+
+
+def _resolve_object(call, catalog: str, schema_key: str, name: str,
+                    is_view: bool) -> dict | None:
+    """The object as the server holds it, matched case-insensitively."""
+    wanted = f"{schema_key}.{name}".lower()
+    try:
+        payload = call("list_views_in" if is_view else "list_tables_in",
+                       catalog=catalog, schema=schema_key)
+    except Exception:
+        return None
+    for item in payload.get("items") or []:
+        if str(item.get("key") or "").lower() == wanted:
+            return item
+    return None
+
+
+def _is_conflict(exc: Exception) -> bool:
+    text = str(exc)
+    return "409" in text or "ongoing" in text.lower()
+
+
+def _planned(columns: list[dict]) -> list[tuple[str, str]]:
+    out = []
+    for col in columns:
+        field = build_table_body("c", "s", "t", [col])["tableFields"][0]
+        out.append((str(field["fieldName"]).upper(),
+                    _norm(field.get("fieldType"), field.get("fieldPrecision"),
+                          field.get("fieldScale"))))
+    return out
+
+
+def _actual(payload: dict, key: str = "tableFields") -> list[tuple[str, str]]:
+    # Field names are upper-cased on BOTH sides before comparing: the server
+    # folds them, and a case fold is not a structure mismatch.
+    return [(str(f.get("fieldName")).upper(),
+             _norm(f.get("fieldType"), f.get("fieldPrecision"),
+                   f.get("fieldScale")))
+            for f in (payload.get(key) or [])]
+
+
+def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
+                   call: Callable[..., dict] | None = None,
+                   retry_delays: tuple[float, ...] = (2.0, 5.0, 10.0),
+                   verify_delays: tuple[float, ...] = (3.0, 5.0, 10.0, 15.0),
+                   timestamp_ntz_as_timestamp: bool = False) -> dict:
+    all_statements = [s for s in ddl_plan.get("statements", [])]
+
+    if target is not None:
+        scope = target.catalog.upper()
+        in_scope_at = {i for i, s in enumerate(all_statements)
+                       if _split(s["target_fqn"])[0].upper() == scope}
+        statements = [s for i, s in enumerate(all_statements) if i in in_scope_at]
+        out_of_scope = [s for i, s in enumerate(all_statements)
+                        if i not in in_scope_at]
+    else:
+        statements, out_of_scope = all_statements, []
+
+    out = {
+        "ran_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "transport": "catalog_api",
+        "dry_run": not execute,
+        "statements": statements,
+        "statement_count": len(statements),
+        "blocked_count": len(ddl_plan.get("blocked", [])),
+        "catalog_in_scope": target.catalog if target is not None else None,
+        "out_of_scope_count": len(out_of_scope),
+        "out_of_scope_catalogs": sorted({
+            _split(s["target_fqn"])[0] for s in out_of_scope}),
+        "executed": 0, "verified": 0,
+        "schemas_created": [], "errors": [],
+        "resolved_schema_keys": {},
+        "attempted_targets": [], "verified_targets": [], "failed_targets": [],
+        "mismatched_targets": [], "mismatches": [],
+        "unverified_structure_targets": [], "unverified_structure": [],
+        "failed": [],
+    }
+    if not execute:
+        return out
+
+    if target is None:
+        raise RefusedToExecute(
+            "execute=True requires a resolved target; ask the user for the AIDP "
+            "datalake OCID, workspace, cluster and catalog and pass them "
+            "explicitly")
+    if call is None:
+        raise RefusedToExecute("execute=True requires a transport callable")
+
+    # 1. schemas, once each, then RESOLVE the key the server actually used
+    resolved: dict[str, str] = {}
+    for catalog, schema in sorted({_split(s["target_fqn"])[:2]
+                                   for s in statements}):
+        requested = f"{catalog}.{schema}"
+        try:
+            call("create_schema", catalog=catalog, schema=schema,
+                 body=build_schema_body(catalog, schema))
+            out["schemas_created"].append(requested)
+        except Exception as exc:
+            # Very likely "already exists". Recorded, never fatal: the
+            # read-back on each object is what decides success.
+            out["errors"].append(f"CREATE SCHEMA {requested}: {exc}")
+        actual = _resolve_schema_key(call, catalog, schema)
+        if actual is None:
+            out["errors"].append(
+                f"could not resolve the server's key for schema {requested}; "
+                f"falling back to the requested name")
+        resolved[requested] = actual or requested
+    out["resolved_schema_keys"] = dict(resolved)
+
+    # 2. tables first, then views: a view's fields reference its base tables
+    ordered = ([s for s in statements if s.get("object_type") != "VIEW"]
+               + [s for s in statements if s.get("object_type") == "VIEW"])
+
+    for stmt in ordered:
+        catalog, schema, name = _split(stmt["target_fqn"])
+        ident = stmt.get("source_identifier")
+        is_view = stmt.get("object_type") == "VIEW"
+        columns = stmt.get("expected_columns") or []
+        out["attempted_targets"].append(ident)
+
+        # The key the SERVER uses, which is lower-cased.
+        schema_key = resolved.get(f"{catalog}.{schema}", f"{catalog}.{schema}")
+        server_schema = schema_key.split(".", 1)[1] if "." in schema_key else schema
+
+        # Build the body FIRST. A type the API silently rejects must fail
+        # here, not become an accepted-then-vanished table.
+        try:
+            if is_view:
+                body = build_view_body(
+                    catalog, server_schema, name,
+                    stmt.get("view_text") or "", columns,
+                    timestamp_ntz_as_timestamp=timestamp_ntz_as_timestamp)
+            else:
+                body = build_table_body(
+                    catalog, server_schema, name, columns,
+                    timestamp_ntz_as_timestamp=timestamp_ntz_as_timestamp)
+        except Exception as exc:
+            out["failed_targets"].append(ident)
+            out["failed"].append({
+                "source_identifier": ident, "target_fqn": stmt["target_fqn"],
+                "reason": f"cannot build a valid catalog body: {exc}"})
+            continue
+
+        # Schema creation is async, so a 409 here means "not settled yet".
+        for attempt in range(len(retry_delays) + 1):
+            try:
+                if is_view:
+                    call("create_view", catalog=catalog, schema=server_schema,
+                         view=name, body=body)
+                else:
+                    call("create_table", catalog=catalog, schema=server_schema,
+                         table=name, body=body)
+                out["executed"] += 1
+                break
+            except Exception as exc:
+                out["errors"].append(f"CREATE {stmt.get('object_type')} "
+                                     f"{stmt['target_fqn']}: {exc}")
+                if _is_conflict(exc) and attempt < len(retry_delays):
+                    time.sleep(retry_delays[attempt])
+                    continue
+                break
+
+        # 3. read it back -- this, not the create's return, is the claim.
+        # Resolved by listing and matching case-insensitively, because the
+        # server's key case is not the one we asked for.
+        payload = None
+        for attempt in range(len(verify_delays) + 1):
+            payload = _resolve_object(call, catalog, schema_key, name, is_view)
+            if payload is not None:
+                break
+            if attempt < len(verify_delays):
+                time.sleep(verify_delays[attempt])
+        if payload is None:
+            out["failed_targets"].append(ident)
+            out["failed"].append({
+                "source_identifier": ident, "target_fqn": stmt["target_fqn"],
+                "reason": f"the create returned 202 Accepted but no object "
+                          f"matching {schema_key}.{name} ever appeared. The "
+                          f"asynchronous create failed and reported nothing "
+                          f"-- most often an unsupported field type."})
+            continue
+
+        if not columns:
+            out["unverified_structure_targets"].append(ident)
+            out["unverified_structure"].append({
+                "source_identifier": ident, "target_fqn": stmt["target_fqn"],
+                "reason": "exists, but the plan carried no column list to "
+                          "compare it against"})
+            continue
+
+        want = _planned(columns)
+        got = _actual(payload, "viewFields" if is_view else "tableFields")
+        if want == got:
+            out["verified"] += 1
+            out["verified_targets"].append(ident)
+        else:
+            out["mismatched_targets"].append(ident)
+            out["mismatches"].append({
+                "source_identifier": ident, "target_fqn": stmt["target_fqn"],
+                "reason": f"planned {want}, found {got}. The object was left "
+                          f"as it was found and has NOT been cloned."})
+    return out

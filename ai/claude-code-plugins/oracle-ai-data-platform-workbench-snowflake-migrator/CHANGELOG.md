@@ -8,6 +8,61 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [0.11.0] — 2026-09-10
+
+**First live migration against a real AIDP DataLake.** Five undocumented
+behaviours, every one of which broke the run. All handled and covered by tests.
+
+### Added
+
+- **`catalog_api` transport (now the default)** — creates schemas, tables and
+  views through the catalog CRUD API instead of SQL. `POST
+  /workspaces/<ws>/sql/execute` returns 404, so the SQL path could not create
+  anything; and for a structure-only clone the catalog API is better anyway: it
+  needs **no Spark cluster** (every cluster in the target environment was
+  stopped) and has no session to lose DDL to. `--transport sql` remains.
+- **`PREFLIGHT.md`** — written and echoed before the first write, once both
+  ends are known: every source → destination mapping, what will be created,
+  and what will *not* happen. A migration that starts without this is one the
+  user did not approve.
+- `--bronze-schema-style db` for a `<catalog>.<snowflake database>.<table>`
+  layout, alongside the collision-safe default.
+- `--timestamp-ntz {block,timestamp}` and `--probe-table-parameters`.
+
+### Changed
+
+- **Target names are now planned lower-cased**, because AIDP folds
+  identifiers. The plan shows the name the destination will really use instead
+  of one that silently differs. This also makes the case-collision detector
+  load-bearing: Snowflake keeps `ORDERS` and `"orders"` apart, AIDP cannot, so
+  two such tables halt the run rather than merging.
+
+### Fixed
+
+- **AIDP lower-cases identifiers.** A schema created as `TEST_DB_20260908_1529`
+  is stored as `test_db_20260908_1529`, so every `schemaKey` and read-back key
+  built from the requested case was wrong — all seven objects reported failed
+  while the schema had in fact been created. Keys are now resolved from the
+  server and compared case-insensitively.
+- **Creation is asynchronous and can fail silently.** `POST /tables` returns
+  **202 Accepted with an empty body**; the object appears seconds later, or
+  never if the async work fails — and when it fails nothing reports it. Six
+  tables once returned 202 and not one existed. The read-back now polls with a
+  bounded backoff, and an object that never appears is a failure that says so.
+  This is the strongest argument for read-back-and-compare: a plugin trusting
+  the create's status code would have reported a clean seven-object migration
+  into an empty schema.
+- **`timestamp_ntz` is the only standard type the catalog API rejects**
+  (`timestamp`, `date`, `boolean`, `binary`, `double`, `bigint`, `int`, `float`
+  all work). It returns 202 and then fails silently, which is how it hid. Since
+  Snowflake `TIMESTAMP_NTZ` maps to Spark `TIMESTAMP_NTZ` deliberately — bare
+  `TIMESTAMP` is session-timezone-dependent — the downgrade is an explicit
+  decision, not a default.
+- **A list response is a collection; a create response is one object.**
+  Collapsing both to `rows[0]` meant key resolution saw one schema instead of
+  the list and found no match.
+- `list_tables` sent a bare `schemaKey`, which returns 400 InvalidParameter.
+
 ## [0.10.1] — 2026-09-10
 
 ### Fixed

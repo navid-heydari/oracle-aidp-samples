@@ -25,8 +25,11 @@ from __future__ import annotations
 import collections
 import re
 
-__all__ = ["LAYERS", "UnknownStrategy", "bronze_target", "layer_jobs",
+__all__ = ["LAYERS", "SCHEMA_STYLES", "UnknownStrategy", "bronze_target",
+           "layer_jobs",
            "detect_target_collisions"]
+
+SCHEMA_STYLES = ("db_schema", "db")
 
 LAYERS = ("BRONZE", "SILVER", "GOLD")
 
@@ -38,26 +41,54 @@ class UnknownStrategy(ValueError):
 
 
 def bronze_target(source_db: str, source_schema: str, object_name: str, *,
-                  catalog_prefix: str | None = None) -> str:
-    """Bronze target name for a source object.
+                  catalog_prefix: str | None = None,
+                  schema_style: str = "db_schema",
+                  fold_case: bool = True) -> str:
+    """The Bronze target FQN for one source object. Names are never rewritten.
 
-    Default (`catalog_prefix=None`) is the required 1:1 mirror:
-    `<database>.<schema>.<object>`, i.e. database becomes the Standard Catalog.
+    Without a prefix, Bronze mirrors the source exactly: the Snowflake database
+    becomes its own AIDP Standard Catalog.
 
-    `catalog_prefix` supports deployments that want ONE bronze catalog instead of
-    catalog-per-database; the source database is then folded into the schema name
-    so distinct databases still cannot merge.
+    With a prefix, everything lands inside one existing catalog and the target
+    schema encodes the source. Two styles:
+
+      db_schema (default) -- `prefix.DB_SCHEMA.NAME`. Keeps two same-named
+        schemas apart inside one catalog, which is why it is the default.
+      db                  -- `prefix.DB.NAME`, giving `lake.<database>.<table>`.
+        Closer to a 1:1 read of the source, and it CAN collide: two schemas in
+        the same database that share a table name map to one target. That is
+        caught by detect_target_collisions, which halts the run rather than
+        merging two different tables.
+
+    The object name itself is carried over verbatim in every style -- only its
+    CASE changes.
+
+    `fold_case` (default on) lower-cases the target name, because **AIDP
+    lower-cases identifiers**: a schema created as `TEST_DB_20260908_1529` comes
+    back as `test_db_20260908_1529`. Planning the folded name means the plan
+    shows the name the destination will really use, rather than one that then
+    silently differs. It also makes the fold visible to
+    detect_target_collisions, which is what stops Snowflake's `ORDERS` and
+    `"orders"` -- two different tables -- from quietly becoming one.
     """
+    if schema_style not in SCHEMA_STYLES:
+        raise ValueError(
+            f"unknown schema_style {schema_style!r}; expected one of "
+            f"{list(SCHEMA_STYLES)}")
     for part in (source_db, source_schema, object_name):
         if not part or not str(part).strip():
             raise UnknownStrategy(f"empty name component in "
                                   f"{source_db!r}.{source_schema!r}.{object_name!r}")
+    def cased(value: str) -> str:
+        return str(value).lower() if fold_case else str(value)
+
     if catalog_prefix is None:
-        return f"{source_db}.{source_schema}.{object_name}"
+        return f"{cased(source_db)}.{cased(source_schema)}.{cased(object_name)}"
     if not _SAFE_IDENT.match(catalog_prefix):
         raise UnknownStrategy(
             f"catalog_prefix {catalog_prefix!r} is not a valid identifier")
-    return f"{catalog_prefix}.{source_db}_{source_schema}.{object_name}"
+    schema = source_db if schema_style == "db" else f"{source_db}_{source_schema}"
+    return f"{cased(catalog_prefix)}.{cased(schema)}.{cased(object_name)}"
 
 
 def layer_jobs(scopes: list[tuple[str, str]]) -> list[dict]:

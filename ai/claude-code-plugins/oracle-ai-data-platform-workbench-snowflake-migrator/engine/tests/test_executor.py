@@ -227,3 +227,43 @@ def test_a_legitimate_row_containing_the_word_code_is_not_an_error():
 
 def test_a_response_with_no_status_field_is_still_accepted():
     assert parse_cli_json(json.dumps({"rows": [{"a": 1}]})) == [{"a": 1}]
+
+
+# --------------------------------------------------------------------------
+# Catalog CRUD transport (T1) and the qualified schemaKey (T3).
+# --------------------------------------------------------------------------
+
+def _t():
+    return resolve_target(datalake_ocid="ocid1.aidataplatform.oc1.iad.a",
+                          workspace="ws", cluster_id="cl", catalog="lake")
+
+
+def test_create_table_posts_to_the_tables_collection():
+    cmd = build_command("oci_raw", "create_table", _t(),
+                        catalog="lake", schema="DB", table="T",
+                        body={"displayName": "T"})
+    assert cmd[:4] == ["oci", "raw-request", "--http-method", "POST"]
+    assert cmd[cmd.index("--target-uri") + 1].endswith("/tables")
+    assert '"displayName": "T"' in cmd[cmd.index("--request-body") + 1]
+
+
+def test_get_table_addresses_the_fully_qualified_key():
+    cmd = build_command("oci_raw", "get_table", _t(),
+                        catalog="lake", schema="DB", table="T")
+    assert cmd[cmd.index("--target-uri") + 1].endswith("/tables/lake.DB.T")
+
+
+def test_list_tables_qualifies_a_bare_schema_key():
+    # A bare schemaKey returns 400 InvalidParameter -- verified live.
+    uri = build_command("oci_raw", "list_tables", _t(), schema="DB")[
+        build_command("oci_raw", "list_tables", _t(), schema="DB").index(
+            "--target-uri") + 1]
+    assert "schemaKey=lake.DB" in uri
+
+
+def test_an_already_qualified_schema_key_is_not_doubled():
+    uri = build_command("oci_raw", "list_tables", _t(), schema="lake.DB")[
+        build_command("oci_raw", "list_tables", _t(), schema="lake.DB").index(
+            "--target-uri") + 1]
+    assert "schemaKey=lake.DB" in uri
+    assert "lake.lake" not in uri
