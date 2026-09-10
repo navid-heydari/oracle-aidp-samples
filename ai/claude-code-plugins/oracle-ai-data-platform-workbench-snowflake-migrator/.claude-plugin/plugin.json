@@ -1,7 +1,7 @@
 {
   "name": "oracle-ai-data-platform-workbench-snowflake-migrator",
-  "version": "0.3.0",
-  "description": "Investigate a Snowflake estate and migrate its structure onto Oracle AI Data Platform (AIDP). Lists every table and view with exact row counts and column types; says which objects can and cannot be migrated with a brief reason for each; applies user-supplied restrictions; orders creation so views follow their base tables; and shallow-clones the structure into a Bronze layer that mirrors the source 1:1 - Snowflake database to AIDP Standard Catalog, schema to schema, table to table, view to view - with disabled Silver and Gold job stubs. Also maps warehouses to Spark cluster shapes with a sizing and credit proposal. Structure only: copies no data - every table arrives with zero rows. Ships a smoke test that verifies read on the source and read/write on the destination, and delivers the migration script as an executable AIDP notebook that prints per-object progress and verifies each object. Read-only against Snowflake, dry-run by default against AIDP, executes through the aidp or oci CLI, and AIDP target coordinates are never stored - they are supplied per conversation and confirmed before any write.",
+  "version": "0.4.0",
+  "description": "Investigate a Snowflake estate and migrate its structure onto Oracle AI Data Platform (AIDP). Lists every table and view with exact row counts and column types; says which objects can and cannot be migrated with a brief reason for each; applies user-supplied restrictions; orders creation so views follow their base tables; and shallow-clones the structure into a Bronze layer that mirrors the source 1:1 - Snowflake database to AIDP Standard Catalog, schema to schema, table to table, view to view - with disabled Silver and Gold job stubs. Also maps warehouses to Spark cluster shapes with a sizing and credit proposal. Structure only: copies no data - every table arrives with zero rows. Ships a smoke test that verifies read on the source and read/write on the destination, and delivers the migration script as an executable AIDP notebook that prints per-object progress and verifies each object. Strictly read-only against Snowflake - the transport refuses any statement that is not a read, so nothing is ever written to or dropped from the source whatever the credential permits - dry-run by default against AIDP, executes through the aidp or oci CLI, and AIDP target coordinates are never stored - they are supplied per conversation and confirmed before any write.",
   "homepage": "https://github.com/oracle-samples/oracle-aidp-samples/tree/main/ai/claude-code-plugins/oracle-ai-data-platform-workbench-snowflake-migrator",
   "repository": "https://github.com/oracle-samples/oracle-aidp-samples",
   "license": "MIT",
@@ -37,6 +37,8 @@
     "notebook",
     "progress-monitoring",
     "migration-status",
-    "risk-assessment"
+    "risk-assessment",
+    "read-only-enforced",
+    "dialect-translation"
   ]
 }

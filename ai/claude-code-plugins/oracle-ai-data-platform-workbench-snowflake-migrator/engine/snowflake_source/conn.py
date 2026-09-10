@@ -15,16 +15,60 @@ Auth modes:
 from __future__ import annotations
 
 import pathlib
+import re
 from typing import Any, Callable
 
-__all__ = ["AuthError", "build_connect_kwargs", "load_private_key_der",
-           "connect", "make_run_sql"]
+__all__ = ["AuthError", "SourceWriteRefused", "READ_ONLY_VERBS",
+           "build_connect_kwargs", "load_private_key_der", "connect",
+           "make_run_sql"]
+
+# The ONLY statements this plugin may send to Snowflake. Default deny: an
+# unrecognised verb is refused rather than assumed safe.
+#
+# This is enforced at the transport, not by convention, so it holds even when the
+# credential has write privileges and even if a future skill, agent or prompt
+# asks for a write. Nothing is written to or dropped from the source, ever.
+READ_ONLY_VERBS = ("SELECT", "SHOW", "DESCRIBE", "DESC", "WITH", "EXPLAIN")
+
+_COMMENT_LINE = re.compile(r"--[^\n]*")
+_COMMENT_BLOCK = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 _MODES = {"keypair", "pat", "password", "externalbrowser"}
 
 
 class AuthError(RuntimeError):
     """Auth arguments are missing, contradictory, or unreadable."""
+
+
+class SourceWriteRefused(PermissionError):
+    """A statement that is not a read was aimed at Snowflake. Refused."""
+
+
+def _strip_comments(sql: str) -> str:
+    return _COMMENT_LINE.sub(" ", _COMMENT_BLOCK.sub(" ", sql or ""))
+
+
+def assert_read_only(sql: str) -> None:
+    """Refuse anything that is not a read. Raises SourceWriteRefused.
+
+    Checked per statement, so a write cannot be smuggled in after a read via
+    statement stacking, and comments cannot disguise the leading verb.
+    """
+    cleaned = _strip_comments(sql)
+    statements = [part.strip() for part in cleaned.split(";") if part.strip()]
+    if not statements:
+        raise SourceWriteRefused(
+            f"empty statement refused; this plugin is read-only against "
+            f"Snowflake (allowed: {', '.join(READ_ONLY_VERBS)})")
+    for part in statements:
+        verb = part.split(None, 1)[0].upper().lstrip("(")
+        if verb not in READ_ONLY_VERBS:
+            recognised = "not a recognised read verb"
+            raise SourceWriteRefused(
+                f"{verb}: {recognised}. This plugin is strictly read-only "
+                f"against Snowflake and never writes to or drops from the "
+                f"source, regardless of what the credential permits. "
+                f"Allowed: {', '.join(READ_ONLY_VERBS)}.")
 
 
 def _read_secret_file(path: str, label: str) -> str:
@@ -97,8 +141,12 @@ def make_run_sql(conn) -> Callable[..., list[dict]]:
     """Return the injected-I/O callable every extract module consumes.
 
     Signature: run_sql(sql, params=None) -> list[dict]
+
+    Every statement passes assert_read_only first. A write never reaches
+    Snowflake, whatever the credential allows.
     """
     def run_sql(sql: str, params: dict | None = None) -> list[dict]:
+        assert_read_only(sql)
         cur = conn.cursor()
         cur.execute(sql, params or {})
         cols = [c[0] for c in cur.description]

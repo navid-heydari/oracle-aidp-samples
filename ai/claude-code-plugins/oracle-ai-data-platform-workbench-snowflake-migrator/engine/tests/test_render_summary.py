@@ -158,3 +158,10 @@ def test_smoke_report_states_when_destination_was_skipped():
                        "destination": {"skipped": True,
                                        "reason": "coordinates not supplied"}})
     assert "Skipped" in md and "not supplied" in md
+
+
+def test_summary_makes_no_destination_claim_when_none_is_supplied():
+    md = render_summary(PLAN, INV, None, None)
+    assert "none is assumed" in md.lower()
+    assert "derived from the OCID" not in md, "no OCID was given to derive from"
+    assert md.count("*not supplied*") >= 5, "every destination field, not just some"
