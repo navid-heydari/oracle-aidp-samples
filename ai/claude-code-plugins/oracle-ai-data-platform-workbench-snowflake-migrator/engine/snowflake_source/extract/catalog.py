@@ -105,7 +105,8 @@ def build_inventory(run_sql: Callable[..., list[dict]],
                     databases: list[str] | None = None, *,
                     row_counts: str = "metadata",
                     semi_structured: str = "block",
-                    geospatial: str = "block") -> dict:
+                    geospatial: str = "block",
+                    timestamp_ntz: str = "preserve") -> dict:
     if row_counts not in ROW_COUNT_MODES:
         raise ValueError(
             f"unknown row_counts mode {row_counts!r}; expected one of "
@@ -146,7 +147,8 @@ def build_inventory(run_sql: Callable[..., list[dict]],
                                 columns.get(obj["name"], []),
                                 row_counts=row_counts, notes=notes,
                                 semi_structured=semi_structured,
-                                geospatial=geospatial))
+                                geospatial=geospatial,
+                                timestamp_ntz=timestamp_ntz))
 
     collisions = detect_collisions([r["source_identifier"] for r in inventory])
     return {
@@ -156,6 +158,7 @@ def build_inventory(run_sql: Callable[..., list[dict]],
         "row_count_mode": row_counts,
         "semi_structured_mode": semi_structured,
         "geospatial_mode": geospatial,
+        "timestamp_ntz_mode": timestamp_ntz,
         "object_count": len(inventory),
         "counts_by_type": dict(collections.Counter(r["object_type"] for r in inventory)),
         "identifier_case_collisions": collisions,
@@ -220,7 +223,8 @@ def _row_count(run_sql, db: str, schema: str, name: str, kind: str, *,
 
 def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
             columns: list[dict], *, row_counts: str, notes: list[str],
-            semi_structured: str = "block", geospatial: str = "block") -> dict:
+            semi_structured: str = "block", geospatial: str = "block",
+            timestamp_ntz: str = "preserve") -> dict:
     name = obj["name"]
     blocked_reasons: list[str] = []
     warnings: list[str] = []
@@ -233,7 +237,8 @@ def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
                      scale=c.get("NUMERIC_SCALE"),
                      char_length=c.get("CHARACTER_MAXIMUM_LENGTH"),
                      semi_structured=semi_structured,
-                     geospatial=geospatial)
+                     geospatial=geospatial,
+                     timestamp_ntz=timestamp_ntz)
         if m.blocked:
             blocked_reasons.append(f'{c["COLUMN_NAME"]}: {m.reason}')
         if m.warning:

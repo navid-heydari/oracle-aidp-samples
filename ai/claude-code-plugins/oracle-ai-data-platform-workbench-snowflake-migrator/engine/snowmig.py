@@ -37,8 +37,10 @@ from plan.data_movement import OPTIONS as DATA_OPTIONS
 from plan.data_movement import options_for, record_choice
 from plan.smoke import run_smoke
 from target.notebook import build_notebook, notebook_workspace_path
+from report.stages import build_stage_board
 from report.render import (
     render_census, render_maintenance, render_preflight,
+    render_stages,
     render_security,
     render_compute, render_ddl_plan, render_inventory, render_planned_objects,
     render_data_options, render_smoke, render_soft_clone_summary,
@@ -54,7 +56,7 @@ from snowflake_source.extract.maintenance import build_maintenance
 from snowflake_source.extract.census import build_census
 from snowflake_source.extract.security import build_security
 from snowflake_source.dialect.types import (
-    GEOSPATIAL_MODES, SEMI_STRUCTURED_MODES)
+    GEOSPATIAL_MODES, SEMI_STRUCTURED_MODES, TIMESTAMP_NTZ_MODES)
 from snowflake_source.extract.dependencies import extract_dependencies
 from snowflake_source.extract.warehouses import extract_warehouses
 from sizing.warehouse_map import propose_all
@@ -107,7 +109,8 @@ def _assess_inventory(args) -> dict:
         run_sql, args.database or None,
         row_counts=getattr(args, "row_counts", "metadata"),
         semi_structured=getattr(args, "semi_structured", "block"),
-        geospatial=getattr(args, "geospatial", "block"))
+        geospatial=getattr(args, "geospatial", "block"),
+        timestamp_ntz=getattr(args, "timestamp_ntz", "preserve"))
     # The census runs in the same pass so the coverage caveat cannot go
     # missing: "N of N objects can move" is only honest next to a statement of
     # what was examined.
@@ -116,6 +119,16 @@ def _assess_inventory(args) -> dict:
             run_sql, inv["databases_in_scope"],
             include_definitions=getattr(args, "capture_definitions", False))
     return inv
+
+
+def cmd_stages(args) -> int:
+    """The stage board. Reads artifacts only; touches no environment."""
+    out = pathlib.Path(args.out_dir)
+    board = build_stage_board(out)
+    _write(out, "STAGES.md", render_stages(board))
+    for line in render_stages(board).splitlines():
+        print(f"  {line}" if line else "")
+    return 0
 
 
 def cmd_assess(args) -> int:
@@ -318,9 +331,8 @@ def cmd_deploy(args) -> int:
         # structure-only clone needs no Spark cluster anyway.
         call = (make_call(target, backend=args.backend or detect_backend())
                 if args.execute else None)
-        result = deploy_catalog(
-            ddl_plan, target=target, execute=args.execute, call=call,
-            timestamp_ntz_as_timestamp=(args.timestamp_ntz == "timestamp"))
+        result = deploy_catalog(ddl_plan, target=target,
+                                execute=args.execute, call=call)
     else:
         run_sql = (make_aidp_run_sql(target, backend=args.backend or detect_backend())
                    if args.execute else None)
@@ -526,6 +538,10 @@ def build_parser() -> argparse.ArgumentParser:
                                  parents=[common])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    st = sub.add_parser("stages", parents=[common],
+                       help="what runs, what has run, what it found (offline)")
+    st.set_defaults(func=cmd_stages)
+
     a = sub.add_parser("assess", parents=[common],
                        help="read-only estate inventory")
     _add_snowflake_args(a)
@@ -541,6 +557,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="block (default): VARIANT/OBJECT/ARRAY block their table "
                         "pending a typed design. string: carry the JSON as text, "
                         "with a warning on every affected column")
+    a.add_argument("--timestamp-ntz", choices=list(TIMESTAMP_NTZ_MODES),
+                   default="preserve",
+                   help="preserve (default): Snowflake TIMESTAMP_NTZ becomes "
+                        "Spark TIMESTAMP_NTZ, keeping timezone-naive "
+                        "semantics. timestamp: downgrade it -- REQUIRED for the "
+                        "AIDP catalog API, which cannot express "
+                        "timestamp_ntz, and it changes timezone semantics")
     a.add_argument("--no-census", action="store_true",
                    help="skip the census of procedures, UDFs, tasks, streams, "
                         "stages, pipes, sequences and file formats. The "
@@ -597,14 +620,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     dep = sub.add_parser("deploy", parents=[common], help="dry-run by default")
     dep.add_argument("--execute", action="store_true")
-    dep.add_argument("--timestamp-ntz", choices=["block", "timestamp"],
-                     default="block",
-                     help="the catalog API accepts `timestamp` but NOT "
-                          "`timestamp_ntz` -- a POST carrying it returns 202 "
-                          "and then fails silently. block (default): refuse "
-                          "the object and say why. timestamp: downgrade it, "
-                          "accepting that Spark timestamp is "
-                          "session-timezone-dependent")
     dep.add_argument("--transport", choices=["catalog_api", "sql"],
                      default="catalog_api",
                      help="catalog_api (default): create schemas/tables/views "

@@ -23,9 +23,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-__all__ = ["TypeMapping", "map_type", "SEMI_STRUCTURED_MODES", "GEOSPATIAL_MODES"]
+__all__ = ["TypeMapping", "map_type", "SEMI_STRUCTURED_MODES",
+           "GEOSPATIAL_MODES", "TIMESTAMP_NTZ_MODES"]
 
 SEMI_STRUCTURED_MODES = ("block", "string")
+# TIMESTAMP_NTZ is preserved by default because bare TIMESTAMP is
+# session-timezone-dependent and the wrong choice shifts every timestamp. The
+# AIDP catalog API cannot express timestamp_ntz, so a target may require the
+# downgrade -- but that is a decision the TRANSLATOR records, with a warning,
+# rather than something a transport does silently.
+TIMESTAMP_NTZ_MODES = ("preserve", "timestamp")
 GEOSPATIAL_MODES = ("block", "string")
 
 
@@ -82,11 +89,16 @@ _INTEGER_ALIASES = {"INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "BYTEINT"
 def map_type(data_type: str, *, precision: int | None = None,
              scale: int | None = None, char_length: int | None = None,
              semi_structured: str = "block",
-             geospatial: str = "block") -> TypeMapping:
+             geospatial: str = "block",
+             timestamp_ntz: str = "preserve") -> TypeMapping:
     if semi_structured not in SEMI_STRUCTURED_MODES:
         raise ValueError(
             f"unknown semi_structured mode {semi_structured!r}; expected one of "
             f"{list(SEMI_STRUCTURED_MODES)}")
+    if timestamp_ntz not in TIMESTAMP_NTZ_MODES:
+        raise ValueError(
+            f"unknown timestamp_ntz mode {timestamp_ntz!r}; expected one of "
+            f"{list(TIMESTAMP_NTZ_MODES)}")
     if geospatial not in GEOSPATIAL_MODES:
         raise ValueError(
             f"unknown geospatial mode {geospatial!r}; expected one of "
@@ -122,7 +134,15 @@ def map_type(data_type: str, *, precision: int | None = None,
         return TypeMapping(resolved, note=note)
 
     if key == "TIMESTAMP_NTZ":
-        return TypeMapping("TIMESTAMP_NTZ")
+        if timestamp_ntz == "preserve":
+            return TypeMapping("TIMESTAMP_NTZ")
+        return TypeMapping(
+            "TIMESTAMP",
+            warning="TIMESTAMP_NTZ -> TIMESTAMP: the AIDP catalog cannot "
+                    "express timestamp_ntz, so the timezone-naive type is "
+                    "downgraded. TIMEZONE SEMANTICS DIFFER -- Spark TIMESTAMP "
+                    "is session-timezone-dependent, so the same value can read "
+                    "back differently depending on the session timezone")
     if key in ("TIMESTAMP_LTZ", "TIMESTAMP_TZ", "TIMESTAMP"):
         return TypeMapping(
             "TIMESTAMP",

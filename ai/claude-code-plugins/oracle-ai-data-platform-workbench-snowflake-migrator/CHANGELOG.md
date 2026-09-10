@@ -8,6 +8,41 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [0.12.0] — 2026-09-10
+
+### Added
+
+- **`snowmig stages`** and the `snowflake-stage-board` skill — the pipeline as
+  a table: which stages run, what each needs, which have run, and what each
+  one found, with `deploy` marked as the only stage that writes. Offline and
+  read-only, so it is safe to run before anything else. A stage that **could
+  not look is flagged, never shown as clean** — "0 exposures" and "policy
+  attachments unreadable" are opposite findings.
+  - `DONE` means the stage ran, not that the result was good: a `deploy` row
+    can read `DONE ⚠️ verified 0/7`, and the skill says to report that plainly
+    rather than as a completed migration.
+
+### Changed
+
+- **The `TIMESTAMP_NTZ` decision moved into the translator**, where type
+  decisions belong. It was briefly handled in the catalog transport, which was
+  the wrong place: the translator owns what a Snowflake type becomes and the
+  transport should only refuse what it genuinely cannot express. The flag is
+  now `assess --timestamp-ntz {preserve,timestamp}`, so the **plan shows the
+  type that will really be created** instead of one the transport silently
+  rejects later. The transport keeps its refusal as defence in depth, and its
+  message now points at the upstream fix.
+
+### Learned
+
+- **The async catalog API offers no waiter.** A `POST` returns 202 Accepted
+  with an empty body and **no `opc-work-request-id`** — only an
+  `opc-request-id` — so there is no work request to poll and no CLI
+  `--wait-for-state` to lean on. `oci raw-request` has no waiter either, and
+  the `aidp` name on PyPI is an unrelated 0.0.1 placeholder, not Oracle's CLI.
+  Poll-and-verify is therefore not a workaround; it is the only sound method
+  available, which is worth knowing before anyone tries to replace it.
+
 ## [0.11.0] — 2026-09-10
 
 **First live migration against a real AIDP DataLake.** Five undocumented
