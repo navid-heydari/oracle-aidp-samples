@@ -266,3 +266,28 @@ def test_data_options_choice_requires_a_rationale(tmp_path, capsys):
                "--choose", "A1_UNLOAD_OBJECT_STORAGE"])
     assert rc == 1
     assert "rationale" in capsys.readouterr().err
+
+
+def test_plan_always_reports_the_architecture_state(tmp_path, capsys):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    assert "architecture: UNDECIDED" in capsys.readouterr().out
+    md = (tmp_path / "PLANNED_OBJECTS.md").read_text()
+    assert "Data-movement architecture" in md
+    assert "A1_UNLOAD_OBJECT_STORAGE" in md and "A5_HYBRID_WAVES" in md
+
+
+def test_plan_picks_up_a_recorded_architecture_choice(tmp_path, capsys):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["data-options", "--out-dir", str(tmp_path),
+          "--choose", "A2_FEDERATE_EXTERNAL_CATALOG",
+          "--chosen-by", "navid", "--rationale", "federate first"])
+    main(["plan", "--out-dir", str(tmp_path)])
+    assert "architecture: A2_FEDERATE_EXTERNAL_CATALOG" in capsys.readouterr().out
+    plan = json.loads((tmp_path / "plan.json").read_text())
+    assert plan["architecture_choice"]["option_id"] == "A2_FEDERATE_EXTERNAL_CATALOG"
+    md = (tmp_path / "PLANNED_OBJECTS.md").read_text()
+    assert "federate first" in md
+    assert "✅" in md, "the chosen option is marked in the table"

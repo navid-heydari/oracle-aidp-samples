@@ -5,11 +5,13 @@ anything that halted or was skipped rather than burying it.
 """
 from __future__ import annotations
 
+from plan.data_movement import architecture_decision
 from plan.status import assess_risk, migration_status
 
 __all__ = ["render_inventory", "render_ddl_plan", "render_planned_objects",
            "render_soft_clone_summary", "render_compute", "render_summary",
-           "render_smoke", "render_data_options"]
+           "render_smoke", "render_data_options",
+           "architecture_section"]
 
 
 def _bytes(n) -> str:
@@ -174,6 +176,8 @@ def render_planned_objects(plan: dict) -> str:
         out += [f'| `{j["name"]}` | {j["layer"]} | `{j["reads_from"]}` '
                 f'| {j["enabled"]} | {j["body_status"]} |' for j in jobs]
         out.append("")
+
+    out += architecture_section(plan)
 
     if plan.get("dependency_source"):
         out += [f'---', "",
@@ -371,6 +375,8 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
         out += ["Last run was a **dry run** — nothing was created.", ""]
     else:
         out += ["No deployment has been attempted yet.", ""]
+
+    out += architecture_section(plan)
     return "\n".join(out).rstrip() + "\n"
 
 
@@ -442,3 +448,44 @@ def render_data_options(options: list[dict]) -> str:
             "whether `NUMBER(p,s)` survives an unload round trip with exact "
             "precision, which has never been measured.", ""]
     return "\n".join(out).rstrip() + "\n"
+
+
+def architecture_section(plan: dict) -> list[str]:
+    """The data-movement architecture options. ALWAYS included, never optional.
+
+    Rendered into every report that describes a migration, whether or not a
+    choice has been made and whether or not a destination was supplied. A user
+    who gave no instruction still has to be shown what the choices are; a user
+    who chose still benefits from seeing what they chose against.
+    """
+    decision = architecture_decision(plan.get("architecture_choice"))
+    out = ["## Data-movement architecture", "",
+           "**This plugin moves no bytes.** None of the paths below is "
+           "implemented; they are the ways data could move in a later phase.", "",
+           decision["statement"], ""]
+
+    if decision["decided"]:
+        chosen = decision["chosen"]
+        executed = ("yes" if chosen["executed"]
+                    else "no — this plugin executes nothing")
+        out += [f'- Chosen: **{chosen["id"]}** — {chosen["name"]}',
+                f'- By: {chosen["chosen_by"]}',
+                f'- Because: {chosen["rationale"]}',
+                f'- Executed: **{executed}**', ""]
+        if decision["unknowns_outstanding"]:
+            out += ["Outstanding unknowns for that choice:", ""]
+            out += [f"- {u}" for u in decision["unknowns_outstanding"]] + [""]
+
+    out += ["| Option | Catalog | Moves bytes | Handles |",
+            "|---|---|---|---|"]
+    for o in decision["options"]:
+        marker = " ✅" if (decision["decided"]
+                          and o["id"] == decision["chosen"]["id"]) else ""
+        out.append(f'| **{o["id"]}**{marker} — {o["name"]} | {o["catalog_type"]} '
+                   f'| {"yes" if o["moves_bytes"] else "no"} '
+                   f'| {", ".join(o["handles"])} |')
+    out += ["",
+            "Full trade-offs, open unknowns and what each option would take to "
+            "build: `references/data-movement-options.md`, or run "
+            "`snowmig data-options`.", ""]
+    return out
