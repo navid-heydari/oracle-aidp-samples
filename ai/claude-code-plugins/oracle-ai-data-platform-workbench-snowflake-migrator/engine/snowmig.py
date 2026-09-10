@@ -37,7 +37,7 @@ from plan.data_movement import options_for, record_choice
 from plan.smoke import run_smoke
 from target.notebook import build_notebook, notebook_workspace_path
 from report.render import (
-    render_maintenance,
+    render_census, render_maintenance, render_security,
     render_compute, render_ddl_plan, render_inventory, render_planned_objects,
     render_data_options, render_smoke, render_soft_clone_summary,
     render_summary,
@@ -49,6 +49,8 @@ from snowflake_source.conn import (
 from snowflake_source.extract.catalog import (
     ROW_COUNT_MODES, build_inventory)
 from snowflake_source.extract.maintenance import build_maintenance
+from snowflake_source.extract.census import build_census
+from snowflake_source.extract.security import build_security
 from snowflake_source.dialect.types import (
     GEOSPATIAL_MODES, SEMI_STRUCTURED_MODES)
 from snowflake_source.extract.dependencies import extract_dependencies
@@ -96,11 +98,20 @@ def _run_sql_from_args(args):
 
 def _assess_inventory(args) -> dict:
     """Seam for tests: patched to avoid a live connection."""
-    return build_inventory(
-        _run_sql_from_args(args), args.database or None,
+    run_sql = _run_sql_from_args(args)
+    inv = build_inventory(
+        run_sql, args.database or None,
         row_counts=getattr(args, "row_counts", "metadata"),
         semi_structured=getattr(args, "semi_structured", "block"),
         geospatial=getattr(args, "geospatial", "block"))
+    # The census runs in the same pass so the coverage caveat cannot go
+    # missing: "N of N objects can move" is only honest next to a statement of
+    # what was examined.
+    if not getattr(args, "no_census", False):
+        inv["census"] = build_census(
+            run_sql, inv["databases_in_scope"],
+            include_definitions=getattr(args, "capture_definitions", False))
+    return inv
 
 
 def cmd_assess(args) -> int:
@@ -108,6 +119,14 @@ def cmd_assess(args) -> int:
     inv = _assess_inventory(args)
     _write(out, "inventory.json", inv)
     _write(out, "INVENTORY.md", render_inventory(inv))
+    if inv.get("census"):
+        _write(out, "CENSUS.md", render_census(inv["census"]))
+        c = inv["census"]
+        print(f'  census: {c["total"]} object(s) that are not tables or views '
+              f'and cannot migrate')
+        if c["unreadable"]:
+            print(f'  census: {len(c["unreadable"])} kind(s) unreadable — the '
+                  f'count is a floor', file=sys.stderr)
     if inv.get("identifier_case_collisions"):
         print("HALT: identifier-case collisions; see INVENTORY.md", file=sys.stderr)
         return HALT
@@ -141,6 +160,27 @@ def cmd_maintenance(args) -> int:
     return 0
 
 
+def cmd_security(args) -> int:
+    """What protects the data today, and what arrives without it."""
+    out = pathlib.Path(args.out_dir)
+    inv = _read(out, "inventory.json")
+    sec = build_security(_run_sql_from_args(args), inv,
+                         include_grants=not args.no_grants)
+    _write(out, "security.json", sec)
+    _write(out, "SECURITY.md", render_security(sec))
+    count = sec["exposure_count"]
+    if count is None:
+        print("  policy attachments UNREADABLE - exposure is UNKNOWN, not zero",
+              file=sys.stderr)
+        return 0
+    extra = len(sec["secure_views"])
+    print(f'  {count} policy exposure(s), {extra} secure view(s) losing SECURE')
+    if count or extra:
+        print("  these objects are created WITHOUT their protection - see "
+              "SECURITY.md", file=sys.stderr)
+    return 0
+
+
 def cmd_plan(args) -> int:
     out = pathlib.Path(args.out_dir)
     inv = _read(out, "inventory.json")
@@ -158,6 +198,9 @@ def cmd_plan(args) -> int:
     except TargetCollision as exc:
         print(f"HALT: {exc}", file=sys.stderr)
         return HALT
+    # Carried so the coverage caveat travels with the count it qualifies.
+    if inv.get("census"):
+        built["census"] = inv["census"]
     _write(out, "plan.json", built)
     _write(out, "PLANNED_OBJECTS.md", render_planned_objects(built))
     s = built["summary"]
@@ -452,6 +495,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="block (default): VARIANT/OBJECT/ARRAY block their table "
                         "pending a typed design. string: carry the JSON as text, "
                         "with a warning on every affected column")
+    a.add_argument("--no-census", action="store_true",
+                   help="skip the census of procedures, UDFs, tasks, streams, "
+                        "stages, pipes, sequences and file formats. The "
+                        "coverage claim then says the estate was not examined")
+    a.add_argument("--capture-definitions", action="store_true",
+                   help="also capture procedure/UDF bodies into the census "
+                        "artifact (they may contain literals)")
     a.add_argument("--geospatial", choices=list(GEOSPATIAL_MODES),
                    default="block",
                    help="block (default): GEOGRAPHY/GEOMETRY block their table. "
@@ -473,6 +523,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "of round trips on a real estate; off by default, "
                          "where the level is inferred from effective values")
     mt.set_defaults(func=cmd_maintenance)
+
+    se = sub.add_parser("security", parents=[common],
+                        help="masking/row-access policies, secure views, grants")
+    _add_snowflake_args(se)
+    se.add_argument("--no-grants", action="store_true",
+                    help="skip the grant summary (needs ACCOUNT_USAGE)")
+    se.set_defaults(func=cmd_security)
 
     p = sub.add_parser("plan", parents=[common], help="waves + medallion layout (offline)")
     p.add_argument("--restrictions",

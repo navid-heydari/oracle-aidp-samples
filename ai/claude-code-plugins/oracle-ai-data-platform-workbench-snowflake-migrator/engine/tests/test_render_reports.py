@@ -1,6 +1,7 @@
 """The two headline reports: what is planned to move, and what got created."""
+from snowflake_source.extract.census import KINDS
 from report.render import (
-    render_ddl_plan, render_maintenance,
+    render_census, render_ddl_plan, render_maintenance,
     render_compute, render_planned_objects, render_soft_clone_summary,
 )
 
@@ -298,3 +299,62 @@ def test_a_clean_estate_says_so_rather_than_rendering_an_empty_table():
         clustered=False, cluster_by="", automatic_clustering=False,
         retention_set_at="inherited", signals=[])], objects_with_signals=0))
     assert "no maintenance" in md.lower() or "nothing" in md.lower()
+
+
+# --------------------------------------------------------------------------
+# The census scope statement must reach the reports that state coverage.
+# "7 of 7 objects can move" was true of what was looked at.
+# --------------------------------------------------------------------------
+
+_CENSUS = {
+    "total": 3, "by_kind": {"PROCEDURE": 2, "TASK": 1},
+    "by_language": {"SQL": 1, "JAVASCRIPT": 1}, "by_effort": {"HIGH": 1},
+    "kinds": {"PROCEDURE": {"count": 2, "readable": True, "note": "2 found"},
+              "TASK": {"count": 1, "readable": True, "note": "1 found"}},
+    "objects": [
+        {"kind": "PROCEDURE", "source_identifier": "DB.SC.SP_LOAD",
+         "detail": "(A VARCHAR)", "migratable": False, "reason": "code",
+         "language": "JAVASCRIPT", "effort": "HIGH", "aidp_path": "rewrite"},
+        {"kind": "TASK", "source_identifier": "DB.SC.T_NIGHTLY",
+         "detail": "state=started", "migratable": False,
+         # The real reason from KINDS, so this tests the shipped text.
+         "reason": next(k["reason"] for k in KINDS if k["kind"] == "TASK"),
+         "language": None, "effort": None, "aidp_path": None}],
+    "unreadable": [],
+    "scope_statement": "**3 object(s) in this estate cannot be migrated by "
+                       "this plugin**: 2 procedure(s), 1 task(s).",
+}
+
+
+def test_planned_objects_carries_the_scope_statement():
+    plan = dict(PLAN)
+    plan["census"] = _CENSUS
+    md = render_planned_objects(plan)
+    assert "cannot be migrated by this plugin" in md
+    assert "procedure(s)" in md
+
+
+def test_planned_objects_without_a_census_says_scope_was_not_examined():
+    # Silence is the bug being fixed: if the census did not run, the coverage
+    # claim must not read as if the whole estate was examined.
+    md = render_planned_objects(dict(PLAN))
+    assert "tables and views" in md.lower()
+
+
+def test_the_census_report_lists_objects_with_their_effort():
+    md = render_census(_CENSUS)
+    assert "DB.SC.SP_LOAD" in md
+    assert "JAVASCRIPT" in md
+    assert "HIGH" in md
+    assert "DB.SC.T_NIGHTLY" in md
+
+
+def test_the_census_report_says_nothing_is_migratable():
+    md = render_census(_CENSUS).lower()
+    assert "cannot" in md or "not migrat" in md
+    assert "no equivalent is generated" in md or "generates no" in md
+
+
+def test_a_task_gets_the_cutover_warning():
+    md = render_census(_CENSUS)
+    assert "stops being populated" in md or "stops being" in md

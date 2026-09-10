@@ -248,3 +248,55 @@ def test_semi_structured_switch_against_real_variant_columns(tmp_path):
                     f'{col["COLUMN_NAME"]} carried as text with no warning'
     finally:
         cx.close()
+
+
+def test_census_and_security_stages_run_live(tmp_path):
+    """Both new stages, end to end against the real account.
+
+    Neither may fabricate a clean bill of health: the census reports what it
+    could not read, and security reports UNKNOWN rather than zero when
+    ACCOUNT_USAGE is denied.
+    """
+    out = tmp_path / "live"
+    assert main(["assess", "--out-dir", str(out), "--database", DB]
+                + auth_args()) == 0
+
+    inv = json.loads((out / "inventory.json").read_text())
+    census = inv.get("census")
+    assert census is not None, "the census must run inside assess by default"
+    # Every declared kind is accounted for, readable or explicitly not.
+    for kind, info in census["kinds"].items():
+        assert info["readable"] or info["count"] is None, \
+            f"{kind}: an unreadable kind must not report a count"
+    assert census["scope_statement"]
+    assert (out / "CENSUS.md").exists()
+    # Nothing in the census is ever migratable.
+    for obj in census["objects"]:
+        assert obj["migratable"] is False
+
+    assert main(["security", "--out-dir", str(out)] + auth_args()) == 0
+    sec = json.loads((out / "security.json").read_text())
+    assert (out / "SECURITY.md").exists()
+    if sec["exposure_count"] is None:
+        assert "could not" in sec["statement"].lower()
+    else:
+        for e in sec["exposures"]:
+            assert e["severity"] == "HIGH"
+            assert e["consequence"]
+    # Grants are reported, never replayed.
+    assert sec["grants"].get("carried_over") in (False, None)
+
+
+def test_maintenance_stage_runs_live(tmp_path):
+    out = tmp_path / "live"
+    assert main(["assess", "--out-dir", str(out), "--database", DB]
+                + auth_args()) == 0
+    assert main(["maintenance", "--out-dir", str(out)] + auth_args()) == 0
+    maint = json.loads((out / "maintenance.json").read_text())
+    assert (out / "MAINTENANCE.md").exists()
+    # Reports, never proposes.
+    assert "RETAIN" not in json.dumps(maint).upper()
+    for t in maint["tables"]:
+        rec = t["reclustering"]
+        if not rec["measured"]:
+            assert rec["credits"] is None, "unmeasured must not read as zero"

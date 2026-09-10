@@ -8,7 +8,9 @@ from __future__ import annotations
 from plan.data_movement import MAINTENANCE_TRAPS, architecture_decision
 from plan.status import assess_risk, migration_status
 
-__all__ = ["render_inventory", "render_ddl_plan", "render_planned_objects",
+__all__ = ["render_census", "census_scope", "render_maintenance",
+           "render_security",
+           "render_inventory", "render_ddl_plan", "render_planned_objects",
            "render_soft_clone_summary", "render_compute", "render_summary",
            "render_smoke", "render_data_options",
            "architecture_section"]
@@ -139,7 +141,10 @@ def render_planned_objects(plan: dict) -> str:
            f'{s.get("objects_inventoried", 0)} inventoried objects — '
            f'{s.get("tables", 0)} table(s), {s.get("views", 0)} view(s). '
            f'**{s.get("cannot_migrate", 0)}** cannot move.', "",
-           f'Bronze mapping: {plan.get("bronze_mapping")}.', ""]
+           f'Bronze mapping: {plan.get("bronze_mapping")}.', "",
+           # Coverage caveat, never silent: the count above is of what was
+           # EXAMINED, and absence of a census is exactly the bug being fixed.
+           census_scope(plan), ""]
 
     if plan.get("restrictions_applied"):
         out += ["## Restrictions in force", "",
@@ -752,4 +757,193 @@ def render_maintenance(maint: dict) -> str:
             f'History window: {maint.get("history_days")} day(s). '
             f'Per-table parameter probing: {probing}.',
             "", "Planned work to close this gap: `ACTION-ITEMS.md` (M3–M8)."]
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# The census: everything that is NOT a table or a view.
+#
+# `assess` looked at tables and views only, so "7 of 7 objects can move" was
+# true of what had been examined and overstated coverage of the estate. The
+# scope statement below is carried into every report that states coverage.
+# ---------------------------------------------------------------------------
+
+_NO_CENSUS_SCOPE = (
+    "**Scope: tables and views only.** No census of the rest of the estate was "
+    "run, so this count is not the size of the estate — procedures, UDFs, "
+    "tasks, streams, materialized and dynamic tables, stages, pipes, sequences "
+    "and file formats were not examined. Run `assess` with the census enabled "
+    "to find out what else is there."
+)
+
+
+def census_scope(plan_or_inventory: dict) -> str:
+    """The one-line coverage caveat. Never silent: absence is the bug."""
+    census = (plan_or_inventory or {}).get("census")
+    if not census:
+        return _NO_CENSUS_SCOPE
+    return census.get("scope_statement") or _NO_CENSUS_SCOPE
+
+
+def render_census(census: dict) -> str:
+    objects = census.get("objects") or []
+    kinds = census.get("kinds") or {}
+
+    out = ["# Estate census — what is not a table or a view", "",
+           census.get("scope_statement", ""), "",
+           "**Nothing here is migrated by this plugin, and no equivalent is "
+           "generated.** These are code, schedulers and storage definitions "
+           "rather than structure. Each entry names the AIDP capability that "
+           "would carry the workload — a pointer, not a promise: a "
+           "plausible-but-wrong procedure translation is worse than an honest "
+           "gap.", ""]
+
+    if kinds:
+        out += ["## Counts by kind", "", "| Kind | Count | Read |", "|---|---:|---|"]
+        for kind, info in sorted(kinds.items()):
+            count = info.get("count")
+            out.append(f'| {kind.replace("_", " ").title()} | '
+                       f'{count if count is not None else "*not measured*"} | '
+                       f'{"yes" if info.get("readable") else "**denied**"} |')
+        out.append("")
+
+    by_effort = census.get("by_effort") or {}
+    if by_effort:
+        out += ["## Rewrite effort, by triage band", "",
+                " · ".join(f"**{k}** {v}" for k, v in sorted(by_effort.items())),
+                "", "A band, not an estimate: it says which pile an object "
+                "belongs in.", ""]
+
+    by_lang = census.get("by_language") or {}
+    if by_lang:
+        out += ["Handler languages: "
+                + " · ".join(f"**{k}** {v}" for k, v in sorted(by_lang.items())),
+                ""]
+
+    if objects:
+        out += ["## Every object, and what it would take", "",
+                "| Object | Kind | Detail | Language | Effort |",
+                "|---|---|---|---|---|"]
+        for o in sorted(objects, key=lambda x: (x["kind"], x["source_identifier"])):
+            out.append(f'| `{o["source_identifier"]}` | {o["kind"]} | '
+                       f'{o.get("detail") or "—"} | {o.get("language") or "—"} | '
+                       f'{o.get("effort") or "—"} |')
+        out.append("")
+
+        out += ["## Why each kind cannot move, and where it would go", ""]
+        seen: set[str] = set()
+        for o in objects:
+            if o["kind"] in seen:
+                continue
+            seen.add(o["kind"])
+            out += [f'**{o["kind"]}** — {o["reason"]}', ""]
+            if o.get("aidp_path"):
+                out += [f'AIDP path: {o["aidp_path"]}', ""]
+
+    if census.get("unreadable"):
+        out += ["## Could not be read", "",
+                "These counts are a floor, not a total.", ""]
+        out += [f"- {n}" for n in census["unreadable"]] + [""]
+
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Security posture. The only report here with an exposure consequence, so it
+# leads with the finding rather than with the inventory.
+# ---------------------------------------------------------------------------
+
+def render_security(sec: dict) -> str:
+    count = sec.get("exposure_count")
+    exposures = sec.get("exposures") or []
+    secure_views = sec.get("secure_views") or []
+
+    out = ["# Security posture — what protects the data, and what arrives "
+           "without it", "", sec["statement"], ""]
+
+    if count is None:
+        out += ["> The check that matters could not run. Everything below is "
+                "partial, and **absence of a finding here is not evidence of "
+                "absence**.", ""]
+    elif count or secure_views:
+        out += ["**This is a data-exposure regression, not a feature gap.** "
+                "The objects below are created on AIDP either way — the clone "
+                "does not fail, it succeeds without the protection. Anyone who "
+                "can read the target table sees what Snowflake was hiding.", ""]
+
+    if exposures:
+        out += ["## Policies that do not travel", "",
+                "| Object | Column | Policy | Kind | Severity |",
+                "|---|---|---|---|---|"]
+        for e in exposures:
+            out.append(f'| `{e["object"]}` | '
+                       f'{("`" + e["column"] + "`") if e.get("column") else "*whole table*"} | '
+                       f'`{e["policy"]}` | {e["policy_kind"]} | **{e["severity"]}** |')
+        out.append("")
+        seen: set[str] = set()
+        for e in exposures:
+            if e["policy_kind"] in seen:
+                continue
+            seen.add(e["policy_kind"])
+            out += [f'**{e["policy_kind"]}** — {e["consequence"]}', "",
+                    e["aidp_path"], ""]
+
+    if secure_views:
+        out += ["## Secure views", "",
+                "| View | Severity |", "|---|---|"]
+        out += [f'| `{v["object"]}` | **{v["severity"]}** |' for v in secure_views]
+        out += ["", secure_views[0]["consequence"], "",
+                secure_views[0]["aidp_path"], ""]
+
+    pol = sec.get("policies") or {}
+    if pol:
+        out += ["## Policy objects defined in the source", "",
+                "Defined is not the same as attached — an unattached policy "
+                "protects nothing, and an attached one is listed above.", "",
+                "| Kind | Count | Read |", "|---|---:|---|"]
+        for label, key in (("Masking", "masking"),
+                           ("Row access", "row_access"), ("Tags", "tags")):
+            info = pol.get(key) or {}
+            c = info.get("count")
+            out.append(f'| {label} | {c if c is not None else "*not measured*"} '
+                       f'| {"yes" if info.get("readable") else "**denied**"} |')
+        out.append("")
+
+    grants = sec.get("grants") or {}
+    if grants.get("measured"):
+        by_obj = grants.get("by_object") or {}
+        out += ["## Who can read what today", "",
+                f"{len(by_obj)} in-scope object(s) carry explicit grants. "
+                "**No grant is replayed on the target** — AIDP roles and "
+                "per-resource permissions are a separate model, so access has "
+                "to be re-granted deliberately rather than copied.", ""]
+        if by_obj:
+            out += ["| Object | Roles |", "|---|---|"]
+            for ident, entries in sorted(by_obj.items()):
+                roles = sorted({e["role"] for e in entries})
+                shown = ", ".join(f"`{r}`" for r in roles[:6])
+                if len(roles) > 6:
+                    shown += f" …and {len(roles) - 6} more"
+                out.append(f"| `{ident}` | {shown} |")
+            out.append("")
+    else:
+        out += ["## Who can read what today", "",
+                f'**Not measured** — {grants.get("note", "unknown")}. So the '
+                "target cannot be checked against the source's access model.",
+                ""]
+
+    if sec.get("policy_references_out_of_scope"):
+        out += [f'{sec["policy_references_out_of_scope"]} policy attachment(s) '
+                "exist on objects outside this migration. Context only — not a "
+                "regression this migration causes.", ""]
+
+    if sec.get("unreadable"):
+        out += ["## Could not be read", ""]
+        out += [f"- {n}" for n in sec["unreadable"]] + [""]
+
+    out += ["---", "",
+           "This plugin **changes nothing** here and generates no equivalent. "
+           "AIDP has no masking API; the equivalent is a restricted view plus "
+           "ontology sensitivity classification granted per role, which is a "
+           "design decision rather than a translation."]
     return "\n".join(out) + "\n"

@@ -176,6 +176,40 @@ affected column. `--geospatial string` does the same for `GEOGRAPHY` and
 Neither hatch solves the problem — both defer it. As text, nothing on the target
 can address a field inside the value.
 
+## What is not a table or a view
+
+`assess` also censuses procedures, UDFs, tasks, streams, materialized and
+dynamic tables, stages, pipes, sequences and file formats → `CENSUS.md`.
+**None of them migrate**, and no equivalent is generated — a
+plausible-but-wrong procedure translation is worse than an honest gap. The
+scope statement travels into `PLANNED_OBJECTS.md` and `SUMMARY.md`, so the
+migratable count is never mistaken for the size of the estate.
+
+Procedures and UDFs are read from `INFORMATION_SCHEMA` rather than `SHOW`,
+because `SHOW PROCEDURES` returns Snowflake's built-ins (33 on an empty
+schema) and `INFORMATION_SCHEMA` does not. It also carries the handler
+language, which drives the triage band — JavaScript is HIGH, since AIDP has no
+JavaScript runtime.
+
+The most damaging entry is a **task**: if it populates a table you are
+migrating, that table stops being refreshed after cutover. The clone succeeds
+and then goes stale.
+
+## Security posture — the one with an exposure consequence
+
+`snowmig security` reports masking, row-access, aggregation and projection
+policy *attachments*, secure views, and who holds grants today →
+`SECURITY.md`.
+
+A masked column arrives **unmasked**. A row filter is simply absent. A secure
+view loses `SECURE`. The clone does not fail — it **succeeds without the
+protection**. AIDP has no masking API; the equivalent is a restricted view
+plus ontology sensitivity granted per role, which is a design decision rather
+than a translation, so this plugin reports and changes nothing.
+
+If `ACCOUNT_USAGE` cannot be read, the exposure count is `null` and the report
+says the question is **unanswered** — never "none found".
+
 ## Table maintenance — a difference worth reading before you migrate
 
 Snowflake exposes **no `OPTIMIZE` and no `VACUUM`**: it maintains layout and

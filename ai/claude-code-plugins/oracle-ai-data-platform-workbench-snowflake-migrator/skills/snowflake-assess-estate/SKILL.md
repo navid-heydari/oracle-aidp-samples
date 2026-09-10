@@ -1,6 +1,6 @@
 ---
 name: snowflake-assess-estate
-description: Read-only investigation of a Snowflake environment. Lists every table and view with row counts, compressed byte sizes, full column types including numeric precision and scale, and the identifier case form of each object, then halts if two objects differ only by case. Use when the user asks what is in a Snowflake account, wants an inventory or estate assessment, asks how big the tables are, or before planning any migration.
+description: Read-only investigation of a Snowflake environment, including the census of objects that are not tables or views, table-maintenance state, and security posture. Lists every table and view with row counts, compressed byte sizes, full column types including numeric precision and scale, and the identifier case form of each object, then halts if two objects differ only by case. Use when the user asks what is in a Snowflake account, wants an inventory or estate assessment, asks how big the tables are, or before planning any migration.
 ---
 
 # Stage 1 — assess the estate
@@ -68,3 +68,44 @@ decision.
 4. **`extraction_notes` is not decoration.** If it is non-empty, some scope
    could not be read, and absence from the inventory is not evidence the object
    does not exist. Say which scopes failed. Row-count failures land here too.
+
+## Three companion stages — run them, do not skip them
+
+```bash
+# what is NOT a table or a view. Runs inside `assess` by default -> CENSUS.md
+# (pass --no-census to skip, and the coverage claim then says so)
+
+python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py maintenance --out-dir ./snowmig_out \
+  --account <...> --user <...> --auth <...> [--key-path ...] [--history-days 30]
+
+python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py security --out-dir ./snowmig_out \
+  --account <...> --user <...> --auth <...> [--key-path ...]
+```
+
+### The census — say what was *not* examined
+
+`assess` used to look at tables and views only, so "N of N objects can move"
+was true of what had been examined and overstated the estate. `CENSUS.md` now
+counts procedures, UDFs, tasks, streams, materialized and dynamic tables,
+stages, pipes, sequences and file formats. **None of them migrate**, and no
+equivalent is generated.
+
+Two things to carry to the user:
+
+- **A task that populates a migrated table means that table stops being
+  populated after cutover.** The clone succeeds and then goes stale. This is
+  the single most damaging thing in the census.
+- Procedures and UDFs come with a **language** and an effort band. JavaScript
+  is the hardest — there is no JavaScript runtime on AIDP, so the logic has to
+  be understood and rewritten, not translated.
+
+### Security — the only stage with an exposure consequence
+
+A masked column arrives **unmasked**; a row-access policy simply is not there;
+a secure view loses SECURE. The clone does not fail — it **succeeds without
+the protection**, so anyone who can read the target sees what Snowflake was
+hiding.
+
+If `exposure_count` is `null`, `ACCOUNT_USAGE` could not be read: the answer is
+**unknown, not zero**. Say that plainly and ask for the grant. Never let a
+denied probe read as a clean bill of health.
