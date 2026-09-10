@@ -630,3 +630,20 @@ def test_a_successful_run_never_probes():
                    retry_delays=(), verify_delays=())
     assert not any(str(kw.get("table", "")).startswith("snowmig_probe_")
                    for _, kw in f.ops), "nothing failed, so nothing to diagnose"
+
+
+def test_the_diagnosis_probe_is_always_named_in_the_result():
+    """Deletes are asynchronous too, so cleanup is best-effort.
+
+    The probe object must therefore be NAMED whether or not the delete took,
+    so it is never silently abandoned in a customer's catalog.
+    """
+    call = NeverAppears(probe_works=True)
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
+                         retry_delays=(), verify_delays=())
+    assert out["diagnosis_probes"], "the probe object must be reported"
+    probe = out["diagnosis_probes"][0]
+    assert probe["name"].startswith("snowmig_probe_")
+    # The SERVER's key, which is folded -- that is the one to go look for.
+    assert probe["schema"] == "lake.db"
+    assert "deleted" in probe

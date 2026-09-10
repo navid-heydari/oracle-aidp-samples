@@ -268,6 +268,16 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
                 for m in res["mismatches"]]
         out.append("")
 
+    if res.get("diagnosis_probes"):
+        out += ["### Diagnosis probe", "",
+                "To tell a burned name from a bad request, one throwaway "
+                "object was created with a novel name in the affected schema. "
+                "Deletes are asynchronous, so cleanup is best-effort and the "
+                "name is reported either way.", ""]
+        out += [f'- `{p["schema"]}.{p["name"]}` — {p["note"]}'
+                for p in res["diagnosis_probes"]]
+        out.append("")
+
     if res.get("poisoned_names"):
         out += ["## These names are burned — retry into a FRESH schema", "",
                 "A create that failed here once is refused for ever after: "
