@@ -39,13 +39,19 @@ class Recorder:
             self.created.add(name)
             return {"key": f'{cat}.{kw.get("schema")}.{name}'}
         if operation == "list_schemas":
-            return {"items": [{"key": f"{cat}.{s}"} for s in ("DB",)]}
+            # Only reports schemas that have actually been created, so a fresh
+            # Recorder starts empty like a real catalog.
+            return {"items": [{"key": f"{cat}.{s}", "lifecycleState": "ACTIVE"}
+                              for s in ("DB",) if s in self.created]}
         if operation in ("list_tables_in", "list_views_in"):
+            # A real list entry carries no fields.
+            return {"items": [{"key": f'{kw["schema"]}.{n}'}
+                              for n in sorted(self.created)]}
+        if operation in ("get_table", "get_view"):
+            if name not in self.created:
+                raise RuntimeError("404 not found")
             fields = [{"fieldName": "A", "fieldType": "string"}]
-            return {"items": [
-                {"key": f'{kw["schema"]}.{n}', "tableFields": fields,
-                 "viewFields": fields}
-                for n in sorted(self.created)]}
+            return {"key": name, "tableFields": fields, "viewFields": fields}
         raise AssertionError(f"unexpected operation {operation}")
 
 
@@ -61,8 +67,11 @@ def test_execute_creates_the_schema_before_its_tables():
     rec = Recorder()
     deploy_catalog(_plan(2), target=TARGET, execute=True, call=rec, retry_delays=(), verify_delays=())
     kinds = [o[0] for o in rec.ops]
-    assert kinds[0] == "create_schema"
+    # It LOOKS first -- re-POSTing an existing schema drops the table creates
+    # that follow -- then creates it once if absent.
+    assert kinds[0] == "list_schemas"
     assert kinds.count("create_schema") == 1, "one schema, created once"
+    assert kinds.index("create_schema") < kinds.index("create_table")
     assert kinds.count("create_table") == 2
 
 
@@ -88,10 +97,10 @@ def test_a_structure_mismatch_on_read_back_is_not_verified():
     class Mismatch(Recorder):
         def __call__(self, operation, **kw):
             out = super().__call__(operation, **kw)
-            if operation == "list_tables_in":
-                return {"items": [{"key": f'{kw["schema"]}.T0',
-                                   "tableFields": [{"fieldName": "DIFFERENT",
-                                                    "fieldType": "string"}]}]}
+            if operation == "get_table":
+                return {"key": "T0",
+                        "tableFields": [{"fieldName": "DIFFERENT",
+                                         "fieldType": "string"}]}
             return out
 
     out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=Mismatch(), retry_delays=(), verify_delays=())
@@ -185,6 +194,13 @@ class Folding:
         if operation in ("list_tables_in", "list_views_in"):
             return {"items": [dict(v) for k, v in self.tables.items()
                               if k.startswith(kw["schema"].lower() + ".")]}
+        if operation in ("get_table", "get_view"):
+            name = kw.get("table") or kw.get("view")
+            key = f'{cat}.{kw["schema"]}.{name}'.lower()
+            full = self.tables.get(key)
+            if full is None:
+                raise RuntimeError("404 not found")
+            return dict(full)
         raise AssertionError(f"unexpected op {operation}")
 
 
@@ -240,10 +256,10 @@ def test_retries_are_bounded_and_the_failure_is_reported():
 def test_a_genuine_structure_difference_is_still_a_mismatch():
     class Wrong(Folding):
         def __call__(self, operation, **kw):
-            if operation in ("list_tables_in", "list_views_in"):
-                return {"items": [{"key": "lake.db.t0",
-                                   "tableFields": [{"fieldName": "different",
-                                                    "fieldType": "string"}]}]}
+            if operation in ("get_table", "get_view"):
+                return {"key": "t0",
+                        "tableFields": [{"fieldName": "different",
+                                         "fieldType": "string"}]}
             return super().__call__(operation, **kw)
 
     out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=Wrong(), retry_delays=(), verify_delays=())
@@ -315,3 +331,116 @@ def test_a_blocked_column_type_is_reported_before_any_create():
     assert "timestamp_ntz" in out["failed"][0]["reason"].lower()
     assert not any(o[0] == "create_table" for o in fold.ops), \
         "an unbuildable body must never be POSTed"
+
+
+# ==========================================================================
+# Do not re-create a schema that already exists.
+#
+# Verified live: POSTing a schema that is already there re-triggers async
+# work, and table creates issued during that window are ACCEPTED (202) and
+# then silently dropped -- six tables returned 202 and none appeared, while
+# the identical bodies posted against a settled schema all landed.
+#
+# So: resolve first, create only if absent, and wait for ACTIVE.
+# ==========================================================================
+
+class Settled(Folding):
+    """Schema already exists and is ACTIVE."""
+
+    def __init__(self, state="ACTIVE"):
+        super().__init__()
+        self.schemas["lake.db"] = "lake.db"
+        self.state = state
+
+    def __call__(self, operation, **kw):
+        if operation == "list_schemas":
+            self.ops.append((operation, kw))
+            return {"items": [{"key": "lake.db", "lifecycleState": self.state}]}
+        return super().__call__(operation, **kw)
+
+
+def test_an_existing_schema_is_not_re_created():
+    s = Settled()
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=s,
+                         retry_delays=(), verify_delays=())
+    assert not any(op == "create_schema" for op, _ in s.ops), \
+        "re-POSTing an existing schema drops the table creates that follow"
+    assert out["schemas_created"] == []
+    assert out["schemas_reused"] == ["lake.db"]
+    assert out["verified"] == 1
+
+
+def test_a_missing_schema_is_still_created():
+    f = Folding()
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=f,
+                         retry_delays=(), verify_delays=())
+    assert any(op == "create_schema" for op, _ in f.ops)
+    assert out["schemas_created"] == ["lake.DB"]
+
+
+def test_a_schema_that_is_not_active_is_waited_for():
+    s = Settled(state="CREATING")
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=s,
+                         retry_delays=(), verify_delays=(),
+                         schema_wait=(0, 0))
+    # It never became ACTIVE, so this is reported rather than pushed through.
+    assert any("ACTIVE" in e or "active" in e for e in out["errors"])
+
+
+# ==========================================================================
+# The LIST response omits tableFields; GET-by-key includes them.
+#
+# Verified live: six tables were created correctly as managed DELTA with the
+# right field types, and the plugin called all six a MISMATCH because it
+# compared the plan against a list entry that carries no fields at all.
+# Existence comes from the list (which is how the real key case is found);
+# STRUCTURE has to come from a GET on that key.
+# ==========================================================================
+
+class Summarised(Folding):
+    """List returns summaries with no fields; GET returns the full object."""
+
+    def __call__(self, operation, **kw):
+        if operation in ("list_tables_in", "list_views_in"):
+            self.ops.append((operation, kw))
+            return {"items": [{"key": k} for k in self.tables]}   # no fields
+        return super().__call__(operation, **kw)
+
+
+def test_structure_is_read_with_a_get_not_from_the_list():
+    s = Summarised()
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=s,
+                         retry_delays=(), verify_delays=())
+    assert out["verified"] == 1, out["mismatches"] + out["failed"]
+    assert any(op == "get_table" for op, _ in s.ops), \
+        "the list carries no fields, so structure needs a GET"
+
+
+def test_a_get_that_fails_leaves_the_structure_unverified_not_mismatched():
+    class NoGet(Summarised):
+        def __call__(self, operation, **kw):
+            if operation in ("get_table", "get_view"):
+                raise RuntimeError("DESCRIBE unavailable")
+            return super().__call__(operation, **kw)
+
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=NoGet(),
+                         retry_delays=(), verify_delays=())
+    assert out["mismatched_targets"] == []
+    assert out["unverified_structure_targets"] == ["DB.PUBLIC.T0"]
+
+
+def test_a_full_type_string_from_the_server_still_compares_equal():
+    # The server returns fieldType "decimal(38,0)" AND fieldPrecision 38;
+    # the plan says fieldType "decimal" with precision "38". Same type.
+    class FullType(Summarised):
+        def __call__(self, operation, **kw):
+            if operation in ("get_table", "get_view"):
+                self.ops.append((operation, kw))
+                return {"key": "x", "tableFields": [
+                    {"fieldName": "a", "fieldType": "string",
+                     "fieldPrecision": 20, "fieldScale": 0}]}
+            return super().__call__(operation, **kw)
+
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=FullType(),
+                         retry_delays=(), verify_delays=())
+    assert out["verified"] == 1, out["mismatches"]

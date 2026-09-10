@@ -32,6 +32,20 @@ TWO BEHAVIOURS LEARNED FROM A LIVE RUN, both of which broke the first attempt:
     reason says exactly that. This is why "the create returned 2xx" cannot be
     the claim: six tables once returned 202 and not one of them existed.
 
+  * THE LIST RESPONSE OMITS FIELDS. Listing gives existence and the server's
+    real key case; it carries no `tableFields` at all. Six tables were created
+    correctly, as managed DELTA with the right types, and every one was
+    reported a MISMATCH because the plan was compared against a fieldless list
+    entry. So existence comes from the list and STRUCTURE comes from a GET on
+    the resolved key.
+
+  * DO NOT RE-CREATE AN EXISTING SCHEMA. POSTing a schema that is already
+    there re-triggers async work, and table creates issued during that window
+    are ACCEPTED (202) and then silently dropped. Six tables returned 202 and
+    none appeared, while the identical bodies posted against a settled schema
+    all landed. So the schema is resolved FIRST, created only if absent, and
+    waited on until ACTIVE.
+
   * SCHEMA CREATION IS ASYNCHRONOUS. Creating a table immediately afterwards
     can return 409 Conflict "ongoing operation", so a 409 is retried with a
     bounded backoff rather than reported as a failure. The retry is still
@@ -70,18 +84,22 @@ def _norm(field_type, precision=None, scale=None) -> str:
     return base
 
 
-def _resolve_schema_key(call, catalog: str, schema: str) -> str | None:
-    """The key the SERVER uses for this schema, case as stored."""
+def _find_schema(call, catalog: str, schema: str) -> dict | None:
+    """The schema as the server holds it, matched case-insensitively."""
     wanted = f"{catalog}.{schema}".lower()
     try:
         payload = call("list_schemas", catalog=catalog)
     except Exception:
         return None
     for item in payload.get("items") or []:
-        key = str(item.get("key") or "")
-        if key.lower() == wanted:
-            return key
+        if str(item.get("key") or "").lower() == wanted:
+            return item
     return None
+
+
+def _resolve_schema_key(call, catalog: str, schema: str) -> str | None:
+    found = _find_schema(call, catalog, schema)
+    return str(found.get("key")) if found else None
 
 
 def _resolve_object(call, catalog: str, schema_key: str, name: str,
@@ -127,6 +145,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                    call: Callable[..., dict] | None = None,
                    retry_delays: tuple[float, ...] = (2.0, 5.0, 10.0),
                    verify_delays: tuple[float, ...] = (3.0, 5.0, 10.0, 15.0),
+                   schema_wait: tuple[float, ...] = (3.0, 5.0, 10.0),
                    timestamp_ntz_as_timestamp: bool = False) -> dict:
     all_statements = [s for s in ddl_plan.get("statements", [])]
 
@@ -153,7 +172,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
             _split(s["target_fqn"])[0] for s in out_of_scope}),
         "executed": 0, "verified": 0,
         "schemas_created": [], "errors": [],
-        "resolved_schema_keys": {},
+        "resolved_schema_keys": {}, "schemas_reused": [],
         "attempted_targets": [], "verified_targets": [], "failed_targets": [],
         "mismatched_targets": [], "mismatches": [],
         "unverified_structure_targets": [], "unverified_structure": [],
@@ -170,25 +189,51 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
     if call is None:
         raise RefusedToExecute("execute=True requires a transport callable")
 
-    # 1. schemas, once each, then RESOLVE the key the server actually used
+    # 1. schemas: LOOK FIRST. Re-POSTing an existing schema re-triggers async
+    #    work and silently drops the table creates that follow it.
     resolved: dict[str, str] = {}
     for catalog, schema in sorted({_split(s["target_fqn"])[:2]
                                    for s in statements}):
         requested = f"{catalog}.{schema}"
-        try:
-            call("create_schema", catalog=catalog, schema=schema,
-                 body=build_schema_body(catalog, schema))
-            out["schemas_created"].append(requested)
-        except Exception as exc:
-            # Very likely "already exists". Recorded, never fatal: the
-            # read-back on each object is what decides success.
-            out["errors"].append(f"CREATE SCHEMA {requested}: {exc}")
-        actual = _resolve_schema_key(call, catalog, schema)
-        if actual is None:
+        found = _find_schema(call, catalog, schema)
+
+        if found is None:
+            try:
+                call("create_schema", catalog=catalog, schema=schema,
+                     body=build_schema_body(catalog, schema))
+                out["schemas_created"].append(requested)
+            except Exception as exc:
+                out["errors"].append(f"CREATE SCHEMA {requested}: {exc}")
+            # Creation is async: wait for it to exist AND be ACTIVE.
+            for attempt in range(len(schema_wait) + 1):
+                found = _find_schema(call, catalog, schema)
+                if found is not None and \
+                        str(found.get("lifecycleState") or "ACTIVE").upper() == "ACTIVE":
+                    break
+                if attempt < len(schema_wait):
+                    time.sleep(schema_wait[attempt])
+        else:
+            out["schemas_reused"].append(str(found.get("key")))
+            # Present but still settling: creating tables now is what gets
+            # them accepted-then-dropped.
+            for attempt in range(len(schema_wait) + 1):
+                if str(found.get("lifecycleState") or "ACTIVE").upper() == "ACTIVE":
+                    break
+                if attempt < len(schema_wait):
+                    time.sleep(schema_wait[attempt])
+                found = _find_schema(call, catalog, schema) or found
+
+        if found is None:
             out["errors"].append(
                 f"could not resolve the server's key for schema {requested}; "
                 f"falling back to the requested name")
-        resolved[requested] = actual or requested
+        elif str(found.get("lifecycleState") or "ACTIVE").upper() != "ACTIVE":
+            out["errors"].append(
+                f"schema {requested} is "
+                f'{found.get("lifecycleState")}, not ACTIVE. Creating tables '
+                f"against a settling schema is what gets them accepted and "
+                f"then silently dropped.")
+        resolved[requested] = (str(found.get("key")) if found else requested)
     out["resolved_schema_keys"] = dict(resolved)
 
     # 2. tables first, then views: a view's fields reference its base tables
@@ -247,14 +292,14 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         # 3. read it back -- this, not the create's return, is the claim.
         # Resolved by listing and matching case-insensitively, because the
         # server's key case is not the one we asked for.
-        payload = None
+        listed = None
         for attempt in range(len(verify_delays) + 1):
-            payload = _resolve_object(call, catalog, schema_key, name, is_view)
-            if payload is not None:
+            listed = _resolve_object(call, catalog, schema_key, name, is_view)
+            if listed is not None:
                 break
             if attempt < len(verify_delays):
                 time.sleep(verify_delays[attempt])
-        if payload is None:
+        if listed is None:
             out["failed_targets"].append(ident)
             out["failed"].append({
                 "source_identifier": ident, "target_fqn": stmt["target_fqn"],
@@ -270,6 +315,21 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 "source_identifier": ident, "target_fqn": stmt["target_fqn"],
                 "reason": "exists, but the plan carried no column list to "
                           "compare it against"})
+            continue
+
+        # The list entry proves existence and gives the real key case, but it
+        # carries no fields. Structure needs a GET on that key.
+        server_name = str(listed.get("key") or "").rsplit(".", 1)[-1] or name
+        try:
+            payload = call("get_view" if is_view else "get_table",
+                           catalog=catalog, schema=server_schema,
+                           **{("view" if is_view else "table"): server_name})
+        except Exception as exc:
+            out["unverified_structure_targets"].append(ident)
+            out["unverified_structure"].append({
+                "source_identifier": ident, "target_fqn": stmt["target_fqn"],
+                "reason": f"exists, but its structure could not be read: "
+                          f"{str(exc)[:200]}"})
             continue
 
         want = _planned(columns)

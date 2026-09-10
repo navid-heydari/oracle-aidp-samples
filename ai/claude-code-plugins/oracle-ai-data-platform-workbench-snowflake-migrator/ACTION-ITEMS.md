@@ -301,3 +301,56 @@ the field description.
 **T5 is the open question for Oracle:** is `timestamp_ntz` support planned on
 the catalog API? Until it is, every Snowflake estate with a timezone-naive
 timestamp — which is most of them — has to accept the downgrade or wait.
+
+
+---
+
+# A failed create POISONS the object name (2026-09-10, verified)
+
+**The most operationally dangerous thing found so far, and it is not a plugin
+bug.**
+
+When an asynchronous `POST /tables` fails, the name it used becomes
+**permanently unusable in that schema**. Every subsequent create for that name
+returns **202 Accepted** and is then silently dropped. Proven by isolating one
+variable at a time:
+
+| Attempt | Body | Result |
+|---|---|---|
+| `test_table` (after earlier failures) | plugin's exact body | 202, **never appears** |
+| `fresh_probe_9` | **identical body**, new name | 202, **appears** |
+| `test_table` after `DELETE` | same body again | 202, **still never appears** |
+
+`DELETE` returns 202 and does **not** recover the name. So the poisoning
+survives an explicit delete.
+
+## Why this matters far beyond this test
+
+**A first failed migration attempt burns every name it touched.** A customer
+whose initial run fails for any reason — a bad type, a permissions gap, a
+transient error — cannot simply fix the problem and re-run into the same
+schema. Every table that failed will keep returning 202 and keep not existing,
+and nothing in the API will say why. The obvious diagnosis ("our plugin is
+broken") is wrong, and the obvious remedy (delete and retry) does not work.
+
+The only recovery found is **a different schema**.
+
+## What the plugin should do about it
+
+| # | Item | Effort | Status |
+|---|---|---|---|
+| P1 | Detect the poisoned-name signature and say so | S | open |
+| P2 | Offer a `--target-suffix` / fresh-schema retry path | S | open |
+| P3 | Ask Oracle whether this is intended, and how to clear a name | S | needs Oracle |
+
+**P1** is the important one. The signature is unmistakable — create returns
+202, the object never appears, and a create with a novel name in the same
+schema succeeds — so the plugin can distinguish "your body is wrong" from
+"this name is burned" and tell the user which. Right now it correctly reports
+*"the create returned 202 Accepted but no object ever appeared"*, which is
+true but sends the reader hunting for a body problem that is not there.
+
+**P3 is a real question for Oracle:** is a failed create meant to reserve the
+name permanently, and if so what clears it? Until that is answered, the
+practical guidance for any real migration is: **if a run fails, retry into a
+new schema, not the same one.**
