@@ -8,6 +8,41 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [0.8.0] — 2026-09-10
+
+### Added
+
+- `references/maintenance-and-layout.md` — how Snowflake and AIDP differ on
+  `OPTIMIZE`/`VACUUM`-shaped maintenance. Snowflake exposes neither and
+  maintains layout automatically; AIDP has both plus `ZORDER` and liquid
+  clustering and runs none of them for you. The capability survives the
+  migration, the responsibility moves.
+- `ACTION-ITEMS.md` — eight tracked items (M1–M8) to close the maintenance gap.
+- A *"Maintenance and layout — decisions, NOT applied"* section in the DDL
+  plan, naming each source setting, its value and its AIDP equivalent.
+- Live tests for `SHOW` pagination semantics and for the semi-structured
+  escape hatch against real `VARIANT`/`OBJECT`/`ARRAY` columns. 12 live tests.
+
+### Fixed
+
+- **`cluster_by`, `retention_time`, `data_retention_time_in_days` and
+  `change_tracking` were reported as "dropped, no Delta equivalent".** All four
+  have AIDP equivalents — liquid clustering / `ZORDER`,
+  `delta.deletedFileRetentionDuration` + `delta.logRetentionDuration`, and
+  Change Data Feed. The claim was false in the expensive direction: it invited
+  a customer to accept a silent performance regression on their largest tables.
+  Now split into properties with genuinely nowhere to go and properties
+  *deferred* with the equivalent named, which raise risk to MEDIUM.
+
+### Verified
+
+- Assumption **B9** (`SHOW … LIMIT n FROM`) live: name-ordered, exclusive
+  resume, and a full paged walk equals the unpaged list.
+- Issue **#7** live against real semi-structured columns in
+  `SNOWFLAKE.ACCOUNT_USAGE`: 8 and 5 columns blocked by default with
+  per-column reasons, carried as `STRING` with a warning on every one when
+  `--semi-structured string` is passed.
+
 ## [0.7.1] — 2026-09-09
 
 ### Fixed

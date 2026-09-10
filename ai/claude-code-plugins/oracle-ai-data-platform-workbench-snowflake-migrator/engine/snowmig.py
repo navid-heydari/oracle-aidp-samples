@@ -191,7 +191,10 @@ def cmd_ddl(args) -> int:
             "rules_applied": [dataclasses.asdict(r) for r in res.rules_applied],
             "warnings": res.warnings, "omitted_properties": res.omitted_properties,
             # Deployment verifies the structure against this, not just the name.
-            "expected_columns": res.expected_columns})
+            "expected_columns": res.expected_columns,
+            # Source settings with an AIDP equivalent that this version does
+            # not apply. Reported, never silently invented.
+            "deferred_properties": res.deferred_properties})
 
     payload = {"statements": statements, "blocked": blocked,
                "bronze_catalog_prefix": built.get("bronze_catalog_prefix")}

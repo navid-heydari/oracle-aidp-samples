@@ -22,15 +22,40 @@ from snowflake_source.dialect.views import (  # noqa: F401  (re-exported)
 )
 
 __all__ = ["RuleApplication", "RewriteResult", "UnsupportedDDL",
-           "SCRUBBED_PROPERTIES", "build_create_schema", "quote_backtick", "quote_spark_string", "build_create_table",
+           "SCRUBBED_PROPERTIES", "DEFERRED_EQUIVALENT_PROPERTIES", "build_create_schema", "quote_backtick", "quote_spark_string", "build_create_table",
            "build_create_view"]
 
-# Real Snowflake table PROPERTIES with no Delta equivalent. A value here was a
-# deliberate source-side setting, so dropping it is a decision worth reporting.
+# Snowflake table PROPERTIES that genuinely have NO AIDP equivalent. A value
+# here was a deliberate source-side setting, so dropping it is a decision worth
+# reporting -- but it is a decision with nowhere to go.
 SCRUBBED_PROPERTIES = (
-    "cluster_by", "retention_time", "change_tracking", "is_iceberg", "is_dynamic",
-    "is_secure", "max_data_extension_time_in_days", "data_retention_time_in_days",
+    "is_iceberg", "is_dynamic", "is_secure",
+    "max_data_extension_time_in_days",
 )
+
+# Properties that DO have an AIDP equivalent, which this version does not
+# apply. These were previously reported as "dropped, no Delta equivalent",
+# which is false for every one of them: telling a customer their clustering key
+# has no equivalent invites them to accept a silent performance regression on
+# their largest tables.
+#
+# They are DEFERRED, not dropped: named, carried into the report with the
+# equivalent, and left for a maintenance decision. No maintenance DDL is
+# emitted here -- see references/maintenance-and-layout.md.
+DEFERRED_EQUIVALENT_PROPERTIES = {
+    "cluster_by": (
+        "Delta liquid clustering (`CLUSTER BY`) or `OPTIMIZE … ZORDER BY`. "
+        "Neither is automatic: Snowflake reclusters in the background, AIDP "
+        "needs a scheduled job"),
+    "retention_time": (
+        "`delta.deletedFileRetentionDuration` + `delta.logRetentionDuration`, "
+        "which bound how far `VERSION AS OF` / `TIMESTAMP AS OF` can reach"),
+    "data_retention_time_in_days": (
+        "`delta.deletedFileRetentionDuration` + `delta.logRetentionDuration` "
+        "(same setting as retention_time)"),
+    "change_tracking": (
+        "Delta Change Data Feed (`delta.enableChangeDataFeed`)"),
+}
 
 # Observational SHOW metadata. Never emitted either, but it was never a property
 # to preserve, so listing it as "dropped" is misleading noise in the report.
@@ -60,6 +85,9 @@ class RewriteResult:
     # deployment can verify the STRUCTURE that arrived rather than only that
     # something with the right name exists.
     expected_columns: list[dict] = field(default_factory=list)
+    # Source settings with a real AIDP equivalent that this version does not
+    # apply. Distinct from omitted_properties, which have nowhere to go.
+    deferred_properties: list[dict] = field(default_factory=list)
 
 
 class UnsupportedDDL(Exception):
@@ -142,15 +170,26 @@ def build_create_table(record: dict, target_fqn: str) -> RewriteResult:
             f'{c["COLUMN_NAME"]}: {c.get("DATA_TYPE")} -> {c["target_type"]}'))
 
     for prop, value in (record.get("source_metadata") or {}).items():
-        if prop in _INFORMATIONAL_METADATA:
+        if prop in _INFORMATIONAL_METADATA or value in _UNSET:
             continue
-        if prop in SCRUBBED_PROPERTIES and value not in _UNSET:
+        if prop in DEFERRED_EQUIVALENT_PROPERTIES:
+            res.deferred_properties.append({
+                "property": prop, "value": value,
+                "aidp_equivalent": DEFERRED_EQUIVALENT_PROPERTIES[prop]})
+        elif prop in SCRUBBED_PROPERTIES:
             res.omitted_properties.append(f"{prop}={value}")
     if res.omitted_properties:
         res.rules_applied.append(RuleApplication(
             "R10_PROP_SCRUB",
-            "dropped Snowflake properties with no Delta equivalent: "
+            "dropped Snowflake properties with no AIDP equivalent: "
             + ", ".join(res.omitted_properties)))
+    if res.deferred_properties:
+        res.rules_applied.append(RuleApplication(
+            "R11_MAINTENANCE_DEFERRED",
+            "source settings with an AIDP equivalent that this version does NOT "
+            "apply, carried into the maintenance decision instead: "
+            + ", ".join(f'{d["property"]}={d["value"]}'
+                        for d in res.deferred_properties)))
 
     if record.get("constraints"):
         res.rules_applied.append(RuleApplication(

@@ -147,3 +147,104 @@ def test_deploy_dry_run_creates_nothing(out):
     assert main(["deploy", "--out-dir", str(out)]) == 0
     res = json.loads((out / "deploy_result.json").read_text())
     assert res["dry_run"] is True and res["executed"] == 0
+
+
+def test_show_pagination_resumes_exclusively_and_in_name_order(tmp_path):
+    """Assumption B9, verified live.
+
+    The inventory pages past SHOW's 10k cap with `LIMIT n FROM '<name>'`. If
+    the resume were inclusive an object would be listed twice; if the order
+    were not by name, paging would silently MISS objects -- the worst outcome
+    available to an assessment, because the result still looks complete.
+    """
+    import os as _os
+    from snowflake_source import conn as _conn
+
+    kw = _conn.build_connect_kwargs(
+        "keypair", account=_os.environ["SNOWFLAKE_ACCOUNT"],
+        user=_os.environ["SNOWFLAKE_USER"],
+        key_path=_os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"],
+        warehouse=_os.environ.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"))
+    cx = _conn.connect(**kw)
+    try:
+        run = _conn.make_run_sql(cx)
+        show = f'show tables in schema "{DB}"."PUBLIC"'
+        full = [r["name"] for r in run(show)]
+        assert len(full) >= 3, "need a few objects to page through"
+        assert full == sorted(full), "SHOW must be name-ordered for paging to work"
+
+        # Walk it in pages of 2 and require the result to equal the unpaged list.
+        paged, cursor = [], None
+        while True:
+            sql = f"{show} limit 2" + (f" from '{cursor}'" if cursor else "")
+            page = [r["name"] for r in run(sql)]
+            assert cursor not in page, "resume must be EXCLUSIVE of the cursor"
+            paged += page
+            if len(page) < 2:
+                break
+            cursor = page[-1]
+        assert paged == full
+    finally:
+        cx.close()
+
+
+def test_semi_structured_switch_against_real_variant_columns(tmp_path):
+    """Issue #7, verified against genuine Snowflake semi-structured columns.
+
+    The corpus has none, so this reads SNOWFLAKE.ACCOUNT_USAGE, whose views
+    carry real VARIANT, OBJECT and ARRAY columns. Read-only: the plugin cannot
+    create a VARIANT column to test with, and must not.
+    """
+    import os as _os
+    from snowflake_source import conn as _conn
+    from snowflake_source.extract.catalog import build_inventory
+
+    kw = _conn.build_connect_kwargs(
+        "keypair", account=_os.environ["SNOWFLAKE_ACCOUNT"],
+        user=_os.environ["SNOWFLAKE_USER"],
+        key_path=_os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"],
+        warehouse=_os.environ.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
+        role="ACCOUNTADMIN")
+    cx = _conn.connect(**kw)
+    try:
+        real = _conn.make_run_sql(cx)
+        targets = ("ACCESS_HISTORY", "AGGREGATE_ACCESS_HISTORY")
+
+        def narrowed(sql, params=None):
+            rows = real(sql, params)
+            low = " ".join(sql.split()).lower()
+            if low.startswith("show schemas in database"):
+                return [r for r in rows if r["name"] == "ACCOUNT_USAGE"]
+            if low.startswith(("show views in schema", "show tables in schema")):
+                return [r for r in rows if r["name"] in targets]
+            return rows
+
+        try:
+            blocked = build_inventory(narrowed, ["SNOWFLAKE"], row_counts="none")
+        except Exception as exc:                      # pragma: no cover
+            pytest.skip(f"ACCOUNT_USAGE not readable by this role: {exc}")
+        if not blocked["inventory"]:
+            pytest.skip("ACCOUNT_USAGE returned no objects for this role")
+
+        # Default: blocked, with a per-column reason naming the actual type.
+        for rec in blocked["inventory"]:
+            assert rec["compatibility_status"] == "blocked"
+            assert rec["blocked_reasons"]
+            assert any(t in " ".join(rec["blocked_reasons"])
+                       for t in ("VARIANT", "OBJECT", "ARRAY"))
+
+        # Escape hatch: carried as STRING, and every one of them warned about.
+        carried = build_inventory(narrowed, ["SNOWFLAKE"], row_counts="none",
+                                  semi_structured="string")
+        for rec in carried["inventory"]:
+            assert rec["compatibility_status"] == "supported"
+            semi = [c for c in rec["columns"]
+                    if c["DATA_TYPE"] in ("VARIANT", "OBJECT", "ARRAY")]
+            assert semi, "expected real semi-structured columns here"
+            for col in semi:
+                assert col["target_type"] == "STRING"
+                assert any(w.startswith(col["COLUMN_NAME"] + ":")
+                           for w in rec["warnings"]), \
+                    f'{col["COLUMN_NAME"]} carried as text with no warning'
+    finally:
+        cx.close()

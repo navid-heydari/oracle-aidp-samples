@@ -2,7 +2,7 @@
 import pytest
 
 from target.ddl import (
-    RewriteResult, SCRUBBED_PROPERTIES, build_create_schema, build_create_table,
+    DEFERRED_EQUIVALENT_PROPERTIES, RewriteResult, SCRUBBED_PROPERTIES, build_create_schema, build_create_table,
     quote_spark_string,
 )
 
@@ -69,14 +69,33 @@ def test_rules_recorded_with_ids():
                for r in res.rules_applied)
 
 
-@pytest.mark.parametrize("prop", ["cluster_by", "retention_time", "change_tracking"])
+@pytest.mark.parametrize("prop", ["is_iceberg", "is_dynamic", "is_secure",
+                                  "max_data_extension_time_in_days"])
 def test_snowflake_properties_scrubbed_and_recorded(prop):
+    """Only properties with genuinely NO AIDP equivalent are 'dropped'."""
     res = build_create_table(
         record([col("A", "TEXT", "STRING")], source_metadata={prop: "something"}),
         "bronze.S.T")
     assert any(prop in o for o in res.omitted_properties)
     assert prop not in res.sql
     assert prop in SCRUBBED_PROPERTIES
+
+
+@pytest.mark.parametrize("prop", ["cluster_by", "retention_time", "change_tracking"])
+def test_maintenance_properties_are_deferred_not_dropped(prop):
+    """These three DO have AIDP equivalents.
+
+    Reporting them as "no Delta equivalent" was wrong, and wrong in the
+    direction that costs the customer: a dropped clustering key is a silent
+    performance regression on the largest tables in the estate.
+    """
+    res = build_create_table(
+        record([col("A", "TEXT", "STRING")], source_metadata={prop: "something"}),
+        "bronze.S.T")
+    assert not any(prop in o for o in res.omitted_properties)
+    assert any(d["property"] == prop for d in res.deferred_properties)
+    assert prop not in SCRUBBED_PROPERTIES
+    assert prop in DEFERRED_EQUIVALENT_PROPERTIES
 
 
 def test_blocked_record_produces_no_sql():
@@ -152,7 +171,10 @@ def test_a_set_property_is_still_reported():
         record([col("A", "TEXT", "STRING")],
                source_metadata={"cluster_by": "(COUNTRY_CODE)", "rows": 5}),
         "bronze.S.T")
-    assert res.omitted_properties == ["cluster_by=(COUNTRY_CODE)"]
+    # Reported, but as a deferral with its equivalent -- not as a dead loss.
+    assert res.omitted_properties == []
+    assert res.deferred_properties[0]["property"] == "cluster_by"
+    assert res.deferred_properties[0]["value"] == "(COUNTRY_CODE)"
 
 
 # ==========================================================================
@@ -185,3 +207,75 @@ def test_a_column_comment_with_an_apostrophe_is_backslash_escaped():
     sql = build_create_table(rec, "CAT.SC.T").sql
     assert r"\'" in sql
     assert "''" not in sql, "doubling is two literals in Spark, not an escape"
+
+
+# ==========================================================================
+# Maintenance and layout properties (vacuum / optimize question).
+#
+# `cluster_by`, `retention_time` and `change_tracking` were all reported as
+# "dropped Snowflake properties with no Delta equivalent". That is FALSE for
+# all three -- Delta has liquid clustering / ZORDER, deletedFileRetention +
+# logRetention, and Change Data Feed. Telling a customer their clustering key
+# has no equivalent invites them to accept a silent performance regression.
+# ==========================================================================
+
+def _with_props(**props):
+    return {"source_identifier": "DB.SC.T", "object_type": "TABLE",
+            "source_metadata": props,
+            "columns": [{"COLUMN_NAME": "A", "target_type": "STRING",
+                         "ORDINAL_POSITION": 1, "IS_NULLABLE": "YES",
+                         "DATA_TYPE": "TEXT", "COMMENT": None}]}
+
+
+def test_a_clustering_key_is_deferred_not_declared_equivalent_free():
+    res = build_create_table(_with_props(cluster_by="(ORDER_DATE, STORE_ID)"),
+                             "CAT.SC.T")
+    assert not any("cluster_by" in o for o in res.omitted_properties), \
+        "a clustering key HAS an AIDP equivalent"
+    deferred = {d["property"]: d for d in res.deferred_properties}
+    assert "cluster_by" in deferred
+    assert deferred["cluster_by"]["value"] == "(ORDER_DATE, STORE_ID)"
+    eq = deferred["cluster_by"]["aidp_equivalent"].upper()
+    assert "CLUSTER BY" in eq or "ZORDER" in eq
+
+
+def test_time_travel_retention_is_deferred_with_its_delta_equivalent():
+    res = build_create_table(_with_props(retention_time=7), "CAT.SC.T")
+    deferred = {d["property"]: d for d in res.deferred_properties}
+    assert "retention_time" in deferred
+    assert "retention" in deferred["retention_time"]["aidp_equivalent"].lower()
+
+
+def test_change_tracking_maps_to_change_data_feed():
+    res = build_create_table(_with_props(change_tracking="ON"), "CAT.SC.T")
+    deferred = {d["property"]: d for d in res.deferred_properties}
+    assert "change_tracking" in deferred
+    assert "feed" in deferred["change_tracking"]["aidp_equivalent"].lower()
+
+
+def test_a_property_with_genuinely_no_equivalent_is_still_omitted():
+    res = build_create_table(_with_props(is_iceberg="Y"), "CAT.SC.T")
+    assert any("is_iceberg" in o for o in res.omitted_properties)
+    assert not any(d["property"] == "is_iceberg" for d in res.deferred_properties)
+
+
+def test_unset_maintenance_properties_are_not_reported():
+    # cluster_by is '' on an unclustered table -- reporting that as a deferred
+    # decision would be noise on every table in the estate.
+    res = build_create_table(_with_props(cluster_by="", change_tracking="OFF"),
+                             "CAT.SC.T")
+    assert res.deferred_properties == []
+
+
+def test_the_deferral_is_recorded_as_a_named_rule():
+    res = build_create_table(_with_props(cluster_by="(A)"), "CAT.SC.T")
+    assert any(r.rule_id == "R11_MAINTENANCE_DEFERRED" for r in res.rules_applied)
+
+
+def test_no_maintenance_ddl_is_emitted():
+    # This MVP does not decide the maintenance story, so it must not silently
+    # invent one either -- no OPTIMIZE, no VACUUM, no CLUSTER BY in the DDL.
+    res = build_create_table(_with_props(cluster_by="(A)"), "CAT.SC.T")
+    up = res.sql.upper()
+    for banned in ("OPTIMIZE", "VACUUM", "CLUSTER BY", "ZORDER", "TBLPROPERTIES"):
+        assert banned not in up
