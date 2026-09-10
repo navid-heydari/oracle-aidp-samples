@@ -8,6 +8,43 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [0.13.0] — 2026-09-10
+
+**First objects actually created on AIDP.** Six tables landed as managed Delta
+with the planned field types, from a real Snowflake estate.
+
+### Fixed
+
+- **Structure is now read with a GET, not from the list.** The list response
+  proves existence and gives the server's real key case, but carries **no
+  `tableFields` at all** — so six tables that had been created *correctly* were
+  every one reported a MISMATCH against a fieldless list entry. Existence comes
+  from the list; structure comes from a GET on the resolved key.
+- **An existing schema is no longer re-created.** Resolve first, create only if
+  absent, and wait for `ACTIVE`.
+
+### Learned — a failed create POISONS the name
+
+The most operationally dangerous finding so far, and **not** a plugin bug.
+When an asynchronous create fails, that name becomes permanently unusable in
+that schema: every later create returns **202 Accepted** and is silently
+dropped. Isolated one variable at a time —
+
+| Attempt | Result |
+|---|---|
+| `test_table` (after earlier failures) | 202, **never appears** |
+| `fresh_probe_9`, **identical body** | 202, **appears** |
+| `test_table` after an explicit `DELETE` | 202, **still never appears** |
+
+`DELETE` returns 202 and does not recover the name. The only recovery found is
+a **different schema**.
+
+This matters well beyond a test: a customer whose first run fails for any
+reason cannot fix the cause and re-run into the same schema. Every failed
+table will keep returning 202 and keep not existing, with nothing in the API
+saying why. Tracked as P1–P3 in `ACTION-ITEMS.md`; the practical guidance is
+**if a run fails, retry into a new schema**.
+
 ## [0.12.0] — 2026-09-10
 
 ### Added
