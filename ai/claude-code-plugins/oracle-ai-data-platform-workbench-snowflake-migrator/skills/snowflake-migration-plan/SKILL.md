@@ -166,3 +166,15 @@ section, read it out. Say three things:
 Do not propose a cadence or a retention. Both need the customer's recovery
 requirements and query patterns. `references/maintenance-and-layout.md` has the
 full mapping; `ACTION-ITEMS.md` has the planned work.
+
+## Finish with `summary` — it is not optional
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py summary --out-dir ./snowmig_out
+```
+
+`SUMMARY.md` is the per-object roll-up the user asked for: one row per table,
+view and job with its row count, migration risk, migration status and a note.
+Run it after `plan`, and again after `deploy` so the statuses reflect what
+actually happened. It also carries the source→destination header, the
+row-count provenance, and the data-movement architecture options.

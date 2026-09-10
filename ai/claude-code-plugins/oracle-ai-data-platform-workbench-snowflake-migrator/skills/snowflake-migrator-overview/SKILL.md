@@ -1,25 +1,43 @@
 ---
 name: snowflake-migrator-overview
-description: Router and shared rules for migrating a Snowflake estate onto Oracle AI Data Platform (AIDP). Read this first whenever the user mentions moving, assessing, inventorying, or cloning Snowflake tables, views, schemas, or databases onto AIDP, or asks what a Snowflake migration would involve. Explains the four-stage pipeline and picks the right next skill; adds no API surface of its own.
+description: Router and shared rules for migrating a Snowflake estate onto Oracle AI Data Platform (AIDP). Read this first whenever the user mentions moving, assessing, inventorying, or cloning Snowflake tables, views, schemas, or databases onto AIDP, or asks what a Snowflake migration would involve. Explains the pipeline and picks the right next skill; adds no API surface of its own.
 ---
 
 # Snowflake → AIDP migrator — router
 
-Four stages, each producing a reviewable artifact. Run them in order; each is
-re-runnable on its own.
+Each stage produces a reviewable artifact. Run them in order; each is
+re-runnable on its own, and every stage after `assess` reads its input from
+`--out-dir`.
 
-| Stage | Skill | Produces |
-|---|---|---|
-| — | `snowflake-migration-plan` (maintenance) | `MAINTENANCE.md` — clustering, retention and churn, and who inherits `OPTIMIZE`/`VACUUM` |
-| 0 | `snowflake-migrator-bootstrap` | verified Snowflake auth |
-| 1 | `snowflake-assess-estate` | `inventory.json` + `INVENTORY.md` |
-| 2 | `snowflake-migration-plan` | `plan.json` + **`PLANNED_OBJECTS.md`** |
-| 3 | `snowflake-medallion-clone` | `ddl_plan.json` + `DDL_PLAN.md`, then **`SOFT_CLONE_SUMMARY.md`** |
-| — | `snowflake-compute-proposal` | `compute.json` + `COMPUTE_PROPOSAL.md` (independent) |
+| Stage | CLI | Skill | Produces |
+|---|---|---|---|
+| 0 | — | `snowflake-migrator-bootstrap` | verified Snowflake auth |
+| 1 | `assess` | `snowflake-assess-estate` | `inventory.json` · `INVENTORY.md` · **`CENSUS.md`** |
+| 2 | `deps` + `plan` | `snowflake-migration-plan` | `plan.json` · **`PLANNED_OBJECTS.md`** |
+| 3 | `ddl` + `deploy` | `snowflake-medallion-clone` | `DDL_PLAN.md` · **`SOFT_CLONE_SUMMARY.md`** |
+| 4 | `summary` | `snowflake-migration-plan` | **`SUMMARY.md`** — the per-object roll-up |
+| — | `maintenance` | `snowflake-assess-estate` | `MAINTENANCE.md` — clustering, retention, churn, and who inherits `OPTIMIZE`/`VACUUM` |
+| — | `security` | `snowflake-assess-estate` | `SECURITY.md` — masking/row-access policies, secure views, grants |
+| — | `compute` | `snowflake-compute-proposal` | `COMPUTE_PROPOSAL.md` |
+| — | `smoke` | `snowflake-smoke-test` | `SMOKE_TEST.md` |
+| — | `notebook` | `snowflake-clone-notebook` | executable `.ipynb` · `NOTEBOOK.md` |
+| — | `data-options` | `snowflake-migration-plan` | `DATA_MOVEMENT_OPTIONS.md` |
 
 The two reports the plugin exists to produce are **`PLANNED_OBJECTS.md`** (what
 is planned to move, and what cannot with reasons) and **`SOFT_CLONE_SUMMARY.md`**
-(what the shallow clone actually created).
+(what the shallow clone actually created). **`SUMMARY.md`** is the per-object
+roll-up: name, rows, risk, migration status.
+
+## Three stages are easy to forget — do not
+
+- **`summary`** produces `SUMMARY.md`, the per-object table with rows, risk and
+  migration status. Run it after `plan` (and again after `deploy`).
+- **`maintenance`** answers "we use `OPTIMIZE`/`VACUUM`-style upkeep, what
+  happens on AIDP". Snowflake exposes neither and does it in the background;
+  AIDP has both and runs neither. Run it after `assess`.
+- **`security`** is the only stage with an exposure consequence. A masked
+  column arrives **unmasked**. Run it after `assess` on any estate that has
+  ever had a masking policy, and never skip it silently.
 
 ## Routing
 
@@ -28,6 +46,12 @@ is planned to move, and what cannot with reasons) and **`SOFT_CLONE_SUMMARY.md`*
 - "create the medallion structure", "clone the schema", "soft clone", "shallow clone" → stage 3
 - "compute sizing", "warehouse equivalent", "what will it cost", "credits" → `snowflake-compute-proposal`
 - auth or connection errors from any stage → stage 0
+- "what about our stored procedures / tasks / streams / UDFs" → `assess` writes
+  `CENSUS.md`; they are inventoried and **none of them migrate**
+- "we use OPTIMIZE/VACUUM", "clustering", "time travel", "retention" → the
+  `maintenance` stage
+- "masking", "row access", "who can see what", "PII", "secure view", "grants"
+  → the `security` stage, and read it out rather than summarising it away
 
 ## Rules that apply to every stage
 

@@ -8,6 +8,44 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [0.10.0] — 2026-09-10
+
+### Added
+
+- **Estate census** — `assess` now inventories everything that is *not* a
+  table or a view: stored procedures, UDFs, tasks, streams, materialized and
+  dynamic tables, stages, pipes, sequences and file formats. Writes
+  `CENSUS.md`, and the resulting scope statement is carried into
+  `PLANNED_OBJECTS.md` and `SUMMARY.md`, so `"N of N objects can move"` is
+  qualified by what was actually examined. `--no-census` skips it, and the
+  coverage claim then says so.
+  - Procedures and UDFs come from `INFORMATION_SCHEMA`, not `SHOW`:
+    `SHOW PROCEDURES IN SCHEMA` returns Snowflake's own built-ins — 33 of them
+    on a completely empty schema — and `INFORMATION_SCHEMA` does not. It also
+    carries the handler language, which is what decides the effort.
+  - Per-language triage bands, with JavaScript flagged HIGH: there is no
+    JavaScript runtime on AIDP, so the logic has to be understood and
+    rewritten, not translated.
+  - **Nothing in the census is migratable**, and no equivalent is generated.
+- **`snowmig security`** — masking, row-access, aggregation and projection
+  policy *attachments* from `ACCOUNT_USAGE.POLICY_REFERENCES`, secure views,
+  and a grant summary. Writes `SECURITY.md`.
+  - This is the only report with a data-**exposure** consequence: a masked
+    column arrives unmasked, a row filter is simply absent, and a secure view
+    loses `SECURE`. The clone does not fail — it succeeds without the
+    protection.
+  - When `ACCOUNT_USAGE` cannot be read, `exposure_count` is `null` and the
+    report says the question is **unanswered**. It must never read as "no
+    policies found", which is the dangerous false negative.
+  - Grants are reported and **never replayed**, enforced by test.
+
+### Fixed
+
+- **Two CLI stages were orphaned** — no skill or command invoked `summary` or
+  `maintenance`, so nothing would ever run them. `summary` produces
+  `SUMMARY.md`, one of the plugin's headline deliverables. Both are now owned
+  by a skill, and a test fails if any stage becomes unreachable again.
+
 ## [0.9.0] — 2026-09-10
 
 ### Added

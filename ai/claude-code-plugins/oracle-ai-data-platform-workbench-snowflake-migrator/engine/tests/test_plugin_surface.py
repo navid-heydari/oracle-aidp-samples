@@ -1,6 +1,7 @@
 """Plugin manifest and skill/command structure."""
 import json
 import pathlib
+import re
 
 import pytest
 
@@ -259,3 +260,28 @@ def test_no_shipped_file_mentions_the_forked_source_platform():
         if hits:
             offenders.append(f"{rel}: {hits}")
     assert not offenders, "shipped files still reference the forked platform:\n" + "\n".join(offenders)
+
+
+def test_every_cli_stage_is_invoked_by_at_least_one_skill():
+    """No stage may be reachable only by reading the README.
+
+    `summary` produces SUMMARY.md -- the per-object roll-up that is one of the
+    plugin's headline deliverables -- and for several versions no skill or
+    command mentioned it, so Claude would only have run it by accident. Same
+    for `maintenance` the day it was added.
+    """
+    root = pathlib.Path(__file__).resolve().parents[2]
+    cli = (root / "engine" / "snowmig.py").read_text()
+    stages = set(re.findall(r'sub\.add_parser\(\s*"([a-z-]+)"', cli))
+    assert stages, "no stages parsed -- the regex needs updating"
+
+    invoked: set[str] = set()
+    for path in list((root / "skills").rglob("SKILL.md")) + \
+            list((root / "commands").glob("*.md")):
+        text = path.read_text()
+        invoked |= set(re.findall(r"snowmig\.py\s+([a-z-]+)", text))
+
+    orphaned = sorted(stages - invoked)
+    assert not orphaned, (
+        f"these CLI stages are not invoked by any skill or command, so nothing "
+        f"will ever run them: {orphaned}")

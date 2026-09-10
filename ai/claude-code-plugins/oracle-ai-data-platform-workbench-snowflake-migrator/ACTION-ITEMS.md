@@ -1,4 +1,4 @@
-# Action items — maintenance and layout parity
+# Action items — maintenance, layout, and estate coverage
 
 Opened 2026-09-10, after verifying how Snowflake and AIDP differ on
 `OPTIMIZE`/`VACUUM`-shaped maintenance. Background and the full mapping:
@@ -175,3 +175,32 @@ unproven.
 
 Deciding the actual cadences and retentions. That needs the customer's recovery
 requirements and query patterns, and it is a conversation, not a default.
+
+
+---
+
+# Estate coverage and security (opened 2026-09-10)
+
+| # | Item | Effort | Status |
+|---|---|---|---|
+| C1 | Census of non-table/view objects, with language triage | M | **done** |
+| C2 | Security posture: policy attachments, secure views, grants | M | **done** |
+| C3 | Blast radius: which migrating tables a task/stream feeds | M | open |
+| C4 | Capture procedure/UDF bodies for sizing | S | partial — `--capture-definitions` |
+
+## C3 — Blast radius (the one that is still open)
+
+**Why it matters most.** The census answers *what exists*. It does not answer
+*what stops working*. A task that populates a migrated table means that table
+goes stale after cutover: the clone succeeds and then quietly stops being
+correct. That is the failure a customer discovers in production.
+
+**Shape:** join the census against `ACCOUNT_USAGE.OBJECT_DEPENDENCIES` and each
+task's / stream's target, then report per migrating table: "populated by task
+`X`, which does not migrate — this table will not be refreshed on AIDP." The
+lineage extraction already exists (`extract/dependencies.py`); what is missing
+is resolving a task or stream to the tables it writes.
+
+**Done when:** every migrating table that is fed by a non-migrating object is
+named in `PLANNED_OBJECTS.md` as *will go stale after cutover*, with the object
+that feeds it.
