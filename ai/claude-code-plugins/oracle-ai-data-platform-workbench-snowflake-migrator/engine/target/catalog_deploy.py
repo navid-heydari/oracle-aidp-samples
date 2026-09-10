@@ -32,6 +32,15 @@ TWO BEHAVIOURS LEARNED FROM A LIVE RUN, both of which broke the first attempt:
     reason says exactly that. This is why "the create returned 2xx" cannot be
     the claim: six tables once returned 202 and not one of them existed.
 
+  * A VIEW'S COLUMN TYPES ARE DERIVED BY THE TARGET, NOT DECLARED BY US.
+    Snowflake reports a view's DECLARED output types; AIDP re-derives them from
+    the SQL. Live, three aggregate columns of a 17-column view came back
+    different: COUNT(*) as bigint rather than decimal(18,0), and two SUMs
+    narrowed by two digits. That is a fidelity finding worth reporting loudly --
+    a narrowing can overflow -- but it is NOT "someone else's object that we
+    left alone", which is what a table mismatch means. The two are reported
+    separately.
+
   * THE LIST RESPONSE OMITS FIELDS. Listing gives existence and the server's
     real key case; it carries no `tableFields` at all. Six tables were created
     correctly, as managed DELTA with the right types, and every one was
@@ -117,6 +126,21 @@ def _resolve_object(call, catalog: str, schema_key: str, name: str,
     return None
 
 
+_DECIMAL_TYPE = __import__("re").compile(r"decimal\((\d+)\s*,\s*(\d+)\)")
+
+
+def _is_narrowing(declared: str, derived: str) -> bool:
+    """Did the target derive a type that holds LESS than the source declared?"""
+    a = _DECIMAL_TYPE.match(str(declared).lower())
+    b = _DECIMAL_TYPE.match(str(derived).lower())
+    if a and b:
+        return int(b.group(1)) < int(a.group(1))
+    # decimal -> bigint loses range above 19 digits.
+    if a and str(derived).lower() in ("bigint", "int", "smallint", "tinyint"):
+        return int(a.group(1)) > 18
+    return False
+
+
 def _is_conflict(exc: Exception) -> bool:
     text = str(exc)
     return "409" in text or "ongoing" in text.lower()
@@ -175,6 +199,9 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         "resolved_schema_keys": {}, "schemas_reused": [],
         "attempted_targets": [], "verified_targets": [], "failed_targets": [],
         "mismatched_targets": [], "mismatches": [],
+        # A view we DID create, whose column types the engine re-derived.
+        # Distinct from a mismatch: the object is ours, the types are not.
+        "derived_type_drift_targets": [], "derived_type_drift": [],
         "unverified_structure_targets": [], "unverified_structure": [],
         "failed": [],
     }
@@ -337,6 +364,25 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         if want == got:
             out["verified"] += 1
             out["verified_targets"].append(ident)
+        elif is_view and [n for n, _ in want] == [n for n, _ in got]:
+            # Same columns in the same order, different types: the engine
+            # derived them from the SQL. The view IS ours.
+            drift = [(n, w, g) for (n, w), (_, g) in zip(want, got) if w != g]
+            details = "; ".join(
+                f"{n}: declared {w.upper()}, derived {g.upper()}"
+                + (" (**NARROWED** -- values near the declared limit can "
+                   "overflow)" if _is_narrowing(w, g) else "")
+                for n, w, g in drift)
+            out["derived_type_drift_targets"].append(ident)
+            out["derived_type_drift"].append({
+                "source_identifier": ident, "target_fqn": stmt["target_fqn"],
+                "columns": [{"column": n, "declared": w, "derived": g}
+                            for n, w, g in drift],
+                "reason": f"created with all {len(want)} columns, but the "
+                          f"target re-derived {len(drift)} column type(s) from "
+                          f"the view SQL: {details}. Snowflake reports a "
+                          f"view's declared output types; the target computes "
+                          f"its own."})
         else:
             out["mismatched_targets"].append(ident)
             out["mismatches"].append({

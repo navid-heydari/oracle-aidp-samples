@@ -268,6 +268,19 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
                 for m in res["mismatches"]]
         out.append("")
 
+    if res.get("derived_type_drift"):
+        out += ["## Created, but the target derived different column types", "",
+                "These views **were created** with every planned column, in "
+                "order. The target computed some column types from the view "
+                "SQL rather than taking the declared ones — Snowflake reports "
+                "a view's *declared* output types, and the target derives its "
+                "own. Aggregates are where this shows up.", "",
+                "**A narrowing can overflow.** Check any column marked below "
+                "before anything depends on it.", ""]
+        for d in res["derived_type_drift"]:
+            out.append(f'- `{d["target_fqn"]}` — {d["reason"]}')
+        out.append("")
+
     if res.get("unverified_structure"):
         out += ["## Structure not verified", "",
                 "These exist, but their columns could not be compared against "

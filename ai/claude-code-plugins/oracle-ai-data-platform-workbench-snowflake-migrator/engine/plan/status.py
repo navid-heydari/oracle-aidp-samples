@@ -32,6 +32,11 @@ def migration_status(identifier: str, *, deployed: dict | None,
         # Structure only. DATA_CLONE/DONE are never returned here: this plugin
         # copies no rows, and claiming otherwise would be a false report.
         return "SHALLOW_CLONE"
+    if identifier in set(deployed.get("derived_type_drift_targets") or []):
+        # The view exists and is ours; the target derived some column types
+        # from the SQL rather than taking ours. Structure-cloned, with a
+        # fidelity caveat -- not BLOCKED, and not silently clean either.
+        return "SHALLOW_CLONE"
     if identifier in set(deployed.get("unverified_structure_targets") or []):
         # It exists, but its columns were never compared, so "cloned" is not a
         # claim we have earned.
