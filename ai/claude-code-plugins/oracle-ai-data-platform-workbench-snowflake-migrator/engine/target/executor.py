@@ -20,12 +20,14 @@ error, not a silent partial migration.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from typing import Callable
 
 from .coords import region_from_ocid
 
-__all__ = ["NoBackendAvailable", "StatementTooLarge", "BACKENDS",
+__all__ = ["BackendError", "NoBackendAvailable", "StatementTooLarge",
+           "BACKENDS",
            "build_command", "detect_backend", "parse_cli_json",
            "MAX_ARGV_STATEMENT"]
 
@@ -38,6 +40,16 @@ MAX_ARGV_STATEMENT = 100_000
 BACKENDS = ("aidp_cli", "oci_raw")
 
 _API_VERSION = "20240831"
+
+
+class BackendError(RuntimeError):
+    """The backend returned an error. Raised, never returned as data.
+
+    `oci raw-request` exits 0 on an HTTP error and puts the error in the
+    response BODY, so exit status proves nothing. Treating that body as data
+    made a 404 look like one row of results, and the smoke test reported PASS
+    against an endpoint that does not exist.
+    """
 
 
 class NoBackendAvailable(RuntimeError):
@@ -156,6 +168,11 @@ def parse_cli_json(stdout: str) -> list[dict]:
 
     Non-JSON output raises. A silent empty list here would make a failed create
     indistinguishable from a success that returned no rows.
+
+    An HTTP error carried in the BODY also raises. `oci raw-request` exits 0 on
+    a 404 and returns `{"data": {"code": ...}, "status": "404 Not Found"}`, so
+    the exit code proves nothing and the old `return [payload]` turned that
+    error object into one row of "results".
     """
     text = (stdout or "").strip()
     if not text:
@@ -165,12 +182,42 @@ def parse_cli_json(stdout: str) -> list[dict]:
     except json.JSONDecodeError as exc:
         raise RuntimeError(
             f"backend output is not JSON ({exc.msg}): {text[:300]}") from exc
+
     if isinstance(payload, list):
         return payload
-    if isinstance(payload, dict):
-        for key in ("data", "items", "rows", "results"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return value
-        return [payload]
-    raise RuntimeError(f"unexpected backend payload type: {type(payload).__name__}")
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"unexpected backend payload type: {type(payload).__name__}")
+
+    _raise_if_error(payload)
+
+    data = payload.get("data")
+    # Collections arrive as {"data": {"items": [...]}} -- unwrap, or three
+    # schemas get reported as one.
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        return data["items"]
+    for key in ("data", "items", "rows", "results"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    if isinstance(data, dict):
+        return [data]
+    return [payload]
+
+
+def _raise_if_error(payload: dict) -> None:
+    """Raise BackendError if this envelope reports an HTTP or service error."""
+    status = str(payload.get("status") or "")
+    code_match = re.match(r"\s*(\d{3})", status)
+    if code_match and not 200 <= int(code_match.group(1)) < 300:
+        detail = payload.get("data")
+        raise BackendError(
+            f"backend returned {status.strip()}: "
+            f"{json.dumps(detail)[:300] if detail is not None else '(no body)'}")
+
+    # Defence in depth: an OCI error object is recognisable without a status.
+    data = payload.get("data")
+    if isinstance(data, dict) and "code" in data and "message" in data \
+            and "items" not in data:
+        raise BackendError(
+            f'backend returned an error: {data["code"]} — {data["message"]}')

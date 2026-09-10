@@ -204,3 +204,44 @@ is resolving a task or stream to the tables it writes.
 **Done when:** every migrating table that is fed by a non-migrating object is
 named in `PLANNED_OBJECTS.md` as *will go stale after cutover*, with the object
 that feeds it.
+
+
+---
+
+# Target transport (opened 2026-09-10, from the first live AIDP contact)
+
+| # | Item | Effort | Status |
+|---|---|---|---|
+| T1 | Choose and implement a working DDL transport | M | **blocking `deploy --execute`** |
+| T2 | Check the HTTP status on every backend response | S | **done** |
+| T3 | Fix `list_tables` to send a fully-qualified `schemaKey` | S | open |
+
+## T1 — the transport question
+
+`POST /workspaces/<ws>/sql/execute` returns **404**: it does not exist. The
+`oci_raw` backend therefore cannot execute DDL, and the `aidp` CLI is not
+installed. Three ways forward:
+
+**Catalog REST API instead of SQL (recommended).** Schema/table/view CRUD is GA
+at `/catalogs`, `/schemas`, `/tables`, `/views`. For a structure-only clone
+this is strictly better than SQL: it needs **no Spark cluster** — which matters,
+because a stopped cluster costs nothing and starting one costs money — and it
+removes the whole "batch DDL is discarded when the session closes" problem the
+deploy module was built around. It also means `expected_columns` can be posted
+as a field list rather than rendered into `CREATE TABLE` text.
+
+**The `aidp` CLI.** The plugin's preferred backend, and its flags remain
+unverified. Cheapest to try if the CLI can be installed.
+
+**Reuse the sibling plugin's `aidp_sql.py`.** A proven WebSocket kernel-session
+transport, but it needs a running cluster and is a much heavier dependency.
+
+**Done when:** one transport executes `CREATE SCHEMA` + `CREATE TABLE` against
+a real catalog, the existence and structure probes read back what was created,
+and the command shapes are recorded as verified rather than assumed.
+
+## T3 — `schemaKey` must be fully qualified
+
+`GET /tables?catalogKey=lake&schemaKey=default` returns **400
+InvalidParameter**; `schemaKey=lake.default` returns 200. `build_command`'s
+`list_tables` sends the bare schema, so it would 400 on every call.
