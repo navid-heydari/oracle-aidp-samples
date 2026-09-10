@@ -63,8 +63,15 @@ def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
     omitted = obj.get("omitted_properties") or []
     if omitted:
         level = "MEDIUM"
-        notes.append("source properties dropped with no Delta equivalent: "
+        notes.append("source properties dropped with no AIDP equivalent: "
                      + ", ".join(omitted))
+
+    deferred = obj.get("deferred_properties") or []
+    if deferred:
+        level = "MEDIUM"
+        notes.append(
+            "source maintenance/layout settings not applied on the target: "
+            + ", ".join(f'{d["property"]}={d["value"]}' for d in deferred))
 
     warnings = obj.get("warnings") or []
     tz = [w for w in warnings if "timezone" in w.lower()]

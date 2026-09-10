@@ -1,5 +1,6 @@
 """The two headline reports: what is planned to move, and what got created."""
 from report.render import (
+    render_ddl_plan,
     render_compute, render_planned_objects, render_soft_clone_summary,
 )
 
@@ -199,3 +200,22 @@ def test_verified_wording_says_structure_not_just_existence():
            "mismatches": [], "unverified_structure": []}
     md = render_soft_clone_summary({"can_migrate": []}, res)
     assert "column" in md.lower()
+
+
+def test_ddl_plan_reports_deferred_maintenance_settings():
+    plan = {"statements": [
+        {"source_identifier": "DB.SC.T", "object_type": "TABLE",
+         "target_fqn": "CAT.SC.T", "sql": "CREATE TABLE ...",
+         "rules_applied": [], "warnings": [], "omitted_properties": [],
+         "deferred_properties": [
+             {"property": "cluster_by", "value": "(ORDER_DATE, STORE_ID)",
+              "aidp_equivalent": "Delta liquid clustering (`CLUSTER BY`) or "
+                                 "`OPTIMIZE … ZORDER BY`"}]}],
+        "blocked": []}
+    md = render_ddl_plan(plan)
+    assert "Maintenance and layout" in md
+    assert "cluster_by" in md
+    assert "(ORDER_DATE, STORE_ID)" in md
+    assert "ZORDER" in md
+    # And it must say plainly that nothing was applied.
+    assert "not applied" in md.lower()

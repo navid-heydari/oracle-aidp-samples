@@ -146,3 +146,15 @@ def test_an_untranslated_view_is_high_risk_not_medium():
     level, note = assess_risk({"object_type": "VIEW"})
     assert level == "HIGH"
     assert "wrong" in note.lower() or "verify" in note.lower()
+
+
+def test_a_deferred_maintenance_setting_raises_risk_and_names_itself():
+    # A clustering key that does not arrive is a performance regression on the
+    # biggest tables. It must not read as LOW.
+    level, note = assess_risk({
+        "object_type": "TABLE",
+        "deferred_properties": [{"property": "cluster_by",
+                                 "value": "(ORDER_DATE)",
+                                 "aidp_equivalent": "CLUSTER BY / ZORDER"}]})
+    assert level == "MEDIUM"
+    assert "cluster_by" in note

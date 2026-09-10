@@ -81,13 +81,38 @@ def render_ddl_plan(ddl: dict) -> str:
             out += ["Rules applied:", ""]
             out += [f'- `{r["rule_id"]}` — {r["detail"]}' for r in rules] + [""]
         if st.get("omitted_properties"):
-            out += ["Properties dropped (no Delta equivalent): "
+            out += ["Properties dropped (no AIDP equivalent): "
                     + ", ".join(f"`{p}`" for p in st["omitted_properties"]), ""]
+        if st.get("deferred_properties"):
+            out += ["Maintenance/layout settings NOT applied: "
+                    + ", ".join(f'`{d["property"]}`'
+                                for d in st["deferred_properties"]), ""]
         if st.get("warnings"):
             out += ["Warnings:", ""] + [f"- {w}" for w in st["warnings"]] + [""]
     if ddl.get("blocked"):
         out += ["## Blocked — no DDL generated", ""]
         out += [f'- `{b["source_identifier"]}` — {b["reason"]}' for b in ddl["blocked"]]
+
+    deferred = [(s["source_identifier"], d) for s in stmts
+                for d in (s.get("deferred_properties") or [])]
+    if deferred:
+        out += ["", "## Maintenance and layout — decisions, NOT applied", "",
+                "These source settings have a real AIDP equivalent, and this "
+                "version applies **none** of them. They are listed so the "
+                "choice gets made deliberately rather than lost: a clustering "
+                "key that quietly fails to arrive is a performance regression "
+                "on the largest tables in the estate.", "",
+                "The deeper difference is *who runs maintenance*. Snowflake "
+                "maintains layout and reclaims storage in the background, "
+                "un-asked. On AIDP the equivalents exist and are **explicit** "
+                "— they have to be scheduled, and `VACUUM` is what bounds how "
+                "far time travel can reach. See "
+                "`references/maintenance-and-layout.md`.", "",
+                "| Object | Source setting | Value | AIDP equivalent |",
+                "|---|---|---|---|"]
+        out += [f'| `{ident}` | `{d["property"]}` | `{d["value"]}` | '
+                f'{d["aidp_equivalent"]} |' for ident, d in deferred]
+        out.append("")
     return "\n".join(out) + "\n"
 
 

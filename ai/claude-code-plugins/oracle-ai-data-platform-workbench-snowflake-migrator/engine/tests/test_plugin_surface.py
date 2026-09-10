@@ -239,6 +239,11 @@ def test_no_shipped_file_mentions_the_forked_source_platform():
     """
     root = pathlib.Path(__file__).resolve().parents[2]
     banned = ("databricks", "dbutils", "dbfs")
+    # Two OSS Delta Spark settings are spelled with that legacy vendor prefix
+    # and OSS honours it, so the name cannot be changed without making the
+    # documentation wrong. Only the literal config prefix is exempt -- prose
+    # about the other platform is still a failure.
+    allowed_literals = ("spark.databricks.delta.",)
     offenders = []
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix not in (".md", ".py", ".json", ".txt", ".sql"):
@@ -248,6 +253,8 @@ def test_no_shipped_file_mentions_the_forked_source_platform():
         if "tests" in parts or "__pycache__" in parts or ".pytest_cache" in parts:
             continue
         low = path.read_text(errors="ignore").lower()
+        for literal in allowed_literals:
+            low = low.replace(literal, "")
         hits = [b for b in banned if b in low]
         if hits:
             offenders.append(f"{rel}: {hits}")

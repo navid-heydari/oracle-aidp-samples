@@ -141,3 +141,28 @@ python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py data-options --out-dir ./snowmig
 
 A rationale is mandatory. Recording executes nothing — **none of the six is
 implemented**, and `execute_transfer()` refuses by design.
+
+## Raise the maintenance question — it does not raise itself
+
+Snowflake exposes **no `OPTIMIZE` and no `VACUUM`**. It maintains layout via
+Automatic Clustering and reclaims storage in the background, un-asked. AIDP has
+`OPTIMIZE`, `VACUUM`, `ZORDER BY` and liquid clustering, and **runs none of
+them**. So a customer who asks for "the same maintenance on AIDP" is not asking
+for a missing feature — they are inheriting a responsibility.
+
+If the DDL plan has a *"Maintenance and layout — decisions, NOT applied"*
+section, read it out. Say three things:
+
+1. **Every listed setting has an AIDP equivalent, and none of them was
+   applied.** A clustering key that does not arrive is a performance regression
+   on the largest tables in the estate, and it is silent.
+2. **On Delta, `VACUUM` is what bounds time travel.** On Snowflake, retention
+   and storage reclamation are independent and automatic. A customer used to
+   reclaiming storage freely will delete their own recovery window. Snowflake's
+   7-day Fail-safe has **no** equivalent at all.
+3. **`OPTIMIZE` without `VACUUM` increases storage.** It leaves the old files
+   behind until retention expires, so half the job is a cost regression.
+
+Do not propose a cadence or a retention. Both need the customer's recovery
+requirements and query patterns. `references/maintenance-and-layout.md` has the
+full mapping; `ACTION-ITEMS.md` has the planned work.

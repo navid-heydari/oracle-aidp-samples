@@ -176,6 +176,24 @@ affected column. `--geospatial string` does the same for `GEOGRAPHY` and
 Neither hatch solves the problem — both defer it. As text, nothing on the target
 can address a field inside the value.
 
+## Table maintenance — a difference worth reading before you migrate
+
+Snowflake exposes **no `OPTIMIZE` and no `VACUUM`**: it maintains layout and
+reclaims storage in the background. AIDP has `OPTIMIZE`, `VACUUM`, `ZORDER BY`
+and liquid clustering, and **runs none of them for you**. The capability
+survives the migration; the *responsibility* moves.
+
+This plugin reports the gap per object and applies nothing — no maintenance
+DDL is generated, enforced by test. Source settings with a real equivalent
+(`cluster_by`, `retention_time`, `change_tracking`) appear in the DDL plan under
+*"Maintenance and layout — decisions, NOT applied"*, with the equivalent named,
+and raise the object's risk to MEDIUM.
+
+Two traps are worth knowing up front: on Delta **`VACUUM` is what bounds time
+travel** (on Snowflake those are independent and automatic), and **`OPTIMIZE`
+increases storage until `VACUUM` runs**. Full mapping and the planned work:
+`references/maintenance-and-layout.md`, `ACTION-ITEMS.md`.
+
 ## Known limitation
 
 The `deploy --execute` path has **never run against a live AIDP deployment** —
