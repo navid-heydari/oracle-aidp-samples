@@ -190,18 +190,18 @@ def test_overview_requires_the_options_to_be_presented_always():
     flat = " ".join(text.lower().split())
     assert "always present the data-movement architecture options" in flat
     assert "undecided" in flat
-    assert "none of the five is implemented" in flat
+    assert "none of the six is implemented" in flat
 
 
-def test_plan_skill_lists_all_five_options_with_a_stated_recommendation():
+def test_plan_skill_lists_every_option_with_a_stated_recommendation():
     text = (ROOT / "skills/snowflake-migration-plan/SKILL.md").read_text()
-    for opt in ("`A1`", "`A2`", "`A3`", "`A4`", "`A5`"):
+    for opt in ("`A1`", "`A2`", "`A3`", "`A4`", "`A5`", "`A6`"):
         assert opt in text, opt
     # Collapse whitespace: markdown line wrapping must not break a prose check.
     flat = " ".join(text.lower().split())
     assert "recommendation, not a decision" in flat
     assert "undecided" in flat
-    assert "none of the five is implemented" in flat
+    assert "none of the six is implemented" in flat
 
 
 def test_reference_carries_the_capability_matrix_and_build_notes():
@@ -210,3 +210,17 @@ def test_reference_carries_the_capability_matrix_and_build_notes():
     assert "What each option would take to build" in text
     for cap in ("historic_bulk", "ongoing_incremental", "read_without_copy"):
         assert cap in text, cap
+
+
+def test_skills_present_the_open_slot_as_a_valid_answer():
+    for name in ("snowflake-migrator-overview", "snowflake-migration-plan"):
+        flat = " ".join((ROOT / "skills" / name / "SKILL.md")
+                        .read_text().lower().split())
+        assert "a6" in flat, name
+        assert "never paraphrase" in flat or "never mapped" in flat, name
+
+
+def test_no_skill_pushes_the_user_to_pick_from_the_listed_options():
+    flat = " ".join((ROOT / "skills/snowflake-migration-plan/SKILL.md")
+                    .read_text().lower().split())
+    assert "real answer, not a fallback" in flat

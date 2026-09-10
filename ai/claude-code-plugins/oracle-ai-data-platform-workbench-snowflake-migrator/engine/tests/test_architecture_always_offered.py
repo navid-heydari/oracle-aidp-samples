@@ -33,10 +33,12 @@ def test_every_option_says_what_building_it_requires():
 
 
 def test_every_option_declares_what_it_handles():
+    from plan.data_movement import CUSTOMER_DEFINED_ID
     for o in OPTIONS:
-        assert o["handles"], o["id"]
         assert set(o["handles"]) <= {"historic_bulk", "ongoing_incremental",
                                      "read_without_copy", "cutover"}
+        if o["id"] != CUSTOMER_DEFINED_ID:
+            assert o["handles"], o["id"]
 
 
 def test_capability_matrix_covers_every_option_and_capability():

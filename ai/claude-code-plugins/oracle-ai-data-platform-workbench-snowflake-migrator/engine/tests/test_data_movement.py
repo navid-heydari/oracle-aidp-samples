@@ -13,8 +13,8 @@ def test_at_least_three_options_offered():
 def test_every_option_is_fully_described():
     for o in OPTIONS:
         assert o["id"] and o["name"]
-        assert o["catalog_type"] in ("INTERNAL", "EXTERNAL", "BOTH", "N/A")
-        assert o["etl"] and o["moves_bytes"] in (True, False)
+        assert o["catalog_type"] in ("INTERNAL", "EXTERNAL", "BOTH", "TBD")
+        assert o["etl"] and o["moves_bytes"] in (True, False, None)
         assert o["pros"] and o["cons"]
         assert o["unknowns"], "every option must state what is still unverified"
         assert o["status"] == "proposal_only"
@@ -36,6 +36,11 @@ def test_internal_and_external_catalog_options_both_exist():
 
 def test_at_least_one_option_moves_no_bytes():
     assert any(o["moves_bytes"] is False for o in OPTIONS)
+
+
+def test_a_customer_defined_slot_exists_so_none_of_the_above_is_answerable():
+    from plan.data_movement import CUSTOMER_DEFINED_ID
+    assert any(o["id"] == CUSTOMER_DEFINED_ID for o in OPTIONS)
 
 
 def test_options_for_historic_and_ongoing_are_distinguished():

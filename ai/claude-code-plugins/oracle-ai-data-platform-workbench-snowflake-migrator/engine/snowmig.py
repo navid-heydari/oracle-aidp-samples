@@ -135,9 +135,16 @@ def cmd_plan(args) -> int:
     s = built["summary"]
     from plan.data_movement import architecture_decision
     decision = architecture_decision(built.get("architecture_choice"))
-    print("  architecture: "
-          + (decision["chosen"]["id"] if decision["decided"]
-             else f'UNDECIDED — {len(decision["options"])} options presented'))
+    if decision["decided"]:
+        state = decision["chosen"]["id"]
+        custom = decision["chosen"].get("custom_architecture")
+        if custom:
+            state += f' — "{custom["name"]}" (customer-defined, not assessed)'
+    elif decision["deferred"]:
+        state = "DEFERRED by the customer — not a gap"
+    else:
+        state = f'UNDECIDED — {len(decision["options"])} options presented'
+    print(f"  architecture: {state}")
     print(f'  planned {s["can_migrate"]} object(s) '
           f'({s["tables"]} table, {s["views"]} view); '
           f'{s["cannot_migrate"]} cannot move')
@@ -343,9 +350,22 @@ def cmd_data_options(args) -> int:
     if args.choose:
         if not args.rationale:
             raise ValueError("--choose requires --rationale")
-        payload["choice"] = record_choice(args.choose, chosen_by=args.chosen_by,
-                                          rationale=args.rationale)
-        print(f'  recorded choice: {args.choose} (executed: False)')
+        custom = None
+        if args.custom_name or args.custom_description_file:
+            if not (args.custom_name and args.custom_description_file):
+                raise ValueError(
+                    "a custom architecture needs both --custom-name and "
+                    "--custom-description-file")
+            custom = {
+                "name": args.custom_name,
+                "description": pathlib.Path(
+                    args.custom_description_file).read_text().strip()}
+        payload["choice"] = record_choice(
+            args.choose, chosen_by=args.chosen_by, rationale=args.rationale,
+            custom_architecture=custom)
+        state = ("DEFERRED — the customer will specify it later"
+                 if payload["choice"]["deferred"] else args.choose)
+        print(f"  recorded: {state} (executed: False)")
     _write(out, "data_options.json", payload)
     _write(out, "DATA_MOVEMENT_OPTIONS.md", render_data_options(options))
     print(f"  {len(options)} option(s) presented; none implemented")
@@ -453,6 +473,11 @@ def build_parser() -> argparse.ArgumentParser:
     do.add_argument("--choose", help="record the chosen option id; executes nothing")
     do.add_argument("--chosen-by", default="unspecified")
     do.add_argument("--rationale", help="required with --choose")
+    do.add_argument("--custom-name",
+                    help="name of a customer architecture that is NOT one of the "
+                         "listed options; use with --choose A6_CUSTOMER_DEFINED")
+    do.add_argument("--custom-description-file",
+                    help="file describing that architecture, recorded verbatim")
     do.set_defaults(func=cmd_data_options)
     return ap
 

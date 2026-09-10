@@ -63,6 +63,8 @@ says what happens if it is wrong. Reviewed 2026-09-09.
 | E3 | Rappi's region is unresolved | Three answers exist: the deck's diagram says Ashburn, a note says Oregon, and the test account is Ohio. **No cost or transfer estimate should be produced until this is settled** |
 | E4 | Data movement is a later phase | See `references/data-movement-options.md`. Five options are presented; none is implemented |
 | E5 | The architecture choice belongs to the customer | The options are surfaced in **every** plan and summary, and no default is applied. If the user expresses no preference, `A2` (federate first) is offered as a stated *recommendation*, never as a silent default |
+| E6 | The eventual architecture may be none of the ones listed | `A6_CUSTOMER_DEFINED` is the open slot. A customer design is recorded verbatim and **never mapped** to `A1`–`A5`, and this plugin makes no assessment of it — so none of the trade-offs or unknowns listed against the others transfer to it |
+| E7 | Deferring the choice is legitimate | Recording `A6` with no description is a **deliberate deferral**, reported as such and distinct from never having been asked. It blocks nothing: assessment, plan and shallow clone all proceed |
 
 ## Outstanding items that block real use
 
