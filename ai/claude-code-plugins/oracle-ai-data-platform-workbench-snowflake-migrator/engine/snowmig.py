@@ -45,7 +45,10 @@ from snowflake_source.conn import (
     AuthError, SourceWriteRefused, build_connect_kwargs, connect,
     make_run_sql,
 )
-from snowflake_source.extract.catalog import build_inventory
+from snowflake_source.extract.catalog import (
+    ROW_COUNT_MODES, build_inventory)
+from snowflake_source.dialect.types import (
+    GEOSPATIAL_MODES, SEMI_STRUCTURED_MODES)
 from snowflake_source.extract.dependencies import extract_dependencies
 from snowflake_source.extract.warehouses import extract_warehouses
 from sizing.warehouse_map import propose_all
@@ -91,7 +94,11 @@ def _run_sql_from_args(args):
 
 def _assess_inventory(args) -> dict:
     """Seam for tests: patched to avoid a live connection."""
-    return build_inventory(_run_sql_from_args(args), args.database or None)
+    return build_inventory(
+        _run_sql_from_args(args), args.database or None,
+        row_counts=getattr(args, "row_counts", "metadata"),
+        semi_structured=getattr(args, "semi_structured", "block"),
+        geospatial=getattr(args, "geospatial", "block"))
 
 
 def cmd_assess(args) -> int:
@@ -182,7 +189,9 @@ def cmd_ddl(args) -> int:
             "object_type": rec.get("object_type"),
             "target_fqn": res.target_fqn, "sql": res.sql,
             "rules_applied": [dataclasses.asdict(r) for r in res.rules_applied],
-            "warnings": res.warnings, "omitted_properties": res.omitted_properties})
+            "warnings": res.warnings, "omitted_properties": res.omitted_properties,
+            # Deployment verifies the structure against this, not just the name.
+            "expected_columns": res.expected_columns})
 
     payload = {"statements": statements, "blocked": blocked,
                "bronze_catalog_prefix": built.get("bronze_catalog_prefix")}
@@ -409,6 +418,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_snowflake_args(a)
     a.add_argument("--database", action="append",
                    help="repeatable; omit to scan all non-system databases")
+    a.add_argument("--row-counts", choices=list(ROW_COUNT_MODES),
+                   default="metadata",
+                   help="metadata (default): Snowflake's maintained count, free "
+                        "to read. exact: COUNT(*) per object -- accurate, but it "
+                        "EXECUTES every view and costs warehouse time. none: skip")
+    a.add_argument("--semi-structured", choices=list(SEMI_STRUCTURED_MODES),
+                   default="block",
+                   help="block (default): VARIANT/OBJECT/ARRAY block their table "
+                        "pending a typed design. string: carry the JSON as text, "
+                        "with a warning on every affected column")
+    a.add_argument("--geospatial", choices=list(GEOSPATIAL_MODES),
+                   default="block",
+                   help="block (default): GEOGRAPHY/GEOMETRY block their table. "
+                        "string: carry as text, with no spatial type on the target")
     a.set_defaults(func=cmd_assess)
 
     d = sub.add_parser("deps", parents=[common], help="dependency edges")

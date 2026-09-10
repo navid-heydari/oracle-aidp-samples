@@ -46,6 +46,89 @@ def _code(*lines: str) -> dict:
             "outputs": [], "source": [l + "\n" for l in lines]}
 
 
+# Verify-cell body, kept as source rather than an escaped list of string
+# literals so that what runs on the cluster is readable here.
+#
+# Existence is NOT the claim. The DDL is CREATE ... IF NOT EXISTS, so an
+# object that already existed with different columns was left exactly as it
+# was found -- calling that a clone would be a false report about someone
+# else's table. So the cell matches the name EXACTLY, then compares the
+# column list, and reports "structure differs" and "unverified" as
+# outcomes distinct from "verified".
+_VERIFY_BODY = r"""
+# `_` and `%` are LIKE wildcards, and `_` is in most real table names, so an
+# unescaped probe matches names other than the one asked for.
+def _like(name):
+    out = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return out.replace("'", "''")
+
+
+def _name_of(row):
+    d = row.asDict()
+    for key in ("tableName", "viewName", "name", "table_name"):
+        if d.get(key) is not None:
+            return str(d[key]).upper()
+    return None
+
+
+def _columns_of(fqn, kind):
+    what = "VIEW" if kind == "VIEW" else "TABLE"
+    cols = []
+    for r in spark.sql(f"DESCRIBE {what} {fqn}").collect():
+        name = (r["col_name"] or "").strip()
+        if not name or name.startswith("#"):
+            break            # metadata section -- the columns are done
+        cols.append((name.upper(), "".join(str(r["data_type"]).split()).upper()))
+    return cols
+
+
+_verified, _missing, _mismatched, _unchecked = [], [], [], []
+
+for _kind, _cat, _sch, _name, _cols in _expected:
+    _label = f"{_cat}.{_sch}.{_name}"
+    _fqn = f"`{_cat}`.`{_sch}`.`{_name}`"
+    _show = "SHOW VIEWS" if _kind == "VIEW" else "SHOW TABLES"
+    try:
+        _rows = spark.sql(
+            f"{_show} IN `{_cat}`.`{_sch}` LIKE '{_like(_name)}'").collect()
+    except Exception as _exc:
+        _missing.append(f"{_label} (probe failed: {_exc})")
+        continue
+
+    # An EXACT name match, not merely a non-empty result.
+    if _name.upper() not in [_name_of(_r) for _r in _rows]:
+        _missing.append(_label)
+        continue
+
+    if not _cols:
+        _unchecked.append(f"{_label} (no planned column list to compare)")
+        continue
+    try:
+        _actual = _columns_of(_fqn, _kind)
+    except Exception as _exc:
+        _unchecked.append(f"{_label} (structure unreadable: {_exc})")
+        continue
+
+    _want = [(str(_n).upper(), "".join(str(_t).split()).upper())
+             for _n, _t in _cols]
+    if _want == _actual:
+        _verified.append(_label)
+    else:
+        _mismatched.append(f"{_label}: planned {_want}, found {_actual}")
+
+print(f"verified {len(_verified)}/{len(_expected)} "
+      f"(planned structure, not just a name that exists)")
+for _m in _missing:
+    print(f"  MISSING: {_m}")
+for _m in _mismatched:
+    print(f"  STRUCTURE DIFFERS -- left as found, NOT cloned: {_m}")
+for _m in _unchecked:
+    print(f"  UNVERIFIED STRUCTURE: {_m}")
+print()
+print("Verified objects are EMPTY. No data was copied.")
+"""
+
+
 def build_notebook(ddl_plan: dict, plan: dict, *, catalog: str,
                    source: dict) -> dict:
     statements = [s for s in ddl_plan.get("statements", [])
@@ -157,25 +240,11 @@ def build_notebook(ddl_plan: dict, plan: dict, *, catalog: str,
     for s in statements:
         kind = "VIEW" if s.get("object_type") == "VIEW" else "TABLE"
         cat, sch, name = s["target_fqn"].split(".", 2)
-        verify.append(f"    ({kind!r}, {cat!r}, {sch!r}, {name!r}),")
-    verify += [
-        "]",
-        "",
-        "_verified, _missing = [], []",
-        "for _kind, _cat, _sch, _name in _expected:",
-        "    _show = 'SHOW VIEWS' if _kind == 'VIEW' else 'SHOW TABLES'",
-        "    try:",
-        "        _rows = spark.sql(",
-        "            f\"{_show} IN `{_cat}`.`{_sch}` LIKE '{_name}'\").collect()",
-        "        (_verified if _rows else _missing).append(f'{_cat}.{_sch}.{_name}')",
-        "    except Exception as _exc:",
-        "        _missing.append(f'{_cat}.{_sch}.{_name} (probe failed: {_exc})')",
-        "",
-        "print(f'verified {len(_verified)}/{len(_expected)}')",
-        "for _m in _missing:",
-        "    print(f'  MISSING: {_m}')",
-        "print()",
-        "print('These objects are EMPTY. No data was copied.')"]
+        cols = [(c.get("name"), c.get("type"))
+                for c in (s.get("expected_columns") or [])]
+        verify.append(f"    ({kind!r}, {cat!r}, {sch!r}, {name!r}, {cols!r}),")
+    verify.append("]")
+    verify += _VERIFY_BODY.strip("\n").split("\n")
     cells.append(_code(*verify))
 
     if blocked:

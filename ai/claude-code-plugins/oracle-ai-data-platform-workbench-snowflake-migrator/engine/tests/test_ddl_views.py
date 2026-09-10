@@ -203,3 +203,68 @@ def test_function_call_in_the_body_does_not_look_like_a_column_list():
 def test_quoted_column_list_still_parses():
     ddl = 'create view V("A", "B") as select a, b from t'
     assert extract_view_body(ddl) == "select a, b from t"
+
+
+# --------------------------------------------------------------------------
+# Header location by scanner, not regex (issue #18).
+# --------------------------------------------------------------------------
+
+def test_body_found_when_the_view_name_is_quoted_and_contains_a_space():
+    # The old header regex allowed [\w$".]+ for the name, so a legal quoted
+    # name with a space failed to match and the whole view was unreadable.
+    body = extract_view_body('create view "my view" as select 1 as a')
+    assert body == "select 1 as a"
+
+
+def test_body_found_when_the_name_contains_a_doubled_quote():
+    assert extract_view_body('create view "we""ird" as select 1') == "select 1"
+
+
+def test_as_inside_a_string_literal_in_the_header_is_not_the_header_end():
+    # COMMENT = 'x as y' -- a scan for ` as ` finds this first.
+    body = extract_view_body(
+        "create view v comment = 'defined as a rollup' as select 1 as a")
+    assert body == "select 1 as a"
+
+
+def test_as_inside_a_comment_in_the_header_is_not_the_header_end():
+    body = extract_view_body("create view v /* used as a stub */ as select 1")
+    assert body == "select 1"
+
+
+def test_column_alias_as_is_not_mistaken_for_the_header_end():
+    body = extract_view_body(
+        "create view v (f) as select IFF(a, 'y', 'n') AS f from t")
+    assert body == "select IFF(a, 'y', 'n') AS f from t"
+
+
+def test_quoted_column_list_with_spaces_is_handled():
+    body = extract_view_body('create view v ("col one", "col two") as select 1, 2')
+    assert body == "select 1, 2"
+
+
+def test_secure_recursive_and_or_replace_prefixes_are_all_accepted():
+    for head in ("create view v",
+                 "create or replace view v",
+                 "create secure view v",
+                 "create or replace secure recursive view v"):
+        assert extract_view_body(f"{head} as select 1") == "select 1"
+
+
+def test_a_statement_that_is_not_a_create_view_is_refused():
+    with pytest.raises(ValueError):
+        extract_view_body("select 1")
+
+
+def test_a_create_view_with_no_as_is_refused():
+    with pytest.raises(ValueError):
+        extract_view_body("create view v")
+
+
+def test_trailing_semicolon_and_whitespace_are_stripped():
+    assert extract_view_body("create view v as select 1 ;  ") == "select 1"
+
+
+def test_unterminated_literal_in_the_ddl_is_reported():
+    with pytest.raises(ValueError):
+        extract_view_body("create view v as select 'oops")

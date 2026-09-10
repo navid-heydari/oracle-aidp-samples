@@ -164,3 +164,65 @@ def test_partial_translation_is_flagged_not_claimed_complete():
     r = t("select IFF(a,1,2) from t qualify row_number() over (order by a) = 1")
     assert r.applied and r.unsupported
     assert r.fully_translated is False
+
+
+# --------------------------------------------------------------------------
+# Literal awareness (issue #18). Every rule used to run re.sub / re.search
+# over raw SQL, so text inside a string literal was treated as code.
+# --------------------------------------------------------------------------
+
+def test_iff_inside_a_literal_is_not_rewritten():
+    # Rewriting here would change the DATA the view returns, not the SQL.
+    out = translate_sql("select 'IFF(x)' as label, IFF(a, 1, 2) as v")
+    assert out.sql == "select 'IFF(x)' as label, IF(a, 1, 2) as v"
+
+
+def test_array_construct_inside_a_literal_is_not_rewritten():
+    out = translate_sql("select 'ARRAY_CONSTRUCT(1)' as doc")
+    assert out.sql == "select 'ARRAY_CONSTRUCT(1)' as doc"
+
+
+def test_qualify_inside_a_literal_does_not_block_the_view():
+    # The word appears in a projected string, not as a clause.
+    out = translate_sql("select 'QUALIFY' as reason from t")
+    assert [u["rule_id"] for u in out.unsupported] == []
+    assert out.fully_translated
+
+
+def test_variant_path_rule_does_not_fire_on_a_json_literal():
+    # T16's detector is `word : word`, which matches inside any JSON-ish
+    # literal. That false positive blocked views with no VARIANT access at all.
+    out = translate_sql("""select '{"a": 1}' as payload from t""")
+    assert [u["rule_id"] for u in out.unsupported] == []
+
+
+def test_variant_path_rule_still_fires_on_real_variant_access():
+    out = translate_sql("select payload:customer from t")
+    assert "T16_VARIANT_PATH" in [u["rule_id"] for u in out.unsupported]
+
+
+def test_cast_shorthand_still_rewrites_a_literal_operand():
+    # The operand is a literal on purpose; only `::` has to be code.
+    out = translate_sql("select 'x'::varchar as v")
+    assert out.sql == "select CAST('x' AS varchar) as v"
+
+
+def test_cast_shorthand_inside_a_literal_is_not_rewritten():
+    out = translate_sql("select 'a::int' as doc from t")
+    assert out.sql == "select 'a::int' as doc from t"
+    assert out.fully_translated
+
+
+def test_listagg_separator_literal_survives_translation():
+    out = translate_sql("select LISTAGG(name, ', ') from t")
+    assert out.sql == "select concat_ws(', ', collect_list(name)) from t"
+
+
+def test_dateadd_inside_a_literal_is_not_rewritten():
+    out = translate_sql("select 'DATEADD(day, 1, d)' as doc")
+    assert out.sql == "select 'DATEADD(day, 1, d)' as doc"
+
+
+def test_comment_text_does_not_trigger_a_declared_rule():
+    out = translate_sql("-- QUALIFY is discussed here\nselect 1")
+    assert [u["rule_id"] for u in out.unsupported] == []

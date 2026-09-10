@@ -200,8 +200,10 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
                f'Created and **verified {res.get("verified", 0)}/{total}** '
                f'(executed {res.get("executed", 0)}/{total}).', "",
                "Verification probes each object individually, because a batch can "
-               "report success while statements inside it failed. `verified` is the "
-               "honest number.", "",
+               "report success while statements inside it failed. `verified` "
+               "means the object exists **with the planned column list** — the "
+               "DDL is `CREATE IF NOT EXISTS`, so a name that already belonged "
+               "to a different table is reported below, not counted here.", "",
                "**These objects are empty — the clone copies structure, no data.**",
                ""]
 
@@ -224,6 +226,24 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
     if res.get("blocked_count"):
         out += [f'{res["blocked_count"]} object(s) were blocked before deployment '
                 "and never attempted. See the planned-objects report.", ""]
+
+    if res.get("mismatches"):
+        out += ["## Structure differs — left as found, NOT cloned", "",
+                "These names already existed in AIDP with a different structure. "
+                "`CREATE IF NOT EXISTS` left them exactly as they were, so they "
+                "have **not been cloned** and nothing of theirs was altered. "
+                "Resolve the name collision before re-running.", ""]
+        out += [f'- `{m["target_fqn"]}` — {m["reason"]}'
+                for m in res["mismatches"]]
+        out.append("")
+
+    if res.get("unverified_structure"):
+        out += ["## Structure not verified", "",
+                "These exist, but their columns could not be compared against "
+                "the plan, so they are not counted as verified.", ""]
+        out += [f'- `{u["target_fqn"]}` — {u["reason"]}'
+                for u in res["unverified_structure"]]
+        out.append("")
 
     if res.get("failed"):
         out += ["## Failed verification", ""]
@@ -290,6 +310,57 @@ def render_compute(sizing: dict) -> str:
 # with row count, migration risk, and migration status. Plus a brief
 # source -> destination header.
 # ---------------------------------------------------------------------------
+
+def _row_count_provenance(inventory: dict | None) -> list[str]:
+    """Explain every blank in the Rows column.
+
+    A `-` for a view that was not counted and a `-` for a job that has no rows
+    are different facts and must not render identically. A count that FAILED is
+    a third thing again, and its reason used to be discarded entirely.
+    """
+    records = (inventory or {}).get("inventory") or []
+    if not records:
+        return []
+    mode = (inventory or {}).get("row_count_mode", "metadata")
+    described = {
+        "metadata": "Snowflake's maintained row count, read from `SHOW` at no "
+                    "cost. It agrees with `COUNT(*)` for a settled standard "
+                    "table, but it can lag very recent DML and is not "
+                    "maintained for external tables, so it is not a verified "
+                    "number.",
+        "exact": "a `COUNT(*)` per object — verified, and it executes every "
+                 "view to get there.",
+        "none": "not collected; `--row-counts` was `none`.",
+    }.get(mode, mode)
+
+    out = ["## Row counts", "",
+           f"Mode: **{mode}** — {described}", ""]
+
+    not_counted = [r for r in records if r.get("row_count_source") == "not_counted"]
+    errored = [r for r in records if r.get("row_count_source") == "error"]
+
+    if not_counted:
+        notes = {r.get("row_count_note") for r in not_counted if r.get("row_count_note")}
+        out.append(f"**{len(not_counted)} object(s) show `-` because they were "
+                   f"not counted**, not because they are empty:")
+        out.append("")
+        out += [f'- `{r["source_identifier"]}`' for r in not_counted[:20]]
+        if len(not_counted) > 20:
+            out.append(f"- …and {len(not_counted) - 20} more")
+        out.append("")
+        out += [f"Reason: {n}" for n in sorted(notes)]
+        out.append("")
+
+    if errored:
+        out.append(f"**{len(errored)} row count(s) FAILED** — these blanks are "
+                   f"an error, not a zero:")
+        out.append("")
+        out += [f'- `{r["source_identifier"]}` — {r.get("row_count_note", "no detail")}'
+                for r in errored[:20]]
+        out.append("")
+
+    return out
+
 
 def render_summary(plan: dict, inventory: dict, deployed: dict | None,
                    target: dict | None) -> str:
@@ -365,6 +436,8 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
             "**`DATA_CLONE` and `DONE` are unreachable in this version: the plugin "
             "copies structure only and moves no data.** Every object that reports "
             "`SHALLOW_CLONE` exists in AIDP with its columns and zero rows.", ""]
+
+    out += _row_count_provenance(inventory)
 
     if deployed and not deployed.get("dry_run"):
         out += [f'Deployed against catalog '

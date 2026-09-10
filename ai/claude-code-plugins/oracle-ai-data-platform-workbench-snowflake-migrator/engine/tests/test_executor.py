@@ -3,7 +3,8 @@ import pytest
 
 from target.coords import resolve_target
 from target.executor import (
-    NoBackendAvailable, build_command, detect_backend, parse_cli_json,
+    NoBackendAvailable, StatementTooLarge, build_command, detect_backend,
+    parse_cli_json,
 )
 
 TARGET = resolve_target(datalake_ocid="ocid1.aidataplatform.oc1.iad.aaaa",
@@ -141,3 +142,22 @@ def test_notebook_operations_contain_no_destructive_verb():
             joined = " ".join(build_command(backend, op, TARGET, **kw)).upper()
             for verb in (" DROP ", " DELETE ", " TRUNCATE "):
                 assert verb not in joined
+
+
+# --------------------------------------------------------------------------
+# A batch too large for argv must fail with advice, not E2BIG (issue #19).
+# --------------------------------------------------------------------------
+
+def test_an_oversized_statement_is_refused_with_advice():
+    target = resolve_target(datalake_ocid="ocid1.aidataplatform.oc1.iad.a",
+                            workspace="ws", cluster_id="cl", catalog="CAT")
+    huge = "SELECT 1;\n" * 40_000
+    with pytest.raises(StatementTooLarge) as exc:
+        build_command("aidp_cli", "sql", target, sql=huge)
+    assert "--chunk-size" in str(exc.value)
+
+
+def test_a_normal_statement_is_not_refused():
+    target = resolve_target(datalake_ocid="ocid1.aidataplatform.oc1.iad.a",
+                            workspace="ws", cluster_id="cl", catalog="CAT")
+    assert build_command("aidp_cli", "sql", target, sql="SELECT 1")

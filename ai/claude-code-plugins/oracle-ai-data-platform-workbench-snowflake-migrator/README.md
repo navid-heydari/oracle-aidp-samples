@@ -34,7 +34,9 @@ the customer rather than logic to invent.
 | Against Snowflake | **Read-only, always.** Only `SHOW`, `SELECT`, `DESCRIBE`, `GET_DDL` |
 | Against AIDP | **Dry-run by default.** Writing needs `--execute` plus all four target coordinates in the same command |
 | Target coordinates | **Never stored and never discovered.** No config file, no environment default, no cache. Supplied per conversation and confirmed in the turn they are used |
-| Unmapped types/features | **Blocked with a reason.** Never approximated, never silently defaulted |
+| Unmapped types/features | **Blocked with a reason.** Never approximated, never silently defaulted. Semi-structured and geospatial types have an explicit opt-in escape hatch — see below |
+| "Verified" | **Means the planned columns are there**, checked by `DESCRIBE`. A name that already belonged to a different structure is reported as a mismatch and left untouched — never counted as cloned |
+| Assessment cost | **Free by default.** Row counts come from Snowflake's maintained metadata; a `COUNT(*)` per object, which executes every view, is opt-in |
 | Collisions | **Halt (exit 3).** Identifier-case and target-name collisions stop the run rather than picking a winner |
 
 ## Pipeline
@@ -72,6 +74,12 @@ python3 -m pip install -r engine/requirements.txt
 # 1. investigate (read-only)
 python3 engine/snowmig.py assess --out-dir ./out \
   --account <org>-<account> --user <user> --auth keypair --key-path ~/.sf_key.p8
+#   [--row-counts metadata|exact|none]        default metadata: free, and exact
+#                                             for a settled table. `exact` runs
+#                                             COUNT(*) per object and EXECUTES
+#                                             every view.
+#   [--semi-structured block|string]          VARIANT/OBJECT/ARRAY
+#   [--geospatial block|string]               GEOGRAPHY/GEOMETRY
 
 # 2. plan (deps needs Snowflake; plan is offline)
 python3 engine/snowmig.py deps --out-dir ./out --account ... --user ... --auth keypair --key-path ...
@@ -142,13 +150,47 @@ raw-request`**. `oci ai-data-platform` covers only the control plane, which is w
 the data plane uses `raw-request`. The engine prints which backend it chose and
 fails loudly if neither CLI is present.
 
+## Row counts, and what they cost
+
+| Mode | Source | Cost |
+|---|---|---|
+| `metadata` (default) | Snowflake's maintained count, from `SHOW`. Views get none | Free |
+| `exact` | `COUNT(*)` per object | **Executes every view.** Warehouse time per object |
+| `none` | — | Free |
+
+The metadata count agrees with `COUNT(*)` for a settled standard table — the
+live corpus confirms it on all six — but it can lag very recent DML and is not
+maintained for external tables, so the reports label it as metadata and never
+call it verified. Every blank in a Rows column carries its reason: not counted,
+not requested, or a named error.
+
+## Semi-structured and geospatial types
+
+`VARIANT`, `OBJECT` and `ARRAY` block their table by default, because the
+target shape is a design decision rather than something to guess. Because that
+would otherwise be a dead end on an estate full of JSON payloads,
+`--semi-structured string` carries the value as text with a warning on every
+affected column. `--geospatial string` does the same for `GEOGRAPHY` and
+`GEOMETRY`. Two flags, not one: they are separate decisions.
+
+Neither hatch solves the problem — both defer it. As text, nothing on the target
+can address a field inside the value.
+
 ## Known limitation
 
 The `deploy --execute` path has **never run against a live AIDP deployment** —
-no environment has been available. Command construction is pure and tested, and
-every command is printed before it runs, so a wrong flag should produce an
-obvious CLI usage error rather than a silent partial migration. Treat the first
-live run as a shake-out.
+no environment has been available. That covers the `aidp`/`oci` command shapes,
+the REST paths, the existence and `DESCRIBE` probes, notebook upload, run-status
+polling, and the destination half of the smoke test. Command construction is
+pure and tested, and every command is printed before it runs, so a wrong flag
+should produce an obvious CLI usage error rather than a silent partial
+migration. **Treat the first live run as a shake-out**, and expect the probe
+response shapes to need adjusting: the code accepts several spellings of the
+name and type columns and reports "unrecognised output" rather than guessing,
+but it cannot know which one AIDP actually returns.
+
+The Snowflake side, by contrast, is live-verified: 10 gated end-to-end tests run
+against a real account.
 
 ## Docs
 
@@ -156,7 +198,6 @@ live run as a shake-out.
 - [docs/plans/2026-09-09-snowflake-migrator-mvp1.md](docs/plans/2026-09-09-snowflake-migrator-mvp1.md) — implementation plan
 - [references/type-mapping.md](references/type-mapping.md) — the type table
 - [PLAN-2PERSON-TIMETABLE.md](PLAN-2PERSON-TIMETABLE.md) — full-programme schedule beyond MVP-1
-- [PORTING-STATUS.md](PORTING-STATUS.md) — what was kept from the Databricks migrator fork and what was deleted
 - [ASSUMPTIONS.md](ASSUMPTIONS.md) — everything this rests on, and what breaks if each is wrong
 - [references/data-movement-options.md](references/data-movement-options.md) — the five ways bytes could move later; **none implemented**
 - [CLEANUP-BEFORE-PUBLISH.md](CLEANUP-BEFORE-PUBLISH.md) — **do this before sharing**

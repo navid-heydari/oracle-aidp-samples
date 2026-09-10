@@ -1,6 +1,10 @@
-Oracle AI Data Platform — Databricks Migrator
+Oracle AI Data Platform — Snowflake Migrator
 Claude Code plugin
 
-Made by Ahmed Awan (Forward Deployed Engineering).
-
 Copyright (c) 2026 Oracle Corporation. Licensed under the MIT License — see the LICENSE file.
+
+This plugin assesses a Snowflake estate and migrates its STRUCTURE onto Oracle
+AI Data Platform. It copies no data.
+
+Oracle and Snowflake are trademarks of their respective owners. This plugin is
+not affiliated with or endorsed by Snowflake Inc.

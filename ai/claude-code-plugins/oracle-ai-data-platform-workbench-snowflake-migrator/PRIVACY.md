@@ -1,62 +1,104 @@
-# Privacy Policy
+# Privacy
 
-**Plugin:** `oracle-ai-data-platform-workbench-databricks-migrator`
-**Effective:** 2026-06-24
+**Plugin:** `oracle-ai-data-platform-workbench-snowflake-migrator`
 
 ## Summary
 
-This plugin **does not collect, store, transmit, or share any user data**. It is a **self-contained** plugin that ships the full migrator engine bundled under `engine/`. Everything runs locally against **your own** Oracle AI Data Platform (AIDP) tenancy and **your own** Databricks workspace.
+This plugin **collects, stores and transmits no data to its authors or to
+Oracle**. There is no telemetry, no analytics, no usage reporting and no
+licence check. It is self-contained: the full engine ships under `engine/` as
+plain Python and runs locally, against **your** Snowflake account and **your**
+Oracle AI Data Platform (AIDP) tenancy.
 
-## What the plugin ships
+## What runs
 
-- **10 SKILL.md** files (Markdown with frontmatter) under `skills/`.
-- **4 slash commands** (Markdown) under `commands/`.
-- **2 specialist agents** (Markdown) under `agents/`.
-- **reference docs** (Markdown) under `references/` — DDL rewrite rules, gotchas, env-coords scaffold, `JOB_REPORT.md` format, CLI map.
-- **The full Python migration engine** bundled under `engine/`:
-  - `engine/scripts/` (Python engine modules) — `job_migrate.py`, `agent_migrate.py`, `cluster_session.py`, `aidp_executor.py`, `build_dag.py`, `check_data_availability.py`, `migrate_catalog.py`, `extract_catalog_databricks.py`, `acceptance_contract.py`, etc.
-  - `engine/aidp_compat/` (21 Python files) — drop-in `dbutils` compatibility shim for AIDP clusters.
-  - `engine/schemas/` — JSON schemas (acceptance contract).
-  - `engine/setup.py`, `engine/requirements.txt` — Python package metadata + deps.
-  - `engine/run_migration.sh` — generic convenience script.
+| Component | What it is |
+|---|---|
+| `engine/` | Python modules invoked as `python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py <stage>` |
+| `skills/`, `commands/` | Markdown instructions for Claude Code. No code, no network access |
+| `references/` | Markdown documentation |
 
-No bundled credentials, no telemetry, no MCP server, no third-party network calls beyond the user's own infrastructure + their chosen model provider.
+Runtime dependencies are `snowflake-connector-python` and `cryptography`
+(`engine/requirements.txt`). `pytest` is used for development only.
 
-## What the plugin does at runtime
+## Where it connects
 
-When you invoke a skill, Claude follows the skill's Markdown instructions to call the **bundled migrator engine** at `${CLAUDE_PLUGIN_ROOT}/engine/scripts/...` with the right arguments. Examples of what the engine itself does:
+Two destinations, both yours:
 
-- Reads notebooks from your Databricks workspace via the Databricks REST API (under **your** Databricks PAT).
-- Calls the AIDP REST API (under **your** OCI profile) to upload migrated `.ipynb` files, register jobs, and start cluster sessions.
-- Opens a Spark WebSocket to **your** AIDP cluster to execute Databricks-rewritten cells live + verify outputs.
-- Invokes Claude with tool use (under **your** `ANTHROPIC_API_KEY`) to rewrite Databricks-specific APIs cell by cell and self-correct on failures.
+1. **Your Snowflake account** — over the official
+   `snowflake-connector-python`. `engine/snowflake_source/conn.py` is the only
+   module that opens a socket.
+2. **Your OCI tenancy / AIDP instance** — never directly. The plugin shells out
+   to the `aidp` CLI, or to the `oci` CLI, using the OCI configuration and keys
+   **already on your machine**. It does not read, copy or transmit your OCI
+   credentials.
 
-All of this is under **your own** credentials, against **your own** infrastructure, with no involvement from the plugin author.
+Nothing else. No third-party service, no update check, no package download at
+runtime.
 
-## What the plugin does NOT do
+## Credentials
 
-- **No telemetry.** The plugin sends nothing to the author or to any third party. No analytics, no error reporting, no usage metrics.
-- **No credential collection.** OCI authentication, Databricks PATs, and `ANTHROPIC_API_KEY` are read from **your** local environment by the bundled engine. The plugin cannot collect or transmit them.
-- **No phone-home.** The skills make no outbound calls to the author. Every network call goes to **your** Databricks workspace, **your** AIDP REST endpoint, and Anthropic's API under **your** key.
+- Snowflake secrets are read **from files you name by path** (`--key-path`,
+  `--pat-path`, `--password-path`). They are never accepted as inline
+  arguments, so they do not reach your shell history or a process listing.
+- No credential is logged, printed, or written into any artifact.
+- AIDP target coordinates (datalake OCID, workspace, cluster, catalog) are
+  **not persisted by the plugin**. They are supplied per invocation and are
+  held only for the life of the process. `engine/target/coords.py` contains no
+  filesystem or environment access at all, and a test enforces that.
 
-## Data flow
+## What it does to your Snowflake account
 
-```
-You (Claude Code) → plugin skill (Markdown only)
-                  → bundled engine (${CLAUDE_PLUGIN_ROOT}/engine/scripts/...)
-                  → YOUR Databricks workspace + YOUR AIDP tenancy + Anthropic API (your key)
-```
+**Reads only.** The transport refuses any statement that is not a read, so
+nothing is written to or dropped from the source whatever your credential
+permits (`engine/snowflake_source/conn.py`). It issues `SHOW`, `DESCRIBE`,
+`SELECT` against `INFORMATION_SCHEMA`, `GET_DDL()`, and — only with
+`--row-counts exact` — `SELECT COUNT(*)`, which returns an aggregate and no row
+content.
 
-There is no party between you and your infrastructure. The plugin author has no visibility into any of it.
+**Your table data is never read.** No stage selects rows from a user table.
 
-## Marketplace install / update
+## What it writes to disk
 
-When you `/plugin marketplace add` and `/plugin install` from the public GitHub repo, Claude Code clones the repo from GitHub. That clone is governed by [GitHub's privacy policy](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement). The plugin author has no visibility into that clone activity.
+Artifacts go to the `--out-dir` you choose, locally. They contain **metadata
+about your estate, not its contents**:
 
-## Contact
+- database, schema, table and view names; column names, types, precision and
+  nullability; row counts; warehouse names and sizes
+- **view SQL, verbatim** — a view definition can embed literal values, so
+  treat these artifacts as sensitive as your schema
+- generated Spark SQL DDL and an `.ipynb` notebook
 
-For questions about this privacy policy, open an issue at <https://github.com/oracle-samples/oracle-aidp-samples/issues>.
+No table rows appear in any artifact.
 
-## Changes
+## What it does to your AIDP tenancy
 
-If this policy ever changes, the change will be announced in `CHANGELOG.md` with a major version bump.
+Dry-run by default: `deploy` prints the statements and executes nothing unless
+you pass `--execute` **and** supply the target coordinates. When it does
+execute, it creates schemas, empty tables and views, and optionally uploads a
+notebook. It never drops or alters an existing object — the DDL is
+`CREATE ... IF NOT EXISTS`, and an object that already exists with a different
+structure is reported and left untouched.
+
+The one exception is `smoke --write-probe`, which creates a schema named
+`snowmig_permission_probe` to prove write access and then drops that one
+schema again. It is opt-in, never uses `CASCADE`, and skips the drop if the
+schema was already there.
+
+## Two things worth knowing
+
+- **SQL is passed to the `aidp`/`oci` CLI as a command-line argument**, so
+  while a statement runs it is visible to other users on the same machine via
+  `ps`. That is DDL and object names, never row data. On a shared host, keep
+  that in mind.
+- **This is a Claude Code plugin.** The skills instruct Claude, and the reports
+  it generates are read back into the conversation so Claude can summarise
+  them. Your conversation — including estate metadata and view SQL that Claude
+  reads — is handled under the terms of whichever Claude product you are using.
+  That is a property of using an AI assistant, not something this plugin adds,
+  but it is the honest answer to "where does this information go".
+
+## Removal
+
+Delete the plugin directory. It leaves nothing behind outside the `--out-dir`
+you chose.

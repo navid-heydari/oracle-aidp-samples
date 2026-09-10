@@ -20,6 +20,8 @@ what a real implementation would have to do.
 from __future__ import annotations
 
 import re
+
+from . import lexer
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -54,19 +56,23 @@ class TranslationRule:
 # --------------------------------------------------------------------------
 
 def _iff(sql: str) -> tuple[str, str | None]:
-    return re.sub(r"\bIFF\s*\(", "IF(", sql, flags=re.IGNORECASE), None
+    return lexer.sub_code(r"\bIFF\s*\(", "IF(", sql)[0], None
 
 
 # Only a bare identifier, qualified column or literal. Anything else (a closing
 # paren, an operator) means the operand's left edge is ambiguous.
-_CAST_SIMPLE = re.compile(
+_CAST_SIMPLE = (
     r"(?<![\w).\"'])([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*|'[^']*'|\d+(?:\.\d+)?)"
-    r"\s*::\s*([A-Za-z_][\w$]*(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)")
+    r"\s*(?P<op>::)\s*([A-Za-z_][\w$]*(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)")
 
 
 def _cast(sql: str) -> tuple[str, str | None]:
-    out = _CAST_SIMPLE.sub(lambda m: f"CAST({m.group(1)} AS {m.group(2)})", sql)
-    if "::" in out:
+    # The operand may legitimately BE a literal ('x'::int), so the anchor is the
+    # `::` operator: that is the token which must be code.
+    out = lexer.sub_code(
+        _CAST_SIMPLE, lambda m: f"CAST({m.group(1)} AS {m.group(3)})", sql,
+        anchor_group="op")[0]
+    if lexer.find_code(r"::", out):
         return sql, ("a `::` cast whose left operand is an expression, not a bare "
                      "column or literal. Rewriting it needs the expression "
                      "boundary, which a token rule cannot determine safely")
@@ -75,7 +81,7 @@ def _cast(sql: str) -> tuple[str, str | None]:
 
 def _rename(pattern: str, replacement: str):
     def fn(sql: str) -> tuple[str, str | None]:
-        return re.sub(pattern, replacement, sql, flags=re.IGNORECASE), None
+        return lexer.sub_code(pattern, replacement, sql)[0], None
     return fn
 
 
@@ -93,16 +99,15 @@ _DATE_UNITS = {
 _CANONICAL_INTERVAL = {"hour": "HOUR", "h": "HOUR", "hh": "HOUR",
                        "minute": "MINUTE", "mi": "MINUTE", "n": "MINUTE",
                        "second": "SECOND", "s": "SECOND", "ss": "SECOND"}
-_DATEADD = re.compile(
-    r"\bDATEADD\s*\(\s*([A-Za-z]+)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)",
-    re.IGNORECASE)
+_DATEADD = (
+    r"\b(?P<kw>DATEADD)\s*\(\s*([A-Za-z]+)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)")
 
 
 def _dateadd(sql: str) -> tuple[str, str | None]:
     problems: list[str] = []
 
     def repl(m: re.Match) -> str:
-        unit, amount, col = m.group(1).lower(), m.group(2).strip(), m.group(3).strip()
+        unit, amount, col = m.group(2).lower(), m.group(3).strip(), m.group(4).strip()
         kind = _DATE_UNITS.get(unit)
         if kind is None:
             problems.append(unit)
@@ -117,7 +122,7 @@ def _dateadd(sql: str) -> tuple[str, str | None]:
             return f"add_months({col}, {amount})"
         return f"({col} + INTERVAL {amount} {_CANONICAL_INTERVAL[unit]})"
 
-    out = _DATEADD.sub(repl, sql)
+    out = lexer.sub_code(_DATEADD, repl, sql, anchor_group="kw")[0]
     if problems:
         return sql, (f"unrecognised DATEADD unit(s): {', '.join(sorted(set(problems)))}. "
                      "Units are not guessed -- add them to _DATE_UNITS once the "
@@ -125,18 +130,21 @@ def _dateadd(sql: str) -> tuple[str, str | None]:
     return out, None
 
 
-_LISTAGG = re.compile(
-    r"\bLISTAGG\s*\(\s*([^,()]+?)\s*,\s*('(?:[^']*)')\s*\)", re.IGNORECASE)
+_LISTAGG = (
+    r"(?P<kw>\bLISTAGG\s*\()\s*([^,()]+?)\s*,\s*('(?:[^']*)')\s*\)")
 
 
 def _listagg(sql: str) -> tuple[str, str | None]:
-    if re.search(r"\bWITHIN\s+GROUP\b", sql, re.IGNORECASE):
+    if lexer.find_code(r"\bWITHIN\s+GROUP\b", sql):
         return sql, ("LISTAGG ... WITHIN GROUP (ORDER BY ...) -- Spark's "
                      "collect_list does not guarantee ordering, so the ordering "
                      "semantics would be lost silently")
-    out = _LISTAGG.sub(
-        lambda m: f"concat_ws({m.group(2)}, collect_list({m.group(1)}))", sql)
-    if re.search(r"\bLISTAGG\s*\(", out, re.IGNORECASE):
+    # The separator IS a literal and is reproduced verbatim, so the anchor is
+    # the LISTAGG keyword rather than the whole span.
+    out = lexer.sub_code(
+        _LISTAGG, lambda m: f"concat_ws({m.group(3)}, collect_list({m.group(2)}))",
+        sql, anchor_group="kw")[0]
+    if lexer.find_code(r"\bLISTAGG\s*\(", out):
         return sql, ("a LISTAGG form beyond LISTAGG(expr, 'sep') -- e.g. DISTINCT "
                      "or an ON OVERFLOW clause")
     return out, None
@@ -241,7 +249,10 @@ def translate_sql(sql: str) -> TranslationResult:
     """Apply every implemented rule; report every declared one that matches."""
     result = TranslationResult(sql=sql)
     for rule in RULES:
-        if not re.search(rule.detect, result.sql, re.IGNORECASE):
+        # Detection runs over CODE only. Otherwise a row containing the text
+        # "QUALIFY", or a JSON-ish literal like '{"a": 1}' matching the VARIANT
+        # path rule, blocks a view that has no such construct in it.
+        if not lexer.find_code(rule.detect, result.sql):
             continue
         if rule.status == "declared" or rule.translate is None:
             result.unsupported.append({

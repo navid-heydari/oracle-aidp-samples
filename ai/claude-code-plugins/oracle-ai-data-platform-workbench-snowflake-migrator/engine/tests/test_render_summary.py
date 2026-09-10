@@ -89,10 +89,10 @@ def test_blocked_object_shows_blocked_and_high_risk():
     assert "BLOCKED" in row and "HIGH" in row
 
 
-def test_view_carries_medium_risk():
+def test_view_carries_high_risk():
     md = render_summary(PLAN, INV, None, None)
     row = next(l for l in md.splitlines() if "`D.PUBLIC.V`" in l)
-    assert "MEDIUM" in row
+    assert "HIGH" in row
 
 
 def test_views_and_tables_are_both_in_the_table():
@@ -165,3 +165,39 @@ def test_summary_makes_no_destination_claim_when_none_is_supplied():
     assert "none is assumed" in md.lower()
     assert "derived from the OCID" not in md, "no OCID was given to derive from"
     assert md.count("*not supplied*") >= 5, "every destination field, not just some"
+
+
+# --------------------------------------------------------------------------
+# A missing row count must carry its reason (issue #6).
+# --------------------------------------------------------------------------
+
+def test_a_dash_in_the_rows_column_is_explained():
+    # `-` for a view that was not counted looked identical to `-` for a job,
+    # which has no rows at all. Different facts must not render the same.
+    inv = {"row_count_mode": "metadata",
+           "inventory": [
+               {"source_identifier": "D.S.T", "object_type": "TABLE",
+                "row_count_exact": 5, "row_count_source": "show_metadata"},
+               {"source_identifier": "D.S.V", "object_type": "VIEW",
+                "row_count_exact": None, "row_count_source": "not_counted",
+                "row_count_note": "not counted: counting a view executes it"}]}
+    md = render_summary({"can_migrate": [
+        {"source_identifier": "D.S.T", "object_type": "TABLE", "rows": 5,
+         "target": "C.S.T"},
+        {"source_identifier": "D.S.V", "object_type": "VIEW", "rows": None,
+         "target": "C.S.V"}]}, inv, None, {})
+    assert "Row counts" in md
+    assert "metadata" in md
+    assert "executes it" in md or "executing" in md
+
+
+def test_a_count_error_is_named_in_the_summary():
+    inv = {"row_count_mode": "exact",
+           "inventory": [{"source_identifier": "D.S.T", "object_type": "TABLE",
+                          "row_count_exact": None, "row_count_source": "error",
+                          "row_count_note": "No active warehouse selected"}]}
+    md = render_summary({"can_migrate": [
+        {"source_identifier": "D.S.T", "object_type": "TABLE", "rows": None,
+         "target": "C.S.T"}]}, inv, None, {})
+    assert "No active warehouse selected" in md
+    assert "D.S.T" in md

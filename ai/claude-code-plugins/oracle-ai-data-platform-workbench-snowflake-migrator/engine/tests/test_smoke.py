@@ -104,20 +104,15 @@ def test_write_probe_creates_and_verifies_a_named_schema():
                for c in calls)
 
 
-def test_write_probe_never_drops_and_says_it_left_the_schema():
-    calls = []
-
-    def rec(sql, params=None):
-        calls.append(sql)
-        return aidp_ok(sql, params)
-
-    r = run_smoke(source_run_sql=sf_ok, target=TARGET, dest_run_sql=rec,
+def test_write_probe_creates_then_removes_and_says_so():
+    # Superseded: the probe used to leave its schema behind because the
+    # source's no-DROP rule had been applied to the destination too.
+    dest = DestRecorder()
+    r = run_smoke(source_run_sql=sf_ok, target=_target(), dest_run_sql=dest,
                   write_probe=True)
-    assert not any("DROP" in c.upper() for c in calls)
-    # left_behind holds fully-qualified names, e.g. MYDB.snowmig_permission_probe
-    assert r["destination"]["left_behind"] == [f"MYDB.{PROBE_SCHEMA}"]
-    assert "remove" in r["destination"]["write_note"].lower()
-
+    assert r["destination"]["write_verified"] is True
+    assert r["destination"]["left_behind"] == []
+    assert "cleaned up" in r["destination"]["write_note"]
 
 def test_write_probe_failure_reported_not_raised():
     def no_write(sql, params=None):
@@ -188,3 +183,113 @@ def test_system_databases_are_not_chosen_as_the_probe_target():
     r = run_smoke(source_run_sql=only_system)
     bad = next(c for c in r["source"]["checks"] if not c["ok"])
     assert "no non-system database" in bad["detail"]
+
+
+# ==========================================================================
+# The write probe cleans up (issue #12).
+#
+# It could not before because the no-DROP rule was applied to the DESTINATION.
+# That rule is a SOURCE guarantee: nothing is ever written to or dropped from
+# Snowflake. AIDP is where this plugin legitimately creates objects, so
+# removing its own probe schema there is correct.
+# ==========================================================================
+
+class DestRecorder:
+    def __init__(self, *, pre_existing=False, fail_drop=False):
+        self.calls: list[str] = []
+        self.pre_existing, self.fail_drop = pre_existing, fail_drop
+        self.created = False
+
+    def __call__(self, sql, params=None):
+        self.calls.append(sql)
+        up = sql.strip().upper()
+        if up.startswith("DROP"):
+            if self.fail_drop:
+                raise RuntimeError("insufficient privilege to drop")
+            self.created = False
+            return []
+        if up.startswith("CREATE SCHEMA"):
+            self.created = True
+            return []
+        if up.startswith("SHOW SCHEMAS") and "LIKE" in up:
+            if self.created or self.pre_existing:
+                return [{"namespace": PROBE_SCHEMA}]
+            return []
+        if up.startswith("SHOW SCHEMAS"):
+            return [{"namespace": "default"}]
+        return []
+
+
+def _target():
+    return resolve_target(datalake_ocid="ocid1.aidataplatform.oc1.iad.a",
+                          workspace="ws", cluster_id="cl", catalog="CAT")
+
+
+class _Src:
+    """Recording source double, so we can assert nothing but reads reach it."""
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def __call__(self, sql, params=None):
+        self.calls.append(sql)
+        return sf_ok(sql, params)
+
+
+def _src():
+    return _Src()
+
+
+def test_write_probe_drops_the_schema_it_created():
+    dest = DestRecorder()
+    res = run_smoke(source_run_sql=_src(), target=_target(), dest_run_sql=dest,
+                    write_probe=True, database="DB")
+    drops = [c for c in dest.calls if c.strip().upper().startswith("DROP")]
+    assert len(drops) == 1
+    assert res["destination"]["write_verified"] is True
+    assert res["destination"]["left_behind"] == []
+    assert "cleaned up" in res["destination"]["write_note"].lower()
+
+
+def test_the_probe_only_ever_drops_its_own_schema():
+    dest = DestRecorder()
+    run_smoke(source_run_sql=_src(), target=_target(), dest_run_sql=dest,
+              write_probe=True, database="DB")
+    for call in dest.calls:
+        if call.strip().upper().startswith("DROP"):
+            assert PROBE_SCHEMA in call
+            assert "CASCADE" not in call.upper(), "must not drop anything nested"
+
+
+def test_a_pre_existing_probe_schema_is_not_dropped():
+    # If it was already there, it is not ours to remove.
+    dest = DestRecorder(pre_existing=True)
+    res = run_smoke(source_run_sql=_src(), target=_target(), dest_run_sql=dest,
+                    write_probe=True, database="DB")
+    assert not [c for c in dest.calls if c.strip().upper().startswith("DROP")]
+    assert res["destination"]["left_behind"] == []
+
+
+def test_a_failed_cleanup_is_reported_and_names_what_is_left():
+    dest = DestRecorder(fail_drop=True)
+    res = run_smoke(source_run_sql=_src(), target=_target(), dest_run_sql=dest,
+                    write_probe=True, database="DB")
+    assert res["destination"]["left_behind"] == [f"CAT.{PROBE_SCHEMA}"]
+    assert "remove it manually" in res["destination"]["write_note"]
+
+
+def test_the_probe_schema_like_pattern_escapes_underscores():
+    dest = DestRecorder()
+    run_smoke(source_run_sql=_src(), target=_target(), dest_run_sql=dest,
+              write_probe=True, database="DB")
+    like = [c for c in dest.calls if "LIKE" in c.upper()][0]
+    assert r"\_" in like, "the probe name is full of `_`, a LIKE wildcard"
+
+
+def test_the_source_never_receives_a_write_even_during_the_write_probe():
+    src = _src()
+    run_smoke(source_run_sql=src, target=_target(), dest_run_sql=DestRecorder(),
+              write_probe=True, database="DB")
+    for call in src.calls:
+        assert call.strip().split()[0].upper() in (
+            "SELECT", "SHOW", "DESCRIBE", "DESC", "WITH", "EXPLAIN")

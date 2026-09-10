@@ -18,6 +18,8 @@ import pathlib
 import re
 from typing import Any, Callable
 
+from .dialect import lexer
+
 __all__ = ["AuthError", "SourceWriteRefused", "READ_ONLY_VERBS",
            "build_connect_kwargs", "load_private_key_der", "connect",
            "make_run_sql"]
@@ -30,9 +32,6 @@ __all__ = ["AuthError", "SourceWriteRefused", "READ_ONLY_VERBS",
 # asks for a write. Nothing is written to or dropped from the source, ever.
 READ_ONLY_VERBS = ("SELECT", "SHOW", "DESCRIBE", "DESC", "WITH", "EXPLAIN")
 
-_COMMENT_LINE = re.compile(r"--[^\n]*")
-_COMMENT_BLOCK = re.compile(r"/\*.*?\*/", re.DOTALL)
-
 _MODES = {"keypair", "pat", "password", "externalbrowser"}
 
 
@@ -44,30 +43,46 @@ class SourceWriteRefused(PermissionError):
     """A statement that is not a read was aimed at Snowflake. Refused."""
 
 
-def _strip_comments(sql: str) -> str:
-    return _COMMENT_LINE.sub(" ", _COMMENT_BLOCK.sub(" ", sql or ""))
-
-
 def assert_read_only(sql: str) -> None:
     """Refuse anything that is not a read. Raises SourceWriteRefused.
 
-    Checked per statement, so a write cannot be smuggled in after a read via
-    statement stacking, and comments cannot disguise the leading verb.
+    Statement boundaries and the leading keyword come from the scanner in
+    `dialect.lexer`, not from a regex, because a regex cannot tell code from
+    the inside of a string literal. Three consequences:
+
+      * a `;` inside a literal does not fabricate a second statement, so
+        `select 'a;drop table t'` is correctly one read and is allowed
+      * a comment marker inside a literal cannot hide a real separator
+      * a statement whose first content is a literal has no verb at all and is
+        refused rather than having a word read out of the literal
+
+    Fails closed: SQL the scanner cannot make sense of is refused.
     """
-    cleaned = _strip_comments(sql)
-    statements = [part.strip() for part in cleaned.split(";") if part.strip()]
+    try:
+        statements = lexer.split_statements(sql or "")
+    except lexer.UnterminatedLiteral as exc:
+        raise SourceWriteRefused(
+            f"statement could not be scanned ({exc}); refused. This plugin "
+            f"only sends Snowflake statements it can positively identify as "
+            f"reads.") from exc
+
     if not statements:
         raise SourceWriteRefused(
             f"empty statement refused; this plugin is read-only against "
             f"Snowflake (allowed: {', '.join(READ_ONLY_VERBS)})")
+
     for part in statements:
-        verb = part.split(None, 1)[0].upper().lstrip("(")
-        if verb not in READ_ONLY_VERBS:
-            recognised = "not a recognised read verb"
+        verb = lexer.leading_verb(part)
+        if verb is None:
             raise SourceWriteRefused(
-                f"{verb}: {recognised}. This plugin is strictly read-only "
-                f"against Snowflake and never writes to or drops from the "
-                f"source, regardless of what the credential permits. "
+                f"statement has no leading SQL keyword; refused. This plugin "
+                f"only sends statements it can positively identify as reads. "
+                f"Allowed: {', '.join(READ_ONLY_VERBS)}.")
+        if verb not in READ_ONLY_VERBS:
+            raise SourceWriteRefused(
+                f"{verb}: not a recognised read verb. This plugin is strictly "
+                f"read-only against Snowflake and never writes to or drops "
+                f"from the source, regardless of what the credential permits. "
                 f"Allowed: {', '.join(READ_ONLY_VERBS)}.")
 
 
