@@ -240,3 +240,29 @@ def test_notebook_needs_no_catalog_flag_when_there_is_only_one(tmp_path):
     main(["plan", "--out-dir", str(tmp_path)])
     main(["ddl", "--out-dir", str(tmp_path)])
     assert main(["notebook", "--out-dir", str(tmp_path)]) == 0
+
+
+def test_data_options_stage_presents_options_and_implements_nothing(tmp_path):
+    assert main(["data-options", "--out-dir", str(tmp_path)]) == 0
+    payload = json.loads((tmp_path / "data_options.json").read_text())
+    assert payload["implemented"] is False
+    assert len(payload["options"]) >= 3
+    md = (tmp_path / "DATA_MOVEMENT_OPTIONS.md").read_text()
+    assert "moves no bytes" in md.lower()
+
+
+def test_data_options_records_a_choice_without_executing(tmp_path):
+    rc = main(["data-options", "--out-dir", str(tmp_path),
+               "--choose", "A2_FEDERATE_EXTERNAL_CATALOG",
+               "--chosen-by", "navid", "--rationale", "no bulk transfer yet"])
+    assert rc == 0
+    payload = json.loads((tmp_path / "data_options.json").read_text())
+    assert payload["choice"]["executed"] is False
+    assert payload["choice"]["unknowns_outstanding"]
+
+
+def test_data_options_choice_requires_a_rationale(tmp_path, capsys):
+    rc = main(["data-options", "--out-dir", str(tmp_path),
+               "--choose", "A1_UNLOAD_OBJECT_STORAGE"])
+    assert rc == 1
+    assert "rationale" in capsys.readouterr().err

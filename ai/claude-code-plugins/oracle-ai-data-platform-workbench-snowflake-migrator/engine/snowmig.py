@@ -14,6 +14,8 @@ and writes its own plus a markdown report, so any stage can be re-run alone.
   smoke   -> smoke.json          + SMOKE_TEST.md            (source; dest if given)
   notebook-> <nb>.ipynb          + NOTEBOOK.md              (offline; --upload writes)
   summary -> SUMMARY.md                                     (offline)
+  data-options -> data_options.json + DATA_MOVEMENT_OPTIONS.md  (offline; PROPOSAL
+                  ONLY -- this plugin moves no bytes and implements no transfer)
 
 Bronze mirrors the source: Snowflake database -> AIDP Standard Catalog, schema ->
 schema, table -> table, view -> view. Silver and Gold get disabled job stubs.
@@ -30,13 +32,19 @@ import sys
 
 from plan.build import TargetCollision, build_plan
 from plan.restrictions import InvalidRestriction
+from plan.data_movement import OPTIONS as DATA_OPTIONS
+from plan.data_movement import options_for, record_choice
 from plan.smoke import run_smoke
 from target.notebook import build_notebook, notebook_workspace_path
 from report.render import (
     render_compute, render_ddl_plan, render_inventory, render_planned_objects,
-    render_smoke, render_soft_clone_summary, render_summary,
+    render_data_options, render_smoke, render_soft_clone_summary,
+    render_summary,
 )
-from snowflake_source.conn import AuthError, build_connect_kwargs, connect, make_run_sql
+from snowflake_source.conn import (
+    AuthError, SourceWriteRefused, build_connect_kwargs, connect,
+    make_run_sql,
+)
 from snowflake_source.extract.catalog import build_inventory
 from snowflake_source.extract.dependencies import extract_dependencies
 from snowflake_source.extract.warehouses import extract_warehouses
@@ -316,6 +324,24 @@ def cmd_summary(args) -> int:
     return 0
 
 
+def cmd_data_options(args) -> int:
+    out = pathlib.Path(args.out_dir)
+    options = options_for(args.phase) if args.phase else list(DATA_OPTIONS)
+    payload = {"options": options, "implemented": False,
+               "note": ("Proposal only. This plugin moves no bytes and implements "
+                        "no transfer path.")}
+    if args.choose:
+        if not args.rationale:
+            raise ValueError("--choose requires --rationale")
+        payload["choice"] = record_choice(args.choose, chosen_by=args.chosen_by,
+                                          rationale=args.rationale)
+        print(f'  recorded choice: {args.choose} (executed: False)')
+    _write(out, "data_options.json", payload)
+    _write(out, "DATA_MOVEMENT_OPTIONS.md", render_data_options(options))
+    print(f"  {len(options)} option(s) presented; none implemented")
+    return 0
+
+
 def _add_target_args(p) -> None:
     p.add_argument("--datalake-ocid")
     p.add_argument("--workspace")
@@ -410,6 +436,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="migration summary table: rows, risk, status")
     _add_target_args(su)
     su.set_defaults(func=cmd_summary)
+
+    do = sub.add_parser("data-options", parents=[common],
+                        help="present the data-movement options (PROPOSAL ONLY)")
+    do.add_argument("--phase", choices=["historic", "ongoing"])
+    do.add_argument("--choose", help="record the chosen option id; executes nothing")
+    do.add_argument("--chosen-by", default="unspecified")
+    do.add_argument("--rationale", help="required with --choose")
+    do.set_defaults(func=cmd_data_options)
     return ap
 
 
@@ -419,7 +453,7 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except (AuthError, MissingTarget, RefusedToExecute, FileNotFoundError,
             InvalidRestriction, NoBackendAvailable, BackendError,
-            ValueError) as exc:
+            SourceWriteRefused, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
