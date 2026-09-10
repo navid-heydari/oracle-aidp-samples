@@ -9,7 +9,7 @@ from plan.status import assess_risk, migration_status
 
 __all__ = ["render_inventory", "render_ddl_plan", "render_planned_objects",
            "render_soft_clone_summary", "render_compute", "render_summary",
-           "render_smoke"]
+           "render_smoke", "render_data_options"]
 
 
 def _bytes(n) -> str:
@@ -405,4 +405,40 @@ def render_smoke(result: dict) -> str:
             out += ["⚠️ Left behind by the write probe (this plugin never issues "
                     "`DROP`, so remove these yourself): "
                     + ", ".join(f'`{x}`' for x in dest["left_behind"]), ""]
+    return "\n".join(out).rstrip() + "\n"
+
+
+def render_data_options(options: list[dict]) -> str:
+    out = ["# Data-movement options — for you to choose", "",
+           "**This plugin moves no bytes, and nothing below is implemented.** "
+           "These are the realistic ways data could move in a later phase, with "
+           "the trade-offs and the open unknowns attached, so the choice is made "
+           "deliberately rather than defaulting to whichever path got built "
+           "first.", "",
+           "| Option | Catalog | Moves bytes | Phase |", "|---|---|---|---|"]
+    for o in options:
+        out.append(f'| **{o["id"]}** — {o["name"]} | {o["catalog_type"]} '
+                   f'| {"yes" if o["moves_bytes"] else "no"} '
+                   f'| {", ".join(o["phase"])} |')
+    out.append("")
+
+    for o in options:
+        out += [f'## {o["id"]} — {o["name"]}', "",
+                f'**Path:** {o["etl"]}', "",
+                "**For**", ""]
+        out += [f"- {x}" for x in o["pros"]]
+        out += ["", "**Against**", ""]
+        out += [f"- {x}" for x in o["cons"]]
+        out += ["", "**Still unknown**", ""]
+        out += [f"- {x}" for x in o["unknowns"]]
+        out += ["", f'Status: `{o["status"]}`', ""]
+
+    out += ["---", "",
+            "## What happens after you choose", "",
+            "`record_choice()` captures the option and the reasoning. It executes "
+            "nothing. Every unknown listed against the chosen option has to be "
+            "retired by a hand-run spike on one representative table before any "
+            "tooling is built — the outstanding one that invalidates the most is "
+            "whether `NUMBER(p,s)` survives an unload round trip with exact "
+            "precision, which has never been measured.", ""]
     return "\n".join(out).rstrip() + "\n"

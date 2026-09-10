@@ -150,3 +150,36 @@ def test_overview_states_the_source_read_only_guarantee_as_enforced():
     assert "enforced" in low
     assert "ever written to or dropped from the source" in low
     assert "assume none" in low, "no destination means no assumption"
+
+
+def test_cleanup_checklist_exists_and_names_the_confidential_file():
+    text = (ROOT / "CLEANUP-BEFORE-PUBLISH.md").read_text()
+    assert "RAPPI-CONTEXT.md" in text
+    assert "history" in text.lower(), "must say the remote history still has it"
+    assert "npxbexe" in text, "must name the developer test account to remove"
+
+
+def test_readme_warns_before_publishing():
+    text = (ROOT / "README.md").read_text()
+    assert "CLEANUP-BEFORE-PUBLISH.md" in text
+    assert text.index("CLEANUP-BEFORE-PUBLISH.md") < 800, "must be near the top"
+
+
+def test_assumptions_register_states_that_aidp_was_never_contacted():
+    text = (ROOT / "ASSUMPTIONS.md").read_text()
+    assert "Never contacted" in text
+    assert "AWS_US_EAST_2" in text, "must name the Snowflake env that WAS used"
+    for section in ("## A.", "## B.", "## C.", "## D.", "## E."):
+        assert section in text
+
+
+def test_data_movement_reference_offers_at_least_three_options():
+    import sys
+    sys.path.insert(0, str(ROOT / "engine"))
+    from plan.data_movement import OPTIONS
+
+    text = (ROOT / "references/data-movement-options.md").read_text()
+    assert len(OPTIONS) >= 3
+    for o in OPTIONS:
+        assert o["id"] in text, o["id"]
+    assert "moves no bytes" in text.lower()

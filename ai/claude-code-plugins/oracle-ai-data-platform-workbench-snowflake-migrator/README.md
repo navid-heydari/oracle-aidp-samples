@@ -1,5 +1,10 @@
 # Oracle AI Data Platform — Snowflake Migrator (Claude Code plugin)
 
+> ⚠️ **Before sharing or publishing this plugin, work through
+> [CLEANUP-BEFORE-PUBLISH.md](CLEANUP-BEFORE-PUBLISH.md).** It carries
+> customer-confidential context and a developer's test-account details that must
+> come out first.
+
 Investigate a Snowflake estate and migrate its **structure** onto Oracle AI Data
 Platform (AIDP): inventory → what can and cannot move → medallion layout →
 shallow clone of schemas, tables and views.
@@ -152,5 +157,8 @@ live run as a shake-out.
 - [references/type-mapping.md](references/type-mapping.md) — the type table
 - [PLAN-2PERSON-TIMETABLE.md](PLAN-2PERSON-TIMETABLE.md) — full-programme schedule beyond MVP-1
 - [PORTING-STATUS.md](PORTING-STATUS.md) — what was kept from the Databricks migrator fork and what was deleted
-- `RAPPI-CONTEXT.md` — **customer-confidential.** Engagement context that shaped
-  the requirements. Not needed to use the plugin; do not publish it.
+- [ASSUMPTIONS.md](ASSUMPTIONS.md) — everything this rests on, and what breaks if each is wrong
+- [references/data-movement-options.md](references/data-movement-options.md) — the five ways bytes could move later; **none implemented**
+- [CLEANUP-BEFORE-PUBLISH.md](CLEANUP-BEFORE-PUBLISH.md) — **do this before sharing**
+- `RAPPI-CONTEXT.md` — **customer-confidential and slated for removal.** Engagement
+  context that shaped the requirements. Not needed to use the plugin.
