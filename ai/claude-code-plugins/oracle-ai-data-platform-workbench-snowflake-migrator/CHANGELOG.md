@@ -8,6 +8,33 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [0.10.1] — 2026-09-10
+
+### Fixed
+
+Both found on first contact with a real AIDP environment.
+
+- **The smoke test reported `PASS` against an endpoint that does not exist.**
+  `oci raw-request` exits **0** on an HTTP error and returns the error in the
+  response *body* — `{"data": {"code": "NotAuthorizedOrNotFound"}, "status":
+  "404 Not Found"}` — so the exit code proves nothing. `parse_cli_json` ended
+  in `return [payload]`, which turned that error object into one row of
+  "results", and the destination check counted it as "1 schema(s) visible".
+  A 404 now raises `BackendError` with the status and body. This affected
+  **every** AIDP call, not just the smoke test.
+- **Nested `data.items` was not unwrapped**, so a collection response of three
+  schemas was also reported as one row. Every AIDP collection response has
+  that shape, so successful reads were being miscounted too.
+
+### Verified live
+
+- `https://aidp.<region>.oci.oraclecloud.com/20240831` is the correct base,
+  and control-plane reads work: `GET /dataLakes/<ocid>/workspaces`,
+  `/clusters`, `/catalogs` and `/schemas?catalogKey=<cat>` all return 200.
+- **`POST /workspaces/<ws>/sql/execute` does not exist (404).** The invented
+  SQL path cannot work, so `deploy --execute` cannot run through the
+  `oci_raw` backend at all. See `ACTION-ITEMS.md` (T1).
+
 ## [0.10.0] — 2026-09-10
 
 ### Added

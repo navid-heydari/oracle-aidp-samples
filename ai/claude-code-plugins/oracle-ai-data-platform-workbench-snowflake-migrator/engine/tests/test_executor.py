@@ -1,9 +1,11 @@
 """AIDP execution backend: aidp CLI preferred, oci raw-request fallback."""
+import json
+
 import pytest
 
 from target.coords import resolve_target
 from target.executor import (
-    NoBackendAvailable, StatementTooLarge, build_command, detect_backend,
+    BackendError, NoBackendAvailable, StatementTooLarge, build_command, detect_backend,
     parse_cli_json,
 )
 
@@ -161,3 +163,67 @@ def test_a_normal_statement_is_not_refused():
     target = resolve_target(datalake_ocid="ocid1.aidataplatform.oc1.iad.a",
                             workspace="ws", cluster_id="cl", catalog="CAT")
     assert build_command("aidp_cli", "sql", target, sql="SELECT 1")
+
+
+# ==========================================================================
+# `oci raw-request` exits 0 on an HTTP error and puts the error in the BODY.
+#
+# Found live: POST to a non-existent endpoint returned exit 0 with
+#   {"data": {"code": "NotAuthorizedOrNotFound", ...}, "status": "404 Not Found"}
+# `return [payload]` turned that error object into ONE ROW, so the SMOKE TEST
+# REPORTED PASS on a 404 -- in the one stage whose entire job is to tell the
+# user whether the destination works.
+# ==========================================================================
+
+_ERR = {"data": {"code": "NotAuthorizedOrNotFound",
+                 "message": "Authorization failed or requested resource not found."},
+        "status": "404 Not Found"}
+
+
+def test_an_http_error_status_in_the_body_is_raised_not_returned_as_a_row():
+    with pytest.raises(BackendError) as exc:
+        parse_cli_json(json.dumps(_ERR))
+    assert "404" in str(exc.value)
+    assert "NotAuthorizedOrNotFound" in str(exc.value)
+
+
+@pytest.mark.parametrize("status", ["400 Bad Request", "401 Unauthorized",
+                                    "403 Forbidden", "404 Not Found",
+                                    "409 Conflict", "500 Internal Server Error"])
+def test_every_error_class_is_raised(status):
+    with pytest.raises(BackendError):
+        parse_cli_json(json.dumps({"data": {"code": "X"}, "status": status}))
+
+
+def test_a_2xx_status_is_accepted():
+    rows = parse_cli_json(json.dumps({"data": {"items": [{"key": "a"}]},
+                                      "status": "200 OK"}))
+    assert rows == [{"key": "a"}]
+
+
+def test_nested_data_items_is_unwrapped_to_rows():
+    # The real shape of every AIDP collection response. Without unwrapping,
+    # three schemas were reported as "1 schema(s) visible".
+    rows = parse_cli_json(json.dumps({"data": {"items": [
+        {"key": "lake.bronze"}, {"key": "lake.default"}, {"key": "lake.scd"}]}}))
+    assert len(rows) == 3
+    assert rows[0]["key"] == "lake.bronze"
+
+
+def test_an_empty_collection_is_zero_rows_not_one_envelope():
+    assert parse_cli_json(json.dumps({"data": {"items": []}})) == []
+
+
+def test_an_error_code_without_a_status_field_is_still_caught():
+    with pytest.raises(BackendError):
+        parse_cli_json(json.dumps(
+            {"data": {"code": "NotAuthorizedOrNotFound", "message": "nope"}}))
+
+
+def test_a_legitimate_row_containing_the_word_code_is_not_an_error():
+    rows = parse_cli_json(json.dumps({"data": {"items": [{"code": "US"}]}}))
+    assert rows[0]["code"] == "US"
+
+
+def test_a_response_with_no_status_field_is_still_accepted():
+    assert parse_cli_json(json.dumps({"rows": [{"a": 1}]})) == [{"a": 1}]
