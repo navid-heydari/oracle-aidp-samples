@@ -8,6 +8,8 @@ and writes its own plus a markdown report, so any stage can be re-run alone.
   deps    -> dependencies.json                              (needs Snowflake)
   plan    -> plan.json           + PLANNED_OBJECTS.md       (offline)
   ddl     -> ddl_plan.json       + DDL_PLAN.md              (offline)
+  catalog -> catalog_result.json + CATALOG.md               (dry-run offline;
+                                                             --execute needs AIDP)
   deploy  -> deploy_result.json  + SOFT_CLONE_SUMMARY.md    (dry-run offline;
                                                              --execute needs AIDP)
   compute -> compute.json        + COMPUTE_PROPOSAL.md      (needs Snowflake)
@@ -17,8 +19,13 @@ and writes its own plus a markdown report, so any stage can be re-run alone.
   data-options -> data_options.json + DATA_MOVEMENT_OPTIONS.md  (offline; PROPOSAL
                   ONLY -- this plugin moves no bytes and implements no transfer)
 
-Bronze mirrors the source: Snowflake database -> AIDP Standard Catalog, schema ->
-schema, table -> table, view -> view. Silver and Gold get disabled job stubs.
+Bronze mirrors the source: Snowflake database -> AIDP catalog, schema -> schema,
+table -> table, view -> view. Silver and Gold get disabled job stubs.
+
+The target catalog is EXTERNAL/SNOWFLAKE by default -- a registered, read-only
+pointer at the live source that copies nothing. A STANDARD catalog is created
+only when the user explicitly asks for one, and its tables are then created on
+AIDP compute by the `notebook` script, not through the catalog CRUD API.
 
 Exit codes: 0 ok | 1 error | 3 HALT (identifier-case or target-name collision)
 """
@@ -39,6 +46,7 @@ from plan.smoke import run_smoke
 from target.notebook import build_notebook, notebook_workspace_path
 from report.stages import build_stage_board
 from report.render import (
+    render_catalog,
     render_census, render_maintenance, render_preflight,
     render_stages,
     render_security,
@@ -63,6 +71,12 @@ from sizing.warehouse_map import propose_all
 from target.coords import MissingTarget, resolve_target
 from target.ddl import build_create_table, build_create_view
 from target.catalog_deploy import deploy_catalog
+from target.catalog_provision import ensure_catalog
+from target.catalog_provision import RefusedToExecute as CatalogRefused
+from target.snowflake_catalog_connection import (
+    ConnectionConfigError, build_snowflake_connection_details,
+    load_connection_config,
+)
 from target.deploy import RefusedToExecute, deploy
 from target.executor import (
     NoBackendAvailable, build_command, detect_backend,
@@ -343,6 +357,67 @@ def cmd_deploy(args) -> int:
     _write(out, "SOFT_CLONE_SUMMARY.md", render_soft_clone_summary(built, result))
     return 1 if result.get("failed") or result.get("chunk_errors") \
         or result.get("mismatched_targets") else 0
+
+
+def cmd_catalog(args) -> int:
+    """Register the target catalog. EXTERNAL/SNOWFLAKE by default.
+
+    A STANDARD catalog is refused here on purpose: its tables have to be
+    created on AIDP compute, which is `snowmig.py notebook` (a script in the
+    workspace `Shared/` directory, run on the cluster), not the control-plane
+    CRUD API.
+    """
+    out = pathlib.Path(args.out_dir)
+    catalog_type = args.catalog_type.upper()
+
+    if catalog_type == "STANDARD":
+        raise CatalogRefused(
+            "--catalog-type standard is not created by this command. A "
+            "STANDARD catalog's tables are created on AIDP compute: generate "
+            "the script with `snowmig.py notebook`, upload it to "
+            "`/Workspace/Shared/`, and run it on the cluster. Only ask for a "
+            "STANDARD catalog when the user has explicitly requested one -- "
+            "EXTERNAL is the default, and it copies nothing.")
+
+    connection = None
+    if args.connection_config:
+        connection = build_snowflake_connection_details(
+            load_connection_config(args.connection_config))
+    elif args.execute:
+        raise ConnectionConfigError(
+            "--connection-config is required to register an EXTERNAL catalog: "
+            "the Snowflake account, warehouse, database, user and credential "
+            "path are read from a YAML or JSON file, never from inline "
+            "arguments or the environment. See "
+            "snowflake-catalog-connection.example.yaml.")
+
+    if not args.execute:
+        result = {"dry_run": True, "catalog": args.catalog,
+                  "catalog_type": catalog_type,
+                  "source_type": args.source_type.upper(),
+                  "connection_config": args.connection_config,
+                  "connection_fields": sorted(connection or {})}
+    else:
+        target = resolve_target(datalake_ocid=args.datalake_ocid,
+                                workspace=args.workspace,
+                                cluster_id=args.cluster_id, catalog=args.catalog)
+        backend = args.backend or detect_backend()
+        print(f"  backend: {backend}")
+        result = ensure_catalog(
+            display_name=args.catalog,
+            call=make_call(target, backend=backend),
+            catalog_type=catalog_type, source_type=args.source_type.upper(),
+            connection=connection,
+            description=args.description or
+            f"Snowflake {args.catalog}, registered by the snowflake-migrator")
+        result["dry_run"] = False
+        result["source_type"] = args.source_type.upper()
+
+    _write(out, "catalog_result.json", result)
+    _write(out, "CATALOG.md", render_catalog(result))
+    print(f'  catalog {args.catalog}: '
+          f'{"dry run — nothing created" if not args.execute else result["action"]}')
+    return 0
 
 
 def cmd_compute(args) -> int:
@@ -639,6 +714,29 @@ def build_parser() -> argparse.ArgumentParser:
     dep.add_argument("--chunk-size", type=int, default=25)
     dep.set_defaults(func=cmd_deploy)
 
+    cat = sub.add_parser("catalog", parents=[common],
+                         help="register the target catalog (EXTERNAL/SNOWFLAKE "
+                              "by default); dry-run without --execute")
+    _add_target_args(cat)
+    cat.add_argument("--catalog-type", choices=["external", "standard"],
+                     default="external",
+                     help="external (default): register a read-only pointer at "
+                          "the live Snowflake source, copying nothing. standard "
+                          "is refused here -- its tables are created on AIDP "
+                          "compute via `snowmig.py notebook`, and only when the "
+                          "user has explicitly asked for a Standard catalog")
+    cat.add_argument("--source-type", default="snowflake",
+                     help="source type for an EXTERNAL catalog (default: "
+                          "snowflake)")
+    cat.add_argument("--connection-config",
+                     help="YAML or JSON file carrying the Snowflake account, "
+                          "warehouse, database, user and a PATH to the "
+                          "credential; never inline secrets. See "
+                          "snowflake-catalog-connection.example.yaml")
+    cat.add_argument("--description", help="catalog description")
+    cat.add_argument("--execute", action="store_true")
+    cat.set_defaults(func=cmd_catalog)
+
     c = sub.add_parser("compute", parents=[common],
                        help="warehouse -> AIDP cluster proposal")
     _add_snowflake_args(c)
@@ -692,7 +790,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except (AuthError, MissingTarget, RefusedToExecute, FileNotFoundError,
+    except (AuthError, MissingTarget, RefusedToExecute, CatalogRefused,
+            ConnectionConfigError, FileNotFoundError,
             InvalidRestriction, NoBackendAvailable, BackendError,
             SourceWriteRefused, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

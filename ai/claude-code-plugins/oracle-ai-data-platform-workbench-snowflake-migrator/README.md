@@ -6,8 +6,8 @@
 > come out first.
 
 Investigate a Snowflake estate and migrate its **structure** onto Oracle AI Data
-Platform (AIDP): inventory → what can and cannot move → medallion layout →
-shallow clone of schemas, tables and views.
+Platform (AIDP): inventory → what can and cannot move → medallion layout → the
+target catalog, registered EXTERNAL against the live Snowflake source.
 
 **Structure only. It copies no data.** Data movement, stored procedures, tasks,
 streams and pipes are later phases.
@@ -16,10 +16,10 @@ streams and pipes are later phases.
 
 | Snowflake | AIDP |
 |---|---|
-| Database | **Standard Catalog** |
+| Database | **EXTERNAL catalog, source type SNOWFLAKE** (default) — a read-only pointer at the live source. A **Standard catalog** only when you explicitly ask for one |
 | Schema | Schema |
-| Table | Table (managed Delta, empty) |
-| View | View — when its SQL is portable |
+| Table | Table (managed Delta, empty) — Standard catalogs only |
+| View | View — when its SQL is portable — Standard catalogs only |
 | Warehouse | Spark compute cluster (see the compute proposal) |
 
 Bronze mirrors the source 1:1, so target names equal source names. Silver and

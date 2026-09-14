@@ -1,13 +1,23 @@
 ---
 name: snowflake-clone-notebook
-description: Generate the shallow-clone migration script as an executable AIDP notebook and place it in the AIDP workspace, ready for the user to run. The notebook creates schemas, then tables, then views in dependency order, prints per-object progress with elapsed time so a long run stays visible, and verifies each object individually at the end. Creates structure only and copies no data - every table arrives with zero rows. Use when the user wants the migration delivered as a runnable notebook rather than executed straight from the CLI.
+description: Generate the table-creation script for a Standard AIDP catalog as an executable notebook, place it in the workspace Shared directory, and run it on AIDP compute. The script creates schemas, then tables, then views in dependency order, prints per-object progress with elapsed time so a long run stays visible, and verifies each object individually at the end. Creates structure only and copies no data - every table arrives with zero rows. Use when the user has explicitly asked for a Standard catalog, or wants the migration delivered as a runnable script rather than executed straight from the CLI.
 ---
 
-# Shallow-clone notebook
+# Standard-catalog table-creation script
 
-Two steps: generate, then upload. Executing it is the user's action, not yours.
+**This is the Standard-catalog path, and only for a Standard catalog the user
+explicitly asked for.** The default target is an EXTERNAL/SNOWFLAKE catalog,
+which needs no tables at all — see `snowflake-medallion-clone` Phase A. Do not
+reach for this skill just because a migration is in progress.
 
-**The notebook creates empty structure and moves no data.** Every table it
+Why a script on compute rather than the control-plane API: it runs **inside AIDP
+compute**, so every statement's success, failure and elapsed time appears in the
+cluster's own output. The catalog CRUD API returns 202 Accepted over OCI/HTTP
+and then fails silently, which is far harder to track down.
+
+Three steps: generate, upload, run.
+
+**The script creates empty structure and moves no data.** Every table it
 creates has its columns and zero rows. A user who hears "clone" may expect rows —
 say this before they run it.
 
@@ -33,9 +43,11 @@ python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py notebook --out-dir ./snowmig_out
 `--dry-run` prints the exact upload command without running it. Ask the user for
 the four coordinates in this turn; nothing is stored.
 
-Lands at `/Workspace/Shared/snowmig_shallow_clone_<catalog>.ipynb`. **Notebooks
-live in the workspace filesystem, not in a data catalog** — catalogs hold tables
-and views. Say that if the user expects to find it under a catalog.
+Lands at `/Workspace/Shared/snowmig_shallow_clone_<catalog>.ipynb` — the
+**shared** directory on purpose, so it can be re-run, read and debugged
+independently of this plugin and of the conversation that generated it.
+**Notebooks live in the workspace filesystem, not in a data catalog** — catalogs
+hold tables and views. Say that if the user expects to find it under a catalog.
 
 ## 3. Execution is the user's call
 

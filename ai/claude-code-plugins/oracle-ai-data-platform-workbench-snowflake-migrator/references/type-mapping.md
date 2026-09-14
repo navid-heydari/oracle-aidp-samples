@@ -68,7 +68,7 @@ equivalent) and **materialized views** (rebuild as a table plus a refresh job).
 
 | Snowflake | AIDP |
 |---|---|
-| Database | Standard Catalog |
+| Database | EXTERNAL catalog (source type SNOWFLAKE) by default; Standard catalog on explicit request |
 | Schema | Schema |
 | Table | Table (managed Delta) |
 | View | View |

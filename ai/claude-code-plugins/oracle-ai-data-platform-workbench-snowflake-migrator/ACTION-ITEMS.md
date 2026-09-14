@@ -262,7 +262,7 @@ smoke test reported PASS against an endpoint that does not exist. Fixed: any
 non-2xx status raises.
 
 **2. AIDP lower-cases identifiers.** A schema created as
-`TEST_DB_20260908_1529` is stored as `test_db_20260908_1529`. Every
+`SNOWMIG_TESTDB` is stored as `snowmig_testdb`. Every
 `schemaKey` and read-back key built from the requested case was wrong, so all
 seven objects reported failed while the schema had in fact been created. Fixed
 twice over: the PLAN now folds target names so the reports show the name the

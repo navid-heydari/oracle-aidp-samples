@@ -6,6 +6,7 @@ which are supplied per conversation and never stored.
 """
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -15,7 +16,19 @@ pytestmark = pytest.mark.skipif(
 
 from snowmig import main  # noqa: E402
 
-DB = os.environ.get("SNOWMIG_LIVE_DB", "TEST_DB_20260908_1529")
+
+def _local_test_account() -> dict:
+    """Optional `local-test-account.yaml` at the plugin root -- gitignored,
+    never committed. Lets a real test database live outside of source."""
+    path = Path(__file__).resolve().parents[2] / "local-test-account.yaml"
+    if not path.exists():
+        return {}
+    import yaml
+    return yaml.safe_load(path.read_text()) or {}
+
+
+DB = os.environ.get("SNOWMIG_LIVE_DB") or _local_test_account().get(
+    "database", "SNOWMIG_TESTDB")
 
 
 @pytest.fixture(scope="module")

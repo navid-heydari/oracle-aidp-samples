@@ -3,7 +3,7 @@ import pytest
 
 from snowflake_source.conn import AuthError, build_connect_kwargs
 
-ACC = "npxbexe-op03637"
+ACC = "example-org-account"
 
 
 def test_keypair_requires_a_key_path():

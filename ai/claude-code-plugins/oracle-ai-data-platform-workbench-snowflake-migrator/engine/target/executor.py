@@ -121,6 +121,25 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
                                 f"{target.datalake_ocid}/{relation}",
                 "--request-body", body]
 
+    if operation == "create_catalog":
+        body = json.dumps(kwargs["body"])
+        if backend == "aidp_cli":
+            return ["aidp", "catalog", "create",
+                    "--datalake-id", target.datalake_ocid,
+                    "--from-json", body, "--output", "json"]
+        return ["oci", "raw-request", "--http-method", "POST",
+                "--target-uri", f"{_endpoint(target)}/dataLakes/"
+                                f"{target.datalake_ocid}/catalogs",
+                "--request-body", body]
+
+    if operation == "list_catalogs":
+        if backend == "aidp_cli":
+            return ["aidp", "catalog", "list",
+                    "--datalake-id", target.datalake_ocid, "--output", "json"]
+        return ["oci", "raw-request", "--http-method", "GET",
+                "--target-uri", f"{_endpoint(target)}/dataLakes/"
+                                f"{target.datalake_ocid}/catalogs"]
+
     if operation == "delete_table":
         key = f'{kwargs["catalog"]}.{kwargs["schema"]}.{kwargs["table"]}'
         if backend == "aidp_cli":
@@ -237,10 +256,7 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
                 f"{_endpoint(target)}/dataLakes/{target.datalake_ocid}"
                 f"/workspaces/{target.workspace}/notebookRuns/{run_id}"]
 
-    raise ValueError(
-        f"unknown operation {operation!r}; this executor deliberately supports "
-        "only 'sql', 'list_tables', 'upload_notebook', 'run_notebook' and "
-        "'run_status' -- there is no drop or delete path")
+    raise ValueError(f"unknown operation {operation!r}")
 
 
 def parse_cli_json(stdout: str) -> list[dict]:

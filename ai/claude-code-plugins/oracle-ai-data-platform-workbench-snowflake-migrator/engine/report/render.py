@@ -12,7 +12,8 @@ __all__ = ["render_stages", "render_preflight", "render_census", "census_scope",
            "render_maintenance",
            "render_security",
            "render_inventory", "render_ddl_plan", "render_planned_objects",
-           "render_soft_clone_summary", "render_compute", "render_summary",
+           "render_soft_clone_summary", "render_catalog", "render_compute",
+           "render_summary",
            "render_smoke", "render_data_options",
            "architecture_section"]
 
@@ -215,6 +216,43 @@ def render_planned_objects(plan: dict) -> str:
                 f'Lineage source: **{plan["dependency_source"]}** — '
                 f'{plan.get("dependency_coverage_note") or ""}']
     return "\n".join(out) + "\n"
+
+
+def render_catalog(res: dict) -> str:
+    """Report on the target catalog. EXTERNAL registers; it copies nothing."""
+    name = res.get("catalog")
+    if res.get("dry_run"):
+        return "\n".join([
+            f"# Target catalog `{name}` — DRY RUN", "",
+            f'Would register an **EXTERNAL** catalog of source type '
+            f'**{res.get("source_type")}**; **nothing was created**.', "",
+            "Connection details come from the YAML/JSON connection config and "
+            "are not echoed here — the secrets they carry are read from files "
+            "at call time.", "",
+            "Re-run with `--execute` plus the AIDP target coordinates to apply.",
+        ])
+
+    out = [f"# Target catalog `{name}`", "",
+           f'- Type: **{res.get("catalog_type")}** '
+           f'(source type `{res.get("source_type", "n/a")}`)',
+           f'- Action: **{res.get("action")}**',
+           f'- Key: `{res.get("key")}`', ""]
+
+    if res.get("action") == "reused":
+        out += ["The catalog already existed and was left exactly as it was "
+                "found. Nothing about its connection was changed.", ""]
+    elif res.get("verified"):
+        out += ["Registered and read back from the server.", ""]
+    else:
+        out += ["**The create was accepted but the catalog has not appeared "
+                "yet.** Catalog creation is asynchronous and can fail silently, "
+                "so this is *pending*, not done — list the catalogs again "
+                "before treating it as registered.", ""]
+
+    out += ["An EXTERNAL catalog is a registered, read-only pointer at the "
+            "live Snowflake source. It holds no managed tables of its own and "
+            "copies no data, so there is nothing here to keep in sync.", ""]
+    return "\n".join(out)
 
 
 def render_soft_clone_summary(plan: dict, res: dict) -> str:

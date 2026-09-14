@@ -16,10 +16,24 @@ Usage:
 """
 from __future__ import annotations
 import os, sys, decimal
+from pathlib import Path
 from cryptography.hazmat.primitives import serialization
 import snowflake.connector
 
-DB, SCHEMA = os.environ.get("CORPUS_DB", "TEST_DB_20260908_1529"), "PUBLIC"
+
+def _local_test_account() -> dict:
+    """Optional `local-test-account.yaml` at the plugin root -- gitignored,
+    never committed. Lets a real test database live outside of source."""
+    path = Path(__file__).resolve().parents[3] / "local-test-account.yaml"
+    if not path.exists():
+        return {}
+    import yaml
+    return yaml.safe_load(path.read_text()) or {}
+
+
+DB = os.environ.get("CORPUS_DB") or _local_test_account().get(
+    "database", "SNOWMIG_TESTDB")
+SCHEMA = "PUBLIC"
 results: list[tuple[str, bool, str]] = []
 
 

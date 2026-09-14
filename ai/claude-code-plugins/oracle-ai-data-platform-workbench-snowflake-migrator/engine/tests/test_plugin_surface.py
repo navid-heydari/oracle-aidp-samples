@@ -80,7 +80,10 @@ def test_type_mapping_reference_covers_the_blocked_types():
 
 def test_reference_documents_the_object_and_view_mapping():
     text = (ROOT / "references/type-mapping.md").read_text()
-    assert "Standard Catalog" in text
+    # A Snowflake database maps to a catalog, and which KIND of catalog is the
+    # part a reader has to get right: EXTERNAL by default, Standard on request.
+    assert "EXTERNAL catalog" in text
+    assert "Standard catalog" in text
     for construct in ["QUALIFY", "LATERAL FLATTEN", "LISTAGG", "DATEADD"]:
         assert construct in text, construct
     assert "secure view" in text.lower()
@@ -158,7 +161,8 @@ def test_cleanup_checklist_exists_and_names_the_confidential_file():
     text = (ROOT / "CLEANUP-BEFORE-PUBLISH.md").read_text()
     assert "RAPPI-CONTEXT.md" in text
     assert "history" in text.lower(), "must say the remote history still has it"
-    assert "npxbexe" in text, "must name the developer test account to remove"
+    assert "local-test-account" in text, \
+        "must point at the gitignored local test-account config"
 
 
 def test_readme_warns_before_publishing():

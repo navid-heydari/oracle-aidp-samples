@@ -21,7 +21,7 @@ python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py plan --out-dir ./snowmig_out \
 ## The bronze mapping is structural, not a choice
 
 ```
-Snowflake database  ->  AIDP Standard Catalog
+Snowflake database  ->  AIDP catalog
 Snowflake schema    ->  AIDP schema
 Snowflake table     ->  AIDP table
 Snowflake view      ->  AIDP view
@@ -78,7 +78,10 @@ ignored line — a typo would otherwise apply nothing while appearing to work.
 ## Present, do not just run
 
 1. The can/cannot split and every reason.
-2. **Catalogs the user must create or confirm as INTERNAL** before stage 3.
+2. **The catalogs stage 3 will register.** One per Snowflake database, and
+   **EXTERNAL/SNOWFLAKE by default** — a read-only pointer at the live source
+   that copies nothing. Name a Standard catalog only if the user has explicitly
+   asked for one.
 3. The waves — views follow their base tables.
 4. Cycles, if any: they need a human decision, not a broken edge.
 5. The Silver/Gold job stubs: created, disabled, never triggered.

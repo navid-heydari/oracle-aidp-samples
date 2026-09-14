@@ -64,8 +64,8 @@ def bronze_target(source_db: str, source_schema: str, object_name: str, *,
     CASE changes.
 
     `fold_case` (default on) lower-cases the target name, because **AIDP
-    lower-cases identifiers**: a schema created as `TEST_DB_20260908_1529` comes
-    back as `test_db_20260908_1529`. Planning the folded name means the plan
+    lower-cases identifiers**: a schema created as `SNOWMIG_TESTDB` comes
+    back as `snowmig_testdb`. Planning the folded name means the plan
     shows the name the destination will really use, rather than one that then
     silently differs. It also makes the fold visible to
     detect_target_collisions, which is what stops Snowflake's `ORDERS` and

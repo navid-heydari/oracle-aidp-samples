@@ -7,7 +7,7 @@ says what happens if it is wrong. Reviewed 2026-09-09.
 
 | | |
 |---|---|
-| **Snowflake** | Account `DU58131` (org URL `npxbexe-op03637`), region **`AWS_US_EAST_2`**, user `NHEYDARI`, role `ACCOUNTADMIN`, version `10.32.102`. Scope: `TEST_DB_20260908_1529` — 6 tables + 1 view |
+| **Snowflake** | A personal test account, region **`AWS_US_EAST_2`**, role `ACCOUNTADMIN`, version `10.32.102`. Scope: one database — 6 tables + 1 view. Real account/user/database coordinates live in `local-test-account.yaml` (gitignored) and the environment, not here |
 | **AIDP** | **None. Never contacted.** No DataLake OCID, workspace or cluster was ever supplied or used. No real OCID exists anywhere on disk. Every deploy run was a dry run |
 | **Writes to Snowflake** | Only by the corpus fixture (`engine/snowflake_source/corpus/00_rappi_setup.sql`), run deliberately to build the test estate. **No plugin skill can write** — the transport refuses non-read verbs |
 
@@ -27,7 +27,8 @@ says what happens if it is wrong. Reviewed 2026-09-09.
 | # | Assumption | If wrong |
 |---|---|---|
 | B1 | Target coordinates arrive per conversation | Enforced: `coords.py` cannot read env, config or cache. No destination is assumed when none is given |
-| B2 | The target catalog exists and is **INTERNAL** | The migrator does not create catalogs. `PLANNED_OBJECTS.md` lists what must exist. An EXTERNAL catalog cannot hold managed Delta and is refused |
+| B2 | The target catalog is **EXTERNAL/SNOWFLAKE** unless the user explicitly asks otherwise | `snowmig.py catalog` registers it: a read-only pointer at the live source that copies nothing. A **Standard** catalog is never created by this plugin — its tables have to be written on AIDP compute (`snowmig.py notebook`, run on the cluster), so a failure is visible in Spark's own output rather than behind a 202 Accepted |
+| B2a | The `connectionDetails` shape for an EXTERNAL/SNOWFLAKE catalog | **Unverified.** `aidp-table-management` gives the `CreateCatalogDetails` envelope but declines to guess `connectionDetails`; the field names in `snowflake_catalog_connection.py` are inferred from the AIDP Snowflake Spark connector's options. Confirm with `aidp catalog test-connection` before production. The values themselves come from a YAML/JSON config file, and every credential is a path read at call time |
 | B3 | `CREATE SCHEMA / TABLE / VIEW` in Spark SQL is the right mechanism | If AIDP requires REST table registration instead, `deploy` needs rework. **Never verified — no environment** |
 | B4 | The `aidp` CLI flags and `oci raw-request` paths are correct | **Unverified.** `aidp` is not installed; `oci ai-data-platform` is control-plane only. Every command is printed before it runs, so a wrong flag should surface as a CLI usage error, not a silent partial migration |
 | B5 | `SHOW TABLES … LIKE` verifies existence on AIDP | If unsupported, verification silently reports 0. **Unverified** |

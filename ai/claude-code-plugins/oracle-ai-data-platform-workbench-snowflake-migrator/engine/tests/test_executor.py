@@ -65,6 +65,21 @@ def test_list_tables_command_available_on_both_backends():
         assert cmd and isinstance(cmd, list)
 
 
+def test_create_catalog_posts_the_body_on_both_backends():
+    body = {"displayName": "sales_db", "catalogType": "EXTERNAL",
+            "sourceType": "SNOWFLAKE"}
+    for backend in ("aidp_cli", "oci_raw"):
+        cmd = build_command(backend, "create_catalog", TARGET, body=body)
+        assert "catalogs" in " ".join(cmd) or "catalog" in cmd
+        assert json.dumps(body) in cmd
+
+
+def test_list_catalogs_command_available_on_both_backends():
+    for backend in ("aidp_cli", "oci_raw"):
+        cmd = build_command(backend, "list_catalogs", TARGET)
+        assert cmd and isinstance(cmd, list)
+
+
 def test_unknown_operation_rejected():
     with pytest.raises(ValueError, match="unknown operation"):
         build_command("aidp_cli", "drop_everything", TARGET)
