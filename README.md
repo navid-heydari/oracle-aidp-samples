@@ -19,6 +19,7 @@ oracle-aidp-samples/
 │   └── migration/            # Migrating workloads to AIDP
 ├── data-engineering/
 │   ├── ingestion/            # Connectors and data loading patterns
+│   ├── lineage/              # Deriving and verifying data lineage
 │   └── transformation/       # Pipeline architectures and table formats
 │       ├── liquid-clustering/
 │       ├── medallion-lake/
@@ -84,6 +85,14 @@ Patterns for connecting to and loading data from a wide range of sources.
 | [Read Excel Files](data-engineering/ingestion/Read_excel_data/read_excel.ipynb) | Read Excel (`.xlsx`) files using the Spark Excel connector and convert them to Spark DataFrames or CSV. |
 | [Streaming from OCI Streaming Service](data-engineering/ingestion/Streaming/StreamingFromOCIStreamingService.ipynb) | Consume messages from OCI Streaming (Kafka-compatible) using Spark Structured Streaming with SASL/OAUTHBearer authentication. |
 | [Streaming from Volume Path](data-engineering/ingestion/Streaming/StreamingFromVolumePath.ipynb) | Process CSV files from a workspace volume using one-time micro-batch streaming with `Trigger.Once()`. |
+
+---
+
+### Data Engineering — Lineage
+
+| Notebook | Description |
+|---|---|
+| [Verify Data Lineage](data-engineering/lineage/Verify_Data_Lineage.ipynb) | Derive table- and column-level lineage from Spark's analyzed plan and verify it against a known DAG, using negative controls and the Delta commit log as corroboration. |
 
 ---
 
