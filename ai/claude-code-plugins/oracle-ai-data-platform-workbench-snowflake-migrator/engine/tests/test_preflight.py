@@ -25,7 +25,7 @@ PLAN = {
     "catalogs_to_create": [], "schemas_to_create": [["lake", "test_db"]],
     "silver_gold_jobs": [{"name": "silver_x", "layer": "SILVER"}],
 }
-SOURCE = {"account": "DU58131", "region": "AWS_US_EAST_2", "role": "ACCOUNTADMIN",
+SOURCE = {"account": "TESTACCT01", "region": "AWS_US_EAST_2", "role": "ACCOUNTADMIN",
           "databases": ["TEST_DB"]}
 TARGET = {"datalake_ocid": "ocid1.aidataplatform.oc1.iad.aaa",
           "workspace": "ws-key", "cluster_id": "cl-key", "catalog": "lake"}
@@ -33,7 +33,7 @@ TARGET = {"datalake_ocid": "ocid1.aidataplatform.oc1.iad.aaa",
 
 def test_it_states_both_ends_before_anything_happens():
     md = render_preflight(PLAN, source=SOURCE, target=TARGET)
-    assert "DU58131" in md and "ocid1.aidataplatform" in md
+    assert "TESTACCT01" in md and "ocid1.aidataplatform" in md
     assert "lake" in md
 
 

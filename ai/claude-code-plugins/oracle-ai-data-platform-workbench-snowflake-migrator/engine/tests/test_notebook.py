@@ -22,7 +22,7 @@ PLAN = {"bronze_mapping": "database -> Standard Catalog",
 
 def nb():
     return build_notebook(DDL, PLAN, catalog="D",
-                          source={"account": "DU58131", "region": "AWS_US_EAST_2"})
+                          source={"account": "TESTACCT01", "region": "AWS_US_EAST_2"})
 
 
 # --- structure ------------------------------------------------------------
@@ -44,7 +44,7 @@ def test_first_cell_is_a_markdown_header_stating_no_data_moves():
 
 def test_header_states_source_and_destination():
     text = "".join(nb()["cells"][0]["source"])
-    assert "DU58131" in text and "AWS_US_EAST_2" in text
+    assert "TESTACCT01" in text and "AWS_US_EAST_2" in text
     assert "D" in text
 
 

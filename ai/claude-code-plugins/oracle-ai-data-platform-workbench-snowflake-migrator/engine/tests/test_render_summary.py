@@ -23,7 +23,7 @@ PLAN = {
                 "tables": 1, "views": 1, "catalogs": 1, "schemas": 1,
                 "silver_gold_jobs": 1, "cannot_by_category": {"unmapped_type": 1}},
 }
-INV = {"session": {"A": "DU58131", "R": "AWS_US_EAST_2", "ROLE": "ACCOUNTADMIN",
+INV = {"session": {"A": "TESTACCT01", "R": "AWS_US_EAST_2", "ROLE": "ACCOUNTADMIN",
                    "V": "10.32.102"},
        "databases_in_scope": ["D"]}
 DEPLOYED = {"dry_run": False, "attempted_targets": ["D.PUBLIC.ORDERS", "D.PUBLIC.V"],
@@ -35,7 +35,7 @@ DEPLOYED = {"dry_run": False, "attempted_targets": ["D.PUBLIC.ORDERS", "D.PUBLIC
 
 def test_source_and_destination_are_stated_briefly():
     md = render_summary(PLAN, INV, None, None)
-    assert "DU58131" in md and "AWS_US_EAST_2" in md
+    assert "TESTACCT01" in md and "AWS_US_EAST_2" in md
     assert "->" in md or "→" in md
 
 

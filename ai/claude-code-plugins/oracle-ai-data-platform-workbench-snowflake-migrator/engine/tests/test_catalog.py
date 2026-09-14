@@ -4,7 +4,7 @@ import pytest
 from fake_sql import FakeSql
 from snowflake_source.extract.catalog import SYSTEM_DBS, build_inventory
 
-SESSION = [{"U": "NHEYDARI", "A": "DU58131", "R": "AWS_US_EAST_2",
+SESSION = [{"U": "TESTUSER", "A": "TESTACCT01", "R": "AWS_US_EAST_2",
             "ROLE": "ACCOUNTADMIN", "WH": "COMPUTE_WH", "V": "10.32.102"}]
 
 COLUMNS = [

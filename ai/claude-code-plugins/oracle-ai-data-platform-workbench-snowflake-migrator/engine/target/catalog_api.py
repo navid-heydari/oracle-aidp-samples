@@ -26,8 +26,14 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["UnmappableFieldType", "field_from_spark_type", "build_schema_body",
-           "build_table_body", "build_view_body", "MANAGED_FORMAT"]
+__all__ = ["UnmappableFieldType", "InvalidCatalogSpec", "field_from_spark_type",
+           "build_schema_body", "build_table_body", "build_view_body",
+           "build_catalog_body", "MANAGED_FORMAT", "CATALOG_TYPES"]
+
+# What AIDP calls this plugin's two catalog shapes. STANDARD holds managed
+# Delta tables the migrator writes to directly; EXTERNAL is a registered,
+# read-only pointer at a live source and holds no managed data of its own.
+CATALOG_TYPES = ("EXTERNAL", "STANDARD")
 
 # Managed Delta, always. The environment's own tables report CSV in places;
 # this plugin creates Delta and says so explicitly rather than inheriting a
@@ -68,6 +74,10 @@ _SILENTLY_REJECTED = {
         "timestamp_ntz_as_timestamp=True (CLI: --timestamp-ntz timestamp) to "
         "accept the timezone semantics change."),
 }
+
+
+class InvalidCatalogSpec(ValueError):
+    """A catalog body was asked for without the fields that make it valid."""
 
 
 class UnmappableFieldType(ValueError):
@@ -157,6 +167,51 @@ def build_table_body(catalog: str, schema: str, table: str,
             columns, timestamp_ntz_as_timestamp=timestamp_ntz_as_timestamp),
         "partitionKeys": [],
     }
+
+
+def build_catalog_body(display_name: str, *, catalog_type: str = "EXTERNAL",
+                       source_type: str | None = None, description: str = "",
+                       connection: dict | None = None,
+                       properties: dict | None = None) -> dict:
+    """A `CreateCatalogDetails` body. EXTERNAL/SNOWFLAKE is the default shape.
+
+    ⚠️ UNVERIFIED SHAPE. `aidp-table-management` gives the outer envelope
+    (`displayName`, `description`, `catalogType`, `sourceType`, `properties`,
+    `connectionDetails`) but explicitly says not to hand-fabricate
+    `connectionDetails` -- confirm it with `aidp catalog test-connection`
+    against a live DataLake before relying on this in production. This
+    function never invents connection fields itself: it passes through
+    exactly what `build_snowflake_connection_details` (or the caller) built.
+
+    STANDARD catalogs hold managed Delta tables the migrator writes into
+    directly and carry no `connectionDetails` or `sourceType` -- they are the
+    higher-blast-radius shape (real storage, not a read-only pointer), which
+    is why callers must ask for one explicitly rather than getting it by
+    default. See `catalog_provision.ensure_catalog` for that gate.
+    """
+    if not display_name or not str(display_name).strip():
+        raise InvalidCatalogSpec("display_name is required")
+    if catalog_type not in CATALOG_TYPES:
+        raise InvalidCatalogSpec(
+            f"catalog_type must be one of {CATALOG_TYPES}, got {catalog_type!r}")
+
+    body: dict = {"displayName": display_name, "description": description,
+                  "catalogType": catalog_type, "properties": properties or {}}
+
+    if catalog_type == "EXTERNAL":
+        if not source_type:
+            raise InvalidCatalogSpec(
+                "an EXTERNAL catalog needs source_type (e.g. 'SNOWFLAKE')")
+        if not connection:
+            raise InvalidCatalogSpec(
+                f"an EXTERNAL {source_type} catalog needs connectionDetails; "
+                f"build one with build_snowflake_connection_details() from a "
+                f"YAML/JSON connection config rather than passing fields "
+                f"inline")
+        body["sourceType"] = source_type
+        body["connectionDetails"] = connection
+
+    return body
 
 
 def build_view_body(catalog: str, schema: str, view: str, view_text: str,

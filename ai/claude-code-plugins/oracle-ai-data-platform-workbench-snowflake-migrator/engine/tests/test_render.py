@@ -3,7 +3,7 @@ from report.render import render_ddl_plan, render_inventory
 
 INV = {
     "probed_at": "2026-09-09T00:00:00+00:00",
-    "session": {"A": "DU58131", "R": "AWS_US_EAST_2", "ROLE": "ACCOUNTADMIN"},
+    "session": {"A": "TESTACCT01", "R": "AWS_US_EAST_2", "ROLE": "ACCOUNTADMIN"},
     "databases_in_scope": ["MYDB"], "object_count": 2,
     "counts_by_type": {"TABLE": 1, "VIEW": 1},
     "identifier_case_collisions": {}, "extraction_notes": [],

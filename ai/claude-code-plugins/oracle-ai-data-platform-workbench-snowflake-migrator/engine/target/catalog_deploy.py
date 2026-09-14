@@ -17,8 +17,8 @@ object that already matches the plan is indistinguishable from one we made.
 
 TWO BEHAVIOURS LEARNED FROM A LIVE RUN, both of which broke the first attempt:
 
-  * AIDP LOWER-CASES IDENTIFIERS. A schema created as `TEST_DB_20260908_1529`
-    comes back as `lake.test_db_20260908_1529`. Every `schemaKey` and every
+  * AIDP LOWER-CASES IDENTIFIERS. A schema created as `SNOWMIG_TESTDB`
+    comes back as `lake.snowmig_testdb`. Every `schemaKey` and every
     read-back key built from the REQUESTED case was wrong, and all seven
     objects reported failed while the schema had in fact been created. So keys
     are RESOLVED from the server by listing and matching case-insensitively,

@@ -11,7 +11,7 @@ TARGET = resolve_target(datalake_ocid="ocid1.aidataplatform.oc1.iad.a",
 def sf_ok(sql, params=None):
     low = sql.lower()
     if "current_user" in low:
-        return [{"U": "NHEYDARI", "A": "DU58131", "R": "AWS_US_EAST_2",
+        return [{"U": "TESTUSER", "A": "TESTACCT01", "R": "AWS_US_EAST_2",
                  "ROLE": "ACCOUNTADMIN"}]
     if "show databases" in low:
         return [{"name": "MYDB"}]
@@ -34,7 +34,7 @@ def aidp_ok(sql, params=None):
 def test_source_identity_reported():
     r = run_smoke(source_run_sql=sf_ok)
     assert r["source"]["reachable"] is True
-    assert r["source"]["account"] == "DU58131"
+    assert r["source"]["account"] == "TESTACCT01"
     assert r["source"]["role"] == "ACCOUNTADMIN"
 
 

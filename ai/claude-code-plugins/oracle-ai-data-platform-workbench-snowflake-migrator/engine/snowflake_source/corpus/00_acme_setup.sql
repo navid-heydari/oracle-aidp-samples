@@ -1,6 +1,8 @@
 -- =====================================================================
 -- 00_acme_setup.sql  --  Acme-shaped Snowflake test corpus
--- Target: TEST_DB_20260908_1529.PUBLIC   Account: npxbexe-op03637 (AWS_US_EAST_2)
+-- Target: SNOWMIG_TESTDB.PUBLIC  (your own test account; see
+-- local-test-account.example.yaml at the plugin root). Substitute the
+-- database name below if yours differs.
 -- Revised 2026-09-09. Supersedes the version in the Snowflake workspace.
 --
 -- WHY THIS REVISION
@@ -44,7 +46,7 @@
 -- Idempotent. Re-runnable. Touches ONLY the derived tables.
 -- =====================================================================
 
-USE DATABASE TEST_DB_20260908_1529;
+USE DATABASE SNOWMIG_TESTDB;
 USE SCHEMA PUBLIC;
 USE WAREHOUSE COMPUTE_WH;
 

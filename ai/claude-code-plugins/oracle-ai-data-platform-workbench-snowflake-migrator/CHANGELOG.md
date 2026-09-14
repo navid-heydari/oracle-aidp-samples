@@ -8,6 +8,62 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [0.16.0] — 2026-09-11
+
+### Changed
+
+- **The target catalog is now EXTERNAL with source type SNOWFLAKE by default.**
+  A new `snowmig.py catalog` stage registers it: a read-only pointer at the live
+  Snowflake source that creates no tables and copies no bytes, so there is
+  nothing to keep in sync. Previously the plugin assumed a pre-existing Standard
+  (INTERNAL) catalog and cloned structure into it, which meant a migration
+  produced managed storage nobody had asked for.
+- **Internal and Standard catalogs are no longer created unless the user
+  explicitly asks for one.** `snowmig.py catalog --catalog-type standard` is
+  refused and says where the Standard path is; the router, the medallion-clone
+  skill and `/snowflake-soft-clone` all state EXTERNAL as the default and
+  require an explicit request before naming a Standard catalog.
+- **A requested Standard catalog gets its tables from a script run inside AIDP
+  compute.** The `notebook` stage already writes that script to the workspace
+  `Shared/` directory, where it can be re-run and debugged independently; it is
+  now the documented path for Standard catalogs, following the established
+  schemas → tables → views pattern with per-object progress and individual
+  verification. Spark reports a real error on the cluster, where the
+  control-plane CRUD API returns 202 Accepted and can silently create nothing.
+
+### Added
+
+- `snowflake-catalog-connection.example.yaml` and a YAML/JSON connection-config
+  loader. The Snowflake account, warehouse, database, user and credential for an
+  EXTERNAL catalog are read from a config **file** — never inline arguments or
+  the environment — and every credential inside it is a path read at call time,
+  so the config itself carries no secret.
+- `create_catalog` and `list_catalogs` on both execution backends.
+
+### Known limitation
+
+- The `connectionDetails` field names for an EXTERNAL/SNOWFLAKE catalog are
+  inferred from the AIDP Snowflake connector's options, not a verified REST
+  contract (see assumption B2a). Validate with `aidp catalog test-connection`
+  before relying on a registered catalog.
+
+## [0.15.2] — 2026-09-10
+
+### Fixed
+
+- **Skill instructions now require verification before reporting success.**
+  AIDP creates are asynchronous and can settle late or fail silently; the
+  router's shared rules and the `deploy` phase of `snowflake-medallion-clone`
+  now say explicitly that a pending or unsettled result ("N of M verified so
+  far", a schema still `CREATING`, exit code nonzero) must be reported as
+  pending, never rounded up to success.
+- **The plugin now reports migration status proactively, without waiting for
+  the next prompt.** After any stage finishes during a migration session, the
+  router's shared rules require stating what just happened, what the stage
+  board's `next_stage` is, and the concrete command that runs it — in the same
+  turn, unprompted. `snowflake-stage-board` is now explicitly in scope for
+  this proactive use, not only for on-request status checks.
+
 ## [0.15.1] — 2026-09-10
 
 ### Fixed
@@ -22,7 +78,7 @@ first release.
 Both of this release's features, against a deliberately poisoned schema:
 
 - **5 of 5 failed objects correctly diagnosed as burned names**, with the
-  right remedy — *"A NOVEL name in lake.test_db_20260908_1529 was created
+  right remedy — *"A NOVEL name in lake.snowmig_testdb was created
   successfully, so the schema and your request are both fine and this NAME IS
   BURNED … Retry into a FRESH SCHEMA."*
 - The smoke test **PASSES** on the catalog API, write probe included, with
@@ -198,8 +254,8 @@ behaviours, every one of which broke the run. All handled and covered by tests.
 
 ### Fixed
 
-- **AIDP lower-cases identifiers.** A schema created as `TEST_DB_20260908_1529`
-  is stored as `test_db_20260908_1529`, so every `schemaKey` and read-back key
+- **AIDP lower-cases identifiers.** A schema created as `SNOWMIG_TESTDB`
+  is stored as `snowmig_testdb`, so every `schemaKey` and read-back key
   built from the requested case was wrong — all seven objects reported failed
   while the schema had in fact been created. Keys are now resolved from the
   server and compared case-insensitively.

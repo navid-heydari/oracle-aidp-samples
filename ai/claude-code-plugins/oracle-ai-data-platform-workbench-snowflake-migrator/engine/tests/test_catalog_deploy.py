@@ -156,7 +156,7 @@ def test_no_row_data_is_ever_sent():
 
 # ==========================================================================
 # AIDP LOWER-CASES IDENTIFIERS. Verified live: a schema created as
-# "TEST_DB_20260908_1529" comes back as "lake.test_db_20260908_1529", so every
+# "SNOWMIG_TESTDB" comes back as "lake.snowmig_testdb", so every
 # schemaKey and read-back key built from the REQUESTED case was wrong and all
 # seven objects reported failed.
 #

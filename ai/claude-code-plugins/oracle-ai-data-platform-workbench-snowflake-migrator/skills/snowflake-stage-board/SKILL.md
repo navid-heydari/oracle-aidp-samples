@@ -1,6 +1,6 @@
 ---
 name: snowflake-stage-board
-description: Show the Snowflake-to-AIDP migration as a stage table before running it - which stages are supposed to run, which have run, and what each one found, with the single writing stage marked. Use when the user asks what the plugin will do, what stage comes next, where a run got to, why something was skipped, or wants an overview before approving a migration. Read-only; touches no environment.
+description: Show the Snowflake-to-AIDP migration as a stage table before running it - which stages are supposed to run, which have run, and what each one found, with the single writing stage marked. Use when the user asks what the plugin will do, what stage comes next, where a run got to, why something was skipped, or wants an overview before approving a migration - AND proactively after any stage finishes during a migration session, to report status and the next stage without waiting to be asked. Read-only; touches no environment.
 ---
 
 # Stage board — read the run before you execute it

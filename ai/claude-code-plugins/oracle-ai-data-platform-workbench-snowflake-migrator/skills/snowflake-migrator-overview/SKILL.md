@@ -14,13 +14,14 @@ re-runnable on its own, and every stage after `assess` reads its input from
 | 0 | — | `snowflake-migrator-bootstrap` | verified Snowflake auth |
 | 1 | `assess` | `snowflake-assess-estate` | `inventory.json` · `INVENTORY.md` · **`CENSUS.md`** |
 | 2 | `deps` + `plan` | `snowflake-migration-plan` | `plan.json` · **`PLANNED_OBJECTS.md`** |
-| 3 | `ddl` + `deploy` | `snowflake-medallion-clone` | `DDL_PLAN.md` · **`SOFT_CLONE_SUMMARY.md`** |
+| 3 | `catalog` (+ `ddl`) | `snowflake-medallion-clone` | **`CATALOG.md`** · `DDL_PLAN.md` |
 | 4 | `summary` | `snowflake-migration-plan` | **`SUMMARY.md`** — the per-object roll-up |
 | — | `maintenance` | `snowflake-assess-estate` | `MAINTENANCE.md` — clustering, retention, churn, and who inherits `OPTIMIZE`/`VACUUM` |
 | — | `security` | `snowflake-assess-estate` | `SECURITY.md` — masking/row-access policies, secure views, grants |
 | — | `compute` | `snowflake-compute-proposal` | `COMPUTE_PROPOSAL.md` |
 | — | `smoke` | `snowflake-smoke-test` | `SMOKE_TEST.md` |
-| — | `notebook` | `snowflake-clone-notebook` | executable `.ipynb` · `NOTEBOOK.md` |
+| — | `notebook` | `snowflake-clone-notebook` | executable `.ipynb` · `NOTEBOOK.md` — the **Standard-catalog** table-creation script, run on AIDP compute |
+| — | `deploy` | `snowflake-medallion-clone` | **`SOFT_CLONE_SUMMARY.md`** — the older control-plane clone path |
 | — | `data-options` | `snowflake-migration-plan` | `DATA_MOVEMENT_OPTIONS.md` |
 
 The two reports the plugin exists to produce are **`PLANNED_OBJECTS.md`** (what
@@ -43,7 +44,10 @@ roll-up: name, rows, risk, migration status.
 
 - "what's in this Snowflake account", "list the tables", "how big are they" → stage 1
 - "what order would we migrate in", "what depends on what", "show me a plan" → stage 2
-- "create the medallion structure", "clone the schema", "soft clone", "shallow clone" → stage 3
+- "create the medallion structure", "create the target catalog", "clone the
+  schema", "soft clone", "shallow clone" → stage 3 (EXTERNAL catalog by default)
+- "I want a Standard catalog", "I need real tables on AIDP" → stage 3 Phase C →
+  `snowflake-clone-notebook`, run on compute. Only on an explicit ask.
 - "compute sizing", "warehouse equivalent", "what will it cost", "credits" → `snowflake-compute-proposal`
 - auth or connection errors from any stage → stage 0
 - "what about our stored procedures / tasks / streams / UDFs" → `assess` writes
@@ -105,10 +109,37 @@ roll-up: name, rows, risk, migration status.
    ours**: a customer design filed under `A1` reads as an assessed variant of
    `A1`, and it is not.
 
-8. **Bronze mirrors the source.** Snowflake database → AIDP Standard Catalog,
-   schema → schema, table → table, view → view. Silver and Gold are
+8. **Bronze mirrors the source.** Snowflake database → AIDP catalog, schema →
+   schema, table → table, view → view. Silver and Gold are
    requirement-driven: the plan emits disabled job stubs for them and the
    migrator never triggers them.
+
+8b. **The target catalog is EXTERNAL/SNOWFLAKE by default.** `snowmig.py
+   catalog` registers a read-only pointer at the live source, which copies
+   nothing and creates no tables. A **Standard** (or Internal) catalog is only
+   ever created when the user has explicitly asked for one, and then its tables
+   come from the `notebook` script run on AIDP compute — not the control-plane
+   CRUD API, where a 202 Accepted can silently create nothing. Never offer or
+   assume a Standard catalog.
+
+9. **Never report success ahead of verification.** AIDP creates are
+   asynchronous and can settle late or fail silently — `catalog_deploy.py`
+   polls for `lifecycleState == ACTIVE` and `deploy` reports `verified/total`
+   for exactly this reason. Read that actual result before saying anything
+   succeeded. "Pending", "still settling", "not yet confirmed" and "exit code
+   nonzero" are not success — say which one it is, not the outcome you expect
+   it to reach. This applies to every stage, not only `deploy`: a `smoke` FAIL,
+   an unreadable `ACCOUNT_USAGE`, or a schema still `CREATING` all get named as
+   what they are, never rounded up.
+
+10. **After running any stage, report where the run stands — before waiting
+    on the user.** Don't stop on a bare command result and let the next
+    prompt be silence. Say, in the same turn: what this stage's actual result
+    was (per rule 9), which stage is next per the stage board's `next_stage`
+    (`snowmig stages --out-dir <dir>`, see `snowflake-stage-board`), and the
+    concrete command or confirmation that would run it. Do this every time a
+    stage finishes during a migration session, unprompted — the user should
+    never have to ask "where are we" to find out.
 
 ## Engine
 

@@ -43,9 +43,12 @@ view — rename if the customer name should not appear at all.
 
 ## 3. Remove the developer-specific test account
 
-`engine/tests/test_live_smoke.py` defaults `SNOWMIG_LIVE_DB` to
-`TEST_DB_20260908_1529`, and the memory notes and skill examples reference
-account `npxbexe-op03637`. Replace with placeholders.
+**Status: DONE.** No source file, fixture, or doc names a real account or
+database anymore. Live-only defaults (`test_live_smoke.py`, `validate.py`)
+now fall back to the placeholder `SNOWMIG_TESTDB` and read a real database
+name from `local-test-account.yaml` at the plugin root -- gitignored, never
+committed, copied from the tracked `local-test-account.example.yaml`. Set
+`SNOWMIG_LIVE_DB` / `CORPUS_DB` instead if you'd rather not keep the file.
 
 ## 4. Confirm no credential material
 

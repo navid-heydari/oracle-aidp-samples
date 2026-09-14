@@ -13,6 +13,14 @@ bucket_mapping.json
 bucket_mapping.local.json
 catalog_manifest.json
 
+# personal Snowflake test-account coordinates for live tests -- see
+# local-test-account.example.yaml for the tracked template
+local-test-account.yaml
+
+# EXTERNAL-catalog connection config -- see the .example.yaml template
+snowflake-catalog-connection.yaml
+snowflake-catalog-connection.json
+
 # Migrator-local artifacts that should never accompany this plugin
 reports/
 **/JOB_REPORT.md.bak
