@@ -5,7 +5,7 @@ Demonstrates two Delta capabilities on AIDP, with explicit expected counts at ea
 | Topic | What the notebook shows |
 |---|---|
 | Zero-copy clone | `SHALLOW CLONE` creates a table referencing the source's data files; `DESCRIBE DETAIL` and `DESCRIBE HISTORY` confirm the zero-copy property and the `CLONE` commit; writing to the clone diverges copy-on-write while the source stays unchanged. |
-| Structure without data | `CREATE TABLE ... LIKE` and `CREATE TABLE ... AS SELECT ... WHERE 1=0` both produce an empty table with the same columns. |
+| Structure without data | `CREATE TABLE ... USING delta AS SELECT ... WHERE 1=0` produces an empty table with the same columns. |
 | Metadata in SQL | Attaching and reading back metadata at table scope (`TBLPROPERTIES`), column scope (column `COMMENT`), and via a registry table that scales across the lakehouse. |
 
 ## Running it
@@ -16,6 +16,11 @@ to a catalog you can create schemas in; the notebook creates the scratch schema
 
 Statements are executed directly rather than through a try/except wrapper, so anything unsupported on
 your build fails at that cell instead of being silently recorded.
+
+**Clear outputs before committing.** `DESCRIBE DETAIL` and friends surface your object-storage
+namespace and bucket in the `location` column. The notebook does not project that column for exactly
+this reason, but a committed run of any cell can still carry tenancy identifiers — strip outputs
+(`nbstripout`, or Kernel → Restart & Clear Output) before opening a PR.
 
 ## Things worth knowing before you use clones
 
@@ -29,8 +34,13 @@ your build fails at that cell instead of being silently recorded.
   `SELECT ... FROM (DESCRIBE DETAIL t)` — that is a parser error, not a missing feature. Run
   `DESCRIBE DETAIL` / `DESCRIBE HISTORY` / `DESCRIBE` as top-level statements and project the result
   with the DataFrame API, as the notebook does.
-- **`CREATE TABLE ... LIKE` takes at most a two-part name** in the Spark 3.5 grammar, which is why the
-  notebook sets the current catalog and schema with `USE` instead of fully qualifying every reference.
+- **Fully qualify every table reference; do not rely on `USE`.** `CREATE TABLE ... LIKE` is the v1
+  `CreateTableLikeCommand`, and both Spark 3.5 and Delta 3.2 resolve its source through the v1
+  `SessionCatalog`. `CatalogManager.setCurrentNamespace` only syncs the v1 current database when the
+  current catalog is `spark_catalog`, so against a plugin catalog `USE cat.schema` followed by
+  `CREATE TABLE b LIKE a` raises `TABLE_OR_VIEW_NOT_FOUND` — or, worse, silently binds to a same-named
+  table in `default`. This notebook uses three-part names throughout and a `CTAS ... WHERE 1=0` for the
+  structure-only clone instead.
 - **`owner` is a reserved table property.** Use a distinct key such as `data_owner`.
 
 ## Metadata is attached, not enforced

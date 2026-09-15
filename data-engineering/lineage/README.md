@@ -183,15 +183,29 @@ gives temporal provenance, not a graph.
 ### Scope — what the 19/19 does and does not cover
 
 The 19 checks are proven for **the pipeline shapes in this notebook**: writes whose top plan node is a
-`Project` or an `Aggregate`. Column resolution reads that node's `projectList()` /
-`aggregateExpressions()` directly, so it is accurate for aliases, aggregates, `COALESCE`/`CASE` across
-two sources, `SELECT *` expansion and self-joins.
+`Project` or an `Aggregate` **and where every attribute that node references is emitted directly by a
+leaf relation**. Column resolution reads that node's `projectList()` / `aggregateExpressions()` and
+maps each reference back through `colmap`, which is built only from `collectLeaves()` — so it is
+accurate for aliases, aggregates, `COALESCE`/`CASE` across two sources, `SELECT *` expansion and
+self-joins over base tables.
+
+The leaf condition is the one that actually bites, and the top-node shape alone does not predict it. An
+attribute minted by an *intermediate* `Project` never appears in `colmap`, so it resolves to nothing
+even though the top node is a plain `Project`:
+
+```sql
+SELECT * FROM (SELECT cust_id, amount * 2 AS amt FROM raw_orders) s   -- amt <- (nothing)
+```
+
+The same happens for `df.withColumn("x", ...).withColumn("y", col("x") + 1)` and for an aggregate over
+a subquery. Cell 14 renders those as `(literal)`, which is indistinguishable from a genuine constant.
 
 It is **not** a general-purpose lineage extractor. Outside those shapes it can return an incomplete or
 empty column map, in some cases without warning:
 
 | Shape | Behaviour |
 |---|---|
+| Alias computed in a `FROM`-subquery, or by an earlier `.withColumn()` / `.select()` — i.e. `Project` over `Project`, `Aggregate` over `Project` | that column's lineage is empty, printed as `(literal)` |
 | Window function, `Project` over `Aggregate`, `LATERAL VIEW explode`, second branch of a `UNION` | column lineage may be wrong or empty |
 | Top node is `Sort` / `GlobalLimit` / `Distinct` / `Filter` (HAVING) / `WithCTE` / `Union` / `Except` | column map empty |
 | CTE | adds a spurious `<CTERelationRef>` leaf |
@@ -211,6 +225,13 @@ durable local capture, register a JVM `QueryExecutionListener` on `spark.listene
 OpenLineage Spark listener
 (`spark.extraListeners=io.openlineage.spark.agent.OpenLineageSparkListener`) and point
 `spark.openlineage.transport.*` at a collector.
+
+## Clear outputs before committing
+
+`DESCRIBE DETAIL` returns a `location` that embeds your object-storage bucket and namespace, and
+`inputFiles()` returns full `oci://` URIs. The notebook prints only the path portion for this reason,
+but a committed run can still carry tenancy identifiers in other cells. Strip outputs (`nbstripout`,
+or Kernel → Restart & Clear Output) before opening a PR.
 
 ## Environment as tested
 

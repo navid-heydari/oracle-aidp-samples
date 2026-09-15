@@ -9,7 +9,9 @@ The suite is deliberately split:
 
   Part A — API EXISTENCE (must be green)
       Proves the endpoint is deployed, authenticated, and enforcing its documented
-      request contract. This is the part that answers "is lineage released?".
+      request contract. This is the part that answers "is lineage released?". It probes
+      with UNRESOLVABLE_ANCHOR so that it stays green whether or not the graph is
+      populated -- it must not depend on Part B's anchor continuing to fail.
 
   Part B — GRAPH POPULATION (xfail = known open gap)
       Proves whether lineage *data* exists for our tables. These are marked xfail
@@ -22,7 +24,7 @@ Run:
     pytest test_aidp_lineage_api.py -v -m existence     # just the proof-of-release
     pytest test_aidp_lineage_api.py -v -rX              # show why Part B is blocked
 
-Requires: oci, requests, pytest  ·  a working ~/.oci/config profile.
+Requires: oci, requests, pytest  ·  a working ~/.oci/config profile  ·  AIDP_DATALAKE.
 """
 import json
 import os
@@ -50,6 +52,13 @@ if not DATALAKE:
 
 SCHEMA_KEY = os.environ.get("AIDP_SCHEMA", "default.lin_demo")
 ANCHOR_TABLE = os.environ.get("AIDP_ANCHOR_TABLE", "%s.mart_customer_revenue" % SCHEMA_KEY)
+
+# Part A proves the route exists and validates its body; it must stay green whether or not
+# the lineage graph is populated. It therefore probes with an anchor that can never resolve,
+# rather than with ANCHOR_TABLE -- which Part B expects to start returning 200 the day the
+# graph is populated. Using the same value for both would turn that success into Part A
+# failures. Part B passes ANCHOR_TABLE explicitly.
+UNRESOLVABLE_ANCHOR = "aidp-samples-nonexistent-node-do-not-create"
 
 # The lineage API lives on the DATA-PLANE host at API version 20260430 — NOT on
 # aidp.{region}.../20240831, which is the older generation with no lineage surface.
@@ -94,7 +103,7 @@ def _req(signer, method, url, body=None):
 def fetch_lineage(signer, **overrides):
     """POST actions/fetchLineage with a valid-by-schema body."""
     body = {
-        "anchorNode": ANCHOR_TABLE,
+        "anchorNode": UNRESOLVABLE_ANCHOR,
         "maxDepth": 3,
         "level": "ENTITY",
         "direction": "BOTH",
@@ -135,6 +144,9 @@ def test_A1_fetchLineage_route_exists(signer):
 
     A deployed-but-validating route answers 400 InvalidParameter. A missing route
     answers 404 NotAuthorizedOrNotFound (see test_A2 for the control).
+
+    Probed with UNRESOLVABLE_ANCHOR, not ANCHOR_TABLE: this assertion is about the route
+    being deployed, so it must not start failing when the graph is populated.
     """
     code, body = fetch_lineage(signer)
     assert code != 404, "lineage route missing (404): %s" % body
@@ -165,7 +177,7 @@ def test_A3_exportLineage_route_exists(signer):
         signer,
         "POST",
         DP_BASE + "/actions/exportLineage",
-        {"anchorNode": ANCHOR_TABLE, "direction": "UPSTREAM"},
+        {"anchorNode": UNRESOLVABLE_ANCHOR, "direction": "UPSTREAM"},
     )
     assert code != 404, "exportLineage route missing (404): %s" % body
     assert code == 400 and body.get("code") == "InvalidParameter", (code, body)
@@ -182,7 +194,7 @@ def test_A4_request_contract_is_enforced_server_side(signer):
     assert code_missing == 400, (code_missing, body_missing)
     assert "must not be null" in body_missing.get("message", ""), body_missing
 
-    code_bad, body_bad = fetch_lineage(signer, anchorNode="definitely-not-a-node")
+    code_bad, body_bad = fetch_lineage(signer, anchorNode=UNRESOLVABLE_ANCHOR)
     assert code_bad == 400, (code_bad, body_bad)
     assert body_bad.get("message") == "Invalid anchorNode", body_bad
 
@@ -207,6 +219,9 @@ def test_A5_documented_enums_are_accepted(signer, field, value):
 
     Each reaches anchorNode resolution ("Invalid anchorNode") rather than being rejected
     as a bad enum — so the server implements these options, including level=COLUMN.
+
+    Uses UNRESOLVABLE_ANCHOR so the enum check is independent of whether any real table
+    resolves; reaching anchor resolution at all is what proves the enum parsed.
     """
     code, body = fetch_lineage(signer, **{field: value})
     assert code == 400, (code, body)
@@ -292,7 +307,9 @@ def test_B0_report_all_anchor_candidates(signer):
 @pytest.mark.xfail(reason=BLOCKED, strict=False)
 def test_B1_entity_lineage_returns_graph(signer):
     """Entity-level lineage for a known table returns nodes (and edges)."""
-    code, body = fetch_lineage(signer, level="ENTITY", direction="BOTH")
+    code, body = fetch_lineage(
+        signer, anchorNode=ANCHOR_TABLE, level="ENTITY", direction="BOTH"
+    )
     assert code == 200, "fetchLineage failed: %s %s" % (code, body)
     assert "nodes" in body, "EntityLineage must carry nodes: %s" % body
     assert body["nodes"], "lineage graph is empty for %s" % ANCHOR_TABLE
@@ -306,7 +323,9 @@ def test_B2_upstream_contains_expected_sources(signer):
     Mirrors the DAG asserted from the Spark plan in Verify_Data_Lineage.ipynb, so a green
     run here means the platform's own graph agrees with what actually executed.
     """
-    code, body = fetch_lineage(signer, level="ENTITY", direction="UPSTREAM", maxDepth=3)
+    code, body = fetch_lineage(
+        signer, anchorNode=ANCHOR_TABLE, level="ENTITY", direction="UPSTREAM", maxDepth=3
+    )
     assert code == 200, (code, body)
     names = {n.get("qualifiedName") or n.get("displayName") for n in body.get("nodes", [])}
     assert any("stg_orders" in (n or "") for n in names), names
@@ -321,7 +340,12 @@ def test_B3_column_level_lineage_returns_links(signer):
     Target claim: mart.revenue traces back to stg_orders.amount.
     """
     code, body = fetch_lineage(
-        signer, level="COLUMN", direction="UPSTREAM", maxDepth=3, shouldIncludeEdges=True
+        signer,
+        anchorNode=ANCHOR_TABLE,
+        level="COLUMN",
+        direction="UPSTREAM",
+        maxDepth=3,
+        shouldIncludeEdges=True,
     )
     assert code == 200, (code, body)
     assert body.get("links"), "expected column-level edges: %s" % body
