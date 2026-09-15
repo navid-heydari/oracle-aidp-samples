@@ -17,15 +17,19 @@ The suite is deliberately split:
       populated -- it must not depend on Part B's anchor continuing to fail.
 
   Part B — GRAPH POPULATION (xfail = known open gap)
-      Proves whether lineage *data* exists for our tables. These are marked xfail
-      because no `anchorNode` value is currently accepted. They are NOT deleted or
-      skipped: if lineage becomes populated (or Oracle documents the id format) they
-      flip to XPASS and the suite tells you the gap closed.
+      Proves whether lineage *data* exists for the tables under test. These are marked
+      xfail because no `anchorNode` value was accepted at the time of observation. They
+      are NOT deleted or skipped: if the graph is populated, or the node-id format turns
+      out to be documented, they flip to XPASS and the suite reports that the gap closed.
 
-Run:
+Run (AIDP_DATALAKE must be exported -- there is no default):
+    export AIDP_DATALAKE=ocid1.aidataplatform.oc1.<region>.<unique-id>
+
     pytest test_aidp_lineage_api.py -v
     pytest test_aidp_lineage_api.py -v -m existence     # just the proof-of-release
-    pytest test_aidp_lineage_api.py -v -rX              # show why Part B is blocked
+    pytest test_aidp_lineage_api.py -v -rx              # xfail reasons: why Part B is blocked
+    pytest test_aidp_lineage_api.py -rP -k B0           # B0's anchor-candidate matrix
+    pytest test_aidp_lineage_api.py -m "existence and not legacy"   # skip the legacy host
 
 Requires: oci, requests, pytest  ·  a working ~/.oci/config profile  ·  AIDP_DATALAKE.
 """
