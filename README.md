@@ -21,6 +21,7 @@ oracle-aidp-samples/
 │   ├── ingestion/            # Connectors and data loading patterns
 │   ├── lineage/              # Deriving and verifying data lineage
 │   └── transformation/       # Pipeline architectures and table formats
+│       ├── delta-clone-metadata/
 │       ├── liquid-clustering/
 │       ├── medallion-lake/
 │       ├── scd/
@@ -164,6 +165,7 @@ Combines Delta UniForm with Apache Iceberg Liquid Clustering for open-format, cr
 | [Slowly Changing Dimensions (SCD Type 2)](data-engineering/transformation/scd/slowly_changing_dimension_template.ipynb) | Track historical changes to dimension records using SCD Type 2 with Jinja2-templated merge logic. |
 | [Streaming — Energy Delta Liquid Clustering](data-engineering/transformation/streaming/energy_delta_streaming_liquid_clustering_demo.ipynb) | Real-time smart grid monitoring with streaming Delta tables, anomaly detection, and statistical baselines for energy consumption. |
 | [Streaming — Manufacturing Delta Liquid Clustering](data-engineering/transformation/streaming/manufacturing_delta_streaming_liquid_clustering_demo.ipynb) | Continuous ingestion and clustering of manufacturing sensor data using Spark Structured Streaming and Delta Lake. |
+| [Zero-Copy Clone and Table Metadata](data-engineering/transformation/delta-clone-metadata/zero_copy_clone_and_table_metadata.ipynb) | Create constant-time zero-copy clones with Delta `SHALLOW CLONE`, observe copy-on-write divergence from the source, and attach and read table and column metadata in SQL. |
 
 #### Cross-Format & External Table Interop
 
