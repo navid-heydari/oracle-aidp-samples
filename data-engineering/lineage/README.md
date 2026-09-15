@@ -4,14 +4,15 @@ Two complementary artifacts:
 
 | File | What it does |
 |---|---|
-| [`test_aidp_lineage_api.py`](./test_aidp_lineage_api.py) | Maintainer harness. Confirms the lineage API is released and reachable, from real responses. 13 passed / 4 xfailed. |
+| [`test_aidp_lineage_api.py`](./test_aidp_lineage_api.py) | Maintainer harness. Confirms the lineage API is released and reachable, from real responses. 13 passed / 4 xfailed as of 2026-08-16. |
 | [`Verify_Data_Lineage.ipynb`](./Verify_Data_Lineage.ipynb) | Derives lineage from Spark's analyzed plan and verifies it against a known DAG. 19/19 checks for the pipeline shapes below. |
 
-> **Read this before you set up a profile.** The API is released, but the graph is **not populated**
-> on the tenancy tested: `fetchLineage` rejects every `anchorNode` we could construct with
-> `400 Invalid anchorNode` (see [Known gap](#known-gap-the-graph-is-not-populated-here)). You can
-> confirm the endpoint exists and enforces its contract; you will **not** get a lineage graph out of
-> it. The notebook does not depend on the API and runs independently.
+> **Read this before you set up a profile.** The API is released. On the one tenancy tested —
+> **observed 2026-08-16, a single DataLake in us-ashburn-1, SDK v4.2.1** — no graph came back:
+> `fetchLineage` rejected every `anchorNode` we could construct with `400 Invalid anchorNode` (see
+> [Known gap](#known-gap-no-graph-came-back-on-the-tenancy-tested)). You can confirm the endpoint
+> exists and enforces its contract. Whether you get a graph may differ on your tenancy — Part B
+> reports **XPASS** if it does. The notebook does not depend on the API and runs independently.
 
 > **Requires your own tenancy.** `test_aidp_lineage_api.py` signs real requests with your OCI profile
 > and needs `AIDP_DATALAKE` exported (see [Running the tests](#running-the-tests)). It is a maintainer
@@ -20,8 +21,9 @@ Two complementary artifacts:
 ## Status: the lineage API is released
 
 AIDP ships lineage under the **`DataLineage`** service (`DataLineageClient`, CLI group
-`data-lineage`). It shipped as `SemanticCatalog` in SDK v4.1.0 (2026-08-07) and was renamed by
-v4.2.1 -- pin any reference you write to the SDK version you checked.
+`data-lineage`). It shipped as `SemanticCatalog` in SDK v4.1.0 (2026-08-07) and was renamed in
+**v4.1.1 (2026-08-31)**, which the SDK changelog flags as a breaking change -- pin any reference you
+write to the SDK version you checked.
 
 | Operation | Call |
 |---|---|
@@ -41,22 +43,29 @@ v4.2.1 -- pin any reference you write to the SDK version you checked.
 
 Column-level lineage (`level: COLUMN`) is part of the released contract, not just table-level.
 
-### If you probe and see 404, you are on the wrong generation
+### Reading a 404
 
-The lineage API is **not** on the older surface. `aidp.{region}.oci.oraclecloud.com/20240831/dataLakes/{ocid}`
-serves `/catalogs` and `/schemas` fine but has no lineage route: the lineage operations are published
-at `datalake.{region}` + `/20260430`. (The SDK CLI reference still documents `aidp.{region}` as the default endpoint for other
-operations, so this is a per-service move, not a wholesale one.) Probing the old host yields
-`404 NotAuthorizedOrNotFound`, which is easy to misread as "AIDP has no lineage API".
+A 404 means different things depending on which host you sent it to, and the response body cannot
+tell you which — it is **byte-identical** (111 bytes, same `code`/`message`) for an absent route and
+for a resource you are not authorised to see.
 
-Worse, that 404 body is **byte-identical** (111 bytes, same `code`/`message`) to the one returned for a
-route that never existed — so on that surface a 404 cannot distinguish *absent route* from *denied
-permission*. `test_A2` and `test_A7` encode both halves of this trap so nobody re-derives the wrong
-conclusion.
+| Host | A 404 here means |
+|---|---|
+| `aidp.{region}` + `/20240831/dataLakes/{ocid}` | the route genuinely does not exist — lineage is not on this generation. It still serves `/catalogs` and `/schemas`. |
+| `datalake.{region}` + `/20260430` | **not** a missing route. Almost always a wrong or unauthorised `AIDP_DATALAKE`, which returns the same `NotAuthorizedOrNotFound`. |
 
-### Known gap: the graph is not populated here
+`test_A0` is the disambiguator: it lists `/catalogs` on the data-plane host, so if A0 passes, your
+profile and OCID are good and a 404 from the lineage route means something else. If A0 fails, fix the
+credentials before reading anything into the rest.
 
-`fetchLineage` reaches its own parameter validation and rejects every `anchorNode` we can construct:
+The lineage operations are published at `datalake.{region}` + `/20260430`; the SDK CLI reference still
+documents `aidp.{region}` as the default endpoint for other operations, so this is a per-service move,
+not a wholesale one. `test_A2` and `test_A7` encode both halves of the trap.
+
+### Known gap: no graph came back on the tenancy tested
+
+Observed 2026-08-16, one DataLake in us-ashburn-1, SDK v4.2.1. `fetchLineage` reaches its own
+parameter validation and rejected every `anchorNode` we could construct:
 
 ```
 default.lin_demo.mart_customer_revenue            -> 400 Invalid anchorNode
@@ -78,13 +87,24 @@ Two candidate explanations, not yet separated:
 2. `anchorNode` expects an internal Data Catalog node id whose format is undocumented — the CLI
    reference lists the field with an **empty description**.
 
-`test_B0` prints the full candidate matrix on every run, so the moment any form resolves, you see it.
+`test_B0` probes the full candidate matrix on every run. It always passes, so pytest **captures** its
+output rather than displaying it — with `-v`, `-m existence` or `-rX` you will never see the table.
+Read it with:
+
+```bash
+pytest test_aidp_lineage_api.py -rP -k B0      # or -s
+```
 
 ## Running the tests
 
 **Prerequisites.** An OCI config profile with access to your own AI Data Platform instance, and
 `AIDP_DATALAKE` exported. There is deliberately no default: without it the suite exits with a message
 rather than signing requests against someone else's resource.
+
+That stop is a **collection error (exit 2)** raised at import, not a skip — deliberately. A session
+fixture calling `pytest.fail` would be absorbed by Part B's `xfail` markers, turning a missing
+variable into the same `xfail` the known gap produces, which is exactly the confusion the note below
+warns about.
 
 ```bash
 pip install -r requirements.txt
@@ -95,7 +115,9 @@ export AIDP_REGION=us-ashburn-1                                     # optional
 
 pytest test_aidp_lineage_api.py -v                 # everything
 pytest test_aidp_lineage_api.py -v -m existence    # just the existence checks
-pytest test_aidp_lineage_api.py -v -rX             # show why Part B is blocked
+pytest test_aidp_lineage_api.py -v -rx             # show why Part B is blocked (xfail reasons)
+pytest test_aidp_lineage_api.py -rP -k B0          # read B0's anchor-candidate matrix
+pytest test_aidp_lineage_api.py -m "existence and not legacy"   # skip the legacy-host probe
 ```
 
 | Variable | Required | Default |
@@ -121,7 +143,7 @@ that Part A passes before reading anything into Part B.
 | `A4_request_contract_is_enforced_server_side` | missing vs invalid `anchorNode` produce different errors |
 | `A5_documented_enums_are_accepted` | `level=ENTITY/COLUMN`, `direction=UPSTREAM/DOWNSTREAM/BOTH` all parse |
 | `A6_invalid_enum_is_rejected` | **control** — `direction=SIDEWAYS` → `Invalid LineageDirection: SIDEWAYS` |
-| `A7_lineage_absent_from_legacy_api_generation` | documents the wrong-generation trap |
+| `A7_lineage_absent_from_legacy_api_generation` | documents the wrong-generation trap (also marked `legacy` — it is the only test that needs the old gateway up) |
 
 A5+A6 together are the strongest evidence: a stub that ignored the body and always complained about
 `anchorNode` would pass A5 but **fail A6**. The server really parses `LineageDirection`, so a genuine
@@ -134,6 +156,10 @@ implementation is behind the route.
 populated they flip to **XPASS** and the suite reports that the gap closed. `B2` asserts the same DAG
 the notebook derives from Spark — so when it goes green, the platform's graph is confirmed against
 independently derived ground truth.
+
+Part B is the only place `AIDP_ANCHOR_TABLE` is used. Part A probes with a deliberately unresolvable
+sentinel instead, so Part A stays green on a populated tenancy rather than failing the day Part B
+starts passing.
 
 ## The notebook: independent ground truth
 
@@ -162,7 +188,8 @@ Three layers must agree:
 
 Plus **negative controls**, which are what make the result meaningful — an extractor that reported
 *every* table would satisfy "no missing edges" while being useless: the decoy appears in no edge; no
-direct `mart → raw_orders` edge; no unresolved leaves. Clean run: **19/19**.
+direct `mart → raw_orders` edge; no unresolved leaves. Clean run **19/19**, observed 2026-08-16 on
+Spark 3.5.0 / Delta 3.2.0-oci-1.0.0.
 
 `DESCRIBE HISTORY` deserves a specific warning: it is commonly mistaken for lineage, but a CTAS commit's
 `operationParameters` holds only `partitionBy` / `properties` / `isManaged` — **no source tables**. It

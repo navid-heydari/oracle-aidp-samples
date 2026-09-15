@@ -2,8 +2,11 @@
 Conformance tests for the AIDP Semantic Catalog **lineage** API.
 
 Purpose: prove, from live responses, that the lineage feature is actually released and
-reachable in this tenancy — and separately, report honestly whether the lineage *graph*
-is populated for our own tables.
+reachable — and separately, report whether the lineage *graph* is populated for the
+tables under test.
+
+Observed 2026-08-16 against one AI Data Platform instance in us-ashburn-1, SDK v4.2.1.
+The Part B result below is that one observation, not a statement about the service.
 
 The suite is deliberately split:
 
@@ -68,6 +71,9 @@ DP_BASE = "%s/%s/aiDataPlatforms/%s" % (DP_HOST, DP_VERSION, DATALAKE)
 
 LEGACY_BASE = "https://aidp.%s.oci.oraclecloud.com/20240831/dataLakes/%s" % (REGION, DATALAKE)
 
+# Single attempt, no retry. requests' HTTPAdapter(max_retries=...) would not help here:
+# it does not retry a POST that times out while reading the response, which is the case
+# that actually bites. Re-run the suite instead of silently retrying a mutating-looking call.
 TIMEOUT = 60
 
 
@@ -85,6 +91,22 @@ def signer():
         private_key_file_location=cfg["key_file"],
         pass_phrase=cfg.get("pass_phrase"),
     )
+
+
+@pytest.fixture(scope="session")
+def unresolvable_message(signer):
+    """The server's own wording for an anchorNode it cannot resolve, captured once.
+
+    Pinning the literal string "Invalid anchorNode" made A4/A5 fail on any Preview-API
+    message change that merely echoed the value back. Capturing it from one probe and
+    comparing the rest against that keeps the discrimination the tests are actually
+    about -- reached anchor resolution vs. rejected earlier -- without pinning wording.
+    """
+    code, body = fetch_lineage(signer)
+    assert code == 400, "expected 400 for an unresolvable anchor, got %s: %s" % (code, body)
+    msg = body.get("message") if isinstance(body, dict) else str(body)
+    assert msg, "server returned no message for an unresolvable anchor: %s" % body
+    return msg
 
 
 def _req(signer, method, url, body=None):
@@ -125,7 +147,6 @@ _OMIT = _Omit()
 # ======================================================================================
 # Part A — API EXISTENCE.  These prove the lineage feature is released and live.
 # ======================================================================================
-pytestmark = []
 
 
 @pytest.mark.existence
@@ -139,7 +160,7 @@ def test_A0_auth_works_on_dataplane_host(signer):
 
 
 @pytest.mark.existence
-def test_A1_fetchLineage_route_exists(signer):
+def test_A1_fetchLineage_route_exists(signer, unresolvable_message):
     """POST actions/fetchLineage is DEPLOYED.
 
     A deployed-but-validating route answers 400 InvalidParameter. A missing route
@@ -153,7 +174,7 @@ def test_A1_fetchLineage_route_exists(signer):
     assert code == 400, "expected 400 from body validation, got %s: %s" % (code, body)
     assert body.get("code") == "InvalidParameter", body
     # It reached the operation's own parameter validation — proof of a real handler.
-    assert "anchorNode" in body.get("message", ""), body
+    assert body.get("message") == unresolvable_message, body
 
 
 @pytest.mark.existence
@@ -184,7 +205,7 @@ def test_A3_exportLineage_route_exists(signer):
 
 
 @pytest.mark.existence
-def test_A4_request_contract_is_enforced_server_side(signer):
+def test_A4_request_contract_is_enforced_server_side(signer, unresolvable_message):
     """The server enforces the documented schema, distinguishing missing from invalid.
 
     Omitting anchorNode yields a *different* message than supplying a bad one. Only a
@@ -196,7 +217,7 @@ def test_A4_request_contract_is_enforced_server_side(signer):
 
     code_bad, body_bad = fetch_lineage(signer, anchorNode=UNRESOLVABLE_ANCHOR)
     assert code_bad == 400, (code_bad, body_bad)
-    assert body_bad.get("message") == "Invalid anchorNode", body_bad
+    assert body_bad.get("message") == unresolvable_message, body_bad
 
     assert body_missing["message"] != body_bad["message"], (
         "server must distinguish missing from invalid anchorNode"
@@ -214,7 +235,7 @@ def test_A4_request_contract_is_enforced_server_side(signer):
         ("direction", "BOTH"),
     ],
 )
-def test_A5_documented_enums_are_accepted(signer, field, value):
+def test_A5_documented_enums_are_accepted(signer, unresolvable_message, field, value):
     """Documented enum values pass schema validation.
 
     Each reaches anchorNode resolution ("Invalid anchorNode") rather than being rejected
@@ -225,13 +246,13 @@ def test_A5_documented_enums_are_accepted(signer, field, value):
     """
     code, body = fetch_lineage(signer, **{field: value})
     assert code == 400, (code, body)
-    assert body.get("message") == "Invalid anchorNode", (
+    assert body.get("message") == unresolvable_message, (
         "%s=%s was rejected before anchor resolution: %s" % (field, value, body)
     )
 
 
 @pytest.mark.existence
-def test_A6_invalid_enum_is_rejected(signer):
+def test_A6_invalid_enum_is_rejected(signer, unresolvable_message):
     """Complement to A5: a bogus enum fails *earlier* than anchor resolution.
 
     This proves A5 is meaningful — the server really parses these fields rather than
@@ -239,18 +260,23 @@ def test_A6_invalid_enum_is_rejected(signer):
     """
     code, body = fetch_lineage(signer, direction="SIDEWAYS")
     assert code == 400, (code, body)
-    assert body.get("message") != "Invalid anchorNode", (
+    assert body.get("message") != unresolvable_message, (
         "bogus enum should be rejected as an enum, not fall through to anchor: %s" % body
     )
 
 
 @pytest.mark.existence
+@pytest.mark.legacy
 def test_A7_lineage_absent_from_legacy_api_generation(signer):
     """Documents *why* lineage looks missing if you probe the old surface.
 
     The previous generation (aidp.{region} + /20240831/dataLakes) has no lineage route,
     while still serving /catalogs. Anyone concluding "AIDP has no lineage API" from that
     host is probing a generation behind.
+
+    Marked `legacy` as well as `existence`: it is the one test that depends on the
+    previous generation staying up, so `-m "existence and not legacy"` skips it when that
+    gateway is retired without losing the rest of Part A.
     """
     code_cat, _ = _req(signer, "GET", LEGACY_BASE + "/catalogs")
     assert code_cat == 200, "legacy base should still serve catalogs (%s)" % code_cat
@@ -272,10 +298,11 @@ ANCHOR_CANDIDATES = [
 ]
 
 BLOCKED = (
-    "No accepted anchorNode format known: every candidate returns "
-    "400 'Invalid anchorNode'. Either the lineage graph is not populated for this "
-    "DataLake, or the node-id format is undocumented (CLI docs leave anchorNode's "
-    "description empty). Open question for Oracle."
+    "No accepted anchorNode format known (observed 2026-08-16, one DataLake in "
+    "us-ashburn-1, SDK v4.2.1): every candidate returns 400 'Invalid anchorNode'. "
+    "Either the lineage graph is not populated for that DataLake, or the node-id format "
+    "is undocumented -- the CLI reference lists anchorNode with an empty description. "
+    "Not yet separated."
 )
 
 
@@ -283,8 +310,8 @@ BLOCKED = (
 def test_B0_report_all_anchor_candidates(signer):
     """Diagnostic, always green: records what every candidate id form returns.
 
-    This is the evidence to hand Oracle, and the tripwire that shows the moment any
-    form starts resolving.
+    The tripwire that shows the moment any form starts resolving. Always passes, so its
+    output is captured rather than displayed -- use `-rP -k B0` (or `-s`) to read it.
     """
     results = {}
     for cand in ANCHOR_CANDIDATES:
@@ -294,7 +321,9 @@ def test_B0_report_all_anchor_candidates(signer):
 
     print("\n  anchorNode candidate probe:")
     for cand, (code, msg) in results.items():
-        print("    %-52s -> %s %s" % (cand[:52], code, msg))
+        # The OCID candidate is redacted: this output is meant to be pasteable.
+        shown = "<the DataLake OCID>" if cand == DATALAKE else cand[:52]
+        print("    %-52s -> %s %s" % (shown, code, msg))
 
     accepted = [c for c, (code, _) in results.items() if code == 200]
     if accepted:

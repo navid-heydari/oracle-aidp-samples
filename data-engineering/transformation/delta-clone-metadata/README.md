@@ -4,7 +4,7 @@ Demonstrates two Delta capabilities on AIDP, with explicit expected counts at ea
 
 | Topic | What the notebook shows |
 |---|---|
-| Zero-copy clone | `SHALLOW CLONE` creates a table referencing the source's data files; `DESCRIBE DETAIL` and `DESCRIBE HISTORY` confirm the zero-copy property and the `CLONE` commit; writing to the clone diverges copy-on-write while the source stays unchanged. |
+| Zero-copy clone | `SHALLOW CLONE` creates a table referencing the source's data files. Zero-copy is proven from the `CLONE` commit's `operationMetrics` (`numCopiedFiles = 0`) and by the clone's `inputFiles()` being exactly the source's; writing to the clone then diverges copy-on-write while the source stays unchanged. |
 | Structure without data | `CREATE TABLE ... USING delta AS SELECT ... WHERE 1=0` produces an empty table with the same columns. |
 | Metadata in SQL | Attaching and reading back metadata at table scope (`TBLPROPERTIES`), column scope (column `COMMENT`), and via a registry table that scales across the lakehouse. |
 
@@ -15,7 +15,8 @@ to a catalog you can create schemas in; the notebook creates the scratch schema
 `clone_metadata_demo` and drops it in the final cell.
 
 Statements are executed directly rather than through a try/except wrapper, so anything unsupported on
-your build fails at that cell instead of being silently recorded.
+your build fails at that cell instead of being silently recorded. Each step also `assert`s its expected
+value rather than only printing it, so a run whose counts disagree stops instead of finishing green.
 
 **Clear outputs before committing.** `DESCRIBE DETAIL` and friends surface your object-storage
 namespace and bucket in the `location` column. The notebook does not project that column for exactly
@@ -26,10 +27,16 @@ this reason, but a committed run of any cell can still carry tenancy identifiers
 
 - **`VACUUM` can break a shallow clone.** The clone references the *source's* parquet files. Vacuuming
   the source may delete files the clone still needs, and Delta does not track that dependency. Avoid
-  vacuuming a cloned source, or raise its retention window.
+  vacuuming a cloned source, or raise its retention window. To repair a clone this has already broken,
+  re-clone it — but `CREATE OR REPLACE TABLE ... SHALLOW CLONE` over a clone holding its own data
+  raises `DELTA_UNSUPPORTED_NON_EMPTY_CLONE`, so `DELETE FROM` the clone first.
 - **`DEEP CLONE` availability varies by build.** The open-source Delta 3.2 grammar rejects it (the OSS
   docs cover shallow clone only); Oracle's `3.2.0-oci` build may accept it. The notebook explains it
   but does not run it, so a build without it does not halt the run.
+- **`DESCRIBE DETAIL` alone does not prove zero-copy.** `format` / `numFiles` / `sizeInBytes` read the
+  same for a deep copy, and `DESCRIBE HISTORY` reports `operation = CLONE` for either kind. The
+  distinguishing evidence is `operationMetrics.numCopiedFiles = 0` on the `CLONE` commit, and the
+  clone's `inputFiles()` matching the source's. The notebook asserts both.
 - **Some `DESCRIBE` forms are not subqueryable.** Spark 3.5 does not parse
   `SELECT ... FROM (DESCRIBE DETAIL t)` — that is a parser error, not a missing feature. Run
   `DESCRIBE DETAIL` / `DESCRIBE HISTORY` / `DESCRIBE` as top-level statements and project the result
@@ -51,6 +58,9 @@ that redacts whichever columns your registry marks sensitive. Writing that gener
 around per-type mask shapes and identifier handling, so it is deliberately left out of this sample
 rather than sketched unsafely.
 
-## Environment as tested
+## Environment
 
-Spark 3.5.0 · Delta 3.2.0-oci-1.0.0 · `spark.sql.sources.default=delta` · catalog impl `hive`
+Statements were verified individually on Spark 3.5.0 · Delta 3.2.0-oci-1.0.0 ·
+`spark.sql.sources.default=delta` · catalog impl `hive`. The notebook has **not** yet been run top to
+bottom in this form — every step asserts its expected value, so a Run All that disagrees fails at the
+cell that disagreed rather than finishing green.
