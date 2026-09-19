@@ -8,6 +8,8 @@ import json
 
 import pytest
 
+from target import jobs
+
 from target.jobs import (
     TERMINAL_STATES, extract_notebook_text, fetch_task_output, job_run_status,
     run_job, watch_job)
@@ -145,3 +147,55 @@ def test_fetch_task_output_is_two_calls():
     fake = Fake(states=[])
     assert "ok" in fetch_task_output(fake, workspace="ws", run_key="r")
     assert fake.ops == ["list_task_runs", "fetch_task_output"]
+
+
+def test_a_second_run_is_refused_while_one_is_in_flight():
+    """maxConcurrentRuns=1 ACCEPTS a second run and then discards it: created,
+    ended instantly, no task output. The console meanwhile streams the OLD
+    run's log, so a freshly deployed fix looks like it never took."""
+    def call(op, **kw):
+        if op == "list_job_runs":
+            return {"items": [{"key": "older", "endTime": None},
+                              {"key": "done", "endTime": 123}]}
+        raise AssertionError(f"must not reach {op}")
+
+    with pytest.raises(jobs.JobRunCollision) as exc:
+        jobs.watch_job(call, workspace="ws", job_key="j", sleep=lambda s: None)
+    msg = str(exc.value)
+    assert "older" in msg and "done" not in msg
+    assert "cancel-job-run" in msg
+
+
+def test_a_finished_previous_run_does_not_block_the_next():
+    started = {}
+
+    def call(op, **kw):
+        if op == "list_job_runs":
+            return {"items": [{"key": "done", "endTime": 123}]}
+        if op == "run_job":
+            started["yes"] = True
+            return {"key": "new"}
+        if op == "get_job_run":
+            return {"status": "SUCCESS"}
+        return {}
+
+    res = jobs.watch_job(call, workspace="ws", job_key="j",
+                         sleep=lambda s: None, max_polls=1)
+    assert started.get("yes") is True
+    assert res["ok"] is True
+
+
+def test_a_transport_that_cannot_list_runs_is_a_guard_not_a_gate():
+    """The guard must never be the reason a migration cannot run."""
+    def call(op, **kw):
+        if op == "list_job_runs":
+            raise RuntimeError("not supported on this build")
+        if op == "run_job":
+            return {"key": "new"}
+        if op == "get_job_run":
+            return {"status": "SUCCESS"}
+        return {}
+
+    res = jobs.watch_job(call, workspace="ws", job_key="j",
+                         sleep=lambda s: None, max_polls=1)
+    assert res["ok"] is True

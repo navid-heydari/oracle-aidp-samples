@@ -1,6 +1,8 @@
 """Spark/Delta DDL generation with a per-rule audit trail. Pure."""
 import pytest
 
+from target import ddl
+
 from target.ddl import (
     DEFERRED_EQUIVALENT_PROPERTIES, RewriteResult, SCRUBBED_PROPERTIES, build_create_schema, build_create_table,
     quote_spark_string,
@@ -279,3 +281,44 @@ def test_no_maintenance_ddl_is_emitted():
     up = res.sql.upper()
     for banned in ("OPTIMIZE", "VACUUM", "CLUSTER BY", "ZORDER", "TBLPROPERTIES"):
         assert banned not in up
+
+
+# --- types the TARGET refuses, caught offline -------------------------------
+
+def test_timestamp_ntz_is_flagged_because_the_metastore_refuses_it():
+    """Delta and Spark 3.4+ support TIMESTAMP_NTZ; the Hive metastore behind
+    the AIDP catalog does not, and says so only at CREATE TABLE -- five to six
+    minutes of cluster startup into a job run, inside a Java traceback."""
+    stmts = [{"target_fqn": "c.s.t", "source_identifier": "DB.S.T",
+              "sql": "CREATE TABLE `c`.`s`.`t` (\n"
+                     "  `ID` DECIMAL(38,0),\n"
+                     "  `EVENT_AT` TIMESTAMP_NTZ,\n"
+                     "  `CREATED_AT` TIMESTAMP_NTZ\n) USING DELTA"}]
+    found = ddl.unsupported_target_types(stmts)
+    assert len(found) == 1
+    assert found[0]["columns"] == ["EVENT_AT", "CREATED_AT"]
+    assert "--timestamp-ntz timestamp" in found[0]["remedy"]
+    assert "SEMANTIC DOWNGRADE" in found[0]["remedy"]
+
+
+def test_the_downgraded_plan_is_not_flagged():
+    stmts = [{"target_fqn": "c.s.t", "source_identifier": "DB.S.T",
+              "sql": "CREATE TABLE `c`.`s`.`t` (`EVENT_AT` TIMESTAMP) "
+                     "USING DELTA"}]
+    assert ddl.unsupported_target_types(stmts) == []
+
+
+def test_the_type_named_in_a_rule_note_is_not_a_false_positive():
+    """The mapping note legitimately says `TIMESTAMP_NTZ -> TIMESTAMP`. Only a
+    column DECLARATION counts."""
+    stmts = [{"target_fqn": "c.s.t", "source_identifier": "DB.S.T",
+              "sql": "-- R03_TYPE_MAP EVENT_AT: TIMESTAMP_NTZ -> TIMESTAMP\n"
+                     "CREATE TABLE `c`.`s`.`t` (`EVENT_AT` TIMESTAMP) "
+                     "USING DELTA"}]
+    assert ddl.unsupported_target_types(stmts) == []
+
+
+def test_the_payload_carries_the_verdict_so_no_caller_can_forget_to_ask():
+    stmts = [{"target_fqn": "c.s.t", "source_identifier": "DB.S.T",
+              "sql": "CREATE TABLE `c`.`s`.`t` (`A` TIMESTAMP_NTZ) USING DELTA"}]
+    assert ddl.unsupported_target_types(stmts)[0]["type"] == "TIMESTAMP_NTZ"

@@ -77,6 +77,25 @@ def render_ddl_plan(ddl: dict) -> str:
     stmts = ddl.get("statements") or []
     out = ["# Target DDL plan", "",
            f"{len(stmts)} statement(s). Nothing has been executed.", ""]
+    # LEAD with what the target will refuse. Buried at the bottom this reads
+    # as a footnote; it is the reason the whole plan would fail.
+    rejected = ddl.get("target_rejected") or []
+    if rejected:
+        cols = sum(len(r["columns"]) for r in rejected)
+        out += [f"## ⛔ HALT — {cols} column(s) in {len(rejected)} table(s) "
+                f"use a type the target refuses at `CREATE TABLE`", "",
+                "**This plan cannot be created as it stands.** It is a "
+                "refusal by the target catalog, not a mapping error, and it "
+                "is caught here rather than minutes into a job run.", "",
+                "| Target table | Columns | Type |", "|---|---|---|"]
+        out += [f'| `{r["target_fqn"]}` | {", ".join(r["columns"])} '
+                f'| `{r["type"]}` |' for r in rejected]
+        out += [""]
+        for remedy in dict.fromkeys(r["remedy"] for r in rejected):
+            out += [f"- {remedy}"]
+        out += ["", "Fix the **input** and re-run `ddl`. Never edit the "
+                "generated SQL to work around this: the next regeneration "
+                "overwrites it.", ""]
     for st in stmts:
         out += [f'## `{st["source_identifier"]}` → `{st["target_fqn"]}`', "",
                 "```sql", st["sql"], "```", ""]

@@ -218,7 +218,7 @@ def test_run_refuses_a_param_it_cannot_deliver():
     args = argparse.Namespace(
         out_dir=".", datalake_ocid="ocid1.aidataplatform.oc1.iad.aaaa",
         workspace="ws", cluster_id=None, catalog=None, backend=None,
-        job="snowmig_01_structure", job_key="k", param=["schema=COMMERCE"],
+        job="snowmig_01_structure", job_key="k", param=["schema=SALES"],
         poll_seconds=1, max_polls=1)
     with pytest.raises(snowmig.MissingTarget) as exc:
         snowmig.cmd_run(args)

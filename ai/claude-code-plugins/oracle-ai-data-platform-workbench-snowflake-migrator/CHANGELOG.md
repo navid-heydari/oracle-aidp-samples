@@ -41,6 +41,40 @@ backs the full plan up before scope is reduced. Provisioning created
 `scripts/`, `plan/` and `reports/` only, so the first backup had nowhere to
 land. `BACKUP_FOLDER` is now created and read back with the others.
 
+### Added — `ddl` halts on a type the TARGET refuses
+
+The Hive metastore behind an AIDP catalog rejects `timestamp_ntz` at `CREATE
+TABLE` — `InvalidObjectException: Invalid column type: timestamp_ntz` — even
+though Delta and Spark 3.4+ support it and the statement runs on compute, not
+through the catalog API. "Delta supports it" is therefore not sufficient; the
+metastore is a second, stricter gate (B19).
+
+Found the expensive way: five to six minutes of cluster startup, then a Java
+traceback partway down a thousand-line log. `ddl` now checks the **emitted**
+SQL against `TARGET_REJECTED_COLUMN_TYPES` — types live-verified as refused,
+each paired with the remedy that cleared that refusal — and HALTs
+with exit 3, naming the offending columns. `DDL_PLAN.md` leads with the halt
+rather than footnoting it. The check is offline and runs in under a second.
+
+Anchored on the backtick-quoted column declaration, so the mapper's own
+`TIMESTAMP_NTZ -> TIMESTAMP` rule note is not a false positive. The remedy
+states plainly that the downgrade changes timezone semantics — Spark
+`TIMESTAMP` is an instant read through the session timezone, `TIMESTAMP_NTZ`
+is wall-clock with none — so it stays a decision, not an inheritance.
+
+### Fixed — a second run was started while one was in flight
+
+A job with `maxConcurrentRuns: 1` ACCEPTS a second run and then discards it:
+created, ended the same millisecond, no task output. Meanwhile the console
+streams the OLD run's log, so a freshly deployed fix looks like it never
+took — which is exactly how a corrected notebook appeared not to apply.
+`watch_job` now refuses to start a run while one is in flight, names the run
+holding the slot and how to cancel it. It is a guard, not a gate: a transport
+that cannot list runs never blocks a migration. Adds the `list_job_runs`
+operation, including the live quirk that `sortBy` is mandatory
+(`400 WORKFLOW_0007 ... Invalid SortBy: null`) and that `startTime` is
+rejected as a sort key while `timeCreated` works.
+
 ### Fixed — S10 shipped a default pair that could not work
 
 `01_create_structure` shipped `source-mode: connector` beside `mode: manifest`

@@ -23,7 +23,58 @@ from snowflake_source.dialect.views import (  # noqa: F401  (re-exported)
 
 __all__ = ["RuleApplication", "RewriteResult", "UnsupportedDDL",
            "SCRUBBED_PROPERTIES", "DEFERRED_EQUIVALENT_PROPERTIES", "build_create_schema", "quote_backtick", "quote_spark_string", "build_create_table",
-           "build_create_view", "build_ddl_payload"]
+           "build_create_view", "build_ddl_payload",
+           "TARGET_REJECTED_COLUMN_TYPES", "unsupported_target_types"]
+
+# COLUMN TYPES THE TARGET REJECTS AT `CREATE TABLE`, LIVE-VERIFIED.
+#
+# Not a style list and not a portability opinion: each entry is a type the
+# AIDP metastore refused on a real run, paired with the remedy that cleared
+# that refusal on the same estate. They are caught HERE -- in an offline stage, in under a
+# second -- because the alternative is finding out from a job run, five to six
+# minutes of cluster startup later, with the failure buried in a Java
+# traceback partway down a thousand-line log.
+#
+# `TIMESTAMP_NTZ` is genuinely supported by Delta and by Spark 3.4+; it is the
+# HIVE METASTORE behind the catalog that refuses it, with
+# `InvalidObjectException: Invalid column type: timestamp_ntz`. So the type is
+# not "wrong" -- it simply cannot be declared to this catalog, which is why
+# the remedy is a documented mapping flag rather than a fix to the mapper.
+TARGET_REJECTED_COLUMN_TYPES: dict[str, str] = {
+    "TIMESTAMP_NTZ":
+        "the AIDP Hive metastore refuses it with `InvalidObjectException: "
+        "Invalid column type: timestamp_ntz` (live-verified 2026-09-19). "
+        "Re-run `ingest`/`assess` with `--timestamp-ntz timestamp`. That is a "
+        "SEMANTIC DOWNGRADE, not a rename: Spark TIMESTAMP is an instant read "
+        "through the session timezone, while TIMESTAMP_NTZ is wall-clock with "
+        "no zone, so the same value can read back differently under a "
+        "different session. The mapper records it as a warning for that "
+        "reason -- decide it, do not inherit it.",
+}
+
+
+def unsupported_target_types(statements: list[dict]) -> list[dict]:
+    """Column types in `statements` that the target will refuse.
+
+    Reads the EMITTED sql, not the source inventory: the question is what this
+    plan would actually declare, after every mapping flag has been applied.
+    """
+    found: list[dict] = []
+    for stmt in statements:
+        sql = stmt.get("sql") or ""
+        if "CREATE TABLE" not in sql.upper():
+            continue
+        for type_name, remedy in TARGET_REJECTED_COLUMN_TYPES.items():
+            # Anchored on the backtick-quoted column the emitter writes, so a
+            # type NAMED in a comment or a rule note is not a false positive.
+            hits = re.findall(r"`(\w+)`\s+" + type_name + r"\b", sql)
+            if hits:
+                found.append({"target_fqn": stmt.get("target_fqn"),
+                              "source_identifier": stmt.get(
+                                  "source_identifier"),
+                              "type": type_name, "columns": hits,
+                              "remedy": remedy})
+    return found
 
 # Snowflake table PROPERTIES that genuinely have NO AIDP equivalent. A value
 # here was a deliberate source-side setting, so dropping it is a decision worth
@@ -351,4 +402,8 @@ def build_ddl_payload(inventory: dict, plan: dict) -> dict:
                if rec.get("object_type") == "VIEW" else {})})
 
     return {"statements": statements, "blocked": blocked,
+            # Checked on the way out so no caller can forget to ask: a plan
+            # that cannot be created is worth knowing about before it is
+            # handed to a workflow.
+            "target_rejected": unsupported_target_types(statements),
             "bronze_catalog_prefix": plan.get("bronze_catalog_prefix")}

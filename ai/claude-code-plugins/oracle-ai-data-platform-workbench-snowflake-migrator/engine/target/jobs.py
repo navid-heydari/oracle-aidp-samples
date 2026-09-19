@@ -21,12 +21,37 @@ import json
 import time
 from typing import Callable
 
-__all__ = ["TERMINAL_STATES", "SUCCESS_STATES", "run_job", "job_run_status",
+__all__ = ["TERMINAL_STATES", "SUCCESS_STATES", "JobRunCollision",
+           "in_flight_runs", "run_job", "job_run_status",
            "fetch_task_output", "extract_notebook_text", "watch_job"]
 
 TERMINAL_STATES = ("SUCCESS", "FAILED", "CANCELED", "TIMED_OUT",
                    "UPSTREAM_FAILED", "BLOCKED")
 SUCCESS_STATES = ("SUCCESS",)
+
+
+class JobRunCollision(RuntimeError):
+    """A run of this job is already in flight. Named so the CLI reports it as
+    a message rather than a traceback, and so it is never mistaken for the
+    job having failed."""
+
+
+def in_flight_runs(call: Callable[..., dict], *, workspace: str,
+                   job_key: str) -> list[str]:
+    """Keys of runs of `job_key` that have not ended.
+
+    A run is finished when it carries an `endTime`; the envelope has no status
+    field of its own (the status lives on the task runs), so absence of an end
+    is the signal. A transport that cannot list runs must not block a run --
+    this is a guard, not a gate -- so any failure here returns nothing.
+    """
+    try:
+        payload = call("list_job_runs", workspace=workspace, job_key=job_key)
+    except Exception:
+        return []
+    items = (payload.get("items") if isinstance(payload, dict) else None) or []
+    return [str(i.get("key")) for i in items
+            if not i.get("endTime") and i.get("key")]
 
 
 def run_job(call: Callable[..., dict], *, workspace: str, job_key: str,
@@ -119,6 +144,24 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
     means the budget ran out with the job still going -- reported as running,
     never rounded to either verdict.
     """
+    # A job created with `maxConcurrentRuns: 1` still ACCEPTS a second run
+    # while the first is going -- and then never executes it: the run is
+    # created, ends the instant it starts, and produces no task output. Polled
+    # naively that reads as a terminal run with nothing in it, while the
+    # console streams the OLD run's log, so the operator sees stale output and
+    # concludes the fix they just deployed did not take. Refuse instead, and
+    # name the run holding the slot.
+    active = in_flight_runs(call, workspace=workspace, job_key=job_key)
+    if active:
+        raise JobRunCollision(
+            f"job {job_key} already has {len(active)} run(s) in flight: "
+            + ", ".join(active)
+            + ". A job with maxConcurrentRuns=1 accepts a second run and then "
+              "discards it, so starting one now would look like a run that "
+              "did nothing. Wait for it, or cancel it "
+              "(`aidp workflow cancel-job-run <workspace> <run-key>`) -- and "
+              "note that a notebook re-uploaded mid-run does NOT affect the "
+              "run already going.")
     run_key = run_job(call, workspace=workspace, job_key=job_key,
                       parameters=parameters)
     status, message = "UNKNOWN", ""

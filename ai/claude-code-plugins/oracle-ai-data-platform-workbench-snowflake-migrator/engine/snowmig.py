@@ -90,6 +90,7 @@ from migration_config import (
     load_config, redact, resolve_secret, snowflake_block, write_template,
 )
 from target.deploy import RefusedToExecute, deploy
+from target.jobs import JobRunCollision
 from target.provisioning import ProvisionTransportError
 from target.executor import (
     NoBackendAvailable, build_command, detect_backend,
@@ -605,6 +606,27 @@ def cmd_ddl(args) -> int:
     payload = build_ddl_payload(inv, built)
     _write(out, "ddl_plan.json", payload)
     _write(out, "DDL_PLAN.md", render_ddl_plan(payload))
+
+    # HALT on a type the target will refuse. The artifacts are written first
+    # on purpose: the plan is still worth reading, and the operator needs to
+    # see WHICH columns are at fault. Exit 3 is the established halt code --
+    # a condition to resolve with the user, never one to pick a winner on.
+    rejected = payload.get("target_rejected") or []
+    if rejected:
+        cols = sum(len(r["columns"]) for r in rejected)
+        print(f"  HALT: {cols} column(s) in {len(rejected)} table(s) use a "
+              f"type the target refuses at CREATE TABLE.", file=sys.stderr)
+        for r in rejected[:5]:
+            print(f"    {r['target_fqn']}: {', '.join(r['columns'])} "
+                  f"-> {r['type']}", file=sys.stderr)
+        if len(rejected) > 5:
+            print(f"    ... and {len(rejected) - 5} more table(s)",
+                  file=sys.stderr)
+        for remedy in dict.fromkeys(r["remedy"] for r in rejected):
+            print(f"  {remedy}", file=sys.stderr)
+        print("  Nothing was created. Fix the INPUT and re-run `ddl` -- do "
+              "not hand this plan to the structure workflow.", file=sys.stderr)
+        return 3
     return 0
 
 
@@ -1785,7 +1807,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except (AuthError, MissingTarget, RefusedToExecute, CatalogRefused,
-            DeployRefused, ProvisionTransportError,
+            DeployRefused, ProvisionTransportError, JobRunCollision,
             ConnectionConfigError, ConfigError, FileNotFoundError,
             InvalidRestriction, NoBackendAvailable, BackendError,
             ExecutorBackendError,

@@ -320,6 +320,13 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
         return raw("POST", f"{base}/workspaces/{ws}/jobRuns", kwargs["body"])
     if operation == "get_job_run":
         return raw("GET", f'{base}/workspaces/{ws}/jobRuns/{kwargs["key"]}')
+    if operation == "list_job_runs":
+        # `sortBy` is REQUIRED: omitting it is a live
+        # `400 WORKFLOW_0007 ... Possible cause: Invalid SortBy: null`, and
+        # `startTime` is rejected as a sort key even though it is a field on
+        # every run. `timeCreated` works.
+        return raw("GET", f'{base}/workspaces/{ws}/jobRuns'
+                          f'?jobKey={kwargs["job_key"]}&sortBy=timeCreated')
     if operation == "list_task_runs":
         # `sortBy` is REQUIRED: without it the call fails "Invalid SortBy:
         # null" (live).
