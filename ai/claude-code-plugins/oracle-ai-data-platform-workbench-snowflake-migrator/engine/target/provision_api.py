@@ -327,6 +327,11 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
         # every run. `timeCreated` works.
         return raw("GET", f'{base}/workspaces/{ws}/jobRuns'
                           f'?jobKey={kwargs["job_key"]}&sortBy=timeCreated')
+    if operation == "cancel_job_run":
+        # Live-verified (2026-09-19): answers 202, and the run reads CANCELED
+        # on the next poll. Used by the cold-start watchdog in jobs.py to let
+        # go of a run the cluster never picked up.
+        return aidp_cli("workflow", "cancel-job-run", ws, kwargs["run_key"])
     if operation == "list_task_runs":
         # `sortBy` is REQUIRED: without it the call fails "Invalid SortBy:
         # null" (live).

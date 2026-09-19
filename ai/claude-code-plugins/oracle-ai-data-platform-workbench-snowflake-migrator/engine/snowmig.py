@@ -761,10 +761,18 @@ def cmd_run(args) -> int:
     def _on_poll(status: str, attempt: int) -> None:
         print(f"    poll {attempt}: {status}", flush=True)
 
+    def _on_restart(stale: str, fresh: str) -> None:
+        print(f"    cold start: the cluster did not pick up run {stale} "
+              f"within {args.cold_start_seconds:.0f}s (its task never "
+              f"started). Cancelled it; resubmitted as {fresh}.", flush=True)
+
     result = watch_job(call, workspace=args.workspace, job_key=job_key,
                        parameters=parameters or None,
                        poll_seconds=args.poll_seconds,
-                       max_polls=args.max_polls, on_poll=_on_poll)
+                       max_polls=args.max_polls, on_poll=_on_poll,
+                       cold_start_seconds=args.cold_start_seconds,
+                       cold_start_restarts=args.cold_start_restarts,
+                       on_restart=_on_restart)
     result["job"] = args.job
     result["job_key"] = job_key
     result["workspace"] = args.workspace
@@ -810,6 +818,27 @@ def _render_run(result: dict) -> str:
     if result.get("parameters"):
         lines += ["Parameters:", ""]
         lines += [f'- `{k}` = `{v}`' for k, v in result["parameters"].items()]
+        lines.append("")
+    # A restart is part of the record. The run that produced the output below
+    # is NOT the run that was first submitted, and a reader comparing this
+    # report against the console has to be able to see that.
+    if result.get("restarts"):
+        lines += [
+            "## Cold-start restarts",
+            "",
+            "The cluster did not pick up the run(s) below — the job run sat "
+            "at `RUNNING` with its task never started. Each was cancelled "
+            "and resubmitted. **The output below belongs to the last run "
+            "key, not the first.**",
+            "",
+            "| Abandoned run | Cancelled to | Waited | Resubmitted as |",
+            "|---|---|---|---|",
+        ]
+        lines += [
+            f'| `{r.get("abandoned_run")}` | `{r.get("cancel_state")}` | '
+            f'{r.get("after_seconds"):.0f}s | `{r.get("new_run")}` |'
+            for r in result["restarts"]
+        ]
         lines.append("")
     lines += ["## Output", "", "```", (result.get("output") or "(none)").strip(),
               "```", ""]
@@ -1623,6 +1652,16 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--max-polls", type=int, default=40,
                     help="poll budget (default: 40). Running out is reported "
                          "as STILL RUNNING, never as a verdict")
+    rn.add_argument("--cold-start-seconds", type=float, default=60.0,
+                    help="how long to wait for the CLUSTER TO PICK UP the "
+                         "task before giving up on the run and resubmitting "
+                         "(default: 60). A cluster sometimes never takes the "
+                         "first run on a new workspace: it sits at RUNNING "
+                         "with the task unstarted and never fails")
+    rn.add_argument("--cold-start-restarts", type=int, default=1,
+                    help="how many times a never-picked-up run may be "
+                         "cancelled and resubmitted (default: 1; 0 disables). "
+                         "Every restart is named in the run report")
     rn.set_defaults(func=cmd_run)
 
     cat = sub.add_parser("catalog", parents=[common],

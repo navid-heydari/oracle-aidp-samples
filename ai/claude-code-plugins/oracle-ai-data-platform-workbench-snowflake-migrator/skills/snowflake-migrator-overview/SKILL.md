@@ -209,6 +209,41 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig run \
 the task output as evidence. A poll budget that runs out is reported as
 **STILL RUNNING** -- never rounded to success, never to failure.
 
+#### The first run on a new workspace often is never picked up
+
+**A cluster sometimes ignores a job run outright, and characteristically it
+is the very first run on a freshly created workspace.** The run does not
+fail. It reports `RUNNING` indefinitely, so nothing times out and nothing
+alerts; an operator watching the status sees a job that appears to be
+working, and waits.
+
+The job-run status cannot tell this apart from real work. **One field can:**
+
+| | wedged | healthy |
+|---|---|---|
+| job run `state.status` | `RUNNING` | `RUNNING` |
+| **task run `startTime`** | **`null`** | a timestamp |
+
+Measured live on 2026-09-19: the first run on a new workspace sat **9+
+minutes** with its task unstarted; the identical job, cancelled and
+resubmitted, succeeded in **90 seconds**.
+
+`run` handles this itself. After `--cold-start-seconds` (default 60) with
+the task still unstarted, it cancels the run and resubmits, up to
+`--cold-start-restarts` times (default 1; `0` disables). The budget measures
+**pick-up, not work** -- a task that has started is never cancelled however
+long it then runs, because killing it would destroy real progress.
+
+Two things to carry into the conversation when it fires:
+
+- **The output belongs to the LAST run key, not the first.** The restart is
+  written into `RUNS_*.md` as a table for exactly that reason. Someone
+  comparing the report against the console must be able to see it.
+- **A resubmit needs the slot free.** `maxConcurrentRuns: 1` accepts a second
+  run while the first still holds it and then silently discards it, so the
+  cancel is polled to a terminal state before the new run is submitted.
+  Never fire a cancel and immediately resubmit by hand.
+
 The manifest is written to `reports/` and **backed up into `backup/`**, dated,
 as the reference input every later script reads. Never re-derive what the
 manifest already holds.

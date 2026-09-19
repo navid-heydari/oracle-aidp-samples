@@ -141,6 +141,45 @@ live in the gitignored config files, never here.
 
 ## P3 — carried forward, re-prioritised
 
+### 12b. `backup/` is created and never written to — S6's backup is not real
+
+Found on a live run, 2026-09-19. `BACKUP_FOLDER` is defined in
+`target/provisioning.py:63`, created with the other folders at line 406, and
+asserted by `test_provisioning.py:519` — **but nothing in the engine ever
+writes a file into it.** The only assertion anywhere is that the folder
+exists.
+
+The runbook promises more than that. S6 says the manifest is "written to
+`reports/` and **backed up into `backup/`**, dated, as the reference input
+every later script reads", and S9 says the full plan is backed up into AIDP
+before a reduced plan replaces it. Neither backup happens. On the 2026-09-19
+run, discovery wrote `reports/discovery_manifest.json` and
+`reports/DISCOVERY.md`, and `backup/` listed empty.
+
+The consequence is not data loss today — `reports/` still holds the manifest —
+but the runbook's evidence guarantee is weaker than it reads. In particular
+S9's "the full plan stays recoverable" is currently untrue: a reduced plan
+overwrites with no copy kept. **Rule 3 says evidence is a deliverable, so
+this is a correctness gap in the audit trail, not a nice-to-have.**
+
+Fix: have `00_discover` write `backup/discovery_manifest_<UTC date>.json`
+alongside the report, and have the plan-reduction path at S9 copy the full
+plan into `backup/` before writing the reduced one. Until then, either back
+the manifest up by hand or accept that `backup/` is decorative.
+
+### 12c. Discovery's summary line counts tables but not views
+
+Cosmetic, same run. `00_discover` printed `11 schema(s), 1000 table(s)` for a
+manifest that actually holds **1000 tables and 2 views**. The manifest itself
+is correct and complete; only the stdout roll-up undercounts, because it sums
+the `tables` bucket and ignores `views`.
+
+It cost real time on the 2026-09-19 run: the line was reconciled against
+Snowflake's 1065 relations and read as 65 objects lost, when the true
+difference was the 63 `INFORMATION_SCHEMA` views that are correctly excluded.
+**A summary that disagrees with its own artifact will be believed over the
+artifact.** Print both counts.
+
 ### 13. `executor.py`'s notebook upload/run shapes are now known to be wrong
 
 Settled by the live campaign, and **not yet removed**: `upload_notebook`,

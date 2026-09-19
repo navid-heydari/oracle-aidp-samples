@@ -23,7 +23,8 @@ from typing import Callable
 
 __all__ = ["TERMINAL_STATES", "SUCCESS_STATES", "JobRunCollision",
            "in_flight_runs", "run_job", "job_run_status",
-           "fetch_task_output", "extract_notebook_text", "watch_job"]
+           "fetch_task_output", "extract_notebook_text", "watch_job",
+           "task_started", "cancel_run"]
 
 TERMINAL_STATES = ("SUCCESS", "FAILED", "CANCELED", "TIMED_OUT",
                    "UPSTREAM_FAILED", "BLOCKED")
@@ -77,6 +78,58 @@ def job_run_status(call: Callable[..., dict], *, workspace: str,
     return {"status": str(state.get("status") or payload.get("status")
                           or "UNKNOWN"),
             "message": str(state.get("stateMessage") or "")}
+
+
+def task_started(call: Callable[..., dict], *, workspace: str,
+                 run_key: str) -> bool:
+    """Has the cluster actually PICKED UP this run's task?
+
+    The distinction the job-run status cannot make. A wedged run and a
+    healthy one both report `RUNNING` on the envelope; what separates them is
+    one field on the task run:
+
+        wedged  (live 2026-09-19): task run exists, `startTime` is null
+        healthy (live 2026-09-19): task run carries a real `startTime`
+
+    So `startTime` is the signal, not the status. A transport that cannot
+    list task runs returns True -- unknown must never be read as wedged, or
+    the watchdog would cancel healthy runs on a transport hiccup.
+    """
+    try:
+        listed = call("list_task_runs", workspace=workspace, run_key=run_key)
+    except Exception:
+        return True
+    items = (listed.get("items") if isinstance(listed, dict) else None) or []
+    if not items:
+        return False
+    return any(i.get("startTime") for i in items)
+
+
+def cancel_run(call: Callable[..., dict], *, workspace: str, run_key: str,
+               poll_seconds: float = 5.0, max_polls: int = 12,
+               sleep: Callable[[float], None] = time.sleep) -> str:
+    """Cancel a run and poll it to a terminal state; returns that state.
+
+    The cancel answers 202, which is acceptance and not completion, so the
+    run is read back. This is polled to terminal rather than fired and
+    forgotten because `maxConcurrentRuns: 1` means a resubmit while the old
+    run still holds the slot is accepted and then silently discarded.
+    """
+    try:
+        call("cancel_job_run", workspace=workspace, run_key=run_key)
+    except Exception:
+        pass  # it may already have ended; the poll below is the real answer
+    status = "UNKNOWN"
+    for _ in range(max_polls):
+        try:
+            status = job_run_status(call, workspace=workspace,
+                                    run_key=run_key)["status"]
+        except Exception:
+            status = "UNKNOWN"
+        if status in TERMINAL_STATES:
+            return status
+        sleep(poll_seconds)
+    return status
 
 
 def fetch_task_output(call: Callable[..., dict], *, workspace: str,
@@ -137,12 +190,28 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
               parameters: dict[str, str] | None = None,
               poll_seconds: float = 30.0, max_polls: int = 40,
               on_poll: Callable[[str, int], None] | None = None,
+              cold_start_seconds: float = 60.0, cold_start_restarts: int = 1,
+              on_restart: Callable[[str, str], None] | None = None,
               sleep: Callable[[float], None] = time.sleep) -> dict:
     """Run a job, poll to a terminal state, and bring back its output.
 
-    Returns {run_key, status, message, output, terminal}. `terminal: False`
-    means the budget ran out with the job still going -- reported as running,
-    never rounded to either verdict.
+    Returns {run_key, status, message, output, terminal, restarts}.
+    `terminal: False` means the budget ran out with the job still going --
+    reported as running, never rounded to either verdict.
+
+    THE COLD-START WATCHDOG. A cluster sometimes never picks up a job run --
+    characteristically the FIRST run on a freshly created workspace. The run
+    sits at `RUNNING` with its task unstarted, indefinitely: it does not fail,
+    so nothing times out, and an operator watching a status field sees a job
+    that is apparently working. Observed live 2026-09-19: the first run on a
+    new workspace sat 9+ minutes untouched, and an identical run submitted
+    after cancelling it succeeded in 90 seconds.
+
+    So after `cold_start_seconds` with the task still unstarted, the run is
+    cancelled and resubmitted, up to `cold_start_restarts` times. The budget
+    is deliberately generous to measure only the pick-up, not the work: it
+    checks whether the cluster TOOK the task, which is independent of how
+    long the task then runs. Set `cold_start_restarts=0` to disable.
     """
     # A job created with `maxConcurrentRuns: 1` still ACCEPTS a second run
     # while the first is going -- and then never executes it: the run is
@@ -166,20 +235,47 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
                       parameters=parameters)
     status, message = "UNKNOWN", ""
     terminal = False
-    for attempt in range(max_polls):
+    restarts: list[dict] = []
+    restarts_left = max(0, cold_start_restarts)
+    waited = 0.0
+    attempt = 0
+    polls_left = max_polls
+    while polls_left > 0:
         sleep(poll_seconds)
+        polls_left -= 1
+        waited += poll_seconds
+        attempt += 1
         state = job_run_status(call, workspace=workspace, run_key=run_key)
         status, message = state["status"], state["message"]
         if on_poll:
-            on_poll(status, attempt + 1)
+            on_poll(status, attempt)
         if status in TERMINAL_STATES:
             terminal = True
             break
+        if (restarts_left and waited >= cold_start_seconds
+                and not task_started(call, workspace=workspace,
+                                     run_key=run_key)):
+            # The cluster has not taken the task. Let this run go and submit
+            # another -- polling the cancel to terminal first, because the
+            # slot must be free or the resubmit is accepted and discarded.
+            ended = cancel_run(call, workspace=workspace, run_key=run_key,
+                               sleep=sleep)
+            stale = run_key
+            run_key = run_job(call, workspace=workspace, job_key=job_key,
+                              parameters=parameters)
+            restarts.append({"abandoned_run": stale, "cancel_state": ended,
+                             "new_run": run_key,
+                             "after_seconds": waited})
+            if on_restart:
+                on_restart(stale, run_key)
+            restarts_left -= 1
+            waited = 0.0
+            status, message = "UNKNOWN", ""
     output = ""
     try:
         output = fetch_task_output(call, workspace=workspace, run_key=run_key)
     except Exception as exc:  # the verdict still stands without the log
         output = f"(output unavailable: {str(exc)[:200]})"
     return {"run_key": run_key, "status": status, "message": message,
-            "output": output, "terminal": terminal,
+            "output": output, "terminal": terminal, "restarts": restarts,
             "ok": terminal and status in SUCCESS_STATES}
