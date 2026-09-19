@@ -8,5 +8,7 @@ Thin wrapper over [`snowflake-clone-notebook`](../skills/snowflake-clone-noteboo
 
 1. Require `ddl_plan.json`; run `/snowflake-plan` then the ddl stage first.
 2. Generate locally and summarise what it will create.
-3. Ask for the four AIDP coordinates in this turn, then upload.
+3. Confirm the four AIDP coordinates in this turn — from the config's `aidp:`
+   block, printed back to the user, plus whatever it does not carry — then
+   upload.
 4. **Ask before executing.** Report progress from the notebook's own per-object output.

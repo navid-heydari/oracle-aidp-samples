@@ -6,6 +6,8 @@ views through the catalog CRUD API instead, which needs no Spark cluster and
 has no session to lose DDL to.
 
 Shape of the run:
+  0. resolve the target catalog's TYPE and refuse EXTERNAL -- managed Delta
+     cannot live in a read-only pointer, and the creates would 202-and-vanish
   1. create each distinct schema once
   2. create tables, then views -- a view's fields reference its base tables
   3. READ EACH OBJECT BACK and compare its field list to the plan
@@ -79,6 +81,21 @@ __all__ = ["deploy_catalog", "RefusedToExecute"]
 
 class RefusedToExecute(RuntimeError):
     """Execution was requested without the arguments that make it safe."""
+
+
+def _resolve_catalog_type(call, catalog: str) -> str | None:
+    """The target catalog's `catalogType` as the server holds it, matched
+    case-insensitively; None when the catalog does not exist.
+
+    A failed LISTING is raised, not swallowed: "could not look" and "absent"
+    lead to different refusals, and neither of them is "safe to write".
+    """
+    payload = call("list_catalogs")
+    for item in payload.get("items") or []:
+        name = str(item.get("displayName") or item.get("key") or "").lower()
+        if name == catalog.strip().lower():
+            return str(item.get("catalogType") or "").upper() or "UNKNOWN"
+    return None
 
 
 def _split(fqn: str) -> tuple[str, str, str]:
@@ -255,6 +272,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         "diagnosis_probes": [],
         "unverified_structure_targets": [], "unverified_structure": [],
         "failed": [],
+        "catalog_type": None,
     }
     if not execute:
         return out
@@ -266,6 +284,40 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
             "explicitly")
     if call is None:
         raise RefusedToExecute("execute=True requires a transport callable")
+
+    # The catalog's TYPE gates everything below. Managed Delta cannot live in
+    # an EXTERNAL catalog -- it is a registered, read-only pointer at the live
+    # Snowflake source -- and the control-plane creates against one would
+    # return 202 Accepted and silently produce nothing.
+    try:
+        catalog_type = _resolve_catalog_type(call, target.catalog)
+    except Exception as exc:
+        raise RefusedToExecute(
+            f"could not read the type of catalog {target.catalog!r} before "
+            f"writing ({str(exc)[:200]}). An EXTERNAL catalog cannot hold the "
+            f"managed Delta this deploy creates, so it refuses rather than "
+            f"guesses.") from exc
+    if catalog_type is None:
+        raise RefusedToExecute(
+            f"catalog {target.catalog!r} does not exist on this DataLake. "
+            f"deploy creates schemas, tables and views -- never catalogs. "
+            f"Create the STANDARD catalog first; `snowmig.py catalog` only "
+            f"registers EXTERNAL ones, which this deploy refuses to write "
+            f"into.")
+    if catalog_type == "EXTERNAL":
+        raise RefusedToExecute(
+            f"catalog {target.catalog!r} is EXTERNAL -- a registered, "
+            f"read-only pointer at the live Snowflake source. It cannot hold "
+            f"managed Delta: the creates would return 202 Accepted and "
+            f"silently produce nothing. A structure clone needs a STANDARD "
+            f"catalog, whose tables are created on AIDP compute via "
+            f"`snowmig.py notebook`, and only when the user has explicitly "
+            f"asked for one.")
+    out["catalog_type"] = catalog_type
+    if catalog_type == "UNKNOWN":
+        out["errors"].append(
+            f"catalog {target.catalog} carries no catalogType in the list "
+            f"response; proceeding, but the EXTERNAL guard could not run")
 
     # 1. schemas: LOOK FIRST. Re-POSTing an existing schema re-triggers async
     #    work and silently drops the table creates that follow it.

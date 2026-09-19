@@ -1,9 +1,0 @@
-# Copy this file to `local-test-account.yaml` (gitignored) and fill in your
-# own Snowflake test account. Only `test_live_smoke.py` and
-# `engine/snowflake_source/corpus/validate.py` read it, and only when the
-# matching environment variable (SNOWMIG_LIVE_DB / CORPUS_DB) is unset.
-#
-# Nothing here is required to run the offline suite -- it only matters for
-# SNOWMIG_LIVE=1 runs and for populating/validating the test corpus.
-
-database: SNOWMIG_TESTDB

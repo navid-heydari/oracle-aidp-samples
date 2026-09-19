@@ -2,9 +2,9 @@
 
 A checklist, not a suggestion. Items 1 and 2 are confidentiality issues.
 
-## 1. Remove `CUSTOMER-CONTEXT.md` — customer-confidential
+## 1. Remove the customer-confidential engagement docs
 
-**Status: OUTSTANDING.** It is committed and **already pushed** to
+**Status: DONE in the working tree, OUTSTANDING in git history.** It is committed and **already pushed** to
 `origin/features/snowflake_migrator_wip` (commit `d6d48fd "skeleton init"`).
 
 It contains a named customer's annual Snowflake spend, estate scale, warehouse
@@ -12,16 +12,17 @@ inventory, internal-review notes naming three colleagues, and lessons cited from
 three other named customers. None of it is needed to use the plugin.
 
 ```bash
-# 1. move it somewhere private
-mv CUSTOMER-CONTEXT.md ~/Workspace/oracle/snowflake_migrator/
+# DONE in the working tree: the engagement docs (the customer-context file and
+# the delivery timetable) were moved to a private directory outside this repo
+# and dropped from the index. `.gitignore` now blocks `*-CONTEXT.md` so they
+# cannot come back by accident.
 
-# 2. drop it from the working tree and index
-git rm --cached CUSTOMER-CONTEXT.md && git commit -m "chore: remove customer context from the plugin"
-
-# 3. it is STILL IN HISTORY on the remote. Removing it properly needs a
-#    history rewrite and a force-push, or deleting the remote branch:
-#      git push origin --delete features/snowflake_migrator_wip
-#    Decide which, then do it deliberately.
+# STILL OUTSTANDING: they remain in git HISTORY on the remote branch. Removing
+# them properly needs a history rewrite and a force-push, or deleting the
+# remote branch:
+#     git push origin --delete <branch>
+# Decide which, then do it deliberately. This is the one item a working-tree
+# cleanup cannot close.
 ```
 
 Then remove the two references to it:
@@ -38,17 +39,19 @@ grep -rniE '<customer>|\$5 ?MM|200,?000 tables' . --exclude-dir=.git
 Expect hits in `PLAN-2PERSON-TIMETABLE.md` and `PORTING-STATUS.md` too. Decide
 per file whether it is genericisable or should move out with the context doc.
 
-The corpus files are named `00_acme_setup.sql` and generate a `ACME_ORDER_360_VW`
-view — rename if the customer name should not appear at all.
+**DONE:** the corpus is `00_acme_setup.sql` generating `ACME_ORDER_360_VW`;
+no source file, fixture or doc names a customer.
 
 ## 3. Remove the developer-specific test account
 
 **Status: DONE.** No source file, fixture, or doc names a real account or
 database anymore. Live-only defaults (`test_live_smoke.py`, `validate.py`)
-now fall back to the placeholder `SNOWMIG_TESTDB` and read a real database
-name from `local-test-account.yaml` at the plugin root -- gitignored, never
-committed, copied from the tracked `local-test-account.example.yaml`. Set
-`SNOWMIG_LIVE_DB` / `CORPUS_DB` instead if you'd rather not keep the file.
+fall back to the placeholder `SNOWMIG_TESTDB` and otherwise read the database
+name from **`snowmig-config.yaml`** -- the one migration config, gitignored and
+never committed. (There used to be a second file for this,
+`local-test-account.yaml`, with its own tracked template; both are gone. One
+config file is the design.) Set `SNOWMIG_LIVE_DB` / `CORPUS_DB` instead if you
+would rather not keep a config at all.
 
 ## 4. Confirm no credential material
 
@@ -60,6 +63,16 @@ The private key lives at `~/.sf_key.p8`, outside the repo — verify it stayed t
 
 ## 5. State the unverified surface in the README
 
-Already noted, but confirm it still says: **no AIDP environment has ever been
-contacted**, so the `deploy --execute` path, the `aidp`/`oci` command shapes, and
-the existence-probe mechanism are all unproven. See `ASSUMPTIONS.md` §B.
+**Superseded — do NOT re-add the old wording.** The README used to say *no
+AIDP environment has ever been contacted*; that has been false since
+2026-09-16 and is now emphatically false. Live-verified against a real
+DataLake: workspace and cluster creation, `workspace-object` upload of
+`NOTEBOOK` objects, job creation, a job run reaching SUCCESS, EXTERNAL/SNOWFLAKE
+and INTERNAL catalog creation read back, and the AIDP Snowflake connector
+reading 1065 relations from a cluster.
+
+What to confirm instead is that the README states the **remaining** unproven
+surface accurately, rather than overclaiming in either direction: the catalog
+CRAWLER (B16 — `testConnection` returns `PENDING`), cluster libraries (B12),
+`01_create_structure` and everything downstream, and anything at real scale.
+See `ASSUMPTIONS.md` §B.

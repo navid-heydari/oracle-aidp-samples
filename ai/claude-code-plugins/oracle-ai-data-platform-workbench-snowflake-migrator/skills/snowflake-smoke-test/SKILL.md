@@ -6,12 +6,13 @@ description: Check connectivity and permissions on both ends before any migratio
 # Smoke test — both ends
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py smoke --out-dir ./snowmig_out \
-  --account <...> --user <...> --auth <...> [--key-path ...] \
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig smoke \
   [--database <db>] \
   [--datalake-ocid <ocid> --workspace <ws> --cluster-id <cl> --catalog <cat>] \
   [--write-probe]
 ```
+
+Every Snowflake coordinate comes from the migration config (`snowmig-config.yaml`, discovered automatically and printed as `config: <path>`). Pass `--account/--user/--auth/...` only to override a field for one run.
 
 Exit 0 = every check passed. Exit 1 = at least one failed. `SMOKE_TEST.md` shows
 which, so a failure points at one end rather than "it doesn't work".
@@ -40,6 +41,13 @@ legitimately creates objects.
 It is still off by default, because it writes. Tell the user what it will create
 before you pass the flag. If cleanup fails, the report names what was left under
 "left behind" — pass that on.
+
+**If the target catalog is EXTERNAL, the probe is skipped with a note** — an
+EXTERNAL catalog is a registered, read-only pointer at the live Snowflake
+source, so it accepts no writes by design. That skip is correct behaviour, not
+a failure: say so rather than treating "write not verified" as a problem. The
+report carries `catalog_type` either way ("unknown" when it could not be
+resolved).
 
 ## If the destination is skipped
 

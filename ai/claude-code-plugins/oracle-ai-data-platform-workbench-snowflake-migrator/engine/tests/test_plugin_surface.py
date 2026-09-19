@@ -11,9 +11,11 @@ SKILLS = ["snowflake-migrator-overview", "snowflake-migrator-bootstrap",
           "snowflake-assess-estate", "snowflake-migration-plan",
           "snowflake-medallion-clone", "snowflake-compute-proposal",
           "snowflake-smoke-test", "snowflake-clone-notebook",
-          "snowflake-stage-board"]
+          "snowflake-stage-board", "snowflake-migrator-demo",
+          "snowflake-provision-environment"]
 COMMANDS = ["snowflake-assess", "snowflake-plan", "snowflake-soft-clone",
-            "snowflake-compute", "snowflake-smoke", "snowflake-notebook"]
+            "snowflake-compute", "snowflake-smoke", "snowflake-notebook",
+            "snowflake-catalog", "snowflake-demo", "snowflake-provision"]
 
 
 def frontmatter(path: pathlib.Path) -> dict:
@@ -58,10 +60,18 @@ def test_no_databricks_scaffold_survives():
 
 
 def test_skills_invoke_the_engine_by_plugin_root():
+    """Always addressed from the plugin root, never a relative path.
+
+    Either entry point satisfies that: the launcher `bin/snowmig`, which is
+    what the docs now use, or the engine directly. What must never appear is
+    a path relative to wherever the user happens to be standing.
+    """
+    accepted = ("${CLAUDE_PLUGIN_ROOT}/bin/snowmig",
+                "${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py")
     for name in SKILLS:
         text = (ROOT / "skills" / name / "SKILL.md").read_text()
         if "snowmig" in text:
-            assert "${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py" in text, name
+            assert any(a in text for a in accepted), name
 
 
 def test_clone_skill_states_the_runtime_coordinate_rule():
@@ -113,12 +123,19 @@ def test_no_skill_still_promises_tables_only():
         assert "tables only" not in text, name
 
 
-def test_smoke_skill_warns_the_write_probe_leaves_a_schema():
+def test_smoke_skill_documents_the_write_probe_lifecycle():
+    """The probe creates one schema, removes it again, and names anything a
+    failed cleanup left behind. An earlier test (and the CLI help) still
+    described the pre-cleanup behaviour -- "it is NOT dropped afterwards" --
+    long after the code was corrected; this one pins the corrected claim."""
     text = (ROOT / "skills/snowflake-smoke-test/SKILL.md").read_text()
     low = text.lower()
     assert "write-probe" in low
-    assert "not remove" in low or "left behind" in low
-    assert "drop" in low, "must explain why it cannot clean up"
+    assert "drop" in low or "remove" in low, "must say it cleans up after itself"
+    assert "left behind" in low or "cleanup fails" in low, \
+        "must say a failed cleanup is named, not hidden"
+    assert "external" in low, \
+        "must say the probe is skipped for a read-only EXTERNAL catalog"
 
 
 def test_notebook_skill_says_execution_is_the_users_call():
@@ -157,12 +174,18 @@ def test_overview_states_the_source_read_only_guarantee_as_enforced():
     assert "assume none" in low, "no destination means no assumption"
 
 
-def test_cleanup_checklist_exists_and_names_the_confidential_file():
+def test_cleanup_checklist_covers_the_confidential_docs_and_the_history():
+    """The engagement docs are gone from the tree but still in git history.
+
+    A working-tree cleanup cannot close that, so the checklist has to keep
+    saying so -- without naming the customer, since this is a public sample.
+    """
     text = (ROOT / "CLEANUP-BEFORE-PUBLISH.md").read_text()
-    assert "CUSTOMER-CONTEXT.md" in text
+    assert "engagement docs" in text.lower()
     assert "history" in text.lower(), "must say the remote history still has it"
-    assert "local-test-account" in text, \
-        "must point at the gitignored local test-account config"
+    assert "snowmig-config" in text, \
+        "must point at the gitignored migration config -- the ONE file that " \
+        "holds live credentials (there is no second config any more)"
 
 
 def test_readme_warns_before_publishing():
@@ -171,9 +194,21 @@ def test_readme_warns_before_publishing():
     assert text.index("CLEANUP-BEFORE-PUBLISH.md") < 800, "must be near the top"
 
 
-def test_assumptions_register_states_that_aidp_was_never_contacted():
+def test_assumptions_register_states_the_live_verified_split():
+    """The header table must say what WAS contacted and what was not.
+
+    An earlier version asserted the literal "AIDP: Never contacted", which
+    became false the day the catalog transport was live-verified -- the test
+    then ENFORCED the stale claim, and correcting the document broke the
+    suite. What is invariant is the split itself: the register must name the
+    live-verified surfaces and the never-executed ones, in both directions."""
     text = (ROOT / "ASSUMPTIONS.md").read_text()
-    assert "Never contacted" in text
+    assert "Never contacted" not in text, \
+        "AIDP has been contacted; the register must say so"
+    low = text.lower()
+    assert "live-verified" in low, "must name what a real AIDP run proved"
+    assert "still unproven" in low or "never executed" in low, \
+        "must name the surfaces still unproven"
     assert "AWS_US_EAST_2" in text, "must name the Snowflake env that WAS used"
     for section in ("## A.", "## B.", "## C.", "## D.", "## E."):
         assert section in text
@@ -203,7 +238,7 @@ def test_plan_skill_lists_every_option_with_a_stated_recommendation():
     text = (ROOT / "skills/snowflake-migration-plan/SKILL.md").read_text()
     for opt in ("`A1`", "`A2`", "`A3`", "`A4`", "`A5`", "`A6`"):
         assert opt in text, opt
-    # Collapse whitespace: markdown line wrapping must not break a prose check.
+    # Collapse whitespace: markdown line wacmeng must not break a prose check.
     flat = " ".join(text.lower().split())
     assert "recommendation, not a decision" in flat
     assert "undecided" in flat
@@ -284,9 +319,117 @@ def test_every_cli_stage_is_invoked_by_at_least_one_skill():
     for path in list((root / "skills").rglob("SKILL.md")) + \
             list((root / "commands").glob("*.md")):
         text = path.read_text()
-        invoked |= set(re.findall(r"snowmig\.py\s+([a-z-]+)", text))
+        # Both invocation forms count: `snowmig.py <stage>` and the
+        # launcher, `bin/snowmig <stage>`, which is what the docs now use.
+        # `snowmig-test` cannot match -- the pattern needs whitespace
+        # straight after the name.
+        invoked |= set(re.findall(r"snowmig(?:\.py)?\s+([a-z-]+)", text))
 
     orphaned = sorted(stages - invoked)
     assert not orphaned, (
         f"these CLI stages are not invoked by any skill or command, so nothing "
         f"will ever run them: {orphaned}")
+
+
+def test_the_readme_carries_a_runnable_from_zero_runbook():
+    """Someone arriving with no context must find the order of operations.
+
+    A fresh conversation has no memory of how the last migration was driven,
+    so the sequence has to live in the repo, name the config file, and cover
+    every stage that writes."""
+    text = (ROOT / "README.md").read_text()
+    assert "How to run a migration, from zero" in text
+    # The config file is the single place coordinates and secrets live.
+    assert "snowmig-config.example.yaml" in text
+    # Every stage a migration cannot be run without, in whichever form the
+    # runbook writes the invocation (`snowmig.py assess` or `$E assess`).
+    for stage in ("init-config", "preflight", "assess", "plan", "ddl",
+                  "smoke", "catalog", "provision"):
+        # `snowmig.py <stage>`, the launcher `snowmig <stage>`, or $E.
+        assert (f"snowmig.py {stage}" in text
+                or f"snowmig {stage}" in text
+                or f"$E {stage}" in text), stage
+    # The four in-AIDP jobs and the deliverable they produce.
+    for job in ("snowmig_00_discover", "snowmig_01_structure",
+                "snowmig_02_copy_schema", "snowmig_03_reconcile"):
+        assert job in text, job
+    assert "MIGRATION_REPORT.md" in text
+
+
+def test_the_runbook_states_the_two_things_it_must_not_let_slide():
+    text = (ROOT / "README.md").read_text()
+    low = text.lower()
+    # A target catalog that exists as a CONTAINER only, and a cutover the
+    # plugin cannot make consistent on its own.
+    #
+    # This used to assert the README said the target catalog is "not created
+    # by this plugin". That was false: `catalog --catalog-type standard
+    # --execute` creates it (runbook S4, live-verified), and the README, the
+    # runbook and the CLI disagreed with each other. The invariant that
+    # actually matters is the one that misleads if dropped -- the container
+    # is not the structure, because a control-plane table create can return
+    # 202 Accepted and create nothing.
+    assert "container" in low
+    assert "202 accepted" in low
+    assert "cutover" in low
+    assert "freeze writers" in low
+
+
+def test_the_router_points_at_the_runbook():
+    text = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text()
+    assert "README.md" in text
+    assert "from zero" in text.lower()
+    # And names the config file as the first thing to establish.
+    assert "snowmig-config.example.yaml" in text
+
+
+def test_the_docs_say_where_each_credential_lives():
+    """"Where do I put the URL, the user and the password?" is the question
+    users actually ask, and answering it wrong once costs a leaked secret.
+
+    Three places, and the plugin holds only one of them: Snowflake
+    coordinates in the config, the Snowflake SECRET in a separate file
+    referenced by path, and AIDP auth in the user's own OCI config.
+    """
+    for path in ("README.md",
+                 "skills/snowflake-migrator-bootstrap/SKILL.md",
+                 "snowmig-config.example.yaml"):
+        text = (ROOT / path).read_text()
+        low = text.lower()
+        # AIDP authentication is NOT this plugin's business.
+        assert "~/.oci/config" in text, f"{path}: AIDP auth is the OCI config"
+        # One file holds both ends, and it holds live credentials.
+        assert "snowmig-config" in text, f"{path}: name the one config file"
+        # And the rule that protects it.
+        assert "never" in low and "chat" in low, \
+            f"{path}: must say a secret is never asked for in chat"
+
+
+def test_the_docs_do_not_assume_the_user_is_inside_this_repo():
+    """An installed plugin has no repo and no open folder: paths come from
+    CLAUDE_PLUGIN_ROOT, and the config belongs in the working directory."""
+    text = (ROOT / "skills/snowflake-migrator-bootstrap/SKILL.md").read_text()
+    assert "${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py" in text
+    assert "init-config" in text, "must say how to create a config from nothing"
+    low = text.lower()
+    assert "do not assume" in low and "inside this repo" in low
+    assert "read-only" in low, \
+        "must explain why the config does not live beside the plugin"
+
+
+def test_the_router_forbids_doing_the_engine_s_work_by_hand():
+    """The plugin's value is that a migration is deterministic and audited.
+
+    An agent that cannot find the engine, or that finds a stage inconvenient,
+    must not fall back to hand-written SQL and ad-hoc API calls: that leaves
+    an estate half-migrated with no artifact saying what happened.
+    """
+    text = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text()
+    low = " ".join(text.lower().split())
+    assert "never do by hand what a stage does" in low
+    assert "do not re-implement a stage" in low
+    assert "do not translate sql or types yourself" in low
+    # And the explicit stop condition.
+    assert "cannot be found, stop" in low
+    assert "${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py" in text
+    assert "never a reason to improvise" in low

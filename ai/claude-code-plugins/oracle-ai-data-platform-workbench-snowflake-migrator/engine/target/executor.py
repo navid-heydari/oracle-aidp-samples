@@ -16,6 +16,18 @@ available. That is why `build_command` is pure and every command is printed
 before it runs: a human can check the command against their deployment before
 anything executes. Getting a flag wrong should produce an obvious CLI usage
 error, not a silent partial migration.
+
+⚠️ PATH-FAMILY NOTE (2026-09-16): Oracle's current REST reference documents
+`/20260430/aiDataPlatforms/{id}/...` -- not this module's
+`/20240831/dataLakes/{id}/...` -- and adds an `aidp-async-operation-key`
+waiter and jobs/clusters/workspaces surfaces. The legacy family here is what
+one live migration verified, so it stays until a live run proves the new one
+(assumption B11). Everything NEW is built on the documented contract in
+`provision_api.py`. Two corrections the doc already settles: there is NO SQL
+endpoint (the 404 is real, permanently), and there is NO `notebookRuns`
+endpoint -- programmatic notebook execution is a Job with a NOTEBOOK_TASK, so
+`run_notebook`/`run_status` below are legacy guesses kept only until the
+job-based path replaces them.
 """
 from __future__ import annotations
 
@@ -61,13 +73,24 @@ class StatementTooLarge(ValueError):
 
 
 def detect_backend(*, which: Callable[[str], str | None] = shutil.which) -> str:
-    if which("aidp"):
-        return "aidp_cli"
+    """Pick a transport, preferring the one whose contract was verified.
+
+    `oci_raw` (the documented REST surface driven through `oci raw-request`)
+    is what the whole control plane was live-verified against. The `aidp`
+    CLI's control-plane subcommands were NOT: this module had guessed
+    `--datalake-id` and an `--output json` flag, neither of which exists in
+    CLI 4.2.1, so preferring it meant every AIDP-side check on a machine with
+    `aidp` installed took a path that could not work. The CLI IS verified for
+    workspace files, which `provision_api.py` drives with its own builder.
+    """
     if which("oci"):
         return "oci_raw"
+    if which("aidp"):
+        return "aidp_cli"
     raise NoBackendAvailable(
-        "no AIDP execution backend found: install the `aidp` CLI (preferred) or "
-        "the `oci` CLI. The migrator will not guess at a transport.")
+        "no AIDP execution backend found: install the `oci` CLI (preferred -- "
+        "its REST surface is the verified one) or the `aidp` CLI. The "
+        "migrator will not guess at a transport.")
 
 
 def _endpoint(target) -> str:
@@ -76,7 +99,23 @@ def _endpoint(target) -> str:
 
 
 def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
-    """Build the argv for one operation. Pure -- runs nothing."""
+    """Build the argv for one operation. Pure -- runs nothing.
+
+    An `aidp` invocation gets the global flags appended here rather than at
+    each of the dozen call sites: the CLI's default auth is `security_token`,
+    and it needs the region explicitly. Omitting them is an auth failure that
+    reads like a permissions problem.
+    """
+    argv = _build_command(backend, operation, target, **kwargs)
+    if argv and argv[0] == "aidp":
+        if "--auth" not in argv:
+            argv += ["--auth", str(kwargs.get("cli_auth") or "api_key")]
+        if "--region" not in argv:
+            argv += ["--region", region_from_ocid(target.datalake_ocid)]
+    return argv
+
+
+def _build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
     if backend not in BACKENDS:
         raise ValueError(f"unknown backend {backend!r}; expected one of {BACKENDS}")
 
@@ -90,12 +129,11 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
                 f"chunked precisely so this is adjustable.")
         if backend == "aidp_cli":
             return ["aidp", "sql", "execute",
-                    "--datalake-id", target.datalake_ocid,
+                    "--instance-id", target.datalake_ocid,
                     "--workspace-id", target.workspace,
                     "--cluster-id", target.cluster_id,
                     "--catalog", target.catalog,
-                    "--statement", sql,
-                    "--output", "json"]
+                    "--statement", sql]
         return ["oci", "raw-request", "--http-method", "POST",
                 "--target-uri",
                 f"{_endpoint(target)}/dataLakes/{target.datalake_ocid}"
@@ -114,19 +152,22 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
             return ["aidp", "schema",
                     {"create_schema": "create", "create_table": "create-table",
                      "create_view": "create-view"}[operation],
-                    "--datalake-id", target.datalake_ocid,
-                    "--from-json", body, "--output", "json"]
+                    "--instance-id", target.datalake_ocid,
+                    "--from-json", body]
         return ["oci", "raw-request", "--http-method", "POST",
                 "--target-uri", f"{_endpoint(target)}/dataLakes/"
                                 f"{target.datalake_ocid}/{relation}",
                 "--request-body", body]
 
     if operation == "create_catalog":
-        body = json.dumps(kwargs["body"])
+        # The body carries the credential; given a spooled file it travels as
+        # file:// rather than argv, where `ps` shows it to every user.
+        body = (f'file://{kwargs["body_file"]}' if kwargs.get("body_file")
+                else json.dumps(kwargs["body"]))
         if backend == "aidp_cli":
             return ["aidp", "catalog", "create",
-                    "--datalake-id", target.datalake_ocid,
-                    "--from-json", body, "--output", "json"]
+                    "--instance-id", target.datalake_ocid,
+                    "--from-json", body]
         return ["oci", "raw-request", "--http-method", "POST",
                 "--target-uri", f"{_endpoint(target)}/dataLakes/"
                                 f"{target.datalake_ocid}/catalogs",
@@ -135,7 +176,7 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
     if operation == "list_catalogs":
         if backend == "aidp_cli":
             return ["aidp", "catalog", "list",
-                    "--datalake-id", target.datalake_ocid, "--output", "json"]
+                    "--instance-id", target.datalake_ocid]
         return ["oci", "raw-request", "--http-method", "GET",
                 "--target-uri", f"{_endpoint(target)}/dataLakes/"
                                 f"{target.datalake_ocid}/catalogs"]
@@ -143,8 +184,8 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
     if operation == "delete_table":
         key = f'{kwargs["catalog"]}.{kwargs["schema"]}.{kwargs["table"]}'
         if backend == "aidp_cli":
-            return ["aidp", "schema", "delete-table", "--datalake-id",
-                    target.datalake_ocid, "--key", key, "--output", "json"]
+            return ["aidp", "schema", "delete-table", "--instance-id",
+                    target.datalake_ocid, "--key", key]
         return ["oci", "raw-request", "--http-method", "DELETE",
                 "--target-uri", f"{_endpoint(target)}/dataLakes/"
                                 f"{target.datalake_ocid}/tables/{key}"]
@@ -152,17 +193,16 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
     if operation == "delete_schema":
         key = f'{kwargs["catalog"]}.{kwargs["schema"]}'
         if backend == "aidp_cli":
-            return ["aidp", "schema", "delete", "--datalake-id",
-                    target.datalake_ocid, "--key", key, "--output", "json"]
+            return ["aidp", "schema", "delete", "--instance-id",
+                    target.datalake_ocid, "--key", key]
         return ["oci", "raw-request", "--http-method", "DELETE",
                 "--target-uri", f"{_endpoint(target)}/dataLakes/"
                                 f"{target.datalake_ocid}/schemas/{key}"]
 
     if operation == "list_schemas":
         if backend == "aidp_cli":
-            return ["aidp", "schema", "list", "--datalake-id",
-                    target.datalake_ocid, "--catalog-key", target.catalog,
-                    "--output", "json"]
+            return ["aidp", "schema", "list", "--instance-id",
+                    target.datalake_ocid, "--catalog-key", target.catalog]
         return ["oci", "raw-request", "--http-method", "GET",
                 "--target-uri", f"{_endpoint(target)}/dataLakes/"
                                 f"{target.datalake_ocid}/schemas"
@@ -177,9 +217,9 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
         if backend == "aidp_cli":
             return ["aidp", "schema",
                     "list-tables" if relation == "tables" else "list-views",
-                    "--datalake-id", target.datalake_ocid,
+                    "--instance-id", target.datalake_ocid,
                     "--catalog-key", kwargs["catalog"],
-                    "--schema-key", qualified, "--output", "json"]
+                    "--schema-key", qualified]
         return ["oci", "raw-request", "--http-method", "GET",
                 "--target-uri", f"{_endpoint(target)}/dataLakes/"
                                 f"{target.datalake_ocid}/{relation}"
@@ -194,8 +234,8 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
         if backend == "aidp_cli":
             return ["aidp", "schema",
                     "get-table" if operation == "get_table" else "get-view",
-                    "--datalake-id", target.datalake_ocid,
-                    "--key", key, "--output", "json"]
+                    "--instance-id", target.datalake_ocid,
+                    "--key", key]
         return ["oci", "raw-request", "--http-method", "GET",
                 "--target-uri", f"{_endpoint(target)}/dataLakes/"
                                 f"{target.datalake_ocid}/{relation}/{key}"]
@@ -204,10 +244,9 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
         schema = kwargs["schema"]
         if backend == "aidp_cli":
             return ["aidp", "catalog", "list-tables",
-                    "--datalake-id", target.datalake_ocid,
+                    "--instance-id", target.datalake_ocid,
                     "--catalog", target.catalog,
-                    "--schema", schema,
-                    "--output", "json"]
+                    "--schema", schema]
         # schemaKey must be FULLY QUALIFIED. A bare schema returns 400
         # InvalidParameter -- verified live.
         qualified = (schema if schema.startswith(f"{target.catalog}.")
@@ -221,9 +260,9 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
         path, local = kwargs["workspace_path"], kwargs["local_path"]
         if backend == "aidp_cli":
             return ["aidp", "workspace", "upload",
-                    "--datalake-id", target.datalake_ocid,
+                    "--instance-id", target.datalake_ocid,
                     "--workspace-id", target.workspace,
-                    "--path", path, "--file", local, "--output", "json"]
+                    "--path", path, "--file", local]
         return ["oci", "raw-request", "--http-method", "PUT",
                 "--target-uri",
                 f"{_endpoint(target)}/dataLakes/{target.datalake_ocid}"
@@ -234,10 +273,10 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
         path = kwargs["workspace_path"]
         if backend == "aidp_cli":
             return ["aidp", "notebook", "run",
-                    "--datalake-id", target.datalake_ocid,
+                    "--instance-id", target.datalake_ocid,
                     "--workspace-id", target.workspace,
                     "--cluster-id", target.cluster_id,
-                    "--path", path, "--output", "json"]
+                    "--path", path]
         return ["oci", "raw-request", "--http-method", "POST",
                 "--target-uri",
                 f"{_endpoint(target)}/dataLakes/{target.datalake_ocid}"
@@ -249,8 +288,8 @@ def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
         run_id = kwargs["run_id"]
         if backend == "aidp_cli":
             return ["aidp", "notebook", "run-status",
-                    "--datalake-id", target.datalake_ocid,
-                    "--run-id", run_id, "--output", "json"]
+                    "--instance-id", target.datalake_ocid,
+                    "--run-id", run_id]
         return ["oci", "raw-request", "--http-method", "GET",
                 "--target-uri",
                 f"{_endpoint(target)}/dataLakes/{target.datalake_ocid}"
@@ -271,6 +310,10 @@ def parse_cli_json(stdout: str) -> list[dict]:
     error object into one row of "results".
     """
     text = (stdout or "").strip()
+    # The aidp CLI prefixes its JSON with a literal `Response:` line. Without
+    # this, every successful aidp call read as "backend output is not JSON".
+    if text.startswith("Response:"):
+        text = text[len("Response:"):].strip()
     if not text:
         return []
     try:

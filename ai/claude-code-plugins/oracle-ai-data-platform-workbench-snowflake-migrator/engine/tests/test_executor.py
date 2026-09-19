@@ -1,4 +1,5 @@
-"""AIDP execution backend: aidp CLI preferred, oci raw-request fallback."""
+"""AIDP execution backend: the verified `oci raw-request` REST surface
+preferred, the `aidp` CLI as the fallback."""
 import json
 
 import pytest
@@ -15,12 +16,35 @@ TARGET = resolve_target(datalake_ocid="ocid1.aidataplatform.oc1.iad.aaaa",
 
 # --- backend detection ----------------------------------------------------
 
-def test_prefers_the_aidp_cli_when_present():
-    assert detect_backend(which=lambda n: "/usr/bin/" + n) == "aidp_cli"
+def test_prefers_the_verified_oci_rest_surface_when_present():
+    """It used to prefer `aidp_cli`, whose control-plane flags this module had
+    GUESSED (`--datalake-id`, `--output json` -- neither exists in CLI 4.2.1).
+    On any machine with `aidp` installed that made the broken path the
+    default. `oci_raw` is the surface the control plane was verified on."""
+    assert detect_backend(which=lambda n: "/usr/bin/" + n) == "oci_raw"
 
 
-def test_falls_back_to_oci_raw_when_aidp_is_absent():
-    assert detect_backend(which=lambda n: None if n == "aidp" else "/x/oci") == "oci_raw"
+def test_falls_back_to_the_aidp_cli_when_oci_is_absent():
+    assert detect_backend(which=lambda n: None if n == "oci" else "/x/aidp") == "aidp_cli"
+
+
+def test_an_aidp_command_carries_auth_and_region():
+    """The CLI defaults to security_token auth and needs the region named;
+    without both, a call fails in a way that reads like a permissions
+    problem."""
+    argv = build_command("aidp_cli", "list_catalogs", TARGET)
+    assert argv[0] == "aidp"
+    assert "--instance-id" in argv, "the flag is --instance-id, not --datalake-id"
+    assert "--output" not in argv, "CLI 4.2.1 has no --output flag"
+    assert argv[argv.index("--auth") + 1] == "api_key"
+    assert argv[argv.index("--region") + 1] == "us-ashburn-1"
+
+
+def test_the_aidp_response_prefix_is_stripped():
+    """The CLI prints `Response:` and then the JSON; every successful call
+    used to read as 'backend output is not JSON'."""
+    rows = parse_cli_json('Response:\n{"data": {"items": [{"key": "gold"}]}}')
+    assert rows == [{"key": "gold"}]
 
 
 def test_no_backend_is_a_loud_failure():
@@ -217,7 +241,7 @@ def test_a_2xx_status_is_accepted():
 
 
 def test_nested_data_items_is_unwrapped_to_rows():
-    # The real shape of every AIDP collection response. Without unwrapping,
+    # The real shape of every AIDP collection response. Without unwacmeng,
     # three schemas were reported as "1 schema(s) visible".
     rows = parse_cli_json(json.dumps({"data": {"items": [
         {"key": "lake.bronze"}, {"key": "lake.default"}, {"key": "lake.scd"}]}}))

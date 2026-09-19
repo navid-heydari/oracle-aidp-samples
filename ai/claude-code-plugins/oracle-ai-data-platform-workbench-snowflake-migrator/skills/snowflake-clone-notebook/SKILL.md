@@ -24,7 +24,7 @@ say this before they run it.
 ## 1. Generate (offline, safe)
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py notebook --out-dir ./snowmig_out \
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig notebook \
   [--catalog <catalog>]
 ```
 
@@ -35,7 +35,7 @@ has several.
 ## 2. Upload to the AIDP workspace
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py notebook --out-dir ./snowmig_out \
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig notebook \
   --upload --datalake-ocid <ocid> --workspace <ws> --cluster-id <cl> --catalog <cat> \
   [--dry-run]
 ```

@@ -222,19 +222,48 @@ def render_catalog(res: dict) -> str:
     """Report on the target catalog. EXTERNAL registers; it copies nothing."""
     name = res.get("catalog")
     if res.get("dry_run"):
-        return "\n".join([
-            f"# Target catalog `{name}` — DRY RUN", "",
-            f'Would register an **EXTERNAL** catalog of source type '
-            f'**{res.get("source_type")}**; **nothing was created**.', "",
-            "Connection details come from the YAML/JSON connection config and "
-            "are not echoed here — the secrets they carry are read from files "
-            "at call time.", "",
-            "Re-run with `--execute` plus the AIDP target coordinates to apply.",
-        ])
+        fields = res.get("connection_fields") or []
+        # The type is whatever was ASKED FOR. Hardcoding EXTERNAL here made a
+        # `--catalog-type standard` dry run claim it would send the Snowflake
+        # credential, which is the opposite of what the execute path does.
+        catalog_type = str(res.get("catalog_type") or "EXTERNAL").upper()
+        is_external = catalog_type == "EXTERNAL"
+        headline = (f'Would register an **EXTERNAL** catalog of source type '
+                    f'**{res.get("source_type")}**'
+                    if is_external else
+                    f'Would create the **STANDARD** catalog **container**, and '
+                    f'nothing inside it — its schemas and tables are created '
+                    f'on AIDP compute by the structure workflow (runbook S10)')
+        out = [f"# Target catalog `{name}` — DRY RUN", "",
+               f'{headline}; **nothing was created**.', ""]
+        if not is_external:
+            out += ["A STANDARD catalog is managed storage, so it carries no "
+                    "`sourceType` and no connection properties: no credential "
+                    "is sent for it.", ""]
+        elif fields:
+            # The NAMES are what a human checks against their deployment, and
+            # they carry no secret; the values never appear.
+            out += ["Connection properties that would be sent, by name only "
+                    "(every value comes from the config file, and a "
+                    "credential is a path read at call time):", ""]
+            out += [f"- `{field}`" for field in fields]
+            out.append("")
+        else:
+            out += ["No connection config was supplied, so no connection "
+                    "properties are listed. `--execute` requires one.", ""]
+        out.append("Re-run with `--execute` plus the AIDP target coordinates "
+                   "to apply.")
+        return "\n".join(out)
 
+    # Only an EXTERNAL catalog has a source. Printing the CLI's default
+    # source type beside an INTERNAL one implied a Snowflake link it has not
+    # got.
+    kind = str(res.get("catalog_type") or "").upper()
+    source = (f' (source type `{res.get("source_type", "n/a")}`)'
+              if kind == "EXTERNAL" else
+              " — managed storage, no source")
     out = [f"# Target catalog `{name}`", "",
-           f'- Type: **{res.get("catalog_type")}** '
-           f'(source type `{res.get("source_type", "n/a")}`)',
+           f'- Type: **{res.get("catalog_type")}**{source}',
            f'- Action: **{res.get("action")}**',
            f'- Key: `{res.get("key")}`', ""]
 
@@ -249,9 +278,15 @@ def render_catalog(res: dict) -> str:
                 "so this is *pending*, not done — list the catalogs again "
                 "before treating it as registered.", ""]
 
-    out += ["An EXTERNAL catalog is a registered, read-only pointer at the "
-            "live Snowflake source. It holds no managed tables of its own and "
-            "copies no data, so there is nothing here to keep in sync.", ""]
+    if res.get("container_only"):
+        # The container existing must never read as the structure existing.
+        out += ["**This is the CONTAINER only — it holds no schemas and no "
+                "tables.** " + str(res.get("note") or ""), ""]
+    else:
+        out += ["An EXTERNAL catalog is a registered, read-only pointer at the "
+                "live Snowflake source. It holds no managed tables of its own "
+                "and copies no data, so there is nothing here to keep in "
+                "sync.", ""]
     return "\n".join(out)
 
 
@@ -1132,9 +1167,12 @@ def render_stages(board: dict) -> str:
     out = ["# Stages — what runs, what has run, what it found", "",
            f'Artifacts read from `{board.get("out_dir")}`. This board makes no '
            f'decisions and touches nothing.', "",
-           "**Every stage is read-only except `deploy`,** which is the only one "
-           "that creates anything — and it is a dry run unless `--execute` is "
-           "passed with the target coordinates.", "",
+           "**Three stages write to AIDP: `provision`** (workspace, cluster, "
+           "scripts, jobs), **`catalog`** (registers the target catalog) "
+           "**and `deploy`** (creates schemas, tables and views). All three "
+           "are a dry run unless `--execute` is passed with the target "
+           "coordinates. Every other stage is read-only, except the narrow "
+           "opt-ins `smoke --write-probe` and `notebook --upload`.", "",
            "| Stage | Needs | Status | What it found |", "|---|---|---|---|"]
     for r in rows:
         mark = " ⚠️" if r.get("attention") else ""
@@ -1164,4 +1202,51 @@ def render_stages(board: dict) -> str:
 
     out += ["---", "", "Purposes:", ""]
     out += [f'- `{r["stage"]}` — {r["purpose"]}' for r in rows]
+    return "\n".join(out) + "\n"
+
+
+def render_databases(res: dict) -> str:
+    """The databases a role can see, and which of them can be migrated.
+
+    A migration registers ONE database as ONE catalog, so this table is the
+    input to a choice, not a report anybody reads for its own sake.
+    """
+    dbs = res.get("databases") or []
+    out = [f"# Source databases — {len(dbs)} visible", "",
+           "**One Snowflake database becomes one AIDP catalog.** Pick a "
+           "single database for this migration; another database is another "
+           "migration, run again from S1.", "",
+           "| Database | Kind | Owner | Migratable | Why not |",
+           "|---|---|---|---|---|"]
+    why = {"system": "the system application database",
+           "share": "an imported share, not owned here",
+           "personal": "a per-user scratch database"}
+    for d in dbs:
+        cat = d.get("category")
+        out.append(
+            f'| `{d.get("name")}` | {d.get("kind") or "—"} '
+            f'| {d.get("owner") or "—"} '
+            f'| {"yes" if cat == "migratable" else "no"} '
+            f'| {why.get(cat, "—")} |')
+    out += ["", f'Migratable: {len(res.get("migratable") or [])}.']
+    return "\n".join(out) + "\n"
+
+
+def render_catalogs(res: dict) -> str:
+    """Every catalog on the DataLake, with the type the SERVER reports.
+
+    The types here are the authority. This plugin once sent
+    `catalogType=STANDARD`, which AIDP rejects outright; reading this list is
+    what showed the real vocabulary to be INTERNAL and EXTERNAL.
+    """
+    cats = res.get("catalogs") or []
+    out = [f"# Catalogs on the target DataLake — {len(cats)}", "",
+           "| Catalog | Type | Source type |", "|---|---|---|"]
+    for c in cats:
+        out.append(f'| `{c.get("name")}` | {c.get("catalog_type") or "—"} '
+                   f'| {c.get("source_type") or "—"} |')
+    seen = res.get("types_seen") or []
+    out += ["", f'Types the server reports: {", ".join(seen) or "none"}. '
+                f'An EXTERNAL catalog points at a live source; an INTERNAL '
+                f'one holds managed Delta tables.']
     return "\n".join(out) + "\n"

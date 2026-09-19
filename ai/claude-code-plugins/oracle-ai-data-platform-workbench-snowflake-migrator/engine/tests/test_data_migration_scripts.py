@@ -1,0 +1,445 @@
+"""The in-AIDP data-migration scripts, exercised offline.
+
+They run on a cluster, so they were the one part of this plugin with no test
+coverage — and the first thing a review found there was a `fail()` that
+recursed into itself, which would have turned every refusal into a
+RecursionError instead of one message and exit 1.
+
+Spark is injected as a fake here (the scripts take `spark` from the session
+they are run in, and everything else through `SnowflakeSource`), so the
+decisions are testable without a cluster: which statements are issued, what
+gets refused, and what the reports record.
+"""
+import importlib.util
+import json
+import pathlib
+import sys
+
+import pytest
+
+# The canonical stage sources. They live under engine/ because the shipped
+# artifact is now a generated notebook (see target/stage_notebooks.py) and
+# `data-migration-scripts/` holds only `.ipynb`.
+SCRIPTS = (pathlib.Path(__file__).resolve().parents[1] / "dataplane")
+
+
+def _load(name: str):
+    """Import one script by path. They are not a package on purpose: each is
+    uploaded to the workspace as a single file."""
+    sys.path.insert(0, str(SCRIPTS))
+    spec = importlib.util.spec_from_file_location(
+        f"snowmig_script_{name}", SCRIPTS / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def discover():
+    return _load("00_discover_snowflake")
+
+
+@pytest.fixture(scope="module")
+def structure():
+    return _load("01_create_structure")
+
+
+@pytest.fixture(scope="module")
+def copy_schema():
+    return _load("02_copy_schema")
+
+
+@pytest.fixture(scope="module")
+def reconcile():
+    return _load("03_reconcile")
+
+
+# --- fail(): the helper every refusal path goes through -------------------
+
+@pytest.mark.parametrize("name", ["00_discover_snowflake",
+                                  "01_create_structure",
+                                  "02_copy_schema", "03_reconcile"])
+def test_fail_returns_one_and_prints_on_both_streams(name, capsys):
+    module = _load(name)
+    assert module.fail("a refusal") == 1
+    captured = capsys.readouterr()
+    # stdout is what a notebook task captures; stderr is what a shell run
+    # shows. A refusal that reaches only one of them is invisible in the
+    # other, which is how a live job failed with no explanation anywhere.
+    assert "a refusal" in captured.out
+    assert "a refusal" in captured.err
+
+
+# --- discovery ------------------------------------------------------------
+
+def test_decimal_from_snowflake_survives_the_json_write(discover):
+    import decimal
+    # `json.dumps` refuses Decimal, and it did so AFTER a successful
+    # 1065-relation read, losing the whole discovery.
+    assert discover._plain(decimal.Decimal("38")) == 38
+    assert isinstance(discover._plain(decimal.Decimal("38")), int)
+    assert discover._plain(decimal.Decimal("1.5")) == "1.5"
+    json.dumps({"n": discover._plain(decimal.Decimal("1250000"))})
+
+
+def test_source_types_are_recorded_with_their_precision(discover):
+    import decimal
+    D = decimal.Decimal
+    assert discover._snowflake_type(
+        {"DATA_TYPE": "NUMBER", "NUMERIC_PRECISION": D(38),
+         "NUMERIC_SCALE": D(0)}) == "NUMBER(38,0)"
+    assert discover._snowflake_type(
+        {"DATA_TYPE": "TEXT", "CHARACTER_MAXIMUM_LENGTH": D(200)}) == "TEXT(200)"
+    # Unqualified types pass through rather than being invented.
+    assert discover._snowflake_type({"DATA_TYPE": "BOOLEAN"}) == "BOOLEAN"
+
+
+class _FakeDF:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def collect(self):
+        class Row(dict):
+            def asDict(self):
+                return dict(self)
+        return [Row(r) for r in self._rows]
+
+    def count(self):
+        return len(self._rows)
+
+
+class _FakeSource:
+    """A SnowflakeSource stand-in that records what was asked of it."""
+
+    def __init__(self, *, tables=(), columns=(), mode="connector"):
+        self.mode = mode
+        self.external_catalog = "ext"
+        self.spark = _FakeSpark()
+        self.queries: list[str] = []
+        self._tables, self._columns = list(tables), list(columns)
+        self.session_schema = "PUBLIC"
+
+    def pushdown(self, sql, schema=None):
+        self.queries.append(sql)
+        return _FakeDF(self._columns if "COLUMNS" in sql else self._tables)
+
+    def describe(self):
+        return {"mode": self.mode, "database": "DB", "host": "h",
+                "user": "u", "warehouse": "w", "role": "r",
+                "session_schema": self.session_schema, "auth": "KeyPair"}
+
+    def database(self):
+        return "DB"
+
+
+class _FakeSpark:
+    def __init__(self):
+        self.statements: list[str] = []
+        self.counts: dict[str, int] = {}
+
+    def sql(self, statement):
+        self.statements.append(" ".join(statement.split()))
+        low = statement.lower()
+        if "count(*)" in low:
+            for fqn, n in self.counts.items():
+                if fqn in statement:
+                    return _FakeDF([{"n": n}])
+            return _FakeDF([{"n": 0}])
+        if low.startswith("describe"):
+            return _FakeDF([{"col_name": "A", "data_type": "string"}])
+        return _FakeDF([])
+
+
+def test_discovery_reads_the_whole_estate_in_two_queries(discover):
+    source = _FakeSource(
+        tables=[{"TABLE_SCHEMA": "SALES", "TABLE_NAME": "ORDERS",
+                 "TABLE_TYPE": "BASE TABLE", "ROW_COUNT": 10, "BYTES": 99},
+                {"TABLE_SCHEMA": "SALES", "TABLE_NAME": "V_ORDERS",
+                 "TABLE_TYPE": "VIEW", "ROW_COUNT": None, "BYTES": None},
+                {"TABLE_SCHEMA": "INFORMATION_SCHEMA", "TABLE_NAME": "TABLES",
+                 "TABLE_TYPE": "VIEW", "ROW_COUNT": None, "BYTES": None}],
+        columns=[{"TABLE_SCHEMA": "SALES", "TABLE_NAME": "ORDERS",
+                  "COLUMN_NAME": "ID", "ORDINAL_POSITION": 1,
+                  "DATA_TYPE": "NUMBER", "IS_NULLABLE": "NO",
+                  "NUMERIC_PRECISION": 38, "NUMERIC_SCALE": 0,
+                  "CHARACTER_MAXIMUM_LENGTH": None},
+                 {"TABLE_SCHEMA": "SALES", "TABLE_NAME": "V_ORDERS",
+                  "COLUMN_NAME": "ID", "ORDINAL_POSITION": 1,
+                  "DATA_TYPE": "NUMBER", "IS_NULLABLE": "YES",
+                  "NUMERIC_PRECISION": 38, "NUMERIC_SCALE": 0,
+                  "CHARACTER_MAXIMUM_LENGTH": None}])
+    schemas = discover.discover_via_connector(
+        source, wanted=None, exclude={"information_schema"})
+    assert len(source.queries) == 2, "the whole estate, in two queries"
+    assert [s["name"] for s in schemas] == ["SALES"], \
+        "INFORMATION_SCHEMA is never a migration target"
+    sales = schemas[0]
+    assert [t["name"] for t in sales["tables"]] == ["ORDERS"]
+    assert [v["name"] for v in sales["views"]] == ["V_ORDERS"]
+    assert sales["tables"][0]["columns"][0]["type"] == "NUMBER(38,0)"
+    assert sales["errors"] == []
+
+
+def test_a_relation_with_no_columns_is_incomplete_not_empty(discover):
+    source = _FakeSource(
+        tables=[{"TABLE_SCHEMA": "S", "TABLE_NAME": "T",
+                 "TABLE_TYPE": "BASE TABLE", "ROW_COUNT": 1, "BYTES": 1}],
+        columns=[])
+    schemas = discover.discover_via_connector(source, wanted=None, exclude=set())
+    assert schemas[0]["errors"], "a column-less relation must be flagged"
+    assert "INCOMPLETE" in schemas[0]["errors"][0]["error"]
+
+
+# --- structure ------------------------------------------------------------
+
+def test_the_approved_plan_is_the_authority(structure):
+    plan = {"statements": [
+        {"source_identifier": "DB.SALES.ORDERS",
+         "expected_columns": [{"name": "ID", "type": "DECIMAL(38,0)"}]},
+        {"source_identifier": "DB.SALES.BLOCKED"},          # no columns
+        {"source_identifier": "SHORT.NAME"}]}               # malformed
+    columns = structure.columns_from_ddl_plan(plan)
+    assert list(columns) == [("SALES", "ORDERS")]
+    assert columns[("SALES", "ORDERS")][0]["type"] == "DECIMAL(38,0)"
+
+
+def test_snowflake_types_in_a_manifest_are_refused_not_translated(structure):
+    # A connector-mode manifest records SOURCE types on purpose; feeding them
+    # to Delta would be a silent mistranslation.
+    assert structure._looks_like_snowflake_types(
+        [{"name": "A", "type": "NUMBER(38,0)"}]) is True
+    assert structure._looks_like_snowflake_types(
+        [{"name": "A", "type": "VARIANT"}]) is True
+    assert structure._looks_like_snowflake_types(
+        [{"name": "A", "type": "decimal(38,0)"}]) is False
+
+
+def test_create_table_from_columns_is_if_not_exists_and_delta(structure):
+    spark = _FakeSpark()
+    structure.create_table_from_columns(
+        spark, [{"name": "ID", "type": "DECIMAL(38,0)"}], "lake", "sales", "t")
+    statement = spark.statements[0]
+    assert "CREATE TABLE IF NOT EXISTS" in statement
+    assert "USING DELTA" in statement
+    assert "`lake`.`sales`.`t`" in statement
+    assert "DROP" not in statement.upper()
+
+
+def test_an_empty_column_list_raises_rather_than_creating_nothing(structure):
+    with pytest.raises(ValueError, match="no column list"):
+        structure.create_table_from_columns(_FakeSpark(), [], "c", "s", "t")
+
+
+def test_a_report_from_a_different_target_is_not_reused(structure, tmp_path):
+    # Resumability is keyed by SOURCE schema, so a prior record against
+    # another destination must not let this run skip every create -- observed
+    # live, against an empty target schema.
+    path = tmp_path / "structure_report_sales.json"
+    path.write_text(json.dumps({"schema": "SALES", "target": "lake.old",
+                                "objects": {"T": {"status": "created"}}}))
+    fresh = structure._load_report(path, "SALES", "lake.new")
+    assert fresh["objects"] == {}
+    assert fresh["target"] == "lake.new"
+    # The old record is kept, not destroyed.
+    assert list(tmp_path.glob("structure_report_sales.lake_old.json"))
+
+
+def test_a_report_for_the_same_target_is_resumed(structure, tmp_path):
+    path = tmp_path / "structure_report_sales.json"
+    path.write_text(json.dumps({"schema": "SALES", "target": "lake.new",
+                                "objects": {"T": {"status": "created"}}}))
+    prior = structure._load_report(path, "SALES", "lake.new")
+    assert prior["objects"]["T"]["status"] == "created"
+
+
+# --- copy -----------------------------------------------------------------
+
+def test_the_copy_never_drops_and_overwrite_rewrites_rows(copy_schema):
+    spark = _FakeSpark()
+    spark.counts = {"`src`": 3, "`lake`.`s`.`t`": 0}
+    out = copy_schema._copy(spark, "`src`", "`lake`.`s`.`t`",
+                            mode="overwrite", verify="counts",
+                            retries=0, retry_wait=0, started="now")
+    blob = " ".join(spark.statements).upper()
+    assert "INSERT OVERWRITE" in blob
+    assert "DROP" not in blob and "TRUNCATE" not in blob
+    assert out["status"] in ("verified", "count_mismatch")
+
+
+def test_skip_existing_leaves_a_nonempty_target_alone(copy_schema):
+    spark = _FakeSpark()
+    spark.counts = {"`src`": 3, "`lake`.`s`.`t`": 3}
+    out = copy_schema._copy(spark, "`src`", "`lake`.`s`.`t`",
+                            mode="skip-existing", verify="counts",
+                            retries=0, retry_wait=0, started="now")
+    assert out["status"] == "skipped_nonempty"
+    assert not any("INSERT" in s.upper() for s in spark.statements)
+
+
+def test_a_count_mismatch_is_not_verified(copy_schema):
+    class Mismatch(_FakeSpark):
+        def sql(self, statement):
+            out = super().sql(statement)
+            if "count(*)" in statement.lower() and "src" in statement:
+                return _FakeDF([{"n": 9}])
+            return out
+
+    spark = Mismatch()
+    spark.counts = {"`lake`.`s`.`t`": 0}
+    out = copy_schema._copy(spark, "`src`", "`lake`.`s`.`t`", mode="append",
+                            verify="counts", retries=0, retry_wait=0,
+                            started="now")
+    assert out["status"] == "count_mismatch"
+    assert "NOT verified" in out["reason"]
+
+
+def test_a_batched_source_count_is_used_instead_of_a_fresh_one(copy_schema):
+    spark = _FakeSpark()
+    spark.counts = {"`lake`.`s`.`t`": 0}
+    out = copy_schema._copy(spark, "`src`", "`lake`.`s`.`t`", mode="append",
+                            verify="counts", retries=0, retry_wait=0,
+                            started="now", source_count=0)
+    # The pre-copy source count came from the caller's batch, so only the
+    # post-copy verification counts the source again.
+    assert sum(1 for s in spark.statements
+               if "count(*)" in s.lower() and "`src`" in s) == 1
+    assert out["status"] == "verified"
+
+
+# --- reconcile ------------------------------------------------------------
+
+def test_an_unreadable_target_schema_is_not_reported_as_empty(reconcile):
+    class NoList(_FakeSpark):
+        def sql(self, statement):
+            if statement.lower().startswith("show tables"):
+                raise RuntimeError("denied")
+            return super().sql(statement)
+
+    manifest = {"schemas": [{"name": "SALES",
+                             "tables": [{"name": "ORDERS", "columns": []}],
+                             "views": [], "errors": []}]}
+    rec = reconcile.reconcile(NoList(), manifest=manifest,
+                              target_catalog="lake",
+                              reports=pathlib.Path("/nonexistent"),
+                              counts=False)
+    schema = rec["schemas"][0]
+    assert schema["target_readable"] is False
+    assert schema["tables"][0]["verdict"] == "TARGET_UNREADABLE"
+    assert "UNREADABLE" in reconcile.render(rec)
+
+
+def test_a_table_a_report_claims_but_the_catalog_lacks_is_flagged(reconcile,
+                                                                  tmp_path):
+    (tmp_path / "copy_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.sales",
+         "tables": {"ORDERS": {"status": "verified"}}}))
+    manifest = {"schemas": [{"name": "SALES",
+                             "tables": [{"name": "ORDERS", "columns": []}],
+                             "views": [], "errors": []}]}
+    rec = reconcile.reconcile(_FakeSpark(), manifest=manifest,
+                              target_catalog="lake", reports=tmp_path,
+                              counts=False)
+    row = rec["schemas"][0]["tables"][0]
+    assert row["verdict"] == "MISSING_DESPITE_REPORT"
+    assert rec["totals"]["MISSING_DESPITE_REPORT"] == 1
+
+
+def test_a_table_with_no_target_is_a_finding_not_a_crash(copy_schema):
+    """Live, the copy died on the sixth table of a schema: the approved plan
+    covered five, the manifest listed a thousand, and the missing target took
+    the whole run with it. A missing target is now recorded and skipped."""
+    class NoTarget(_FakeSpark):
+        def sql(self, statement):
+            if statement.lower().startswith("describe"):
+                raise RuntimeError("TABLE_OR_VIEW_NOT_FOUND")
+            return super().sql(statement)
+
+    source = _FakeSource()
+    source.spark = NoTarget()
+    out = copy_schema.copy_table(source, "SALES", "ORDERS",
+                                 "`lake`.`s`.`orders`", mode="append",
+                                 verify="counts", retries=0, retry_wait=0)
+    assert out["status"] == "target_missing"
+    assert "not in the approved plan" in out["reason"]
+    assert not any("INSERT" in s.upper() for s in source.spark.statements)
+
+
+def test_not_migrated_is_pending_not_a_problem(reconcile):
+    """A migration runs schema by schema, so most of the estate is "not
+    attempted yet" for most of the project. Exiting non-zero on that would
+    make every partial run look broken — and that is how a real signal gets
+    ignored."""
+    assert "NOT_MIGRATED" not in reconcile.PROBLEM_VERDICTS
+    assert "STRUCTURE_ONLY" not in reconcile.PROBLEM_VERDICTS
+    for verdict in ("MISSING_DESPITE_REPORT", "STRUCTURE_ONLY_COPY_FAILED",
+                    "TARGET_UNREADABLE"):
+        assert verdict in reconcile.PROBLEM_VERDICTS
+
+
+def test_the_report_says_plainly_when_nothing_is_wrong(reconcile):
+    md = reconcile.render({"target_catalog": "lake", "generated_at": "now",
+                           "totals": {"MIGRATED_VERIFIED": 5,
+                                      "NOT_MIGRATED": 995},
+                           "schemas": []})
+    assert "No table is in a problem state" in md
+    assert "not a failure" in md
+
+
+def test_the_report_leads_with_the_count_that_needs_attention(reconcile):
+    md = reconcile.render({"target_catalog": "lake", "generated_at": "now",
+                           "totals": {"MISSING_DESPITE_REPORT": 2,
+                                      "MIGRATED_VERIFIED": 1},
+                           "schemas": []})
+    assert "2 table(s) need attention" in md
+
+
+# --- the source config as it actually arrives on the mount -----------------
+
+@pytest.fixture(scope="module")
+def source_helpers():
+    return _load("snowmig_source")
+
+
+def test_the_one_migration_config_is_read_as_uploaded(source_helpers, tmp_path):
+    """`provision --source-config` uploads the migration config VERBATIM, and
+    that file nests the connection under `snowflake:`. Reading the top level
+    for `account` found only the envelope keys, so the cluster reported every
+    required field missing at once — which reads like a dead credential, not a
+    config one level too deep."""
+    cfg = tmp_path / "snowmig-config.yaml"
+    cfg.write_text(json.dumps({
+        "snowflake": {"account": "ACC", "warehouse": "WH", "database": "DB",
+                      "user": "u", "auth": "password", "password": "p"},
+        "aidp": {"datalake_ocid": "ocid1.aidataplatform.oc1..x"},
+    }))
+    loaded = source_helpers.load_source_config(cfg)
+    assert loaded["account"] == "ACC"
+    assert loaded["auth"] == "password"
+    assert "aidp" not in loaded
+
+
+def test_a_flat_source_config_still_loads(source_helpers, tmp_path):
+    """The loader predates the envelope and JSON is the documented fallback
+    for a cluster with no PyYAML, so the flat shape stays supported."""
+    cfg = tmp_path / "source.json"
+    cfg.write_text(json.dumps({"account": "ACC", "warehouse": "WH",
+                               "database": "DB", "user": "u",
+                               "auth": "password"}))
+    assert source_helpers.load_source_config(cfg)["account"] == "ACC"
+
+
+def test_the_structure_stage_does_not_ship_a_default_that_cannot_work():
+    """`manifest` mode reads types from the discovery manifest, but a manifest
+    built in `connector` mode carries SNOWFLAKE types and Delta rejects them
+    verbatim. Shipping `source-mode: connector` beside `mode: manifest` meant
+    the default pair refused every table on a first run."""
+    import sys
+    sys.path.insert(0, str(SCRIPTS.parent))
+    from target.stage_notebooks import STAGES
+
+    stage = next(s for s in STAGES if s.key == "structure")
+    assert stage.params["mode"] == "ddl-plan", stage.params
+    if stage.params.get("source-mode") == "connector":
+        assert stage.params["mode"] != "manifest", (
+            "connector-built manifests carry Snowflake types; this pair "
+            "cannot create a Delta table")

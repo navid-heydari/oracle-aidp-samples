@@ -3,3 +3,9 @@
 # no WebSocket in this plugin.
 snowflake-connector-python>=4.7.0
 cryptography>=42.0.0
+
+# Reads the EXTERNAL-catalog connection config (YAML is the documented format
+# of snowflake-catalog-connection.example.yaml), so it is a runtime dependency
+# of the default path -- it was dev-only once, and a clean install then hit an
+# ImportError on the documented happy path.
+pyyaml>=6.0

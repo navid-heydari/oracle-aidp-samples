@@ -17,6 +17,10 @@ schema, is never CASCADE, and is skipped if the schema was already there -- a
 pre-existing schema is not ours to remove. If cleanup fails, the report names
 what was left.
 
+The probe is also skipped, with a note, when the target catalog is EXTERNAL:
+a read-only pointer at the live Snowflake source accepts no writes by design,
+and probing it would report FAIL against a destination that works.
+
 Both ends take an injected run_sql, so this is unit-testable with no connection.
 Every check captures its own failure: one denied privilege should not hide the
 result of the others.
@@ -112,6 +116,25 @@ def run_smoke(*, source_run_sql, target=None, dest_call=None,
                        "left_behind": [], "catalog": target.catalog,
                        "cluster": target.cluster_id}
 
+        # The catalog's TYPE decides which probes make sense. An EXTERNAL
+        # catalog is a registered, read-only pointer at the live Snowflake
+        # source: a write probe against it would report FAIL against a
+        # destination that works -- exactly the failure class this smoke test
+        # exists to prevent. Unresolvable is reported as "unknown", never
+        # silently assumed either way.
+        catalog_type = None
+        try:
+            for item in dest_call("list_catalogs").get("items") or []:
+                name = str(item.get("displayName") or item.get("key")
+                           or "").lower()
+                if name == target.catalog.lower():
+                    catalog_type = (str(item.get("catalogType") or "").upper()
+                                    or None)
+                    break
+        except Exception:
+            catalog_type = None
+        destination["catalog_type"] = catalog_type or "unknown"
+
         # Read: list the catalog's schemas through the CATALOG API. The SQL
         # endpoint returns 404, so using it reported FAIL against a
         # destination that works.
@@ -125,6 +148,13 @@ def run_smoke(*, source_run_sql, target=None, dest_call=None,
                 "not verified: the write probe is opt-in because it writes. It "
                 "creates one schema and removes it again. Re-run with "
                 "--write-probe to prove write access.")
+        elif catalog_type == "EXTERNAL":
+            destination["write_note"] = (
+                f"not applicable: {target.catalog} is an EXTERNAL catalog — a "
+                f"registered, read-only pointer at the live Snowflake source. "
+                f"It accepts no writes by design, so skipping the probe is "
+                f"correct, not a failure. Write access is only meaningful for "
+                f"a STANDARD catalog.")
         elif not destination["checks"][0]["ok"]:
             destination["write_note"] = (
                 "not attempted: the catalog could not be read, so a write "

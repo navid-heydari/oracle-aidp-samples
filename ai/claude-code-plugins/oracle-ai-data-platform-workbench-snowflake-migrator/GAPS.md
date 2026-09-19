@@ -1,217 +1,205 @@
 # Gaps and next steps
 
-**State:** v0.16.0 · 910 offline tests · 14 live tests (skipped without
-credentials) · one real structure migration completed end to end against a
-live AIDP DataLake.
+**State:** v0.18.0 · 1005 offline tests · 14 live tests (skipped without
+credentials) · dev mode (`demo`) runs the whole pipeline emulated · **a live
+validation campaign on 2026-09-16 exercised the whole prod path**: 1002-object
+assessment, EXTERNAL registration, canary structure clone, provisioning, and
+in-AIDP discovery + structure creation as AIDP jobs.
 
 This is the single list. `ACTION-ITEMS.md` holds the detail and the reasoning
 behind each item; this file is the ranked view of what is left.
 `ARCHITECTURE.md` holds the stage-level design the items below are measured
 against.
 
-**Reviewed 2026-09-11.** The 0.16.0 EXTERNAL-catalog pivot is the dominant
-source of new gaps. It changed the default target without re-running the
-plugin's own verification discipline across the stage board, the smoke probe,
-the deploy guard and the dependency list — so the P0 items below are all one
-finding wearing four hats.
+**Reviewed 2026-09-16.** The 0.16.0 pivot's P0s (the EXTERNAL default not
+wired through the deploy guard, the smoke probe, or the stage board), the P1
+packaging/security items and every P2 documentation contradiction are now
+closed — see *Recently closed*. What remains ranked below is the P3 list:
+surfaces whose command shapes are inferred and unexecuted, and the analysis
+items (blast radius, maintenance proposal, parity, cost).
+
+---
+
+## P0 — the twelve-step runbook is not fully wired
+
+`skills/snowflake-migrator-overview/SKILL.md` now specifies the migration as a
+fixed sequence, S1 to S12, with the data plane running inside AIDP as
+workflows. Some of that sequence is wired and some of it is not. **An agent
+following the runbook will reach S7 and find no bridge**, so these are ranked
+first.
+
+### Wired
+
+| Step | How | State |
+|---|---|---|
+| S1 workspace | `snowmig.py provision` | creates; a taken name now HALTS |
+| S2 migration cluster | `snowmig.py provision` | creates; a taken name now HALTS. A cluster POST fired before the workspace reports ACTIVE is a `409`; resume with `--reuse-existing` |
+| S3 EXTERNAL catalog | `snowmig.py catalog` | live-verified. Needs `--workspace` and `--cluster-id`, which is why it follows S1/S2 |
+| S4 INTERNAL target catalog | `snowmig.py catalog --catalog-type standard` | live-verified 2026-09-19; creates the container only. `STANDARD` is an alias — the wire value is `INTERNAL` |
+| S5 folder + scripts | `snowmig.py provision` | live-verified |
+| S6 discovery as a workflow | `snowmig.py run --job snowmig_00_discover` | **new stage**; `watch_job` was unreachable from the CLI before |
+| S7 manifest -> plan | `snowmig.py ingest` | **new stage**; calls the same type mapper as `assess`, so verdicts agree |
+| S10 structure as a workflow | `snowmig.py run --job snowmig_01_structure` | same stage, per schema |
+| S12 warehouse-equivalent clusters | `provision --warehouse-clusters` | creates at default config |
+
+### Not wired — ranked
+
+1. **Views discovered in AIDP arrive without their SQL.** `00_discover`
+   records a view's columns, not its definition, so `ingest` marks such a
+   view untranslatable and the planner refuses it. Tables are unaffected.
+   Closing this means having discovery also capture `GET_DDL` per view —
+   cheap in absolute terms (views are a small fraction of an estate) but it
+   does cost one query per view, giving up the two-queries-per-database
+   property for that subset. Until then, an estate whose views must migrate
+   has to be planned from a live `assess`.
+
+2. **`deps` still needs a live Snowflake session.** `ingest` writes
+   `dependencies.json` empty with provenance `not_extracted`, which is
+   correct for a manifest — no view edges exist to lose, because manifest
+   views are refused. But an estate that needs real view ordering cannot get
+   it from the in-AIDP path.
+
+3. **S7's plan is not the nested shape the runbook describes.** The runbook
+   promises schemas -> tables -> columns -> types nested in one JSON with
+   per-item review flags. `ddl_plan.json` is a flat statement list and
+   `plan.json` splits `can_migrate` / `cannot_migrate`. The information is
+   there; the shape and the explicit review flag are not.
+
+4. **S8 has no grouping.** The runbook forbids asking about conflicts one at a
+   time and requires them grouped into families with a count each. Nothing
+   computes those families — an agent would have to group by hand, which is
+   the failure mode the rule exists to prevent.
+
+5. **S9's scope reduction is manual and unbacked.** Reducing scope today means
+   hand-writing a `--restrictions` file; nothing backs the full plan up into
+   AIDP first, and nothing writes the reduced plan as a distinct, named
+   artifact. The runbook requires both.
+
+6. **S11 creates one copy job, not one per schema.** `provision` wires four
+   jobs, one of which is `snowmig_02_copy_schema` taking `--schema` as a
+   parameter. The runbook asks for **one script and one workflow per schema**
+   so each has its own run history and evidence. Parameterising one job is
+   not the same deliverable.
+
+7. **The estate statistics S11 promises are not computed.** Average table
+   size, largest, smallest, totals per schema — `inventory.json` carries the
+   inputs, no stage rolls them up.
+
+### Behaviour changed in this pass
+
+- **Never reuse.** `provision(reuse_existing=False)` is the default: a
+  workspace, cluster or job whose name is taken is reported `name_taken` and
+  the run stops, rather than being adopted. `--reuse-existing` opts back in.
+  Previously all four were silently reused.
+- **A managed target catalog may be created.** The CLI refused it outright;
+  it now creates the container and says that only the container was made. The
+  refusal that remains is the correct one: its *tables* are not created
+  through the control-plane CRUD API.
+- **`STANDARD` was never a real catalog type.** `CATALOG_TYPES` claimed
+  `("EXTERNAL", "STANDARD")`, but AIDP answers `400 InvalidParameter: Invalid
+  CatalogType: STANDARD`. Reading the catalogs of a live DataLake shows only
+  `INTERNAL` and `EXTERNAL`. The constant is corrected and `STANDARD` is kept
+  as an alias, normalised once so it can never reach the wire.
+- **The environment is created before the catalogs.** `resolve_target()`
+  requires all four coordinates for any AIDP write, so registering the source
+  catalog first — as the runbook used to say — stopped on `AIDP target
+  coordinates not supplied`. The order is now workspace, cluster, EXTERNAL,
+  INTERNAL.
+- **`snowmig.py run`.** `target/jobs.py` had a live-verified `watch_job` —
+  run, poll to terminal, fetch task output — reachable from no CLI stage. It
+  is now the `run` stage, and it reports a spent poll budget as STILL
+  RUNNING rather than rounding it to a verdict.
 
 ---
 
 ## What is actually proven
 
 Worth stating first, because "verified" now means something specific here.
+Updated after the 2026-09-16 live validation campaign: a trial Snowflake
+account (1002 objects, 11 schemas) and a shared AIDP DataLake. Coordinates
+live in the gitignored config files, never here.
 
 | Surface | Status |
 |---|---|
-| Snowflake extraction (inventory, census, lineage, maintenance, security) | **Live-verified** against a real account |
+| Snowflake extraction (inventory, census, lineage, maintenance, security) | **Live-verified**, now at 1002 objects / 11 schemas in one batched pass |
 | Read-only enforcement on the source | Enforced at the transport, tested |
-| Plan, waves, restrictions, DDL generation | Unit-tested; generated SQL parsed by a real Spark parser |
-| Target **catalog CRUD** transport | **Live-verified** — 7 objects created and read back |
+| Plan, waves, restrictions, DDL generation | Unit-tested; generated SQL parsed by a real Spark parser; 1002-statement plan built live |
+| Target **catalog CRUD** transport | **Live-verified** — canary 5/5 tables created in an INTERNAL catalog and read back structure-equal |
+| The deploy **EXTERNAL guard** | **Live-verified** — refused before the first create, clean message, exit 1 |
 | Case folding, async polling, key resolution | **Live-verified** (each was a real failure first) |
-| Target **SQL** transport | **Dead** — `POST …/sql/execute` returns 404 |
-| Smoke test, destination half | **Live-verified** — read + write probe, against a **Standard** catalog |
-| **EXTERNAL catalog registration** (the 0.16.0 default) | **Never executed.** Body shape inferred, not verified — see B2a |
-| Notebook upload / run | **Never executed** |
-| Data movement | **Not implemented, by design** |
-
----
-
-## P0 — the 0.16.0 default path is not wired through
-
-### 1. `ensure_catalog` never polls the read-back
-
-`target/catalog_provision.py` calls `_find_catalog` once, immediately after
-the create. Simulated against a normal asynchronous create (catalog visible on
-the third list), it returns `action: "create_requested", verified: False`.
-
-So **every successful registration reports pending.** `catalog_deploy.py`
-already learned this — assumption D11, creates are async and settle seconds
-later — and polls with a bounded backoff. The new module regresses it. With
-router rule 9 ("never report success ahead of verification"), the default path
-can never self-verify, and the honest "this is pending" message in
-`render_catalog` degrades into noise the user has to check past by hand.
-
-**Fix:** reuse the bounded backoff from `catalog_deploy.py`.
-
-Second-order: `_find_catalog` swallows every exception and returns `None`, so a
-failed `list_catalogs` is indistinguishable from "the catalog is absent" — and
-the pre-create call then decides to create.
-
-### 2. Nothing stops `deploy --execute` targeting an EXTERNAL catalog
-
-No `catalogType` check exists anywhere in `target/catalog_deploy.py`. The old
-assumption B2 said *"an EXTERNAL catalog cannot hold managed Delta and is
-refused"* — the refusal was never code. It did not matter while the default
-was a pre-existing Standard catalog. It matters now: EXTERNAL is the default,
-and `plan/data_movement.py` states in its own option text that EXTERNAL
-catalogs are read-only in AIDP.
-
-**Fix:** resolve the target catalog's `catalogType` before the first create and
-refuse in `deploy_catalog`, in the same shape as
-`catalog_provision.RefusedToExecute`.
-
-### 3. `smoke --write-probe` fails against the new default
-
-`plan/smoke.py` creates a schema in `target.catalog` to prove write access.
-That cannot succeed in a read-only EXTERNAL catalog.
-
-This reproduces exactly the failure the smoke-test item (now closed, below)
-was opened for: **a FAIL reported against a destination that works.** Anyone
-running the pipeline in order on the default path hits it and stops.
-
-**Fix:** make the probe catalog-type aware — read-only checks for EXTERNAL,
-the write probe only for Standard.
-
-### 4. The stage board does not know `catalog` exists
-
-`report/stages.py` lists twelve stages; `catalog` is not one of them, and
-`catalog_result.json` is not read. The rendered header still asserts *"Every
-stage is read-only except `deploy`"*, which is false now that
-`catalog --execute` writes.
-
-This is load-bearing, not cosmetic: router rule 10 requires reporting
-`next_stage` from this board after every stage, so **the new default stage is
-unreachable by the documented flow.**
-
-**Fix:** add `catalog` to `STAGES` in its dependency position, mark it
-`writes: True`, and restate the one-writer claim as two.
-
----
-
-## P1 — security and packaging
-
-### 5. Credentials are passed in argv
-
-`executor.py` puts the whole `create_catalog` body — including `privateKey`,
-`password` or `token` — into `--request-body`, so the secret is visible in
-`ps` to any other user on the host.
-
-`runner.make_call` prints the command before running it. Measured: the secret
-does **not** appear in the printed line, but only because the flat 200-char
-per-argument truncation happens to cut just before it (271-byte body with
-minimum-length inputs, password at ~254). That is incidental, not designed —
-any reordering of `connectionDetails`, or a shorter envelope, and it prints.
-
-The dry-run artifact is handled correctly: `cmd_catalog` records only
-`connection_fields` (the key names), never values.
-
-**Fix:** redact `connectionDetails` explicitly before printing, and pass the
-body by file rather than argv — `upload_notebook` already uses the `file://`
-form, so the pattern exists.
-
-### 6. `pyyaml` is a runtime dependency of the default path, listed as dev-only
-
-`target/snowflake_catalog_connection.py` imports `yaml` to read the connection
-config. YAML is what `snowflake-catalog-connection.example.yaml` and the
-`snowflake-medallion-clone` skill both document. But `pyyaml` appears only in
-`requirements-dev.txt`, and `snowflake-migrator-bootstrap` installs
-`requirements.txt`.
-
-A clean install therefore hits the ImportError on the documented happy path.
-It degrades with a clear message, which is why it is P1 and not P0.
-
-**Fix:** move `pyyaml` to `requirements.txt`.
-
-### 7. Ten `.pyc` files are tracked in git
-
-Including `engine/target/__pycache__/aidp_runner.cpython-311.pyc`, for a module
-that no longer exists. They ship inside the published plugin, and one shows as
-modified in the working tree. `.gitignore` cannot help — they were committed
-before the rule, so it does not apply to them.
-
-**Fix:** `git rm --cached` the ten, and confirm the `!engine/target/**`
-re-include does not pull `__pycache__` back.
-
-### 8. All of 0.16.0 is uncommitted
-
-`plugin.json` says `0.16.0` and `CHANGELOG.md` carries a dated release entry,
-but `catalog_provision.py`, `snowflake_catalog_connection.py`, both of their
-test files and `snowflake-catalog-connection.example.yaml` are untracked.
-
----
-
-## P2 — the documentation contradicts the code
-
-### 9. ASSUMPTIONS.md still says AIDP was never contacted — and a test pins it
-
-The header table reads **"AIDP | None. Never contacted."** That is flatly
-contradicted by this file, by `CHANGELOG.md`, and by the live-verified rows in
-the table above.
-
-Worse: `tests/test_plugin_surface.py::test_assumptions_register_states_that_aidp_was_never_contacted`
-asserts `"Never contacted" in text`. **Correcting the document breaks the test
-suite.** The test was right when written and is now enforcing a false claim.
-
-B3, B4, B5 and "Outstanding items that block real use" item 1 are stale for
-the same reason.
-
-**Fix:** rewrite the header table to state what *was* contacted and what was
-not, and rewrite the test to assert the live/unverified split rather than the
-literal phrase.
-
-### 10. Router lists 6 of 13 stages
-
-`skills/snowflake-migrator-overview/SKILL.md` ends with
-*"Stages: `assess` · `deps` · `plan` · `ddl` · `deploy` · `compute`."* Missing:
-`catalog`, `maintenance`, `security`, `smoke`, `notebook`, `summary`,
-`data-options`, `stages`.
-
-### 11. No `/snowflake-catalog` command
-
-Six less-central stages have a slash command; the new default stage does not.
-
-### 12. `--write-probe` help says the opposite of what the code does
-
-`plan/smoke.py` creates the probe schema, checks visibility, and then calls
-`delete_schema`. The CLI help still reads *"it is NOT dropped afterwards"*,
-and `test_smoke_skill_warns_the_write_probe_leaves_a_schema` is still named
-for the old behaviour. The skill text itself was corrected; the help string
-and the test name were not.
-
-Separately, that visibility check is a single `list_schemas` immediately after
-the create, with no backoff — the same unbounded-async assumption as item 1,
-and the reason it is grouped with it rather than treated as cosmetic.
+| `asyncOperations` waiter (`aidp-async-operation-key`) | **Live-verified** — SUCCEEDED/FAILED with error fields |
+| Target **SQL** transport | **Dead** — no SQL REST endpoint exists (doc + live 404 agree) |
+| Smoke test, destination half | **Live-verified** — read + write probe with cleanup, catalog-type aware |
+| **EXTERNAL catalog registration** | **Executed and created.** The API itself enumerated the real contract (`connectionDetails.connectionProperties`, `SNOWFLAKE_*` keys, auth enum `Basic\|KeyPair`) — see B2a. The connection **values** remain unproven: the crawler/testConnection fail with "Login has timed out", and every pre-existing external catalog in that DataLake is Oracle-network ATP/ADW, so crawler egress to the public internet is the suspect, not the body |
+| Provisioning (workspace/cluster reuse, folder tree, uploads, jobs) | **Live-verified end to end, exit 0** — via the `workspace-object` surface; the Jupyter contents API on that build 200s on PUT and then 404/500s on read-back, and cannot create directories |
+| Jobs | **Live-verified**: creation, run and output fetch for NOTEBOOK_TASK (driver notebooks). PYTHON_TASK is accepted at creation and fails every run resolving the file; job `parameters` reach the notebook neither as argv nor env — hence the generated drivers with inline args. `/Workspace` mount on cluster FS probed and confirmed |
+| Data movement scripts | **Live-verified**: discovery (11 schemas / 1000 tables / 9935 columns in two `INFORMATION_SCHEMA` queries) and structure creation from the approved `ddl_plan` both ran SUCCESS inside AIDP. Copy + reconcile were exercised on one schema |
+| **AIDP Snowflake connector** as the source | **Live-verified** — read a table and ran pushdown from the cluster with no extra library. Now the DEFAULT source mode |
+| EXTERNAL catalog **crawler** | **Fails on the validated deployment** — `CONNECTOR_0067, Login has timed out`, with credentials the connector accepts. Not an FQDN form (both host forms resolve identically and both fail). Suspect: the crawler's network path, which is not the cluster's. Raised as B16 |
 
 ---
 
 ## P3 — carried forward, re-prioritised
 
-### 13. Notebook upload and run — never executed
+### 13. `executor.py`'s notebook upload/run shapes are now known to be wrong
 
-Unchanged as a gap, but **its priority went up in 0.16.0**: it is no longer a
-convenience, it is the only sanctioned path for Standard-catalog tables. The
-`upload_notebook` and `run_notebook` command shapes are invented, exactly as
-the SQL path was — and that one turned out to be a 404. Assume wrong until
-proven.
+Settled by the live campaign, and **not yet removed**: `upload_notebook`,
+`run_notebook` and `run_status` in `executor.py` are legacy guesses that the
+validated surfaces contradict. Upload is `workspace-object` (relative paths,
+via the `aidp` CLI) — the Jupyter contents API 200s and then cannot read the
+file back. Execution is a **Job with a NOTEBOOK_TASK plus a jobRun**;
+`notebookRuns` does not exist. Both working shapes are implemented in
+`provision_api.py` / `jobs.py`.
 
-### 14. The EXTERNAL `connectionDetails` shape is a guess *(B2a)*
+**Fix:** point `snowmig.py notebook --upload` at the working surface and
+delete the three dead operations. Until then, `notebook --upload` is the one
+command in the plugin whose transport is known-bad.
 
-Field names are inferred from the AIDP Snowflake Spark connector's options,
-not a verified REST contract. `aidp catalog test-connection` is recommended in
-prose but wired into nothing.
+### 13a. The external catalog's crawler cannot reach Snowflake *(B16)*
 
-**Fix:** add a `catalog --test-connection` step so validation is a command,
-not a suggestion.
+The one finding from the live campaign that is **not** fixed and is not ours
+to fix. The catalog registers and is ACTIVE; `actions/refresh` and
+`actions/testConnection` both fail `CONNECTOR_0067 — Login has timed out`,
+while the AIDP Snowflake connector reads the same account from the cluster
+with the same credentials. Ruled out: credentials (the connector uses them),
+cluster egress (probed, :443 open), and the FQDN form (org-account and
+account-locator hosts resolve to the same backend and fail identically).
+Remaining hypothesis: the crawler runs outside the cluster's network path, and
+this is the first non-Oracle-network external catalog on that DataLake.
+
+**Consequence, already absorbed:** `--source-mode connector` is the default
+for every in-AIDP script, so the migration does not wait on this. What is
+still blocked is the *browsability* an external catalog provides.
+
+**To do:** raise with the AIDP team; the Slack thread about mandating
+`testConnection` before `createCatalog` is the same class of problem
+(a catalog accepts metadata it cannot actually use, and the failure surfaces
+much later from inside the crawler).
+
+### 13b. Still inferred after the campaign *(B12)*
+
+Only one shape remains unproven in `provision_api.py`: the cluster-library
+item's artifact field (`package` / `path` / `coordinates`). Nothing in the
+validated path installs a library, so it was never exercised. Everything else
+in that module — workspaces, clusters, folders, uploads, jobs, job runs, task
+runs, output fetch, asyncOperations, testConnection — is live-verified.
+
+### 14. ~~The EXTERNAL `connectionDetails` shape is a guess~~ ✅ SETTLED *(B2a)*
+
+The API enumerated its own contract when handed a wrong key, and a catalog now
+exists that was built from it: the map nests under
+`connectionDetails.connectionProperties`, the keys are `SNOWFLAKE_*`, and the
+auth enum is `Basic | KeyPair`. `catalog --test-connection` is now a wired
+command — and it needs an EXISTING catalog key, because it resolves RBAC
+`DESCCATALOG` (B17).
+
+### 14a. Structure creation is the only scale-tested write path
+
+`--mode ddl-plan` applies the engine's already-translated types with no source
+read, which is why it is the default: `--mode ctas` costs one Snowflake round
+trip per table, and creating 100 tables that way was still running after
+minutes. Neither mode has run against a full estate. Job STARTUP is ~5–6
+minutes per run (measured), so the operating unit is a schema, never a table.
 
 ### 15. The region map covers 12 short codes
 
@@ -250,6 +238,50 @@ Needs a live AIDP run to calibrate.
 
 ## Recently closed
 
+**2026-09-16 — the 0.16.0 P0/P1/P2 sweep.** All four P0s were one finding —
+the EXTERNAL pivot changed the default without re-running the verification
+discipline — and are now code:
+
+- **`deploy --execute` refuses an EXTERNAL catalog.** `deploy_catalog` now
+  resolves the target's `catalogType` before its first create and refuses
+  EXTERNAL, an absent catalog, and an unreadable listing — "could not look"
+  and "safe to write" are different claims. The resolved type is recorded in
+  `deploy_result.json`. (Also fixed on the way: `catalog_deploy`'s
+  `RefusedToExecute` was not in `main()`'s except tuple, so the refusal would
+  have been a traceback, not a message.)
+- **`smoke --write-probe` is catalog-type aware.** The probe is skipped with
+  an explanatory note against an EXTERNAL catalog — read-only by design is not
+  a failure — and `catalog_type` is reported either way (`"unknown"` when it
+  could not be resolved, never silently assumed).
+- **The stage board knows `catalog` exists.** It sits between `smoke` and
+  `deploy`, reads `catalog_result.json`, flags `create_requested` as pending
+  rather than success, and the board now claims **two** writers. Bonus:
+  `data-options` moved to its real position (feeding `plan`) and is marked
+  optional so `next_stage` never stalls on it.
+- **`ensure_catalog` polls the read-back** — this had in fact already been
+  fixed (`_poll_for_catalog`, bounded backoff, and `_find_catalog` raises on a
+  failed listing); the entry here was stale. The remaining nuance is
+  deliberate: a listing that fails *mid-poll* counts as "not visible yet",
+  because it is not evidence either way.
+- **The catalog credential left argv.** The `create_catalog` body now travels
+  by a 0600 temp file (`file://`, removed after the call), and the printed
+  command redacts `connectionDetails` **values** explicitly — field names
+  stay, since they are what a human checks. The old 200-char truncation only
+  hid the secret by luck.
+- **`pyyaml` moved to `requirements.txt`** — it is a runtime dependency of the
+  default path's connection config.
+- **The ten tracked `.pyc` files are gone**, and the `.gitignore` re-include
+  that pulled `engine/target/__pycache__` back in is explicitly counter-ruled.
+- **ASSUMPTIONS.md tells the truth about AIDP** — the header now states the
+  live-verified/never-executed split, B3/B4/B5 and "Outstanding items" item 1
+  were rewritten, and the test that enforced the stale "Never contacted"
+  literal now pins the split instead.
+- **The router lists all 13 stages + `stages`**, `/snowflake-catalog` exists,
+  and the `--write-probe` help says what the code does (creates one schema,
+  removes it, names a failed cleanup).
+
+Older closures:
+
 - **The smoke test lied about the destination.** It called the SQL endpoint
   that returns 404 and reported FAIL against a destination that worked. The
   destination half now runs on the catalog API, with a uniquely-named write
@@ -262,7 +294,7 @@ Needs a live AIDP run to calibrate.
   `--no-diagnose` turns it off, since the probe writes. Live: 5 of 5 correctly
   diagnosed against a deliberately poisoned schema.
 - **Test-account identifiers genericised** in source and fixtures; real values
-  now only in the gitignored `local-test-account.yaml`.
+  now only in the gitignored `snowmig-config.yaml` -- the one config file.
 
 ---
 
@@ -284,15 +316,16 @@ conversation until the phase that needs them arrives.
 | Question | Blocking |
 |---|---|
 | Silver/Gold job body shape | The medallion deliverable is one third stubs |
-| `CUSTOMER-CONTEXT.md` is on the remote — rewrite history, delete the branch, or accept? | Publishing |
+| `ACME-CONTEXT.md` is on the remote — rewrite history, delete the branch, or accept? | Publishing |
 | Acme's region: Ashburn, Oregon or Ohio? | Any cost or transfer estimate |
 
 ## Publish blockers
 
-- `CUSTOMER-CONTEXT.md` (customer-confidential, already pushed) — still tracked
+- `ACME-CONTEXT.md` (customer-confidential, already pushed) — still tracked
 - `PLAN-2PERSON-TIMETABLE.md` and `docs/specs/` ship inside the plugin — still tracked
-- Ten tracked `.pyc` files (item 7)
-- ~~Test-account identifiers in eight fixtures (`npxbexe`, `DU58131`, `NHEYDARI`)~~ ✅ DONE — genericized in source/fixtures; real values now only in gitignored `local-test-account.yaml`
+- ~~Ten tracked `.pyc` files~~ ✅ DONE — untracked, deleted, and the
+  `.gitignore` re-include that resurrected them is counter-ruled
+- ~~Test-account identifiers in eight fixtures~~ ✅ DONE — genericized in source/fixtures; real values now only in the gitignored config files
 
 ---
 

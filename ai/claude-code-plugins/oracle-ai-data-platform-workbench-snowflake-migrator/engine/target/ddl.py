@@ -15,7 +15,7 @@ Two AIDP-specific behaviours are encoded here rather than rediscovered:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from snowflake_source.dialect.views import (  # noqa: F401  (re-exported)
     detect_unsupported_constructs, extract_view_body, translate_view_body,
@@ -23,7 +23,7 @@ from snowflake_source.dialect.views import (  # noqa: F401  (re-exported)
 
 __all__ = ["RuleApplication", "RewriteResult", "UnsupportedDDL",
            "SCRUBBED_PROPERTIES", "DEFERRED_EQUIVALENT_PROPERTIES", "build_create_schema", "quote_backtick", "quote_spark_string", "build_create_table",
-           "build_create_view"]
+           "build_create_view", "build_ddl_payload"]
 
 # Snowflake table PROPERTIES that genuinely have NO AIDP equivalent. A value
 # here was a deliberate source-side setting, so dropping it is a decision worth
@@ -297,3 +297,58 @@ def build_create_view(record: dict, target_fqn: str,
                         key=lambda c: c.get("ORDINAL_POSITION") or 0)
         if c.get("target_type")]
     return res
+
+
+def _view_text(sql: str | None) -> str:
+    """The SELECT body of a generated CREATE VIEW, for the catalog API."""
+    try:
+        return extract_view_body(sql or "")
+    except ValueError:
+        return ""
+
+
+def build_ddl_payload(inventory: dict, plan: dict) -> dict:
+    """The whole `ddl` stage as a pure function: inventory + plan -> payload.
+
+    Emits in wave order, so a view always follows the tables it reads. Shared
+    by the CLI stage and the emulated (demo) pipeline, so the two cannot
+    drift apart.
+    """
+    by_id = {r["source_identifier"]: r for r in inventory["inventory"]}
+    name_map = plan.get("target_names", {})
+    ordered = [i for wave in plan.get("waves", []) for i in wave]
+    ordered += [i for i in plan.get("clone_targets", []) if i not in ordered]
+
+    statements, blocked = [], []
+    for ident in ordered:
+        rec = by_id.get(ident)
+        if rec is None:
+            continue
+        if rec.get("object_type") == "VIEW":
+            res = build_create_view(rec, name_map[ident], name_map)
+        else:
+            res = build_create_table(rec, name_map[ident])
+        if res.blocked:
+            blocked.append({"source_identifier": ident,
+                            "object_type": rec.get("object_type"),
+                            "reason": res.blocked_reason})
+            continue
+        statements.append({
+            "source_identifier": res.source_identifier,
+            "object_type": rec.get("object_type"),
+            "target_fqn": res.target_fqn, "sql": res.sql,
+            "rules_applied": [asdict(r) for r in res.rules_applied],
+            "warnings": res.warnings,
+            "omitted_properties": res.omitted_properties,
+            # Deployment verifies the structure against this, not just the name.
+            "expected_columns": res.expected_columns,
+            # Source settings with an AIDP equivalent that this version does
+            # not apply. Reported, never silently invented.
+            "deferred_properties": res.deferred_properties,
+            # The catalog API takes a view's body as a field, not as CREATE
+            # VIEW text, so it is carried separately.
+            **({"view_text": _view_text(res.sql)}
+               if rec.get("object_type") == "VIEW" else {})})
+
+    return {"statements": statements, "blocked": blocked,
+            "bronze_catalog_prefix": plan.get("bronze_catalog_prefix")}

@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Plan vs reality: what landed in the target catalog, what did not, and why.
+
+Runs on AIDP compute; READS ONLY. Joins three sources of truth —
+
+  * `discovery_manifest.json`  what the external catalog exposed,
+  * `structure_report_*.json` / `copy_report_*.json`  what the scripts claim,
+  * the TARGET CATALOG itself  what actually exists (SHOW TABLES, and counts
+    with --counts) —
+
+into `reconciliation.json` and `MIGRATION_REPORT.md`: one row per table with
+its structure status, copy status, live existence, and live row count. The
+catalog is consulted directly so the report cannot be flattered by a stale
+script report: an object a report calls verified but the catalog no longer
+holds is flagged, and an object in the catalog that no report claims is
+flagged the other way.
+
+"Could not look" never renders as zero: an unreadable schema is marked
+UNREADABLE, distinct from empty.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import pathlib
+import sys
+
+# /Workspace is the live-verified mount of the workspace tree on cluster
+# filesystems (probed 2026-09-16 on a real cluster).
+DEFAULT_REPORTS_DIR = "/Workspace/backup-snowflake-migration/reports"
+MANIFEST_NAME = "discovery_manifest.json"
+
+# Verdicts that mean something is WRONG, as opposed to not done yet. A
+# migration runs schema by schema, so "this table was never attempted" is the
+# normal state of most of the estate for most of the project -- exiting
+# non-zero on it would make every partial run look broken, which is how a
+# real signal gets ignored.
+PROBLEM_VERDICTS = ("MISSING_DESPITE_REPORT", "STRUCTURE_ONLY_COPY_FAILED",
+                    "TARGET_UNREADABLE")
+
+
+def q(identifier: str) -> str:
+    return "`" + str(identifier).replace("`", "``") + "`"
+
+
+def log(msg: str) -> None:
+    print(f"[reconcile] {msg}", flush=True)
+
+
+def fail(msg: str) -> int:
+    """Report a refusal on BOTH streams and return 1.
+
+    A notebook task captures stdout only: live, a script that exited 1 via a
+    stderr-only message produced a job failure with NO explanation anywhere.
+    """
+    print(f"ERROR: {msg}", flush=True)
+    print(f"error: {msg}", file=sys.stderr)
+    return 1
+
+
+def _load(reports: pathlib.Path, name: str) -> dict | None:
+    path = reports / name
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def _live_tables(spark, catalog: str, schema: str) -> set[str] | None:
+    """Lower-cased table names the catalog holds, or None when unreadable."""
+    try:
+        rows = spark.sql(f"SHOW TABLES IN {q(catalog)}.{q(schema)}").collect()
+    except Exception:
+        return None
+    out = set()
+    for r in rows:
+        d = {k.lower(): v for k, v in r.asDict().items()}
+        out.add(str(d.get("tablename") or d.get("name") or "").lower())
+    return out
+
+
+def reconcile(spark, *, manifest: dict, target_catalog: str,
+              reports: pathlib.Path, counts: bool) -> dict:
+    out = {"target_catalog": target_catalog,
+           "generated_at": datetime.datetime.now(
+               datetime.timezone.utc).isoformat(),
+           "schemas": [], "totals": {}}
+    tally: dict[str, int] = {}
+
+    for schema_rec in manifest["schemas"]:
+        schema = schema_rec["name"]
+        structure = _load(reports, f"structure_report_{schema.lower()}.json")
+        copy = _load(reports, f"copy_report_{schema.lower()}.json")
+        target_schema = ((copy or structure or {}).get("target") or
+                         f"{target_catalog}.{schema}").split(".", 1)[1]
+        live = _live_tables(spark, target_catalog, target_schema)
+
+        rows = []
+        for table in schema_rec["tables"]:
+            name = table["name"]
+            s_status = ((structure or {}).get("objects", {})
+                        .get(name, {}).get("status", "not_attempted"))
+            c_rec = (copy or {}).get("tables", {}).get(name, {})
+            c_status = c_rec.get("status", "not_attempted")
+            exists = (None if live is None else name.lower() in live)
+
+            if live is None:
+                verdict = "TARGET_UNREADABLE"
+            elif not exists:
+                verdict = ("MISSING_DESPITE_REPORT"
+                           if s_status == "created" or c_status == "verified"
+                           else "NOT_MIGRATED")
+            elif c_status == "verified":
+                verdict = "MIGRATED_VERIFIED"
+            elif c_status in ("count_mismatch", "sum_mismatch", "failed"):
+                verdict = "STRUCTURE_ONLY_COPY_FAILED"
+            elif c_status == "skipped_nonempty":
+                verdict = "PRESENT_NOT_REVERIFIED"
+            else:
+                verdict = "STRUCTURE_ONLY"
+
+            row = {"table": name, "structure": s_status, "copy": c_status,
+                   "exists_in_target": exists, "verdict": verdict,
+                   "reason": c_rec.get("reason")
+                             or (structure or {}).get("objects", {})
+                             .get(name, {}).get("reason")}
+            if counts and exists:
+                try:
+                    row["target_count"] = spark.sql(
+                        f"SELECT COUNT(*) AS n FROM {q(target_catalog)}."
+                        f"{q(target_schema)}.{q(name)}").collect()[0]["n"]
+                except Exception as exc:
+                    row["target_count"] = None
+                    row["count_error"] = str(exc)[:200]
+            rows.append(row)
+            tally[verdict] = tally.get(verdict, 0) + 1
+
+        unclaimed = (sorted(live - {t["name"].lower()
+                                    for t in schema_rec["tables"]})
+                     if live is not None else [])
+        out["schemas"].append({
+            "schema": schema, "target_schema": target_schema,
+            "target_readable": live is not None,
+            "tables": rows,
+            "in_target_but_not_in_manifest": unclaimed})
+
+    out["totals"] = tally
+    return out
+
+
+def render(rec: dict) -> str:
+    totals = rec["totals"]
+    problems = sum(totals.get(v, 0) for v in PROBLEM_VERDICTS)
+    lines = [
+        "# Migration report — plan vs what the target catalog actually holds",
+        "",
+        f'Target: `{rec["target_catalog"]}` · generated {rec["generated_at"]}',
+        "",
+        "Verdicts: " + ", ".join(f'{k} = {v}'
+                                 for k, v in sorted(totals.items())),
+        "",
+        (f'**{problems} table(s) need attention** '
+         f'({", ".join(PROBLEM_VERDICTS)}).' if problems else
+         "No table is in a problem state. Anything below that is not "
+         "migrated simply has not been attempted yet — a migration runs "
+         "schema by schema, so that is the expected middle of the project, "
+         "not a failure."),
+        "",
+    ]
+    for s in rec["schemas"]:
+        lines += [f'## `{s["schema"]}` → `{rec["target_catalog"]}.'
+                  f'{s["target_schema"]}`', ""]
+        if not s["target_readable"]:
+            lines += ["**Target schema UNREADABLE — nothing below is "
+                      "confirmed, and this is not the same as empty.**", ""]
+        lines += ["| Table | Structure | Copy | In target | Verdict | Why |",
+                  "|---|---|---|---|---|---|"]
+        for t in s["tables"]:
+            exists = {True: "yes", False: "**no**", None: "?"}[t["exists_in_target"]]
+            count = (f' ({t["target_count"]:,} rows)'
+                     if t.get("target_count") is not None else "")
+            reason = (t.get("reason") or "").replace("|", "\\|")[:120]
+            lines.append(f'| {t["table"]}{count} | {t["structure"]} | '
+                         f'{t["copy"]} | {exists} | {t["verdict"]} | {reason} |')
+        if s["in_target_but_not_in_manifest"]:
+            lines += ["", f'⚠️ In the target but in no report: '
+                          f'{", ".join(s["in_target_but_not_in_manifest"])} — '
+                          f'someone else\'s objects, or a stale manifest.']
+        lines.append("")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--target-catalog", required=True)
+    ap.add_argument("--reports-dir", default=DEFAULT_REPORTS_DIR)
+    ap.add_argument("--counts", action="store_true",
+                    help="also read a live COUNT(*) per existing table")
+    args = ap.parse_args(argv)
+
+    reports = pathlib.Path(args.reports_dir)
+    manifest = _load(reports, MANIFEST_NAME)
+    if manifest is None:
+        return fail(f"error: {reports / MANIFEST_NAME} not found; run 00_discover "
+              f"first")
+
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.getOrCreate()
+
+    rec = reconcile(spark, manifest=manifest,
+                    target_catalog=args.target_catalog, reports=reports,
+                    counts=args.counts)
+    (reports / "reconciliation.json").write_text(json.dumps(rec, indent=2))
+    (reports / "MIGRATION_REPORT.md").write_text(render(rec))
+    log(f"totals: {rec['totals']}")
+    log(f"-> {reports / 'MIGRATION_REPORT.md'}")
+
+    problems = sum(rec["totals"].get(v, 0) for v in PROBLEM_VERDICTS)
+    pending = sum(v for k, v in rec["totals"].items()
+                  if k not in PROBLEM_VERDICTS
+                  and k not in ("MIGRATED_VERIFIED",
+                                "PRESENT_NOT_REVERIFIED"))
+    if pending:
+        log(f"{pending} table(s) not migrated yet — expected while the "
+            f"migration is still running, schema by schema. Not an error.")
+    if problems:
+        log(f"{problems} table(s) in a PROBLEM state "
+            f"({', '.join(PROBLEM_VERDICTS)}) — see the report.")
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -6,7 +6,7 @@ description: Show the Snowflake-to-AIDP migration as a stage table before runnin
 # Stage board — read the run before you execute it
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py stages --out-dir ./snowmig_out
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig stages
 ```
 
 Offline. It reads the artifacts already in `--out-dir` and reports the pipeline
@@ -21,10 +21,11 @@ and **what it found**.
 
 Then say three things out loud:
 
-1. **`deploy` is the only stage that writes anything**, and it is a dry run
-   unless `--execute` is passed with all four AIDP coordinates. Everything else
-   is read-only. If someone is nervous about running the pipeline, this is the
-   sentence that answers them.
+1. **Three stages write to AIDP — `provision`, `catalog` and `deploy`** — and each is a dry
+   run unless `--execute` is passed with all four AIDP coordinates. Everything
+   else is read-only, apart from two narrow opt-ins that say so themselves
+   (`smoke --write-probe`, `notebook --upload`). If someone is nervous about
+   running the pipeline, this is the sentence that answers them.
 2. **Read out every ⚠️ row.** A flagged stage either found something or could
    not look, and those are not the same. `0 policy exposures` means the check
    ran and found none; *"policy attachments unreadable — exposure UNKNOWN, not

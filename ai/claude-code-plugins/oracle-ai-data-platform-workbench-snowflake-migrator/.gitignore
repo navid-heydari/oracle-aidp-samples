@@ -13,15 +13,40 @@ bucket_mapping.json
 bucket_mapping.local.json
 catalog_manifest.json
 
-# personal Snowflake test-account coordinates for live tests -- see
-# local-test-account.example.yaml for the tracked template
-local-test-account.yaml
+# THE migration config: ONE file, both ends, live credentials inline.
+# Never committed -- see snowmig-config.example.yaml. The live tests and the
+# corpus validator read this same file; there is no second config.
+snowmig-config.yaml
+snowmig-config.yml
+snowmig-config.json
 
-# EXTERNAL-catalog connection config -- see the .example.yaml template
+# Dead names from the old multi-file design, kept ONLY so an old copy left on
+# someone's disk cannot be committed by accident. Nothing reads them.
+local-test-account.yaml
 snowflake-catalog-connection.yaml
 snowflake-catalog-connection.json
 
-# Migrator-local artifacts that should never accompany this plugin
+# ---------------------------------------------------------------------------
+# GENERATED MIGRATOR OUTPUT — NEVER COMMIT. Do not remove these rules.
+# ---------------------------------------------------------------------------
+# `migration-artifacts/` is where every stage writes. It holds a real
+# Snowflake estate's database, schema, table and column names, which is
+# customer data and must never reach a public samples repository.
+#
+# It lives inside the plugin folder because this repo gives each sample one
+# folder and everything related to it, and because the stages chain -- `plan`
+# reads the `inventory.json` that `assess` wrote -- so it cannot be temporary
+# scratch. It carries its own README and its own `.gitignore` so it stays
+# explained and stays ignored even if it is copied elsewhere.
+#
+# Everything in it is regenerable: re-run the stage. `bin/snowmig clean`
+# removes it.
+migration-artifacts/
+snowmig_demo/
+
+# Former name of the artifact directory. Kept so an older working tree, or a
+# branch predating the rename, cannot commit one by accident.
+snowmig_out/
 reports/
 **/JOB_REPORT.md.bak
 
@@ -45,3 +70,15 @@ venv/
 # The directory itself must be un-excluded before its contents can be.
 !engine/target/
 !engine/target/**
+
+# ...but not its bytecode: the `!engine/target/**` re-include above would
+# otherwise override the __pycache__/*.pyc rules for this one subtree, which
+# is how ten .pyc files ended up tracked and shipped inside the plugin.
+engine/target/__pycache__/
+engine/target/**/*.pyc
+
+# Customer-confidential engagement records. Never in a public sample:
+# customer context, delivery timetables, spend and estate figures. Keep them
+# in a private directory outside this repo.
+*-CONTEXT.md
+*-TIMETABLE.md

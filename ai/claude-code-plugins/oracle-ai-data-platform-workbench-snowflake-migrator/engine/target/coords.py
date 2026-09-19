@@ -14,7 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-__all__ = ["MissingTarget", "REGIONS", "Target", "region_from_ocid", "resolve_target"]
+__all__ = ["ALL_COORDINATES", "MissingTarget", "REGIONS", "Target",
+           "region_from_ocid", "resolve_target"]
 
 REGIONS = {
     "iad": "us-ashburn-1", "phx": "us-phoenix-1", "fra": "eu-frankfurt-1",
@@ -36,18 +37,36 @@ class Target:
     catalog: str
 
 
+#: Every coordinate a write needs. A read may need fewer -- listing the
+#: catalogs of a DataLake needs no catalog, and demanding one would force a
+#: caller to invent a name just to ask what names exist.
+ALL_COORDINATES = ("datalake_ocid", "workspace", "cluster_id", "catalog")
+
+
 def resolve_target(*, datalake_ocid: str | None = None, workspace: str | None = None,
                    cluster_id: str | None = None,
-                   catalog: str | None = None) -> Target:
+                   catalog: str | None = None,
+                   require: tuple[str, ...] = ALL_COORDINATES) -> Target:
+    """Resolve the coordinates. `require` narrows WHICH must be present.
+
+    Narrowing is opt-in and per-call: the default is still all four, so a
+    write cannot lose a coordinate by accident. An unrequired coordinate is
+    carried through as the empty string rather than invented.
+    """
+    unknown = [k for k in require if k not in ALL_COORDINATES]
+    if unknown:
+        raise ValueError(f"not a coordinate: {', '.join(sorted(unknown))}")
     supplied = {"datalake_ocid": datalake_ocid, "workspace": workspace,
                 "cluster_id": cluster_id, "catalog": catalog}
-    missing = [k for k, v in supplied.items() if not (v and str(v).strip())]
+    missing = [k for k, v in supplied.items()
+               if k in require and not (v and str(v).strip())]
     if missing:
         raise MissingTarget(
             "AIDP target coordinates not supplied: " + ", ".join(sorted(missing)) +
             ". These are never read from the environment or a config file -- ask the "
             "user for them and pass them explicitly.")
-    return Target(**{k: str(v).strip() for k, v in supplied.items()})
+    return Target(**{k: str(v).strip() if v else ""
+                     for k, v in supplied.items()})
 
 
 def region_from_ocid(ocid: str) -> str:

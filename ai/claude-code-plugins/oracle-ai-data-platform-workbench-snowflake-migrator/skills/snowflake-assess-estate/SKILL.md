@@ -1,18 +1,32 @@
 ---
 name: snowflake-assess-estate
-description: Read-only investigation of a Snowflake environment, including the census of objects that are not tables or views, table-maintenance state, and security posture. Lists every table and view with row counts, compressed byte sizes, full column types including numeric precision and scale, and the identifier case form of each object, then halts if two objects differ only by case. Use when the user asks what is in a Snowflake account, wants an inventory or estate assessment, asks how big the tables are, or before planning any migration.
+description: Read-only PREVIEW of a Snowflake environment from the operator's machine - inventory of tables and views with row counts, byte sizes and column types, plus the census of objects that are not tables or views, table-maintenance state and security posture. Use ONLY when the user wants to look at an account without migrating it - answering what is in there, how big the tables are, what the security posture looks like. This is NOT the discovery step of a migration: a migration discovers inside AIDP as a workflow (runbook S6), because a laptop-side read leaves no log and no evidence on the platform. If the user asked to migrate, route to snowflake-migrator-overview and follow S1 through S12.
 ---
 
-# Stage 1 — assess the estate
+# Preview the estate — from the operator's machine
+
+> **This is not the migration's discovery step.** A migration discovers the
+> estate **inside AIDP, as a workflow** (`snowmig.py run --job
+> snowmig_00_discover`, runbook S6), reading through the AIDP connector: two
+> `INFORMATION_SCHEMA` queries for the whole database, a manifest backed up
+> in the workspace, and a job run somebody can audit afterwards.
+>
+> What follows reads Snowflake from the laptop. It is the right tool for
+> *"what is in this account?"* and the wrong one for *"migrate this
+> account"* — it leaves no workflow, no log and no evidence inside AIDP, and
+> it does not scale the way the in-AIDP path does.
+>
+> If the user asked to migrate, stop here and follow
+> `snowflake-migrator-overview` from S1.
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py assess \
-  --account <org>-<account> --user <user> --auth <method> [--key-path ...] \
-  [--warehouse <wh>] [--database DB]... \
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig assess \
+  [--database DB]... \
   [--row-counts metadata|exact|none] \
-  [--semi-structured block|string] [--geospatial block|string] \
-  --out-dir ./snowmig_out
+  [--semi-structured block|string] [--geospatial block|string] 
 ```
+
+Every Snowflake coordinate comes from the migration config (`snowmig-config.yaml`, discovered automatically and printed as `config: <path>`). Pass `--account/--user/--auth/...` only to override a field for one run.
 
 Omit `--database` to scan every non-system database. Repeat it to scope.
 
@@ -75,10 +89,10 @@ decision.
 # what is NOT a table or a view. Runs inside `assess` by default -> CENSUS.md
 # (pass --no-census to skip, and the coverage claim then says so)
 
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py maintenance --out-dir ./snowmig_out \
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig maintenance \
   --account <...> --user <...> --auth <...> [--key-path ...] [--history-days 30]
 
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py security --out-dir ./snowmig_out \
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig security \
   --account <...> --user <...> --auth <...> [--key-path ...]
 ```
 

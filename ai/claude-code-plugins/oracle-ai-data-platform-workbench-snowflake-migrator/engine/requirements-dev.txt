@@ -6,7 +6,3 @@ pytest>=8.0.0
 # and never parses it. Added after a real Spark parser caught generated DDL
 # that every hand-written assertion had accepted.
 sqlglot>=25.0.0
-
-# Dev-only. Reads the optional, gitignored local-test-account.yaml so a real
-# test database never has to be hardcoded as a default in source.
-pyyaml>=6.0

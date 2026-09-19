@@ -28,12 +28,32 @@ import re
 
 __all__ = ["UnmappableFieldType", "InvalidCatalogSpec", "field_from_spark_type",
            "build_schema_body", "build_table_body", "build_view_body",
-           "build_catalog_body", "MANAGED_FORMAT", "CATALOG_TYPES"]
+           "build_catalog_body", "MANAGED_FORMAT", "CATALOG_TYPES",
+           "normalize_catalog_type"]
 
-# What AIDP calls this plugin's two catalog shapes. STANDARD holds managed
-# Delta tables the migrator writes to directly; EXTERNAL is a registered,
-# read-only pointer at a live source and holds no managed data of its own.
-CATALOG_TYPES = ("EXTERNAL", "STANDARD")
+# What AIDP calls its two catalog shapes, LIVE-VERIFIED 2026-09-18 by reading
+# the catalogType of every catalog on a real DataLake: INTERNAL and EXTERNAL,
+# and nothing else. INTERNAL holds managed Delta tables the migrator writes to
+# directly; EXTERNAL is a registered, read-only pointer at a live source and
+# holds no managed data of its own.
+CATALOG_TYPES = ("EXTERNAL", "INTERNAL")
+
+# The runbook, the skills and the CLI all say "STANDARD" for the managed
+# shape, but the API has never accepted it -- POSTing catalogType=STANDARD is
+# a flat `400 InvalidParameter: Invalid CatalogType: STANDARD`. The word is
+# kept as an ACCEPTED ALIAS so the documented vocabulary keeps working, and
+# it is translated here, once, so no caller can put it on the wire.
+_CATALOG_TYPE_ALIASES = {"STANDARD": "INTERNAL"}
+
+
+def normalize_catalog_type(catalog_type: str | None) -> str:
+    """The wire value for a catalog type, resolving the STANDARD alias.
+
+    Unknown values pass through untouched so the caller -- not this helper --
+    owns the refusal and its message.
+    """
+    value = str(catalog_type or "").strip().upper()
+    return _CATALOG_TYPE_ALIASES.get(value, value)
 
 # Managed Delta, always. The environment's own tables report CSV in places;
 # this plugin creates Delta and says so explicitly rather than inheriting a
@@ -175,13 +195,16 @@ def build_catalog_body(display_name: str, *, catalog_type: str = "EXTERNAL",
                        properties: dict | None = None) -> dict:
     """A `CreateCatalogDetails` body. EXTERNAL/SNOWFLAKE is the default shape.
 
-    ⚠️ UNVERIFIED SHAPE. `aidp-table-management` gives the outer envelope
-    (`displayName`, `description`, `catalogType`, `sourceType`, `properties`,
-    `connectionDetails`) but explicitly says not to hand-fabricate
-    `connectionDetails` -- confirm it with `aidp catalog test-connection`
-    against a live DataLake before relying on this in production. This
-    function never invents connection fields itself: it passes through
-    exactly what `build_snowflake_connection_details` (or the caller) built.
+    LIVE-VERIFIED NESTING (2026-09-16): the connection map rides inside
+    `connectionDetails.connectionProperties` -- a flat `connectionDetails`
+    is rejected with 400 InvalidParameter
+    ("connectionDetails.connectionProperties must not be null"), observed
+    against a real deployment and matching the documented
+    `CreateCatalogDetails` schema. The KEY NAMES inside the map are still the
+    connector-inferred ones; `testConnection` (see provision_api) is the
+    documented way to prove them. This function never invents connection
+    fields itself: it passes through exactly what
+    `build_snowflake_connection_details` (or the caller) built.
 
     STANDARD catalogs hold managed Delta tables the migrator writes into
     directly and carry no `connectionDetails` or `sourceType` -- they are the
@@ -191,6 +214,7 @@ def build_catalog_body(display_name: str, *, catalog_type: str = "EXTERNAL",
     """
     if not display_name or not str(display_name).strip():
         raise InvalidCatalogSpec("display_name is required")
+    catalog_type = normalize_catalog_type(catalog_type)
     if catalog_type not in CATALOG_TYPES:
         raise InvalidCatalogSpec(
             f"catalog_type must be one of {CATALOG_TYPES}, got {catalog_type!r}")
@@ -209,7 +233,8 @@ def build_catalog_body(display_name: str, *, catalog_type: str = "EXTERNAL",
                 f"YAML/JSON connection config rather than passing fields "
                 f"inline")
         body["sourceType"] = source_type
-        body["connectionDetails"] = connection
+        # The map is NESTED under connectionProperties -- flat is a live 400.
+        body["connectionDetails"] = {"connectionProperties": dict(connection)}
 
     return body
 

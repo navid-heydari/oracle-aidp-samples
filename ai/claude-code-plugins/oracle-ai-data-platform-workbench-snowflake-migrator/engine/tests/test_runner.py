@@ -120,3 +120,109 @@ def test_a_nonzero_exit_raises():
     call = make_call(_target(), backend="oci_raw", run_process=fake)
     with pytest.raises(RuntimeError):
         call("list_schemas", catalog="lake")
+
+
+# --------------------------------------------------------------------------
+# The create_catalog body carries the Snowflake credential.
+#
+# In argv it is visible to every user on the host via `ps`, and the old
+# 200-char print truncation only hid it by luck -- reorder the body and it
+# printed. So the body travels by FILE, and the printed command redacts the
+# connectionDetails VALUES while keeping the field names, which the dry-run
+# artifact already records.
+# --------------------------------------------------------------------------
+
+_SECRET = "s3cr3t-hunter2-Zx9"
+
+
+def _catalog_body():
+    return {"displayName": "snowcat", "catalogType": "EXTERNAL",
+            "connectionDetails": {"accountName": "acct",
+                                  "password": _SECRET}}
+
+
+def test_the_catalog_credential_never_reaches_argv(capsys):
+    seen = {}
+
+    def fake(cmd):
+        seen["cmd"] = list(cmd)
+        return types.SimpleNamespace(
+            returncode=0, stdout=json.dumps({"data": {"key": "k"}}), stderr="")
+
+    call = make_call(_target(), backend="oci_raw", run_process=fake)
+    call("create_catalog", body=_catalog_body())
+    blob = " ".join(seen["cmd"])
+    assert _SECRET not in blob, "the secret must not be an argv element"
+    assert any(a.startswith("file://") for a in seen["cmd"]), \
+        "the body must travel by file"
+    assert _SECRET not in capsys.readouterr().out
+
+
+def test_the_spooled_body_file_is_removed_after_the_call():
+    import os
+    seen = {}
+
+    def fake(cmd):
+        path = next(a[len("file://"):] for a in cmd if a.startswith("file://"))
+        seen["path"] = path
+        assert os.path.exists(path), "the file must exist while the CLI runs"
+        with open(path) as fh:
+            assert _SECRET in fh.read(), "the CLI reads the real body"
+        return types.SimpleNamespace(
+            returncode=0, stdout=json.dumps({"data": {"key": "k"}}), stderr="")
+
+    call = make_call(_target(), backend="oci_raw", run_process=fake)
+    call("create_catalog", body=_catalog_body())
+    assert not os.path.exists(seen["path"]), "the spool must not outlive the call"
+
+
+def test_the_spool_is_removed_even_when_the_call_fails():
+    import os
+    seen = {}
+
+    def fake(cmd):
+        seen["path"] = next(a[len("file://"):] for a in cmd
+                            if a.startswith("file://"))
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="denied")
+
+    call = make_call(_target(), backend="oci_raw", run_process=fake)
+    with pytest.raises(RuntimeError):
+        call("create_catalog", body=_catalog_body())
+    assert not os.path.exists(seen["path"])
+
+
+def test_the_printed_command_keeps_the_field_names(capsys):
+    # The names are what a human checks against the deployment; only the
+    # values are secret.
+    from target.runner import _printable
+    line = _printable(json.dumps(_catalog_body()))
+    assert _SECRET not in line
+    assert "accountName" in line and "password" in line
+    assert "<redacted>" in line
+
+
+def test_an_unparseable_argument_mentioning_the_details_is_fully_redacted():
+    from target.runner import _printable
+    assert "hunter" not in _printable('not-json connectionDetails hunter')
+    assert "redacted" in _printable('not-json connectionDetails hunter')
+
+
+def test_run_refuses_a_param_it_cannot_deliver():
+    """AIDP job parameters reach a notebook as neither argv nor environment,
+    so `--param schema=X` used to start a run that ignored it and executed
+    whatever the PARAMS cell already held. A scope flag that silently does
+    nothing reads as applied, which is worse than one that is absent."""
+    import argparse
+    import snowmig
+
+    args = argparse.Namespace(
+        out_dir=".", datalake_ocid="ocid1.aidataplatform.oc1.iad.aaaa",
+        workspace="ws", cluster_id=None, catalog=None, backend=None,
+        job="snowmig_01_structure", job_key="k", param=["schema=COMMERCE"],
+        poll_seconds=1, max_polls=1)
+    with pytest.raises(snowmig.MissingTarget) as exc:
+        snowmig.cmd_run(args)
+    msg = str(exc.value)
+    assert "schema" in msg
+    assert "PARAMS" in msg
+    assert "provision" in msg

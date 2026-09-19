@@ -7,6 +7,7 @@ having seen this is a migration they did not approve.
 """
 import pytest
 
+from plan import preflight
 from report.render import render_preflight
 
 PLAN = {
@@ -77,3 +78,60 @@ def test_a_missing_target_is_stated_not_faked():
     md = render_preflight(PLAN, source=SOURCE, target=None)
     assert "not supplied" in md.lower()
     assert "nothing will be created" in md.lower()
+
+
+def _sql_for(schema_counts):
+    """A transport that answers the three preflight reads."""
+    def run_sql(sql, *a, **k):
+        low = sql.lower()
+        if "current_user" in low:
+            return [{"U": "U", "R": "R", "W": "W", "D": "DB"}]
+        if "show schemas" in low:
+            return [{"name": s} for s in schema_counts]
+        if "group by table_schema" in low:
+            return [{"S": s, "N": n} for s, n in
+                    sorted(schema_counts.items(), key=lambda kv: -kv[1])]
+        if "information_schema.tables" in low:
+            name = sql.split("'")[1]
+            return [{"N": schema_counts.get(name, 0)}]
+        return []
+    return run_sql
+
+
+BASE = {"account": "A", "warehouse": "W", "database": "DB", "user": "u",
+        "auth": "password", "password": "p"}
+
+
+def _named(result, name):
+    return next(c for c in result["checks"] if c["name"] == name)
+
+
+def test_an_empty_session_schema_fails_before_the_cluster_does():
+    """PUBLIC exists but holds nothing, so the connector rejects it with
+    DATA_ACCESS_LAYER_0031 six minutes into a job run. Preflight is where that
+    belongs."""
+    res = preflight.run_preflight(dict(BASE, schema="PUBLIC"),
+                                  run_sql=_sql_for({"PUBLIC": 0, "SALES": 10}))
+    check = _named(res, "connector session schema")
+    assert check["ok"] is False
+    assert "DATA_ACCESS_LAYER_0031" in check["detail"]
+
+
+def test_a_populated_session_schema_passes_and_says_it_is_not_a_filter():
+    res = preflight.run_preflight(dict(BASE, schema="SALES"),
+                                  run_sql=_sql_for({"PUBLIC": 0, "SALES": 10}))
+    check = _named(res, "connector session schema")
+    assert check["ok"] is True
+    assert "not the discovery" in check["detail"]
+
+
+def test_the_suggested_schemas_are_read_from_the_account_not_shipped():
+    """A generic migrator cannot know which schema is populated in someone
+    else's estate, so the suggestion is DERIVED from the account in front of
+    it. Nothing schema-shaped is hardcoded in the plugin."""
+    res = preflight.run_preflight(dict(BASE, schema="PUBLIC"),
+                                  run_sql=_sql_for({"PUBLIC": 0, "SALES": 10,
+                                                    "OPS": 7}))
+    detail = _named(res, "connector session schema")["detail"]
+    assert "SALES (10)" in detail and "OPS (7)" in detail
+    assert "PUBLIC (0)" not in detail, "an empty schema is not a suggestion"

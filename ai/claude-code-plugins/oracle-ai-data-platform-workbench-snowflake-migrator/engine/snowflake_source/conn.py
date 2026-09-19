@@ -147,9 +147,53 @@ def build_connect_kwargs(auth: str, *, account: str, user: str | None = None,
     return kw
 
 
+# A driver error code -> the config field that is actually wrong. The first
+# thing anyone gets wrong is the account identifier, and the driver's own
+# message for that is a 404 on a URL, which reads like a tool failure.
+_CONNECT_HINTS = {
+    "250001": "the account/host could not be reached at all",
+    "290404": "the account/host could not be reached at all",
+    "390100": "the user or the password/key was rejected",
+    "390190": "this account has no SAML IdP, so `auth: externalbrowser` "
+              "cannot work here",
+    "390201": "the role or warehouse named does not exist, or the user has "
+              "no grant on it",
+    "002003": "the database, schema or warehouse named does not exist for "
+              "this role",
+}
+
+_CONNECT_ADVICE = (
+    "Check `account`/`host`, `user`, `role`, `warehouse` and `database` in the "
+    "migration config, then re-run `preflight --test-source`. Do not paste the "
+    "credential here — fix it in the file.")
+
+
 def connect(**kwargs):
+    """Open the source connection, or fail with something a human can act on.
+
+    The driver reports a mistyped account as `404 Not Found: post
+    <account>.snowflakecomputing.com/session/v1/login-request` and lets the
+    traceback escape. That is the single most common first-run mistake, and a
+    traceback sends people looking for a bug in this tool instead of at the
+    one field they need to fix -- so every driver-level failure is re-raised
+    as an AuthError naming the likely field.
+
+    The secret is never in the message: only the error code, the driver's own
+    text (which carries the host, not the credential) and what to check.
+    """
     import snowflake.connector
-    return snowflake.connector.connect(**kwargs)
+    from snowflake.connector.errors import Error as SnowflakeError
+    try:
+        return snowflake.connector.connect(**kwargs)
+    except SnowflakeError as exc:
+        code = str(getattr(exc, "errno", "") or "")
+        hint = _CONNECT_HINTS.get(code)
+        account = kwargs.get("account") or "<unset>"
+        head = (f"could not connect to Snowflake account {account}"
+                + (f": {hint}" if hint else ""))
+        raise AuthError(
+            f"{head}.\n  driver said ({code or 'no code'}): {exc}\n  "
+            f"{_CONNECT_ADVICE}") from exc
 
 
 def make_run_sql(conn) -> Callable[..., list[dict]]:

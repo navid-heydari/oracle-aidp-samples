@@ -37,18 +37,19 @@ Three consequences, all deliberate:
 | Target | `target/` | The only layer that can write to AIDP. All I/O injected as `call` / `run_sql` |
 
 The injected-callable convention is what makes the whole target layer
-unit-testable with no environment — 910 offline tests, and the five behaviours
-a live AIDP taught us are all regression-tested without one.
+unit-testable with no environment — 1032 offline tests, and every behaviour a
+live AIDP taught us is regression-tested without one.
 
 ---
 
 ## 2. Stage inventory
 
-Thirteen stages. `needs` is what must be reachable; `writes` means it can
+Sixteen stages. `needs` is what must be reachable; `writes` means it can
 change the destination.
 
 | # | Stage | Needs | Reads | Produces | Writes to AIDP |
 |---|---|---|---|---|---|
+| 0 | `preflight` | a connection config *(+ either end, to test it)* | the config file | `preflight.json`, `PREFLIGHT_CONFIG.md` | no |
 | 1 | `assess` | Snowflake | — | `inventory.json`, `INVENTORY.md`, `CENSUS.md` | no |
 | 2 | `deps` | Snowflake | `inventory.json` | `dependencies.json` | no |
 | 3 | `maintenance` | Snowflake | `inventory.json` | `maintenance.json`, `MAINTENANCE.md` | no |
@@ -62,13 +63,22 @@ change the destination.
 | 11 | `deploy` | AIDP | `ddl_plan.json`, `plan.json`, `inventory.json` | `PREFLIGHT.md`, `deploy_result.json`, `SOFT_CLONE_SUMMARY.md` | **yes, with `--execute`** |
 | 12 | `notebook` | offline *(AIDP with `--upload`)* | `ddl_plan.json`, `plan.json`, `inventory.json` | `*.ipynb`, `NOTEBOOK.md` | **only with `--upload`** |
 | 13 | `summary` | offline | `plan.json`, `inventory.json`, *(`deploy_result.json`)* | `SUMMARY.md` | no |
+| 14 | `provision` | AIDP | the scripts + whatever plan artifacts exist | `provision_result.json`, `PROVISION.md`, and the AIDP-side folder, drivers and jobs | **yes, with `--execute`** |
 | — | `stages` | offline | everything present | `STAGES.md` | no |
+| — | `demo` | offline | — | every artifact above, emulated, + `DEMO.md` | no |
+
+Past `provision`, the work moves INSIDE AIDP: four jobs run the scripts in
+`data-migration-scripts/` — self-contained `.ipynb`, generated from
+`engine/dataplane/` (discover → structure → copy, schema by schema →
+reconcile), and their reports land in the workspace, not in `--out-dir`.
 
 `stages` is not a pipeline step; it is the read-out of one.
 
-**Three stages can write, not one.** `catalog`, `deploy`, and — narrowly —
-`smoke --write-probe` and `notebook --upload`. The stage board still says one.
-**[GAP 4]**
+**Three stages write — `provision`, `catalog` and `deploy` — plus, narrowly
+and opt-in, `smoke --write-probe` and `notebook --upload`.** The stage board
+says exactly that, lists `provision` and `catalog` in their dependency
+positions, and reads their artifacts (a `create_requested` that never became
+visible is flagged as pending, not success).
 
 ---
 
@@ -128,8 +138,10 @@ change the destination.
 `deploy` is the legacy third branch: control-plane CRUD straight into a
 Standard catalog. It is live-proven (7 objects) but is no longer the
 recommended path for Standard catalogs, because a 202 Accepted can silently
-create nothing and Spark cannot. It must refuse an EXTERNAL target and
-currently does not. **[GAP 2]**
+create nothing and Spark cannot. It resolves the target's `catalogType`
+before its first create and **refuses an EXTERNAL target** — and equally an
+absent catalog or an unreadable listing, because "could not look" is not
+"safe to write".
 
 ### Why the fork exists
 
@@ -159,8 +171,9 @@ asynchronous and return **202 Accepted with an empty body and no work-request
 id**, so there is no waiter and a failure reports nothing. Six tables once
 returned 202 and not one existed. Verification is therefore: poll with a
 bounded backoff, resolve the key from the server, `GET` the object, compare
-the field list. "The planned columns are there" is the claim. **[GAP 1]** —
-`ensure_catalog` skips the poll, so the default path cannot satisfy I2.
+the field list. "The planned columns are there" is the claim. `ensure_catalog`
+polls the same way; a listing that fails mid-poll counts as "not visible yet",
+because it is not evidence either way.
 
 **I3 — "Could not look" never renders as zero.** An unreadable `ACCOUNT_USAGE`
 reports `measured: false` with null counts, because *0 reclustering credits*
@@ -172,11 +185,16 @@ a `LISTAGG … WITHIN GROUP`, a `::` cast over an expression: all raise. A
 guessed value produces an object that silently differs from the plan, and the
 structure probe then reports a mismatch it cannot explain.
 
-**I5 — Nothing is chosen on the user's behalf.** Target coordinates are never
-read from the environment, a config file or a cache. The architecture options
-are presented in full with `A6_CUSTOMER_DEFINED` as an open slot, and a
-customer design is recorded verbatim, never mapped onto one of ours. One
-catalog per run: a multi-database estate needs one approval each.
+**I5 — Nothing is chosen on the user's behalf.** Target coordinates may come
+from the one migration config (`snowmig-config.yaml`), but never *silently*:
+the CLI prints the file it read and the destination it took from it before
+anything acts on them, and a write still needs `--execute`. `target/coords.py`
+performs no I/O at all — it cannot discover a destination, only be handed one —
+so a stale config can misdirect a run only in plain sight. Nothing is read from
+the environment or a cache. The architecture options are presented in full with
+`A6_CUSTOMER_DEFINED` as an open slot, and a customer design is recorded
+verbatim, never mapped onto one of ours. One catalog per run: a multi-database
+estate needs one approval each.
 
 **I6 — Say where the run stands, unprompted.** After every stage the agent
 reports the stage's real result, the board's `next_stage`, and the concrete
@@ -193,9 +211,10 @@ A gate is a point where the run stops and does not proceed on its own.
 | **Target collision** | `plan` | Two source objects fold to one target name (`ORDERS` / `"orders"`). Exits `HALT`. AIDP lower-cases identifiers, so the two would silently merge |
 | **Unmappable type** | `ddl` | `VARIANT`/`OBJECT`/`ARRAY`/`GEOGRAPHY` block their table unless the operator opts into `string`, which defers rather than solves |
 | **`timestamp_ntz`** | `ddl` | The catalog API silently rejects it. Blocked by default; `--timestamp-ntz timestamp` accepts the timezone-semantics change and records the caveat on the field |
-| **Connectivity** | `smoke` | Both ends reachable with the permissions the next stage needs |
+| **Connectivity** | `smoke` | Both ends reachable with the permissions the next stage needs. The write probe is skipped, with a note, against an EXTERNAL catalog — read-only by design is not a FAIL |
 | **`--execute`** | `catalog`, `deploy` | Dry run otherwise. Nothing reaches AIDP without it |
-| **Standard catalog** | `catalog` | `--catalog-type standard` is **refused**, with a pointer to the notebook path |
+| **EXTERNAL target** | `deploy` | The target's `catalogType` is resolved before the first create; EXTERNAL, absent, or unreadable → **refused** |
+| **Managed catalog** | `catalog` | `--catalog-type standard` creates the CONTAINER only (as `INTERNAL`; `STANDARD` is an alias the API rejects) and returns `container_only`. Its **tables** are still refused here, with a pointer to the notebook path |
 | **Explicit request** | skill layer | A Standard catalog requires the user to have asked, in words |
 
 ### Failure semantics
@@ -242,7 +261,7 @@ python3 $E smoke --out-dir $OUT --account ... --datalake-ocid ... \
 
 # --- Register (the only stage that writes, on this path) ---
 python3 $E catalog --out-dir $OUT --catalog MYCAT \
-                   --connection-config ./snowflake-catalog-connection.yaml \
+                   --config ./snowmig-config.yaml \
                    --datalake-ocid ... --workspace ... --cluster-id ...
 #   dry run first — prints the fields, never the secrets
 python3 $E catalog ... --execute
@@ -280,13 +299,14 @@ not pass.
 Recorded here so the design is not read as a description of what ships. Full
 detail and ranking in `GAPS.md`.
 
+The 2026-09-16 sweep closed the wiring gaps (deploy's EXTERNAL guard, the
+catalog-type-aware smoke probe, the stage board's `catalog` row and its
+writer claim, the argv credential), and the live campaign that followed
+settled the EXTERNAL registration contract and wired `test-connection` as a
+command. What remains divergent:
+
 | Design element | Divergence |
 |---|---|
-| I2 — read back and compare | `ensure_catalog` reads back once, immediately, with no backoff. Every successful registration reports pending **[GAP 1]** |
-| EXTERNAL / STANDARD fork | `deploy` has no `catalogType` guard and will attempt managed Delta in an EXTERNAL catalog **[GAP 2]** |
-| `smoke` gate | The write probe creates a schema, which a read-only EXTERNAL catalog cannot accept — a FAIL against a working default **[GAP 3]** |
-| Stage inventory | `catalog` is absent from `report/stages.py`, and the board still claims one writer **[GAP 4]** |
-| Secret handling | The credential is in argv; the printed-command redaction is incidental truncation, not redaction **[GAP 5]** |
-| `data-options` position | It feeds `plan`, but the board lists it last, after `summary` |
-| Standard-catalog path | Its only sanctioned transport, `notebook --upload` / `run_notebook`, has never been executed **[GAP 13]** |
-| EXTERNAL registration | `connectionDetails` field names are inferred from the Spark connector, not a verified REST contract **[GAP 14]** |
+| `notebook --upload` | Still points at the Jupyter contents API and `notebookRuns`. Both are now **known wrong**: files go through `workspace-object`, and execution is a Job with a NOTEBOOK_TASK. The working shapes live in `provision_api.py` / `jobs.py`; this command has not been moved onto them **[GAP 13]** |
+| EXTERNAL catalog browsability | The catalog registers, but its **crawler** cannot reach Snowflake on the validated deployment, so the estate is not browsable there. The data plane does not depend on it (connector mode) **[GAP 13a]** |
+| Cluster libraries | The library-item artifact field is the last inferred shape; nothing in the validated path installs one **[GAP 13b]** |

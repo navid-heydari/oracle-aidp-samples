@@ -8,12 +8,13 @@ description: Build a high-level Snowflake to AIDP migration plan and present it 
 Two commands. The first needs Snowflake; the second is offline.
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py deps \
-  --account <...> --user <...> --auth <...> [--key-path ...] --out-dir ./snowmig_out
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig deps
 
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py plan --out-dir ./snowmig_out \
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig plan \
   [--restrictions restrictions.json] [--bronze-catalog-prefix bronze]
 ```
+
+Every Snowflake coordinate comes from the migration config (`snowmig-config.yaml`, discovered automatically and printed as `config: <path>`). Pass `--account/--user/--auth/...` only to override a field for one run.
 
 `PLANNED_OBJECTS.md` is the report to walk the user through. It is the answer to
 "what are the objects planned to move".
@@ -119,7 +120,7 @@ When they do describe a design — including one not listed here — record it
 verbatim:
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py data-options --out-dir ./snowmig_out \
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig data-options \
   --choose A6_CUSTOMER_DEFINED --chosen-by <name> --rationale "<why>" \
   --custom-name "<their name for it>" --custom-description-file <file>
 ```
@@ -138,7 +139,7 @@ whether a later migration can run unattended.
 Record a choice with:
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py data-options --out-dir ./snowmig_out \
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig data-options \
   --choose A2_FEDERATE_EXTERNAL_CATALOG --chosen-by <name> --rationale "<why>"
 ```
 
@@ -173,7 +174,7 @@ full mapping; `ACTION-ITEMS.md` has the planned work.
 ## Finish with `summary` — it is not optional
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py summary --out-dir ./snowmig_out
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig summary
 ```
 
 `SUMMARY.md` is the per-object roll-up the user asked for: one row per table,

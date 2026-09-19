@@ -17,17 +17,30 @@ pytestmark = pytest.mark.skipif(
 from snowmig import main  # noqa: E402
 
 
-def _local_test_account() -> dict:
-    """Optional `local-test-account.yaml` at the plugin root -- gitignored,
-    never committed. Lets a real test database live outside of source."""
-    path = Path(__file__).resolve().parents[2] / "local-test-account.yaml"
-    if not path.exists():
+PLUGIN_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _migration_config() -> dict:
+    """The Snowflake block of the ONE migration config, if there is one.
+
+    There used to be a second file for this (`local-test-account.yaml`, with
+    its own tracked template). One config file is the whole design, so the
+    live tests read the same file every stage reads -- and skip cleanly when
+    it is absent.
+    """
+    try:
+        from migration_config import (discover_config, load_config,
+                                      snowflake_block)
+    except ImportError:
         return {}
-    import yaml
-    return yaml.safe_load(path.read_text()) or {}
+    try:
+        return snowflake_block(load_config(
+            discover_config(plugin_root=PLUGIN_ROOT)))
+    except Exception:
+        return {}
 
 
-DB = os.environ.get("SNOWMIG_LIVE_DB") or _local_test_account().get(
+DB = os.environ.get("SNOWMIG_LIVE_DB") or _migration_config().get(
     "database", "SNOWMIG_TESTDB")
 
 

@@ -129,16 +129,20 @@ class DestCall:
     """Catalog-API transport double: call(operation, **kwargs) -> dict."""
 
     def __init__(self, *, schemas=("bronze", "default"), fail=(),
-                 created_visible=True):
+                 created_visible=True, catalog_type="STANDARD"):
         self.ops: list[tuple] = []
         self.schemas = list(schemas)
         self.fail = set(fail)
         self.created_visible = created_visible
+        self.catalog_type = catalog_type
 
     def __call__(self, operation, **kw):
         self.ops.append((operation, kw))
         if operation in self.fail:
             raise RuntimeError(f"denied: {operation}")
+        if operation == "list_catalogs":
+            return {"items": [{"displayName": "CAT",
+                               "catalogType": self.catalog_type}]}
         if operation == "list_schemas":
             return {"items": [{"key": f'{kw["catalog"]}.{s}'}
                               for s in self.schemas]}
@@ -219,3 +223,48 @@ def test_the_source_is_still_read_only_during_the_destination_probe():
     for call in src.calls:
         assert call.strip().split()[0].upper() in (
             "SELECT", "SHOW", "DESCRIBE", "DESC", "WITH", "EXPLAIN")
+
+
+# ==========================================================================
+# The write probe is catalog-type aware.
+#
+# An EXTERNAL catalog is a registered, read-only pointer at the live Snowflake
+# source. Probing it for write access FAILS against a destination that works
+# -- exactly the failure class this smoke test was rebuilt to prevent -- and
+# since 0.16.0 EXTERNAL is the DEFAULT, so anyone running the pipeline in
+# order hit that false FAIL and stopped.
+# ==========================================================================
+
+def test_the_write_probe_is_skipped_for_an_external_catalog():
+    dest = DestCall(catalog_type="EXTERNAL")
+    r = run_smoke(source_run_sql=sf_ok, target=_target(), dest_call=dest,
+                  write_probe=True)
+    assert not any(op == "create_schema" for op, _ in dest.ops), \
+        "a read-only catalog must never receive the probe"
+    assert r["ok"] is True, "read-only by design is not a failure"
+    assert r["destination"]["write_verified"] is False
+    assert "EXTERNAL" in r["destination"]["write_note"]
+    assert "not a failure" in r["destination"]["write_note"]
+
+
+def test_the_catalog_type_is_reported_either_way():
+    dest = DestCall(catalog_type="EXTERNAL")
+    r = run_smoke(source_run_sql=sf_ok, target=_target(), dest_call=dest)
+    assert r["destination"]["catalog_type"] == "EXTERNAL"
+
+
+def test_a_standard_catalog_still_gets_the_write_probe():
+    dest = DestCall(catalog_type="STANDARD")
+    run_smoke(source_run_sql=sf_ok, target=_target(), dest_call=dest,
+              write_probe=True)
+    assert any(op == "create_schema" for op, _ in dest.ops)
+
+
+def test_an_unresolvable_catalog_type_reads_unknown_and_still_probes():
+    # "Could not look" is reported as unknown, never silently assumed -- and
+    # the probe proceeds, which is the pre-guard behaviour.
+    dest = DestCall(fail={"list_catalogs"})
+    r = run_smoke(source_run_sql=sf_ok, target=_target(), dest_call=dest,
+                  write_probe=True)
+    assert r["destination"]["catalog_type"] == "unknown"
+    assert any(op == "create_schema" for op, _ in dest.ops)

@@ -8,7 +8,8 @@ Thin wrapper over [`snowflake-medallion-clone`](../skills/snowflake-medallion-cl
 
 1. Require an approved `plan.json`.
 2. Ask for the DataLake OCID, workspace, cluster id, catalog name and the path
-   to the YAML/JSON connection config **in this turn**.
+   to the migration config **in this turn** — or confirm the one the CLI
+   discovered and printed.
 3. Confirm, then register the **EXTERNAL/SNOWFLAKE** catalog with
    `snowmig.py catalog --execute`. It copies nothing and creates no tables.
 4. **Only if the user explicitly asked for a Standard catalog:** generate DDL,

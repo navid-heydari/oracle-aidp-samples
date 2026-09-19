@@ -44,24 +44,71 @@ def test_a_missing_config_file_names_the_path(tmp_path):
 def test_keypair_credential_is_read_from_the_file_not_the_config(tmp_path):
     config = _config(tmp_path)
     details = build_snowflake_connection_details(config)
-    assert details["authenticationType"] == "KEY_PAIR"
-    assert details["privateKey"].startswith("-----BEGIN PRIVATE KEY-----")
+    # Enum live-enumerated by the API: "Basic" | "KeyPair".
+    assert details["SNOWFLAKE_AUTHENTICATION_METHOD"] == "KeyPair"
+    assert details["SNOWFLAKE_PRIVATE_KEY_CONTENT"].startswith(
+        "-----BEGIN PRIVATE KEY-----")
     # The path itself is not what gets sent.
     assert config["key_path"] not in json.dumps(details)
 
 
-def test_account_warehouse_database_and_user_are_carried_over(tmp_path):
+def test_the_live_verified_key_names_are_used(tmp_path):
+    # The API enumerated the allowed connectionProperties itself (2026-09-16);
+    # these names are that list, not a guess.
     details = build_snowflake_connection_details(_config(tmp_path))
-    assert details["accountName"] == "ORG-ACC"
-    assert details["warehouseName"] == "WH"
-    assert details["databaseName"] == "SALES_DB"
-    assert details["userName"] == "SVC"
+    assert details["SNOWFLAKE_HOST"] == "org-acc.snowflakecomputing.com"
+    assert details["SNOWFLAKE_PORT"] == "443"
+    assert details["SNOWFLAKE_WAREHOUSE"] == "WH"
+    assert details["SNOWFLAKE_DATABASE_NAME"] == "SALES_DB"
+    assert details["SNOWFLAKE_USERNAME"] == "SVC"
 
 
-def test_optional_role_and_schema_are_omitted_when_absent(tmp_path):
+def test_an_explicit_host_overrides_the_account_derivation(tmp_path):
+    details = build_snowflake_connection_details(
+        _config(tmp_path, host="sf.private.example.com"))
+    assert details["SNOWFLAKE_HOST"] == "sf.private.example.com"
+
+
+def test_optional_role_is_omitted_when_absent(tmp_path):
     details = build_snowflake_connection_details(_config(tmp_path))
-    assert "role" not in details
-    assert "schemaName" not in details
+    assert "SNOWFLAKE_ROLE" not in details
+
+
+def test_a_schema_key_is_accepted_and_left_out_of_the_body(tmp_path):
+    """It used to be REFUSED, which made one config file for both ends
+    impossible: the source side needs a real `schema` to scope the
+    connector's pushdown session, and the catalog contract has no schema
+    property at all (an EXTERNAL catalog registers the whole database). So it
+    is ignored here rather than fatal -- and nothing is smuggled into the
+    body, which the API validates key by key."""
+    details = build_snowflake_connection_details(_config(tmp_path, schema="S"))
+    assert not any("SCHEMA" in k.upper() for k in details), details
+    assert all(not k.startswith("_") for k in details), \
+        "the body is the API request; an unknown key earns a 400"
+    assert details["SNOWFLAKE_DATABASE_NAME"]
+
+
+def test_the_credential_may_be_inline_in_the_one_config_file(tmp_path):
+    """One file, everything in it -- the documented default."""
+    config = {"account": "ORG-ACC", "user": "SVC", "warehouse": "WH",
+              "database": "DB", "auth": "keypair",
+              "private_key": "-----BEGIN PRIVATE KEY-----\nINLINE\n"}
+    details = build_snowflake_connection_details(config)
+    assert details["SNOWFLAKE_AUTHENTICATION_METHOD"] == "KeyPair"
+    assert "INLINE" in details["SNOWFLAKE_PRIVATE_KEY_CONTENT"]
+
+    pw = build_snowflake_connection_details(
+        {**config, "auth": "password", "private_key": None,
+         "password": "inline-pw"})
+    assert pw["SNOWFLAKE_AUTHENTICATION_METHOD"] == "Basic"
+    assert pw["SNOWFLAKE_PASSWORD"] == "inline-pw"
+
+
+def test_keypair_with_neither_inline_nor_path_is_refused(tmp_path):
+    with pytest.raises(ConnectionConfigError, match="private_key"):
+        build_snowflake_connection_details(
+            {"account": "A", "user": "U", "warehouse": "W", "database": "D",
+             "auth": "keypair"})
 
 
 def test_password_auth_reads_the_password_file(tmp_path):
@@ -69,17 +116,15 @@ def test_password_auth_reads_the_password_file(tmp_path):
     secret.write_text("hunter2\n")
     details = build_snowflake_connection_details(
         _config(tmp_path, auth="password", password_path=str(secret)))
-    assert details["authenticationType"] == "PASSWORD"
-    assert details["password"] == "hunter2"
+    assert details["SNOWFLAKE_AUTHENTICATION_METHOD"] == "Basic"
+    assert details["SNOWFLAKE_PASSWORD"] == "hunter2"
 
 
-def test_pat_auth_reads_the_token_file(tmp_path):
-    secret = tmp_path / "pat"
-    secret.write_text("tok\n")
-    details = build_snowflake_connection_details(
-        _config(tmp_path, auth="pat", pat_path=str(secret)))
-    assert details["authenticationType"] == "OAUTH_PAT"
-    assert details["token"] == "tok"
+def test_pat_auth_is_refused_because_the_contract_has_no_token(tmp_path):
+    # The live-enumerated property list carries no PAT/token field.
+    with pytest.raises(ConnectionConfigError, match="pat is not supported"):
+        build_snowflake_connection_details(
+            _config(tmp_path, auth="pat", pat_path="x"))
 
 
 @pytest.mark.parametrize("field",

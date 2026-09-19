@@ -6,9 +6,11 @@ description: Map Snowflake warehouses onto AIDP Spark compute clusters and produ
 # Compute proposal — warehouses to clusters
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py compute --out-dir ./snowmig_out \
-  --account <...> --user <...> --auth <...> [--key-path ...] [--credit-price 3.0]
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig compute \
+  [--credit-price 3.0]
 ```
+
+Every Snowflake coordinate comes from the migration config (`snowmig-config.yaml`, discovered automatically and printed as `config: <path>`). Pass `--account/--user/--auth/...` only to override a field for one run.
 
 Produces `warehouses.json`, `compute.json` and `COMPUTE_PROPOSAL.md`.
 

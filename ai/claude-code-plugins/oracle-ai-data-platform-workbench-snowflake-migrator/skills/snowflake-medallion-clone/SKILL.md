@@ -3,18 +3,38 @@ name: snowflake-medallion-clone
 description: Create the medallion architecture on Oracle AI Data Platform - registering an EXTERNAL catalog of source type SNOWFLAKE by default, and generating Spark SQL for schemas, tables and views from an approved Snowflake plan only when the user has explicitly asked for a Standard catalog. Structure only; copies no data. Use when the user asks to create the medallion structure, soft clone, shallow clone, create the target catalog, or deploy the target schema.
 ---
 
-# Stage 3 — target catalog and medallion structure
+# Catalogs — runbook S3 and S4
 
-**The default target is an EXTERNAL catalog of source type SNOWFLAKE.** It is a
-registered, read-only pointer at the live Snowflake source: it copies no bytes,
-creates no tables and has nothing to keep in sync. That is Phase A, and for most
-runs it is the whole of stage 3.
+A migration creates **two** catalogs, and they are different steps.
 
-A **Standard catalog is managed storage** — real tables this migrator has to
-create and someone has to keep current. Create one **only when the user has
-explicitly asked for a Standard catalog**, and then via Phase C, not the
-control-plane API. Never create an Internal or Standard catalog on your own
-initiative, and never offer one as the obvious default.
+**S3 — the EXTERNAL catalog** registers the live Snowflake source: a read-only
+pointer that copies no bytes, creates no tables and has nothing to keep in
+sync. **One Snowflake database becomes one AIDP catalog, always.** An EXTERNAL
+catalog registers the *whole database* — a plan-level restriction such as
+`include_objects` does **not** narrow it, so never tell a user their subset
+applies here. If the account holds several databases, the user picks one
+before anything is created; another database is another migration.
+
+**S4 — the INTERNAL target catalog** is the managed target the migrated
+schemas and tables land in. Creating it is part of the sequence, not an
+exception to argue for. It is a **container**: one control-plane object. Its
+schemas and tables are a separate matter and are created on compute at S10,
+because a control-plane table create can return `202 Accepted` and silently
+create nothing.
+
+**`INTERNAL` is the type on the wire.** "Standard" is the runbook's and the
+CLI's word, kept as an accepted alias and translated once by
+`normalize_catalog_type()`. AIDP rejects `catalogType=STANDARD` outright with
+`400 InvalidParameter: Invalid CatalogType: STANDARD`; its two real types are
+`INTERNAL` and `EXTERNAL`.
+
+**Both catalogs come after the workspace and the cluster.** Any AIDP write
+resolves four coordinates — DataLake, workspace, cluster, catalog — so neither
+catalog can be registered before S1 and S2 have made the first three.
+
+Do not confuse the two refusals. The engine no longer refuses to create the
+managed container; it refuses to create its **tables** through the catalog
+CRUD API, and that refusal still stands.
 
 ## Phase A — register the EXTERNAL catalog (the default path)
 
@@ -28,12 +48,12 @@ initiative, and never offer one as the obvious default.
 
 The Snowflake account, warehouse, database, user and credential come from a
 config **file**, never from inline arguments — see
-`snowflake-catalog-connection.example.yaml`. The credential itself is a *path*
+`snowmig-config.example.yaml`. The credential itself is a *path*
 inside that config, so the config carries no secret.
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py catalog --out-dir ./snowmig_out \
-  --catalog <cat> --connection-config ./snowflake-catalog-connection.yaml \
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig catalog \
+  --catalog <cat> --config ./snowmig-config.yaml \
   --execute --datalake-ocid <ocid> --workspace <ws> --cluster-id <cl>
 ```
 
@@ -47,7 +67,7 @@ Snowflake reads as created and returns nothing.
 ## Phase B — generate the DDL (offline, safe; needed only for Phase C)
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py ddl --out-dir ./snowmig_out
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig ddl
 ```
 
 Show `DDL_PLAN.md`: the SQL, the rule behind each transformation, dropped
@@ -61,10 +81,14 @@ are created on AIDP compute, not through the control-plane API**: a Spark run on
 the cluster prints per-object progress and a real Spark error, where a series of
 catalog-CRUD HTTP calls returns 202 Accepted and then fails silently.
 
-So for a Standard catalog, hand over the script and let it run on compute — use
-the **`snowflake-clone-notebook`** skill, which writes the table-creation script
-to `/Workspace/Shared/` and runs it on the cluster. The user creates the Standard
-catalog itself; `snowmig.py catalog --catalog-type standard` refuses and says so.
+So for a Standard catalog's TABLES, hand over the script and let it run on
+compute. In the runbook that is S10: `snowmig.py run --job
+snowmig_01_structure`, one workflow per schema, logged and re-runnable.
+
+The catalog container itself comes from
+`snowmig.py catalog --catalog-type standard` at S4, which creates it as
+`INTERNAL` and reports `container_only: true` — pass that on, so nobody reads
+a created container as created structure.
 
 `snowmig.py deploy` is the older control-plane path. Prefer Phase C; reach for
 `deploy` only when the user asks for it specifically.
@@ -74,10 +98,12 @@ catalog itself; `snowmig.py catalog --catalog-type standard` refuses and says so
 1. **One catalog per run.** Bronze mirrors the source, so a multi-database estate
    spans catalogs. A run covers only `--catalog` and reports the rest as out of
    scope. Another catalog is another explicit confirmation.
-2. **EXTERNAL by default; Standard on explicit request only.** Say plainly what
-   an EXTERNAL catalog is — a live read-only view of Snowflake, not a copy — so
-   nobody expects migrated tables from it. If the user wants tables on AIDP,
-   that is the explicit Standard-catalog request, and it goes through Phase C.
+2. **Both catalogs, in order: EXTERNAL at S3, INTERNAL at S4 — and both
+   after the workspace and cluster.** Say plainly what an EXTERNAL catalog is
+   — a live read-only view of Snowflake, not a copy — so nobody expects
+   migrated tables from it, and say that its scope is the whole database. The
+   tables the user wants on AIDP live in the INTERNAL target catalog and are
+   created at S10, on compute.
 3. **Never `--execute` on an earlier approval.** Ask in the turn you run it.
 4. **ADB/ADW/ALH EXTERNAL catalogs cannot hold managed Delta.** If a Standard
    clone is aimed at one, explain rather than trying.

@@ -9,7 +9,9 @@ Two rules it holds to, both learned the hard way elsewhere in this plugin:
   * A stage that could not look is FLAGGED, never shown as clean. "0
     exposures" and "we could not read the policy references" are opposite
     findings and must not render the same.
-  * Exactly one stage writes to AIDP, and the board says which.
+  * Three stages write to AIDP -- `provision`, `catalog` and `deploy` -- and
+    the board says which. (`smoke --write-probe` and `notebook --upload` can
+    write too, narrowly and opt-in, and say so in their own reports.)
 """
 from __future__ import annotations
 
@@ -19,6 +21,12 @@ import pathlib
 __all__ = ["STAGES", "build_stage_board"]
 
 STAGES: tuple[dict, ...] = (
+    # Optional only in the sense that a run can skip it; skipping it is how
+    # a wrong host or role costs hours later.
+    {"stage": "preflight", "needs": "a connection config", "writes": False,
+     "optional": True, "artifact": "preflight.json",
+     "purpose": "read the connection config back to the user, field by "
+                "field, and test both ends before anything else runs"},
     {"stage": "assess", "needs": "Snowflake", "writes": False,
      "artifact": "inventory.json",
      "purpose": "inventory tables and views, plus a census of everything that "
@@ -36,6 +44,12 @@ STAGES: tuple[dict, ...] = (
     {"stage": "compute", "needs": "Snowflake", "writes": False,
      "artifact": "compute.json",
      "purpose": "warehouse-to-cluster sizing proposal"},
+    # Optional: it feeds `plan` when run, but `plan` runs without it, so the
+    # board must not stall on it as "next".
+    {"stage": "data-options", "needs": "nothing (offline)", "writes": False,
+     "optional": True,
+     "artifact": "data_options.json",
+     "purpose": "the data-movement architecture options — presented, never chosen"},
     {"stage": "plan", "needs": "nothing (offline)", "writes": False,
      "artifact": "plan.json",
      "purpose": "what can migrate, in what order, to which target name"},
@@ -45,19 +59,28 @@ STAGES: tuple[dict, ...] = (
     {"stage": "smoke", "needs": "Snowflake + AIDP", "writes": False,
      "artifact": "smoke.json",
      "purpose": "connectivity and permissions on both ends"},
+    # Optional: required for the in-AIDP data path, not for a structure-only
+    # clone, so the board must not stall on it as "next".
+    {"stage": "provision", "needs": "AIDP", "writes": True, "optional": True,
+     "artifact": "provision_result.json",
+     "purpose": "workspace, migration-assets cluster, the backup-snowflake-"
+                "migration/ folder with scripts + plan, and the four "
+                "migration jobs. Dry-run unless --execute"},
+    {"stage": "catalog", "needs": "AIDP", "writes": True,
+     "artifact": "catalog_result.json",
+     "purpose": "register the target catalog — EXTERNAL/SNOWFLAKE by default, "
+                "a read-only pointer that copies nothing. Dry-run unless "
+                "--execute"},
     {"stage": "deploy", "needs": "AIDP", "writes": True,
      "artifact": "deploy_result.json",
-     "purpose": "**the only stage that creates anything.** Dry-run unless "
-                "--execute"},
+     "purpose": "create schemas, tables and views in a STANDARD catalog. "
+                "Refuses an EXTERNAL target. Dry-run unless --execute"},
     {"stage": "notebook", "needs": "nothing (offline)", "writes": False,
      "artifact": "NOTEBOOK.md",
      "purpose": "the clone as an executable AIDP notebook"},
     {"stage": "summary", "needs": "nothing (offline)", "writes": False,
      "artifact": "SUMMARY.md",
      "purpose": "per-object roll-up: rows, risk, migration status"},
-    {"stage": "data-options", "needs": "nothing (offline)", "writes": False,
-     "artifact": "data_options.json",
-     "purpose": "the data-movement architecture options — presented, never chosen"},
 )
 
 _UNKNOWN = "could not be determined"
@@ -135,6 +158,40 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
         ok = data.get("ok")
         return ("PASS" if ok else "**FAIL**", not ok)
 
+    if stage == "preflight":
+        cfg = data.get("config") or {}
+        failed, skipped = data.get("failed", 0), data.get("skipped", 0)
+        text = (f'{len(cfg.get("fields") or [])} field(s) echoed; '
+                f'{failed} check(s) failed, {skipped} skipped')
+        if cfg.get("missing"):
+            return (text + f' — **missing: {", ".join(cfg["missing"])}**', True)
+        return (text, bool(failed))
+
+    if stage == "provision":
+        if data.get("dry_run"):
+            return ("DRY RUN — nothing was provisioned", False)
+        steps = data.get("steps") or []
+        bad = [s for s in steps if s.get("verified") is False]
+        text = (f'{len(steps)} step(s); workspace '
+                f'{(data.get("workspace") or {}).get("name", "?")}')
+        if bad:
+            return (text + f' — **{len(bad)} failed/unverified**', True)
+        return (text, False)
+
+    if stage == "catalog":
+        if data.get("dry_run"):
+            return (f'DRY RUN — {data.get("catalog", "?")} '
+                    f'({data.get("catalog_type", "?")}) would be registered; '
+                    f'nothing was', False)
+        action = data.get("action", _UNKNOWN)
+        text = (f'{data.get("catalog", "?")} '
+                f'({data.get("catalog_type", "?")}): {action}')
+        if action == "create_requested":
+            # The create was accepted but the catalog never became visible.
+            # Pending is pending; it must not read as success.
+            return (text + " — **requested, never became visible**", True)
+        return (text, False)
+
     if stage == "deploy":
         if data.get("dry_run"):
             return (f'DRY RUN — {data.get("statement_count", 0)} object(s) '
@@ -163,7 +220,9 @@ def build_stage_board(out_dir) -> dict:
         if data is None:
             rows.append({**spec, "status": "NOT_RUN", "found": "—",
                          "attention": False})
-            if next_stage is None:
+            # An optional stage that has not run is not "next": the pipeline
+            # proceeds without it.
+            if next_stage is None and not spec.get("optional"):
                 next_stage = spec["stage"]
             continue
         found, attention = _finding(spec["stage"], data)

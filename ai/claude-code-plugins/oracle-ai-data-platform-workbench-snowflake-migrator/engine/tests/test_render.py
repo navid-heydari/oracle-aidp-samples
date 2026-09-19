@@ -58,3 +58,26 @@ def test_ddl_plan_shows_sql_rules_and_omissions():
     assert "VARIANT" in md
 
 
+
+
+def test_the_catalog_dry_run_lists_the_connection_field_names():
+    """The command promises CATALOG.md shows which properties would be sent.
+
+    The NAMES are what a human checks against their deployment and carry no
+    secret; the values must never appear.
+    """
+    from report.render import render_catalog
+    md = render_catalog({
+        "dry_run": True, "catalog": "snowcat", "source_type": "SNOWFLAKE",
+        "connection_fields": ["SNOWFLAKE_HOST", "SNOWFLAKE_USERNAME",
+                              "SNOWFLAKE_PRIVATE_KEY_CONTENT"]})
+    assert "SNOWFLAKE_HOST" in md
+    assert "SNOWFLAKE_PRIVATE_KEY_CONTENT" in md
+    assert "nothing was created" in md
+
+
+def test_the_catalog_dry_run_says_so_when_no_config_was_given():
+    from report.render import render_catalog
+    md = render_catalog({"dry_run": True, "catalog": "c",
+                         "source_type": "SNOWFLAKE"})
+    assert "No connection config" in md

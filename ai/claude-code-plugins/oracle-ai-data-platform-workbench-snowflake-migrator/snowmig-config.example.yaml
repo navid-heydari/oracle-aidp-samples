@@ -1,0 +1,128 @@
+# ============================================================================
+# THE MIGRATION CONFIG — one file, both ends. Copy it, fill it in, keep it out
+# of git. Everything the migrator needs lives here and nowhere else.
+# ============================================================================
+#
+#   cp snowmig-config.example.yaml ./snowmig-config.yaml
+#   $EDITOR ./snowmig-config.yaml
+#   python3 engine/snowmig.py preflight --out-dir ./snowmig_out \
+#       --config ./snowmig-config.yaml --test-source
+#
+# `preflight` reads every field back to you with the secrets masked, then
+# actually connects. Do that before anything else.
+#
+# ----------------------------------------------------------------------------
+# FOR CLAUDE (or any agent driving this plugin)
+# ----------------------------------------------------------------------------
+# This file contains live credentials in plain text.
+#
+#   * ASK THE USER before reading it, and say why you need it.
+#   * NEVER print, echo, quote or summarise a secret value from it — not in
+#     chat, not in a report, not in a commit message. Render it only through
+#     `migration_config.redact()`, which is what `preflight` uses.
+#   * NEVER ask the user to paste a password or a key into the conversation.
+#     They put it HERE, in this file, on their own machine.
+#   * If a secret does end up in the conversation or in a committed file, say
+#     so plainly and tell them to rotate it.
+#
+# ----------------------------------------------------------------------------
+# WHAT IS *NOT* HERE
+# ----------------------------------------------------------------------------
+# AIDP authentication. The plugin drives the `oci` and `aidp` CLIs, which use
+# your normal OCI setup (`~/.oci/config`, created by `oci setup config`). This
+# file only names WHICH AIDP resources to use, never how to authenticate.
+#
+# ----------------------------------------------------------------------------
+
+snowflake:
+  # --- who to connect to ---------------------------------------------------
+  account: MYORG-MYACCOUNT      # the account identifier
+  # The "Account/Server URL" from the Snowflake console. Omit it and it is
+  # derived as <account>.snowflakecomputing.com, which is right for an
+  # org-account identifier. Set it for the account-locator form
+  # (<locator>.<region>.<cloud>.snowflakecomputing.com) or PrivateLink.
+  # host: MYORG-MYACCOUNT.snowflakecomputing.com
+
+  user: MIGRATION_READER        # the user the migration reads as
+  warehouse: MIGRATE_WH         # must be resumable
+  database: SALES_DB            # the database being migrated
+
+  # The role whose GRANTS decide what the migration can see at all. Omitting
+  # it means the user's default role, which is rarely what anyone intended.
+  role: MIGRATION_READER_ROLE
+
+  # Any REAL, NON-EMPTY schema. It only scopes the connector's pushdown
+  # session inside AIDP — that option rejects INFORMATION_SCHEMA, and
+  # discovery reads INFORMATION_SCHEMA through a session scoped to a real
+  # schema instead.
+  #
+  # THIS IS NOT A FILTER. Discovery still reads every schema and every table
+  # in the database; INFORMATION_SCHEMA is database-scoped and the queries
+  # carry no schema predicate.
+  #
+  # It must HOLD TABLES. The connector resolves this option by fetching the
+  # schema's relations, so an empty schema comes back as
+  # `DATA_ACCESS_LAYER_0031 - Schema: <name> not found` — which reads as a
+  # missing schema rather than an empty one, minutes into a job run. PUBLIC
+  # is the usual default and the usual casualty, which is why it is not the
+  # value here. `snowmig preflight --test-source` checks this before
+  # anything runs.
+  schema: A_SCHEMA_THAT_HAS_TABLES
+
+  # --- how to authenticate: password OR key pair ---------------------------
+  # Everything goes IN THIS FILE. There is no second file to create.
+  # A read-only role is enough: the Snowflake transport refuses every
+  # non-read verb whatever the credential permits.
+
+  auth: password
+  password: PUT-THE-PASSWORD-HERE
+
+  # Key pair instead (what AIDP's own Snowflake connector uses) — paste the
+  # PEM inline, indented under `private_key: |`:
+  #
+  #   auth: keypair
+  #   private_key: |
+  #     -----BEGIN PRIVATE KEY-----
+  #     ...
+  #     -----END PRIVATE KEY-----
+  #   key_passphrase: only-if-the-key-is-encrypted
+  #
+  # To create one:
+  #   openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -nocrypt \
+  #     -out ./migrator_rsa_key.p8
+  #   openssl rsa -in ./migrator_rsa_key.p8 -pubout \
+  #     | grep -v '^-----' | tr -d '\n'
+  #   # then in Snowsight:
+  #   #   ALTER USER MIGRATION_READER SET RSA_PUBLIC_KEY='<that string>';
+  #
+  # If you would rather keep the key OUT of this file, every secret also
+  # accepts a path instead — `key_path:`, `password_path:`. Set one or the
+  # other, never both.
+  #
+  # `pat` is not usable for the EXTERNAL catalog registration: the live
+  # catalog contract has no token property. Use password or keypair.
+
+aidp:
+  # WHICH resources to use. Every one of these can also be passed as a flag,
+  # and a flag always wins. When a value comes from this file, the CLI prints
+  # it before acting, so the destination is never silently assumed — and
+  # writing still needs `--execute`.
+
+  datalake_ocid: ocid1.aidataplatform.oc1.<region>.<unique-id>
+
+  # The workspace and cluster the migration jobs run in. `provision` creates
+  # them if absent; leave them out until you know their keys.
+  # workspace: <workspace-key>
+  # cluster_id: <cluster-key>
+
+  # The INTERNAL catalog the migrated tables land in. `snowmig catalog
+  # --catalog <name> --catalog-type standard --execute` creates it as an empty
+  # CONTAINER (runbook S4); its schemas and tables are created later, on AIDP
+  # compute, by the structure workflow at S10.
+  # catalog: my_target_catalog
+
+  # The name to register the Snowflake source under, as an EXTERNAL catalog.
+  # external_catalog: my_snowflake_source
+
+  # Non-default OCI CLI profile, if you use one.
+  # oci_profile: DEFAULT

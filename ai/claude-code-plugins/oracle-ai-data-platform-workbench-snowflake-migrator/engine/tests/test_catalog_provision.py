@@ -1,10 +1,10 @@
-"""Registering the target catalog. EXTERNAL/SNOWFLAKE by default, never STANDARD.
+"""Registering the target catalog. EXTERNAL/SNOWFLAKE by default.
 
 An EXTERNAL catalog is a read-only pointer at the live Snowflake source and
-copies nothing. A STANDARD catalog is managed storage, so it is not created
-from here at all: its tables belong on AIDP compute, where a failure is
-visible in the cluster's own output instead of somewhere inside a series of
-control-plane HTTP calls.
+copies nothing. A STANDARD catalog is managed storage, so it is created only
+when asked for by name, and only ever as the CONTAINER (runbook S3): its
+tables belong on AIDP compute, where a failure is visible in the cluster's own
+output instead of somewhere inside a series of control-plane HTTP calls.
 """
 import pytest
 
@@ -43,7 +43,8 @@ def test_external_body_carries_the_source_type_and_connection():
                               connection=CONNECTION)
     assert body["catalogType"] == "EXTERNAL"
     assert body["sourceType"] == "SNOWFLAKE"
-    assert body["connectionDetails"] == CONNECTION
+    # Live-verified nesting: a flat connectionDetails is a 400.
+    assert body["connectionDetails"] == {"connectionProperties": CONNECTION}
 
 
 def test_external_is_the_default_catalog_type():
@@ -53,9 +54,10 @@ def test_external_is_the_default_catalog_type():
 
 
 def test_standard_body_carries_no_connection_and_no_source_type():
-    # Managed storage has nothing to connect to.
+    # Managed storage has nothing to connect to. STANDARD is the runbook's
+    # word; INTERNAL is what goes on the wire.
     body = build_catalog_body("lake", catalog_type="STANDARD")
-    assert body["catalogType"] == "STANDARD"
+    assert body["catalogType"] == "INTERNAL"
     assert "connectionDetails" not in body
     assert "sourceType" not in body
 
@@ -71,8 +73,16 @@ def test_external_without_a_source_type_is_refused():
 
 
 def test_an_unknown_catalog_type_is_refused_rather_than_guessed():
+    # INTERNAL used to be the example here, back when this module thought the
+    # managed shape was called STANDARD. It is a real type; MANAGED is not.
     with pytest.raises(InvalidCatalogSpec, match="catalog_type"):
-        build_catalog_body("x", catalog_type="INTERNAL")
+        build_catalog_body("x", catalog_type="MANAGED")
+
+
+def test_internal_is_a_real_catalog_type():
+    body = build_catalog_body("lake", catalog_type="INTERNAL")
+    assert body["catalogType"] == "INTERNAL"
+    assert "sourceType" not in body
 
 
 # ------------------------------------------------------------- ensure
@@ -113,20 +123,52 @@ def test_a_catalog_that_never_appears_is_pending_not_created():
     assert res["verified"] is False
 
 
-def test_standard_is_refused_and_points_at_the_compute_path():
+def test_standard_creates_the_container_and_says_so():
     call = Recorder()
-    with pytest.raises(RefusedToExecute) as exc:
-        ensure_catalog(display_name="lake", call=call,
-                       catalog_type="STANDARD")
-    # The refusal has to name where the Standard path actually is.
-    assert "notebook" in str(exc.value)
-    assert call.ops == []
+    res = ensure_catalog(display_name="lake", call=call,
+                         catalog_type="STANDARD", verify_delays=())
+    assert res["catalog_type"] == "INTERNAL"
+    assert res["action"] == "created"
+    # The container existing must never read as the tables existing.
+    assert res["container_only"] is True
+    # The note has to name where the structure path actually is.
+    assert "notebook" in res["note"]
 
 
-def test_internal_is_not_a_catalog_type_this_module_creates():
+def test_standard_never_carries_the_source_credential():
+    # A connection passed alongside a STANDARD request is dropped, not
+    # attached: managed storage has no source to point at.
+    call = Recorder()
+    ensure_catalog(display_name="lake", call=call, catalog_type="STANDARD",
+                   source_type="SNOWFLAKE", connection=CONNECTION,
+                   verify_delays=())
+    body = [kw["body"] for op, kw in call.ops if op == "create_catalog"][0]
+    assert "connectionDetails" not in body
+    assert "sourceType" not in body
+
+
+def test_external_still_reports_no_container_only_flag():
+    call = Recorder()
+    res = ensure_catalog(display_name="sales_db", call=call,
+                         source_type="SNOWFLAKE", connection=CONNECTION,
+                         verify_delays=())
+    assert "container_only" not in res
+
+
+def test_standard_is_an_alias_never_put_on_the_wire():
+    # The API rejects catalogType=STANDARD with 400 InvalidParameter, so the
+    # alias must be translated before the POST, not passed through.
+    call = Recorder()
+    ensure_catalog(display_name="lake", call=call, catalog_type="STANDARD",
+                   verify_delays=())
+    body = [kw["body"] for op, kw in call.ops if op == "create_catalog"][0]
+    assert body["catalogType"] == "INTERNAL"
+
+
+def test_an_unknown_catalog_type_is_refused():
     with pytest.raises(RefusedToExecute):
         ensure_catalog(display_name="lake", call=Recorder(),
-                       catalog_type="INTERNAL")
+                       catalog_type="MANAGED")
 
 
 # ------------------------------------------------- asynchronous create

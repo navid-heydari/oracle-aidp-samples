@@ -1,7 +1,7 @@
 """Deploy structure through the catalog API. I/O injected as `call`."""
 import pytest
 
-from target.catalog_deploy import deploy_catalog
+from target.catalog_deploy import RefusedToExecute, deploy_catalog
 from target.coords import resolve_target
 
 TARGET = resolve_target(datalake_ocid="ocid1.aidataplatform.oc1.iad.a",
@@ -33,6 +33,10 @@ class Recorder:
         self.ops.append((operation, kw))
         cat = kw.get("catalog")
         name = kw.get("table") or kw.get("view") or kw.get("schema")
+        if operation == "list_catalogs":
+            # The deploy resolves the catalog TYPE before its first create.
+            return {"items": [{"displayName": "lake",
+                               "catalogType": "STANDARD"}]}
         if operation in ("create_table", "create_view", "create_schema"):
             if name in self.fail_on:
                 raise RuntimeError(f"boom on {name}")
@@ -67,9 +71,11 @@ def test_execute_creates_the_schema_before_its_tables():
     rec = Recorder()
     deploy_catalog(_plan(2), target=TARGET, execute=True, call=rec, retry_delays=(), verify_delays=())
     kinds = [o[0] for o in rec.ops]
-    # It LOOKS first -- re-POSTing an existing schema drops the table creates
-    # that follow -- then creates it once if absent.
-    assert kinds[0] == "list_schemas"
+    # The catalog TYPE gates everything: an EXTERNAL catalog is refused before
+    # the first create. Then it LOOKS -- re-POSTing an existing schema drops
+    # the table creates that follow -- and creates the schema once if absent.
+    assert kinds[0] == "list_catalogs"
+    assert kinds[1] == "list_schemas"
     assert kinds.count("create_schema") == 1, "one schema, created once"
     assert kinds.index("create_schema") < kinds.index("create_table")
     assert kinds.count("create_table") == 2
@@ -143,7 +149,7 @@ def test_out_of_scope_catalogs_are_not_touched():
     rec = Recorder()
     out = deploy_catalog(plan, target=TARGET, execute=True, call=rec, retry_delays=(), verify_delays=())
     assert out["out_of_scope_count"] == 1
-    assert all(o[1].get("catalog") == "lake" for o in rec.ops)
+    assert all(kw["catalog"] == "lake" for _, kw in rec.ops if "catalog" in kw)
 
 
 def test_no_row_data_is_ever_sent():
@@ -175,6 +181,9 @@ class Folding:
     def __call__(self, operation, **kw):
         self.ops.append((operation, kw))
         cat = kw.get("catalog")
+        if operation == "list_catalogs":
+            return {"items": [{"displayName": "lake",
+                               "catalogType": "STANDARD"}]}
         if operation == "create_schema":
             key = f'{cat}.{kw["schema"]}'.lower()
             self.schemas[key] = key
@@ -647,3 +656,85 @@ def test_the_diagnosis_probe_is_always_named_in_the_result():
     # The SERVER's key, which is folded -- that is the one to go look for.
     assert probe["schema"] == "lake.db"
     assert "deleted" in probe
+
+
+# ==========================================================================
+# The target catalog's TYPE gates the whole deploy.
+#
+# An EXTERNAL catalog is a registered, read-only pointer at the live Snowflake
+# source. It cannot hold the managed Delta this deploy creates -- the
+# control-plane creates would return 202 Accepted and silently produce nothing
+# -- and since 0.16.0 EXTERNAL is the DEFAULT catalog type, so nothing
+# stopping `deploy --execute` from targeting one was a live footgun, not a
+# theoretical one.
+# ==========================================================================
+
+class ExternalCatalog(Folding):
+    def __call__(self, operation, **kw):
+        if operation == "list_catalogs":
+            self.ops.append((operation, kw))
+            return {"items": [{"displayName": "lake",
+                               "catalogType": "EXTERNAL"}]}
+        return super().__call__(operation, **kw)
+
+
+def test_deploy_refuses_an_external_catalog_before_any_create():
+    call = ExternalCatalog()
+    with pytest.raises(RefusedToExecute, match="EXTERNAL"):
+        deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
+                       retry_delays=(), verify_delays=())
+    assert [op for op, _ in call.ops] == ["list_catalogs"], \
+        "the refusal must come before anything is created or even listed"
+
+
+def test_deploy_refuses_when_the_target_catalog_does_not_exist():
+    class NoCatalogs(Folding):
+        def __call__(self, operation, **kw):
+            if operation == "list_catalogs":
+                return {"items": []}
+            return super().__call__(operation, **kw)
+
+    with pytest.raises(RefusedToExecute, match="does not exist"):
+        deploy_catalog(_plan(1), target=TARGET, execute=True,
+                       call=NoCatalogs(), retry_delays=(), verify_delays=())
+
+
+def test_deploy_refuses_when_the_catalog_type_cannot_be_read():
+    # "Could not look" and "safe to write" are different claims: a transient
+    # listing failure must not fall through to the creates.
+    class BrokenList(Folding):
+        def __call__(self, operation, **kw):
+            if operation == "list_catalogs":
+                raise RuntimeError("503 service unavailable")
+            return super().__call__(operation, **kw)
+
+    with pytest.raises(RefusedToExecute, match="could not read"):
+        deploy_catalog(_plan(1), target=TARGET, execute=True,
+                       call=BrokenList(), retry_delays=(), verify_delays=())
+
+
+def test_the_catalog_is_matched_case_insensitively_for_the_guard():
+    class UpperCased(Folding):
+        def __call__(self, operation, **kw):
+            if operation == "list_catalogs":
+                return {"items": [{"displayName": "LAKE",
+                                   "catalogType": "EXTERNAL"}]}
+            return super().__call__(operation, **kw)
+
+    with pytest.raises(RefusedToExecute, match="EXTERNAL"):
+        deploy_catalog(_plan(1), target=TARGET, execute=True,
+                       call=UpperCased(), retry_delays=(), verify_delays=())
+
+
+def test_the_resolved_catalog_type_is_recorded_in_the_result():
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=Folding(),
+                         retry_delays=(), verify_delays=())
+    assert out["catalog_type"] == "STANDARD"
+
+
+def test_a_dry_run_never_asks_for_the_catalog_type():
+    rec = Recorder()
+    out = deploy_catalog(_plan(1), target=TARGET, execute=False, call=rec,
+                         retry_delays=(), verify_delays=())
+    assert rec.ops == []
+    assert out["catalog_type"] is None
