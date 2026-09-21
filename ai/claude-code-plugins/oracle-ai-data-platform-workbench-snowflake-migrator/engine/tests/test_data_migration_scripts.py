@@ -1001,6 +1001,52 @@ def test_a_table_a_report_claims_but_the_catalog_lacks_is_flagged(reconcile,
     assert rec["totals"]["MISSING_DESPITE_REPORT"] == 1
 
 
+# --- reconcile: a report is evidence about the catalog it was written for --
+#
+# 01 and 02 both refuse to reuse a report whose `target` differs from this
+# run's. 03 split the report's target on the first '.' and kept only the
+# schema half, so a copy report verified against a TEST catalog was applied
+# to the PRODUCTION catalog: after re-pointing the structure stage, the
+# deliverable said every empty production table was MIGRATED_VERIFIED.
+
+def test_a_report_written_for_another_catalog_is_not_evidence_here(
+        reconcile, tmp_path, capsys):
+    (tmp_path / "copy_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake_test.SALES",
+         "tables": {"ORDERS": {"status": "verified"}}}), encoding="utf-8")
+    (tmp_path / "structure_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake_prod.SALES",
+         "objects": {"ORDERS": {"status": "created"}}}), encoding="utf-8")
+    spark = _CatalogSpark({"`LAKE_PROD`.`SALES`.`ORDERS`": [("A", "string")]})
+    rec = reconcile.reconcile(spark, manifest=_manifest("ORDERS"),
+                              target_catalog="LAKE_PROD", reports=tmp_path,
+                              counts=False)
+    s = rec["schemas"][0]
+    row = s["tables"][0]
+    assert row["copy"] == "not_attempted"
+    assert row["structure"] == "created", \
+        "the same-catalog report (case-insensitively) is still used"
+    assert row["verdict"] == "STRUCTURE_ONLY"
+    assert "MIGRATED_VERIFIED" not in rec["totals"]
+    assert s["reports_ignored_for_other_catalog"] == {"copy": "lake_test.SALES"}
+    assert "lake_test.SALES" in capsys.readouterr().out
+    assert "lake_test.SALES" in reconcile.render(rec)
+
+
+def test_a_report_without_a_target_key_is_still_trusted(reconcile, tmp_path):
+    # Older reports carry no `target`; 02 trusts those too (prior.get("target")
+    # in (None, target)), and so does reconcile.
+    (tmp_path / "copy_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "tables": {"ORDERS": {"status": "verified"}}}),
+        encoding="utf-8")
+    spark = _CatalogSpark({"`lake`.`SALES`.`ORDERS`": [("A", "string")]})
+    rec = reconcile.reconcile(spark, manifest=_manifest("ORDERS"),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=False)
+    assert rec["schemas"][0]["tables"][0]["verdict"] == "MIGRATED_VERIFIED"
+    assert rec["schemas"][0]["reports_ignored_for_other_catalog"] == {}
+
+
 def _manifest(*tables, views=()):
     return {"schemas": [{"name": "SALES",
                          "tables": [{"name": t, "columns": []} for t in tables],

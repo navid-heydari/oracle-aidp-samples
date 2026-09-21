@@ -13,7 +13,8 @@ its structure status, copy status, live existence, and live row count. The
 catalog is consulted directly so the report cannot be flattered by a stale
 script report: an object a report calls verified but the catalog no longer
 holds is flagged, and an object in the catalog that no report claims is
-flagged the other way.
+flagged the other way. A script report written for a DIFFERENT target
+catalog is ignored (and said so), not applied to this one.
 
 "Could not look" never renders as zero: an unreadable schema is marked
 UNREADABLE, distinct from empty.
@@ -68,6 +69,25 @@ def _load(reports: pathlib.Path, name: str) -> dict | None:
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
 
+def _for_catalog(report: dict | None,
+                 target_catalog: str) -> tuple[dict | None, str | None]:
+    """`report` if it was written for `target_catalog`, else (None, target).
+
+    A report is evidence about the catalog it was written against and no
+    other: 01 and 02 already refuse to resume from a report whose `target`
+    differs, and the reports directory is shared, so after re-pointing at
+    another catalog a copy report verified against the old one is still on
+    disk. A report with no `target` (older shape) stays trusted, as 02 does.
+    Catalog names compare case-insensitively, as Spark resolves them.
+    """
+    if not report:
+        return None, None
+    target = str(report.get("target") or "")
+    if target and target.split(".", 1)[0].lower() != target_catalog.lower():
+        return None, target
+    return report, None
+
+
 def _live_tables(spark, catalog: str, schema: str) -> set[str] | None:
     """Lower-cased table names the catalog holds, or None when unreadable."""
     try:
@@ -91,8 +111,17 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
 
     for schema_rec in manifest["schemas"]:
         schema = schema_rec["name"]
-        structure = _load(reports, f"structure_report_{schema.lower()}.json")
-        copy = _load(reports, f"copy_report_{schema.lower()}.json")
+        structure, s_other = _for_catalog(
+            _load(reports, f"structure_report_{schema.lower()}.json"),
+            target_catalog)
+        copy, c_other = _for_catalog(
+            _load(reports, f"copy_report_{schema.lower()}.json"),
+            target_catalog)
+        ignored = {kind: other for kind, other in
+                   (("structure", s_other), ("copy", c_other)) if other}
+        for kind, other in ignored.items():
+            log(f"{schema}: the {kind} report targets {other}, not "
+                f"{target_catalog} — ignored for this catalog")
         target_schema = ((copy or structure or {}).get("target") or
                          f"{target_catalog}.{schema}").split(".", 1)[1]
         live = _live_tables(spark, target_catalog, target_schema)
@@ -177,7 +206,8 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
             "target_readable": live is not None,
             "tables": rows,
             "views": view_rows,
-            "in_target_but_not_in_manifest": unclaimed})
+            "in_target_but_not_in_manifest": unclaimed,
+            "reports_ignored_for_other_catalog": ignored})
 
     out["totals"] = tally
     return out
@@ -208,6 +238,10 @@ def render(rec: dict) -> str:
         if not s["target_readable"]:
             lines += ["**Target schema UNREADABLE — nothing below is "
                       "confirmed, and this is not the same as empty.**", ""]
+        for kind, other in (s.get("reports_ignored_for_other_catalog")
+                            or {}).items():
+            lines += [f"The {kind} report on disk targets `{other}`, not this "
+                      f"catalog — ignored here.", ""]
         lines += ["| Table | Structure | Copy | In target | Verdict | Why |",
                   "|---|---|---|---|---|---|"]
         for t in s["tables"]:
