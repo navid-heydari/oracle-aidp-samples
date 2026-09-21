@@ -459,7 +459,8 @@ Use `--out-dir` only when the user wants artifacts kept somewhere they chose
 
 4. **Read-only against Snowflake — enforced, not promised.** The transport
    rejects any statement whose verb is not `SELECT`, `SHOW`, `DESCRIBE`,
-   `DESC`, `WITH` or `EXPLAIN`, before it reaches Snowflake.
+   `DESC`, `WITH` (only when what follows the CTE list is a `SELECT`) or
+   `EXPLAIN`, before it reaches Snowflake.
    **Nothing is ever written to or dropped from the source**, whatever the
    credential permits and whatever any prompt asks for.
 
