@@ -469,3 +469,46 @@ def test_gitignore_covers_every_key_file_the_docs_tell_you_to_create(name):
     if proc.returncode == 128:
         pytest.skip("the plugin is not inside a git work tree")
     assert proc.returncode == 0, f"{name} would be committed by `git add -A`"
+
+
+def test_privacy_doc_describes_the_current_credential_and_data_flows():
+    """PRIVACY.md is what a security reviewer reads before the live run. It
+    described the structure-only era: path-only secrets, no credential in any
+    artifact, coordinates not persisted, table data never read, only `deploy`
+    writes. The code does the opposite on each point -- the one config file
+    holds the credential inline, `provision --source-config` uploads it to
+    the workspace, `catalog --execute` sends it to AIDP in connectionDetails,
+    the copy stage reads every row -- and an approval obtained on the old text
+    would be obtained on false premises."""
+    from plan.smoke import PROBE_SCHEMA
+    from snowmig import ARTIFACTS_DIRNAME
+    text = (ROOT / "PRIVACY.md").read_text(encoding="utf-8")
+    flat = " ".join(text.lower().split())
+    # What leaves the machine, and how.
+    assert "backup-snowflake-migration/plan" in flat, \
+        "name the workspace folder the config is uploaded to"
+    assert "provision --execute" in flat and "catalog --execute" in flat
+    assert "connectiondetails" in flat or "snowflake_password" in flat, \
+        "say the credential travels in the catalog registration body"
+    assert "raw-request" in flat or "aidp catalog" in flat
+    assert "tls" in flat
+    # What the data plane does with rows.
+    assert "select * from" in flat or "every row" in flat
+    # Where things land locally, and what the probe is called.
+    assert ARTIFACTS_DIRNAME.lower() in flat
+    assert (PROBE_SCHEMA + "_").lower() in flat, \
+        "the probe schema carries a per-run suffix"
+    assert "pyyaml" in flat
+    # `run` starts jobs and has no dry-run gate; say so.
+    assert "`run`" in text
+    # The stale claims must be gone, verbatim.
+    for stale in ("never accepted as inline",
+                  "written into any artifact",
+                  "not persisted by the plugin",
+                  "table data is never read",
+                  "no stage selects rows",
+                  "creates a schema named `snowmig_permission_probe`",
+                  "leaves nothing behind outside"):
+        assert stale not in flat, f"stale claim still in PRIVACY.md: {stale!r}"
+    # And it still says what a reviewer must hear plainly.
+    assert "rotate" in flat, "advise rotating the credential after the run"
