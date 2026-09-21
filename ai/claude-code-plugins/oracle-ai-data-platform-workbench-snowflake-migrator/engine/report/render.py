@@ -150,10 +150,6 @@ def render_ddl_plan(ddl: dict) -> str:
     stmts = ddl.get("statements") or []
     out = ["# Target DDL plan", "",
            f"{len(stmts)} statement(s). Nothing has been executed.", ""]
-    # Carried from plan.json when present: how the target catalog comes to
-    # exist. Guarded, so an older ddl_plan.json renders as before.
-    if ddl.get("target_catalog_note"):
-        out += [ddl["target_catalog_note"], ""]
     # LEAD with what the target will refuse. Buried at the bottom this reads
     # as a footnote; it is the reason the whole plan would fail.
     rejected = ddl.get("target_rejected") or []

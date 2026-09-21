@@ -145,17 +145,3 @@ def test_the_catalog_dry_run_says_so_when_no_config_was_given():
     md = render_catalog({"dry_run": True, "catalog": "c",
                          "source_type": "SNOWFLAKE"})
     assert "No connection config" in md
-
-
-def test_ddl_plan_renders_the_target_catalog_note_when_present():
-    note = "The target catalog is a CONTAINER created at S4; structure lands at S10."
-    md = render_ddl_plan({"statements": [], "blocked": [],
-                          "target_catalog_note": note})
-    assert note in md
-    assert "None" not in md
-
-
-def test_ddl_plan_without_the_note_still_renders():
-    md = render_ddl_plan({"statements": [], "blocked": []})
-    assert "0 statement(s)" in md
-    assert "None" not in md
