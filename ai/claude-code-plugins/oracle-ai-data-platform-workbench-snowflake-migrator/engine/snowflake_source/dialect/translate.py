@@ -86,10 +86,11 @@ _QUOTED_IDENT = r'"(?:[^"]|"")*"'
 
 # Only a bare identifier, qualified column, quoted identifier or literal.
 # Anything else (a closing paren, an operator) means the operand's left edge is
-# ambiguous. A preceding backslash is excluded too: that is the inside of a
-# literal, never an operand.
+# ambiguous. A preceding backslash or `$` is excluded too: the first is the
+# inside of a literal, the second a `$$` closer or a `$1` positional
+# reference -- never an operand.
 _CAST_SIMPLE = (
-    r"(?<![\w).\"'\\])([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*|" + _QUOTED_IDENT
+    r"(?<![\w).\"'\\$])([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*|" + _QUOTED_IDENT
     + "|" + _LITERAL + r"|\d+(?:\.\d+)?)"
     r"\s*(?P<op>::)\s*((?:DOUBLE\s+PRECISION|[A-Za-z_][\w$]*)"
     r"(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)")
@@ -113,7 +114,30 @@ def _cast(sql: str) -> tuple[str, str | None, list[str]]:
     problems: list[str] = []
     warnings: list[str] = []
 
+    # The operand is matched against the RAW text -- only `::` has to be code,
+    # since a literal operand is legitimate -- so it could END inside a
+    # `$$...$$` string or a line comment: `$$a$$::string` matched `a$$`, and
+    # `x -- note a` with `::int` on the next line matched the `a` in the
+    # comment, and the rewrite was spliced into the segment. The residue
+    # check cannot see that: the re-lex reads the spliced text as the string.
+    # So the operand has to be wholly code, or exactly one whole string or
+    # identifier segment.
+    segs: list[tuple[int, int, str]] = []
+    pos = 0
+    for kind, text in lexer.segments(sql):
+        segs.append((pos, pos + len(text), kind))
+        pos += len(text)
+
+    def operand_ok(start: int, end: int) -> bool:
+        for a, b, kind in segs:
+            if a <= start and end <= b:
+                return kind == "code" or (
+                    kind in ("string", "ident") and (start, end) == (a, b))
+        return False
+
     def repl(m: re.Match) -> str:
+        if not operand_ok(*m.span(1)):
+            return m.group(0)
         written = m.group(3)
         parsed = _CAST_TYPE.match(written)
         if parsed is None:
@@ -385,9 +409,14 @@ RULES: tuple[TranslationRule, ...] = (
         r"\bAT\s*\(\s*(?:TIMESTAMP|OFFSET|STATEMENT)\b|\bBEFORE\s*\(", None,
         "Delta time travel uses VERSION AS OF / TIMESTAMP AS OF and its retention "
         "is configured differently, so the two are not interchangeable."),
+    # An identifier followed by ONE colon. The field after it may be bare
+    # (`v:customer`) or quoted (`v:"Field Name"`); wanting an identifier
+    # character after the colon let the quoted form through, where T07 then
+    # quoted the field and the colon path stayed in a body stamped exact. The
+    # lookahead keeps `x::int` out.
     TranslationRule(
         "T16_VARIANT_PATH", "VARIANT path", "col:field.sub -> struct access",
-        "declared", r"[A-Za-z_][\w]*\s*:\s*[A-Za-z_]", None,
+        "declared", r"\b[A-Za-z_][\w$]*\s*:(?!:)", None,
         "Requires the VARIANT column to have been given a concrete struct type "
         "first; until then there is no field to address."),
     TranslationRule(

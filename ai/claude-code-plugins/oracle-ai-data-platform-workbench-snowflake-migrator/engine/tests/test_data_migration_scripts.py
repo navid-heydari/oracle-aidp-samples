@@ -609,6 +609,65 @@ def test_the_copy_scope_excludes_a_drifted_table(copy_schema, monkeypatch,
     assert "scope: 2 table(s)" in capsys.readouterr().out
 
 
+def _copy_main(monkeypatch, reports, spark, *, argv=()):
+    """`_copy_run` without the report read: a run that refuses before the
+    first table writes no copy report."""
+    _inject_spark(monkeypatch, spark)
+    module = _load("02_copy_schema")
+    monkeypatch.setattr(module, "SnowflakeSource", _MainSource)
+    return module.main(["--target-catalog", "lake", "--schema", "SALES",
+                        "--reports-dir", str(reports), *argv])
+
+
+_REORDERED = {
+    "`ext`.`SALES`.`T`": [("FIRST_NAME", "string"), ("LAST_NAME", "string")],
+    "`lake`.`SALES`.`T`": [("LAST_NAME", "string"), ("FIRST_NAME", "string")]}
+
+
+def test_an_all_drift_schema_is_refused_not_copied_from_the_manifest(
+        copy_schema, monkeypatch, tmp_path, capsys):
+    """The `created` filter only ran when the structure step created
+    something. A report recording every table `type_drift` -- a re-plan over
+    tables that all pre-exist with the old layout -- fell back to the whole
+    manifest, and the positional INSERT landed rows in the wrong columns with
+    matching counts: `verified`, exit 0. The copy's own pre-flight cannot
+    catch a same-count reorder of STRING columns."""
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["T"]})
+    (reports / "structure_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "objects": {"T": {"status": "type_drift", "reason": "x"}}}),
+        encoding="utf-8")
+    spark = _CatalogSpark(_REORDERED)
+    spark.counts = {"`ext`.`SALES`.`T`": 3}
+    rc = _copy_main(monkeypatch, reports, spark)
+    assert rc == 1, "an empty scope is a refusal, not a job that did nothing"
+    assert not any("INSERT" in s for s in spark.statements), spark.statements
+    recorded = (_report(reports, "copy_report_sales.json")["tables"]
+                if (reports / "copy_report_sales.json").exists() else {})
+    assert recorded.get("T", {}).get("status") != "verified"
+    out = capsys.readouterr().out
+    assert "type_drift" in out and "nothing to copy" in out
+
+
+def test_the_manifest_fallback_still_excludes_a_drifted_table(
+        copy_schema, monkeypatch, tmp_path, capsys):
+    """Nothing created, one table drifted, one not in the plan: the fallback
+    copies what is left and says what it left out."""
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["T", "U"]})
+    (reports / "structure_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "objects": {"T": {"status": "type_drift", "reason": "x"},
+                     "U": {"status": "not_in_plan"}}}), encoding="utf-8")
+    spark = _CatalogSpark(_REORDERED)
+    spark.counts = {"`ext`.`SALES`.`T`": 3}
+    rc, report = _copy_run(monkeypatch, reports, spark)
+    assert not any("INSERT" in s and "`T`" in s for s in spark.statements), \
+        spark.statements
+    assert "T" not in report["tables"]
+    assert report["tables"]["U"]["status"] == "target_missing"
+    assert "1 type_drift table(s) excluded" in capsys.readouterr().out
+
+
 def test_copy_says_the_truth_when_the_structure_report_created_nothing(
         copy_schema, monkeypatch, tmp_path, capsys):
     """The structure report exists and records every table `not_in_plan`;

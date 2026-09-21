@@ -773,6 +773,61 @@ def test_a_failed_cluster_listing_is_recorded_not_raised(scripts):
         "could not look is not absent"
 
 
+# The two calls past the cluster that still escaped provision(): the job
+# listing, and the cluster listing inside the warehouse loop. An expired
+# session token on either lost provision_result.json and PROVISION.md with
+# the workspace and cluster already created.
+
+def test_a_failed_job_listing_after_the_cluster_is_recorded_not_raised(scripts):
+    fake = Fake(fail={"list_jobs"})
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=())                 # returns, no raise
+    steps = [(s["step"], s["action"], s["verified"]) for s in res["steps"]]
+    assert ("workspace", "created", True) in steps
+    assert ("cluster", "created", True) in steps
+    assert [st[:2] for st in steps[-2:]] == [("job", "failed"),
+                                             ("halt", "stopped")]
+    halt = res["steps"][-1]
+    assert "--reuse-existing" in halt["detail"] and "ws-acme" in halt["detail"]
+    assert "create_job" not in [op for op, _ in fake.ops]
+
+
+class ClusterListingFailsLater(Fake):
+    """`list_clusters` answers the migration cluster's look and its poll,
+    then fails: the warehouse loop is the third caller."""
+
+    def __init__(self, fail_from, **kw):
+        super().__init__(**kw)
+        self.fail_from = fail_from
+        self.cluster_lists = 0
+
+    def __call__(self, operation, **kw):
+        if operation == "list_clusters":
+            self.cluster_lists += 1
+            if self.cluster_lists >= self.fail_from:
+                self.ops.append((operation, kw))
+                raise RuntimeError(
+                    "list_clusters failed (exit 1): 401 NotAuthenticated")
+        return super().__call__(operation, **kw)
+
+
+def test_a_failed_warehouse_cluster_listing_is_recorded_and_the_rest_continue(
+        scripts):
+    fake = ClusterListingFailsLater(3)
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    warehouse_clusters=[{"name": "WH_ETL", "size": "M"}],
+                    execute=True, delays=())
+    steps = [(s["step"], s["action"], s["verified"]) for s in res["steps"]]
+    assert ("cluster", "created", True) in steps
+    failed = [s for s in res["steps"]
+              if s["step"] == "warehouse-cluster" and s["action"] == "failed"]
+    assert len(failed) == 1 and failed[0]["verified"] is False
+    assert "WH_ETL" in failed[0]["detail"]
+    assert "list_clusters" in failed[0]["detail"]
+    # Customer compute; the migration's own jobs still get created.
+    assert [op for op, _ in fake.ops].count("create_job") == len(JOB_SPECS)
+
+
 class Settling(Fake):
     """A created workspace reports CREATING until the `active_after`-th
     listing, then ACTIVE -- the way the live API behaves for a few seconds

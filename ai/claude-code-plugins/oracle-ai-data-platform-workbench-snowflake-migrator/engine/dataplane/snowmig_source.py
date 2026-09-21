@@ -84,12 +84,12 @@ def load_source_config(path: str | pathlib.Path) -> dict:
         raise SourceConfigError(f"{p}: expected a mapping at the top level")
     # THE MIGRATION CONFIG IS ONE FILE FOR BOTH ENDS: the Snowflake connection
     # nested under `snowflake:`, the AIDP coordinates under `aidp:`. That is
-    # the file `provision --source-config` uploads, and it uploads it
-    # verbatim -- so the shape that actually reaches the mount is the nested
-    # one, and reading the top level for `account` found nothing but the two
-    # envelope keys. The failure surfaced on the cluster, as every required
-    # field missing at once, which reads like a broken credential rather than
-    # a config one level too deep.
+    # the file `provision --source-config` reads, and it uploads the
+    # `snowflake:` block as JSON (`plan/<stem>.json`) -- so the shape that
+    # reaches the mount is the nested one, and reading the top level for
+    # `account` found nothing but the envelope key. The failure surfaced on
+    # the cluster, as every required field missing at once, which reads
+    # like a broken credential rather than a config one level too deep.
     nested = data.get("snowflake")
     if isinstance(nested, dict):
         return dict(nested)

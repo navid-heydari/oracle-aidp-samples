@@ -626,9 +626,17 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     # one is recorded and the rest continue, and NOTHING here changes the
     # migration cluster the jobs are bound to.
     for target in warehouse_targets:
-        existing = _match(
-            call("list_clusters", workspace=ws_key).get("items") or [],
-            target["name"])
+        try:
+            existing = _match(
+                call("list_clusters", workspace=ws_key).get("items") or [],
+                target["name"])
+        except Exception as exc:
+            # Could not look is not absent: creating on a failed read is how
+            # a duplicate gets made. Recorded, and the next warehouse tried.
+            step("warehouse-cluster", "failed", False,
+                 f'{target["warehouse"]} -> {target["name"]}: '
+                 f'list_clusters: {str(exc)[:200]}')
+            continue
         if existing is not None:
             target["key"] = _key(existing, target["name"])
             step("warehouse-cluster",
@@ -757,7 +765,15 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         # The scripts read the credential from the derived copy ON THE MOUNT,
         # so the path they receive is the /Workspace one, not the local one.
         defaults["source-config"] = f"/Workspace/{credential_object}"
-    existing = call("list_jobs", workspace=ws_key).get("items") or []
+    try:
+        existing = call("list_jobs", workspace=ws_key).get("items") or []
+    except Exception as exc:
+        # The last bare call past the cluster. An expired session token here
+        # escaped provision() and lost the record of the workspace and
+        # cluster created seconds earlier.
+        step("job", "failed", False, f"list_jobs: {str(exc)[:200]}")
+        step("halt", "stopped", False, resume)
+        return out
     stages_by_notebook = {st.notebook_name: st for st in STAGES}
 
     # Which stage notebooks are already on the workspace. Looked up once,

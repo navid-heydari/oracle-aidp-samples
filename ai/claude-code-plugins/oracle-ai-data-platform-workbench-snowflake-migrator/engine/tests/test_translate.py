@@ -202,6 +202,32 @@ def test_variant_path_rule_still_fires_on_real_variant_access():
     assert "T16_VARIANT_PATH" in [u["rule_id"] for u in out.unsupported]
 
 
+def test_variant_path_with_a_quoted_field_is_refused_not_quoted():
+    # `v:"Field Name"` is Snowflake's quoted-field path. The detector wanted
+    # an identifier character after the colon, so this form slipped past it;
+    # T07 then turned the field into a backtick identifier and the view was
+    # stamped an exact rewrite with a colon path still in the body.
+    out = translate_sql('select v:"Field Name" from t')
+    assert "T16_VARIANT_PATH" in [u["rule_id"] for u in out.unsupported], \
+        "T07 quoting the field is not a report of the path"
+
+
+def test_variant_path_on_an_identifier_with_a_dollar_is_detected():
+    out = translate_sql("select v$1:x from t")
+    assert "T16_VARIANT_PATH" in [u["rule_id"] for u in out.unsupported]
+
+
+@pytest.mark.parametrize("sql", [
+    "select x::int from t",
+    "select x :: int from t",
+    'select "c"::int from t',
+    "select count(*)::int from t",
+])
+def test_a_cast_operator_is_not_a_variant_path(sql):
+    out = translate_sql(sql)
+    assert "T16_VARIANT_PATH" not in [u["rule_id"] for u in out.unsupported]
+
+
 def test_cast_shorthand_still_rewrites_a_literal_operand():
     # The operand is a literal on purpose; only `::` has to be code.
     out = translate_sql("select 'x'::varchar as v")
@@ -541,4 +567,50 @@ def test_a_translated_body_never_carries_a_double_quoted_identifier():
         r = t(sql)
         assert r.fully_translated, r.unsupported
         assert not any(kind == "ident" and text.startswith('"')
+                       for kind, text in lexer.segments(r.sql)), r.sql
+
+
+# --------------------------------------------------------------------------
+# T02's operand was matched against the RAW text -- only the `::` had to be
+# code -- so the operand could end inside a `$$...$$` string or a line comment
+# and the rewrite was spliced into it: `select $$a$$::string from t` became
+# `select $$CAST(a$$ AS STRING) from t` with T02 recorded as applied. The
+# residue check could not see it because the re-lex read the spliced text as
+# the string. `$1` positional references were mangled the same way.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("sql", [
+    "select $$a$$::string from t",
+    "select $$a b$$::string from t",
+    "select x -- note a\n::int from t",
+    "select $1::int from t",
+])
+def test_cast_shorthand_never_splices_into_an_opaque_segment(sql):
+    r = t(sql)
+    assert r.sql == sql, r.sql
+    assert r.applied == []
+    assert "T02_CAST_SHORTHAND" in [u["rule_id"] for u in r.unsupported]
+
+
+@pytest.mark.parametrize("sql", [
+    "select a::string from t",
+    "select 'a'::string from t",
+    "select 'it''s'::string from t",
+    'select "Q"::string from t',
+    "select c$x::int, t.c::int, 1.5::float from t",
+    "select x /* a */::int from t",
+    "select 'a::int' as doc, b::int from t",
+    "select $$a$$::string from t",
+    "select $$a b$$::string from t",
+    "select x -- note a\n::int from t",
+    "select $1::int from t",
+])
+def test_an_applied_cast_lands_in_code_only(sql):
+    # The invariant behind the cases above: whenever T02 is applied, CAST(
+    # appears in code and nowhere else. Inside a literal it changes the DATA
+    # the view returns; inside a comment it swallows the rest of the line.
+    from snowflake_source.dialect import lexer
+    r = t(sql)
+    if "T02_CAST_SHORTHAND" in [a["rule_id"] for a in r.applied]:
+        assert not any(kind != "code" and "CAST(" in text
                        for kind, text in lexer.segments(r.sql)), r.sql

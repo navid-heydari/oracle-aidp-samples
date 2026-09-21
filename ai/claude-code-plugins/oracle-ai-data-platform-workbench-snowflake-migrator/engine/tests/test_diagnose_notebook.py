@@ -29,7 +29,8 @@ SECRET = "S3CRET-PASSWORD-VALUE"
 PEM_BODY = "FAKEKEYBYTES"
 PEM = f"-----BEGIN PRIVATE KEY-----\n{PEM_BODY}\n-----END PRIVATE KEY-----"
 # The documented shape: the one migration config, connection under
-# `snowflake:`, AIDP coordinates under `aidp:`, uploaded verbatim.
+# `snowflake:`, AIDP coordinates under `aidp:`. `provision` uploads its
+# `snowflake:` block as JSON; the notebook reads either form.
 NESTED = {"snowflake": {"account": "ACC", "user": "u", "warehouse": "WH",
                         "database": "DB", "schema": "S1", "auth": "keypair",
                         "password": SECRET, "private_key": PEM},
@@ -180,12 +181,13 @@ def test_the_notebook_is_self_contained_and_generated():
     params = "".join(nb["cells"][1]["source"])
     config_line = next(line for line in params.splitlines()
                        if line.startswith("CONFIG_PATH = "))
-    # provision keeps the config's own name under plan/, and the default
-    # points there -- not at a file nothing creates.
-    assert "/Workspace/backup-snowflake-migration/plan/snowmig-config.yaml" \
+    # provision uploads the `snowflake:` block as <stem>.json under plan/,
+    # and the default points there -- not at a file nothing creates.
+    assert "/Workspace/backup-snowflake-migration/plan/snowmig-config.json" \
         in config_line
+    assert "snowmig-config.yaml" not in config_line
     assert "snowmig_source_config.json" not in body, \
-        "nothing creates that file; provision keeps the config's own name"
+        "nothing creates that file; provision writes <stem>.json under plan/"
     for cell in nb["cells"]:
         if cell["cell_type"] == "code":
             compile("".join(cell["source"]), "<cell>", "exec")

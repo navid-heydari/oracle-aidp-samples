@@ -62,6 +62,37 @@ def test_a_cluster_409_still_writes_the_provision_record(tmp_path,
     assert fake.workspaces, "the workspace really was created server-side"
 
 
+class JobsListFails(Fake):
+    """The workspace and cluster are created, then the session token expires
+    on the job listing."""
+
+    def __call__(self, operation, **kw):
+        if operation == "list_jobs":
+            self.ops.append((operation, kw))
+            raise ProvisionTransportError(
+                "list_jobs failed (exit 1): 401 NotAuthenticated")
+        return super().__call__(operation, **kw)
+
+
+def test_a_failed_job_listing_still_writes_the_provision_record(tmp_path,
+                                                                monkeypatch):
+    """Same loss as the 409 above, one step later: the job listing was the
+    last bare call past the cluster, so a 401 there exited 1 with one
+    `error:` line and no artifact."""
+    fake = JobsListFails()
+    _install(monkeypatch, fake)
+    rc = _provision(tmp_path, "--execute")
+    assert rc == 1
+    res = json.loads((tmp_path / "provision_result.json").read_text(
+        encoding="utf-8"))
+    assert any(s["step"] == "workspace" and s["verified"] is True
+               for s in res["steps"])
+    assert res["workspace"]["key"] == "ws-acme"
+    md = (tmp_path / "PROVISION.md").read_text(encoding="utf-8")
+    assert "--reuse-existing" in md
+    assert fake.workspaces and fake.clusters, "both were created server-side"
+
+
 # --- --source-config through the CLI -----------------------------------------
 
 _FAKE_PASSWORD = "FAKE-PASSWORD-not-real-123"

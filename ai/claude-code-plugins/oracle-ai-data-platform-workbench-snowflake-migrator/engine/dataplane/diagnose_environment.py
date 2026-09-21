@@ -12,10 +12,10 @@ check prints a verdict rather than a traceback:
 4. **Does the registered EXTERNAL catalog actually expose anything?**
    (Its crawler can fail while the connector works — observed live.)
 
-`CONFIG_PATH` points at the migration config `provision --source-config`
-placed on the workspace mount — the one file, YAML or JSON, with the
-connection nested under `snowflake:`. `provision` fills the path in when it
-uploads this notebook. The config is echoed as its SHAPE only: key names with
+`CONFIG_PATH` points at the config's `snowflake:` block, which
+`provision --source-config` places on the workspace mount as JSON
+(`plan/<stem>.json`). `provision` fills the path in when it uploads this
+notebook. The config is echoed as its SHAPE only: key names with
 `<set>` / `<unset>`, never a value — the file holds the credential, and cell
 output is persisted with the workspace object.
 
@@ -35,7 +35,7 @@ from snowmig_source import (  # noqa: E402
 # ── PARAMETERS ─────────────────────────────────────────────────
 # Edit these, then run the notebook top to bottom. `provision` writes this
 # run's values in when it uploads the notebook.
-CONFIG_PATH = "/Workspace/backup-snowflake-migration/plan/snowmig-config.yaml"
+CONFIG_PATH = "/Workspace/backup-snowflake-migration/plan/snowmig-config.json"
 EXTERNAL_CATALOG = ""   # optional: the registered EXTERNAL catalog's name
 SESSION_SCHEMA = ""     # a REAL schema for the pushdown check; blank = the config's `schema:`
 

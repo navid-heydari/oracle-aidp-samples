@@ -66,6 +66,7 @@ def test_portable_view_has_no_unsupported_constructs():
     ("select system$current_user() from t", "SYSTEM$"),
     ("select * from t at(timestamp => x)", "Time Travel"),
     ("select j:field from t", "VARIANT path"),
+    ('select j:"Field Name" from t', "VARIANT path"),
     ("select datediff(day, a, b) from t", "DATEDIFF / TIMESTAMPDIFF"),
     ("select timestampadd(day, 1, ts) from t", "TIMESTAMPADD / TIMEADD"),
 ])
@@ -527,3 +528,14 @@ def test_rewritten_target_with_a_hyphen_is_backticked_and_parses():
     tables = {t.sql(dialect="spark").split(" AS ")[0]
               for t in tree.find_all(sqlglot.exp.Table)}
     assert "lake.`my-data-db_sales`.orders" in tables, tables
+
+
+def test_view_with_a_quoted_field_variant_path_is_blocked_not_quoted():
+    # T16 used to want an identifier character after the colon, so the quoted
+    # field slipped past it; T07 then turned "Field Name" into a backtick
+    # identifier and the view was stamped an exact rewrite with a colon path
+    # still in the body. The construct is refused, named.
+    ddl = 'create view V as select payload:"Field Name" as f from t'
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is True and res.sql is None
+    assert "VARIANT path" in res.blocked_reason

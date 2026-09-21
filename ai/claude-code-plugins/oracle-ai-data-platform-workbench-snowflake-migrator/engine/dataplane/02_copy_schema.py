@@ -401,7 +401,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"{target} (the manifest lists "
                 f'{len(record["tables"])} for this schema)')
         else:
-            names = [t["name"] for t in record["tables"]]
+            # The `created` filter above never runs when nothing was created,
+            # and that is exactly the all-drift schema: a re-plan over tables
+            # that all pre-exist with the old layout records every one of
+            # them `type_drift`. They are excluded here too, or the fallback
+            # copies into the very layout the structure step refused.
+            drifted = {n for n, r in (objects or {}).items()
+                       if r.get("status") == "type_drift"}
+            names = [t["name"] for t in record["tables"]
+                     if t["name"] not in drifted]
             if objects is None:
                 why = f"no structure report for {target} was found"
             else:
@@ -412,9 +420,22 @@ def main(argv: list[str] | None = None) -> int:
                 nip = sum(1 for r in objects.values()
                           if r.get("status") == "not_in_plan")
                 why = (f"the structure report for {target} records 0 created "
-                       f"table(s) ({nip} not_in_plan, {len(objects) - nip} "
+                       f"table(s) ({nip} not_in_plan, {len(drifted)} "
+                       f"type_drift, {len(objects) - nip - len(drifted)} "
                        f"other) -- re-run 01_create_structure with the right "
                        f"ddl_plan.json, or pass --tables")
+                if drifted:
+                    why += (f"; {len(drifted)} type_drift table(s) excluded "
+                            f"-- recreate them from the approved plan")
+                if drifted and not names:
+                    # Zero iterations below would be exit 0: a copy job that
+                    # did nothing, reported as a success.
+                    return fail(
+                        f"error: every table the manifest lists for "
+                        f"{args.schema} is recorded type_drift in the "
+                        f"structure report for {target}; nothing to copy. "
+                        f"Recreate them from the approved plan "
+                        f"(01_create_structure) or pass --tables to override")
             log(f"scope: all {len(names)} table(s) the manifest lists for "
                 f"this schema; {why}")
 
