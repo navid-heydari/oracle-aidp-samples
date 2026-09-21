@@ -354,3 +354,119 @@ def test_a_cancel_is_polled_to_terminal_because_202_is_not_done():
                             sleep=lambda s: None)
     assert state == "CANCELED"
     assert seen["n"] == 3
+
+
+# --- the full State vocabulary ---------------------------------------------
+#
+# The API's State.status enum is PENDING, QUEUED, RUNNING, SKIPPED,
+# INTERNAL_ERROR, BLOCKED, SUCCESS, FAILED, CANCELING, CANCELED,
+# UPSTREAM_CANCELED, UPSTREAM_FAILED, EXCLUDED, TIMED_OUT, PAUSED_MAINTENANCE.
+# TERMINAL_STATES used to omit INTERNAL_ERROR, SKIPPED, UPSTREAM_CANCELED and
+# EXCLUDED, so a run that died that way -- the cluster failing to start is the
+# realistic case -- was polled for the whole budget, cancelled and resubmitted
+# once by the cold-start watchdog, and then reported STILL RUNNING with exit 0.
+
+_API_STATES = {"PENDING", "QUEUED", "RUNNING", "SKIPPED", "INTERNAL_ERROR",
+               "BLOCKED", "SUCCESS", "FAILED", "CANCELING", "CANCELED",
+               "UPSTREAM_CANCELED", "UPSTREAM_FAILED", "EXCLUDED", "TIMED_OUT",
+               "PAUSED_MAINTENANCE"}
+
+
+def test_the_state_sets_cover_the_api_vocabulary_and_do_not_overlap():
+    assert not set(TERMINAL_STATES) & set(jobs.ACTIVE_STATES)
+    assert set(TERMINAL_STATES) | set(jobs.ACTIVE_STATES) >= _API_STATES
+    assert "UNKNOWN" in jobs.ACTIVE_STATES, \
+        "a transport hiccup must stay non-terminal, and must not restart"
+
+
+@pytest.mark.parametrize("state", ["INTERNAL_ERROR", "SKIPPED",
+                                   "UPSTREAM_CANCELED", "EXCLUDED"])
+def test_a_dead_run_ends_the_watch_as_terminal_and_not_ok(state):
+    fake = Fake(states=["PENDING", state])
+    result = watch_job(fake, workspace="ws", job_key="j", poll_seconds=0,
+                       sleep=lambda _s: None)
+    assert result["terminal"] is True
+    assert result["ok"] is False
+    assert result["status"] == state
+    assert fake.ops.count("run_job") == 1
+    assert "cancel_job_run" not in fake.ops
+
+
+def test_a_dead_run_is_never_cancelled_and_resubmitted_by_the_watchdog():
+    """The cluster failed to start: the run ended INTERNAL_ERROR within a
+    minute and its task never got a startTime. That is a verdict, not a
+    cold start."""
+    counts = {"run_job": 0, "cancel_job_run": 0}
+
+    def call(op, **kw):
+        if op == "list_job_runs":
+            return {"items": []}
+        if op in counts:
+            counts[op] += 1
+            return {"key": "run-%d" % counts["run_job"]}
+        if op == "get_job_run":
+            return {"state": {"status": "INTERNAL_ERROR"}}
+        if op == "list_task_runs":
+            return {"items": [{"key": "t1", "startTime": None}]}
+        if op == "fetch_task_output":
+            return {"data": []}
+        raise AssertionError(op)
+
+    res = watch_job(call, workspace="ws", job_key="j", poll_seconds=30,
+                    cold_start_seconds=60, max_polls=6, sleep=lambda s: None)
+    assert counts == {"run_job": 1, "cancel_job_run": 0}
+    assert res["terminal"] is True and res["ok"] is False
+    assert res["status"] == "INTERNAL_ERROR"
+
+
+def test_an_unrecognised_status_is_flagged_and_never_restarted():
+    """A status this code does not know is neither a verdict nor "still
+    running", and the watchdog must not cancel a run it cannot classify."""
+    counts = {"run_job": 0, "cancel_job_run": 0}
+
+    def call(op, **kw):
+        if op == "list_job_runs":
+            return {"items": []}
+        if op in counts:
+            counts[op] += 1
+            return {"key": "run-%d" % counts["run_job"]}
+        if op == "get_job_run":
+            return {"state": {"status": "SOME_FUTURE_STATE"}}
+        if op == "list_task_runs":
+            return {"items": [{"key": "t1", "startTime": None}]}
+        if op == "fetch_task_output":
+            return {"data": []}
+        raise AssertionError(op)
+
+    res = watch_job(call, workspace="ws", job_key="j", poll_seconds=30,
+                    cold_start_seconds=60, max_polls=4, sleep=lambda s: None)
+    assert res["terminal"] is False and res["ok"] is False
+    assert res["unrecognised"] is True
+    assert res["status"] == "SOME_FUTURE_STATE"
+    assert counts == {"run_job": 1, "cancel_job_run": 0}
+
+
+def test_a_spent_budget_on_a_running_job_is_not_unrecognised():
+    fake = Fake(states=["RUNNING"] * 10)
+    result = watch_job(fake, workspace="ws", job_key="j", poll_seconds=0,
+                       max_polls=3, sleep=lambda _s: None)
+    assert result["terminal"] is False
+    assert result["unrecognised"] is False
+    assert result["polls"] == 3, "the report says how much budget was spent"
+
+
+@pytest.mark.parametrize("state", TERMINAL_STATES)
+def test_every_terminal_state_ends_a_cancel_poll(state):
+    seen = {"n": 0}
+
+    def call(op, **kw):
+        if op == "cancel_job_run":
+            return {}
+        if op == "get_job_run":
+            seen["n"] += 1
+            return {"state": {"status": state}}
+        raise AssertionError(op)
+
+    assert jobs.cancel_run(call, workspace="ws", run_key="r",
+                           sleep=lambda s: None) == state
+    assert seen["n"] == 1

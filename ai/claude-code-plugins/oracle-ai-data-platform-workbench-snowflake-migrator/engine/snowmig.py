@@ -783,6 +783,15 @@ def cmd_run(args) -> int:
     _write(out, f"RUN_{slug}.md", _render_run(result))
 
     if not result["terminal"]:
+        if result.get("unrecognised"):
+            # Neither a verdict nor "still going": a status this plugin does
+            # not classify. Saying STILL RUNNING here would round it up.
+            print(f'  {slug}: UNRECOGNISED STATE {result["status"]} after '
+                  f'{result.get("polls")} poll(s) — not a status this plugin '
+                  f'knows, so neither done nor still running. Check the run '
+                  f'in the console and report the status so it can be '
+                  f'classified.')
+            return 1
         print(f"  {slug}: STILL RUNNING after {args.max_polls} poll(s) — "
               f"not failed, not done. Re-check with the run key above.")
         return 0
@@ -793,10 +802,17 @@ def cmd_run(args) -> int:
 
 def _render_run(result: dict) -> str:
     """The workflow run as evidence: what ran, what it returned, its log."""
-    if not result.get("terminal"):
-        verdict = ("**STILL RUNNING** — the poll budget ran out with the job "
-                   "still going. This is neither success nor failure; "
-                   "re-check the run key.")
+    polls = result.get("polls", "?")
+    if not result.get("terminal") and result.get("unrecognised"):
+        verdict = (f'**UNRECOGNISED STATE `{result.get("status")}`** — after '
+                   f'{polls} poll(s) the run reports a status this plugin '
+                   f'classifies as neither running nor ended. This is neither '
+                   f'success nor failure; check the run in the console.')
+    elif not result.get("terminal"):
+        verdict = (f"**STILL RUNNING** — the poll budget ({polls} poll(s)) "
+                   f"ran out with the job still `{result.get('status')}`. "
+                   f"This is neither success nor failure; re-check the run "
+                   f"key.")
     elif result.get("ok"):
         verdict = "**SUCCESS**"
     else:
