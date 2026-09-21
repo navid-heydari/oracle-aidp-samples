@@ -738,3 +738,143 @@ def test_a_dry_run_never_asks_for_the_catalog_type():
                          retry_delays=(), verify_delays=())
     assert rec.ops == []
     assert out["catalog_type"] is None
+
+
+# ==========================================================================
+# A listing that FAILS is not a listing that came back empty.
+#
+# `_find_schema` and `_resolve_object` used to swallow every exception from
+# the list call and return None, so a 403 on list_schemas read as "absent"
+# and the schema was re-POSTed -- the exact write the module docstring says
+# drops the table creates that follow -- while a 403 on list_tables_in made
+# every table that WAS created report "never appeared", burned 33 s of
+# polling per table, and left a diagnosis probe behind in the customer's
+# schema because its own read-back was blind too. None of it recorded the
+# 403 anywhere.
+# ==========================================================================
+
+class DeniedList(Folding):
+    """A principal that may create but not list. `deny` names the operations
+    that raise, the way `oci raw-request` does on a 403."""
+
+    def __init__(self, *deny, **kw):
+        super().__init__(**kw)
+        self.deny = set(deny)
+
+    def __call__(self, operation, **kw):
+        if operation in self.deny:
+            self.ops.append((operation, kw))
+            raise RuntimeError(
+                f"{operation} failed (exit 1): 403 NotAuthorizedOrNotFound")
+        return super().__call__(operation, **kw)
+
+
+def test_a_failed_schema_listing_refuses_before_any_write():
+    call = DeniedList("list_schemas")
+    with pytest.raises(RefusedToExecute, match="could not list"):
+        deploy_catalog(_plan(2), target=TARGET, execute=True, call=call,
+                       retry_delays=(), verify_delays=())
+    assert not any(op in ("create_schema", "create_table", "create_view")
+                   for op, _ in call.ops), "nothing may be written blind"
+
+
+def test_an_existing_schema_is_never_re_posted_when_listing_fails():
+    call = DeniedList("list_schemas")
+    call.schemas["lake.db"] = "lake.db"     # it is already there
+    with pytest.raises(RefusedToExecute):
+        deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
+                       retry_delays=(), verify_delays=())
+    assert [op for op, _ in call.ops].count("create_schema") == 0, \
+        "a schema that cannot be listed is not known to be absent"
+
+
+def test_a_failed_table_listing_is_reported_as_unknown_not_never_appeared():
+    call = DeniedList("list_tables_in", "list_views_in")
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
+                         retry_delays=(), verify_delays=())
+    assert out["failed_targets"] == ["DB.PUBLIC.T0"]
+    reason = out["failed"][0]["reason"]
+    assert "could not be read back" in reason and "403" in reason
+    assert "never appeared" not in reason
+    assert "unsupported field type" not in reason
+    # No probe: the schema cannot even be listed, so a probe would be
+    # created blind and judged blind.
+    assert not any(op == "create_table"
+                   and str(kw.get("table", "")).startswith("snowmig_probe_")
+                   for op, kw in call.ops)
+    assert out["diagnosis_probes"] == []
+    assert any("403" in e for e in out["errors"]), \
+        "the actual error must be on the record"
+
+
+def test_a_permission_error_on_listing_does_not_poll(monkeypatch):
+    from target import catalog_deploy
+    slept = []
+    monkeypatch.setattr(catalog_deploy.time, "sleep", slept.append)
+    call = DeniedList("list_tables_in")
+    deploy_catalog(_plan(3), target=TARGET, execute=True, call=call,
+                   retry_delays=(), verify_delays=(3, 5, 10, 15))
+    assert [op for op, _ in call.ops].count("list_tables_in") == 3, \
+        "one look per table: a 403 reads the same on every attempt"
+    assert sum(slept) == 0
+
+
+def test_a_transient_listing_error_is_polled_like_a_slow_create(monkeypatch):
+    from target import catalog_deploy
+    slept = []
+    monkeypatch.setattr(catalog_deploy.time, "sleep", slept.append)
+
+    class Flaky(Folding):
+        def __init__(self):
+            super().__init__()
+            self.failures_left = 2
+
+        def __call__(self, operation, **kw):
+            if operation == "list_tables_in" and self.failures_left:
+                self.failures_left -= 1
+                self.ops.append((operation, kw))
+                raise RuntimeError("backend returned 503 Service Unavailable")
+            return super().__call__(operation, **kw)
+
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=Flaky(),
+                         retry_delays=(), verify_delays=(3, 5, 10, 15))
+    assert out["verified_targets"] == ["DB.PUBLIC.T0"]
+    assert slept == [3, 5]
+
+
+def test_a_schema_listing_that_fails_mid_poll_is_recorded_not_read_as_absent():
+    class BlindAfterCreate(Folding):
+        def __call__(self, operation, **kw):
+            if operation == "list_schemas" and self.schemas:
+                self.ops.append((operation, kw))
+                raise RuntimeError("list_schemas failed (exit 1): 403 denied")
+            return super().__call__(operation, **kw)
+
+    call = BlindAfterCreate()
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
+                         retry_delays=(), verify_delays=(), schema_wait=())
+    assert out["schemas_created"] == ["lake.DB"]
+    assert any("403" in e and "list" in e.lower() for e in out["errors"])
+
+
+def test_diagnosis_probe_is_deleted_when_its_listing_fails():
+    from target.catalog_deploy import _diagnose_never_appeared
+
+    class ProbeBlind(Folding):
+        def __call__(self, operation, **kw):
+            if operation in ("list_tables_in", "list_views_in"):
+                self.ops.append((operation, kw))
+                raise RuntimeError("503 service unavailable")
+            if operation == "delete_table":
+                self.ops.append((operation, kw))
+                return {}
+            return super().__call__(operation, **kw)
+
+    call = ProbeBlind()
+    probes = []
+    assert _diagnose_never_appeared(call, "lake", "lake.db", probes) is None
+    deleted = [kw["table"] for op, kw in call.ops if op == "delete_table"]
+    assert deleted == [probes[0]["name"]], \
+        "never leave the probe behind because we could not look"
+    assert probes[0]["created"] is None
+    assert "503" in probes[0]["list_error"]
