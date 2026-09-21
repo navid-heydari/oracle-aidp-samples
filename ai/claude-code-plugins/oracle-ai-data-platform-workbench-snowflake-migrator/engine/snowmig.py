@@ -721,9 +721,10 @@ def cmd_run(args) -> int:
             "ignore " + ", ".join(sorted(parameters)) + " and execute "
             "whatever the notebook's PARAMS cell already holds.\n"
             "Set stage parameters where they are actually read:\n"
-            "  * re-run `provision --execute --reuse-existing` with the "
-            "coordinate flags -- it rewrites each stage notebook's PARAMS "
-            "cell and uploads it, or\n"
+            "  * re-run `provision --execute --reuse-existing "
+            "--refresh-notebooks` with the coordinate flags -- it rewrites "
+            "each stage notebook's PARAMS cell and uploads it (console edits "
+            "to that cell are lost), or\n"
             "  * edit the PARAMS cell of "
             "backup-snowflake-migration/scripts/<stage>.ipynb in the "
             "console.\n"
@@ -786,6 +787,26 @@ def cmd_run(args) -> int:
     _write(out, f"RUN_{slug}.md", _render_run(result))
 
     if not result["terminal"]:
+        if result.get("unrecognised"):
+            # Neither a verdict nor "still going": a status this plugin does
+            # not classify. Saying STILL RUNNING here would round it up.
+            print(f'  {slug}: UNRECOGNISED STATE {result["status"]} after '
+                  f'{result.get("polls")} poll(s) — not a status this plugin '
+                  f'knows, so neither done nor still running. Check the run '
+                  f'in the console and report the status so it can be '
+                  f'classified.')
+            return 1
+        if result.get("cancel_unconfirmed"):
+            # The watchdog fired but the cancel never reached a terminal
+            # state, so nothing was resubmitted: the slot is still held by a
+            # run the cluster may never pick up. That is not "still running"
+            # in the healthy sense, and not a verdict either.
+            print(f'  {slug}: cold start suspected; cancel unconfirmed after '
+                  f'{args.max_polls} poll(s). Run {result["run_key"]} was '
+                  f'never confirmed cancelled, so nothing was resubmitted. '
+                  f'Cancel it by hand (`aidp workflow cancel-job-run '
+                  f'{args.workspace} {result["run_key"]}`), then re-run.')
+            return 1
         print(f"  {slug}: STILL RUNNING after {args.max_polls} poll(s) — "
               f"not failed, not done. Re-check with the run key above.")
         return 0
@@ -796,10 +817,25 @@ def cmd_run(args) -> int:
 
 def _render_run(result: dict) -> str:
     """The workflow run as evidence: what ran, what it returned, its log."""
-    if not result.get("terminal"):
-        verdict = ("**STILL RUNNING** — the poll budget ran out with the job "
-                   "still going. This is neither success nor failure; "
-                   "re-check the run key.")
+    polls = result.get("polls", "?")
+    if not result.get("terminal") and result.get("unrecognised"):
+        verdict = (f'**UNRECOGNISED STATE `{result.get("status")}`** — after '
+                   f'{polls} poll(s) the run reports a status this plugin '
+                   f'classifies as neither running nor ended. This is neither '
+                   f'success nor failure; check the run in the console.')
+    elif not result.get("terminal") and result.get("cancel_unconfirmed"):
+        verdict = (f"**STILL RUNNING — cold start suspected; cancel "
+                   f"unconfirmed.** The cluster had not picked up run "
+                   f"`{result.get('run_key')}`, the cancel did not reach a "
+                   f"terminal state (see below), so nothing was resubmitted "
+                   f"and the poll budget ({polls} poll(s)) ran out with it "
+                   f"still `{result.get('status')}`. Cancel it by hand and "
+                   f"re-run; this is neither success nor failure.")
+    elif not result.get("terminal"):
+        verdict = (f"**STILL RUNNING** — the poll budget ({polls} poll(s)) "
+                   f"ran out with the job still `{result.get('status')}`. "
+                   f"This is neither success nor failure; re-check the run "
+                   f"key.")
     elif result.get("ok"):
         verdict = "**SUCCESS**"
     else:
@@ -830,18 +866,27 @@ def _render_run(result: dict) -> str:
             "## Cold-start restarts",
             "",
             "The cluster did not pick up the run(s) below — the job run sat "
-            "at `RUNNING` with its task never started. Each was cancelled "
-            "and resubmitted. **The output below belongs to the last run "
-            "key, not the first.**",
+            "at `RUNNING` with its task never started. A run whose cancel "
+            "reached a terminal state was resubmitted, and **the output "
+            "below then belongs to the last run key, not the first.** A "
+            "run whose cancel did NOT (it raised, or never left CANCELING) "
+            "was kept: resubmitting into a slot that is still held gets "
+            "the new run accepted and discarded.",
             "",
-            "| Abandoned run | Cancelled to | Waited | Resubmitted as |",
+            "| Run | Cancelled to | Waited | Outcome |",
             "|---|---|---|---|",
         ]
-        lines += [
-            f'| `{r.get("abandoned_run")}` | `{r.get("cancel_state")}` | '
-            f'{r.get("after_seconds"):.0f}s | `{r.get("new_run")}` |'
-            for r in result["restarts"]
-        ]
+        for r in result["restarts"]:
+            if r.get("new_run"):
+                outcome = f'resubmitted as `{r.get("new_run")}`'
+                run = r.get("abandoned_run")
+            else:
+                outcome = ("kept — cancel unconfirmed"
+                           + (f': {r.get("cancel_error")}'
+                              if r.get("cancel_error") else ""))
+                run = r.get("kept_run")
+            lines.append(f'| `{run}` | `{r.get("cancel_state")}` | '
+                         f'{r.get("after_seconds"):.0f}s | {outcome} |')
         lines.append("")
     lines += ["## Output", "", "```", (result.get("output") or "(none)").strip(),
               "```", ""]
@@ -908,8 +953,8 @@ def cmd_catalog(args) -> int:
         result["source_type"] = args.source_type.upper()
 
     # Validation as a COMMAND, not a suggestion: the documented
-    # POST /actions/testConnection, polled through /asyncOperations. Both
-    # contracts live-verified 2026-09-16.
+    # POST /actions/testConnection (live-verified 2026-09-16), then the
+    # async operation it names polled through /asyncOperations to a verdict.
     if args.test_connection and not args.execute:
         print("  test-connection: skipped — it needs an existing catalog "
               "(the API resolves RBAC on the key), so it only runs with "
@@ -926,8 +971,8 @@ def cmd_catalog(args) -> int:
                 "--test-connection needs the aiDataPlatform OCID: put it "
                 "under `aidp:` in the config, or pass --datalake-ocid")
         from target.provision_api import build_test_connection_body
-        from target.provisioning import make_provision_call
-        import time as _time
+        from target.provisioning import (make_provision_call,
+                                         connection_test_outcome)
         pcall = make_provision_call(ocid)
         # The API resolves the catalog KEY (RBAC DESCCATALOG), which is what
         # ensure_catalog reported back -- not necessarily the display name.
@@ -937,25 +982,17 @@ def cmd_catalog(args) -> int:
                           source_type=args.source_type.upper(),
                           connection_properties=connection,
                           display_name=args.catalog))
-        # The response body is empty; the async key rides in a header the
-        # raw-request JSON parser does not surface, so when it is absent the
-        # result is reported PENDING, never assumed. When present, poll.
-        outcome = {"requested": True, "status": "PENDING",
-                   "note": "test requested; result not yet readable"}
-        op_key = probe.get("aidp-async-operation-key") or probe.get("key")
-        if op_key:
-            for delay in (5, 10, 15, 20, 30):
-                _time.sleep(delay)
-                op = pcall("get_async_operation", key=op_key)
-                outcome["status"] = str(op.get("status") or "PENDING")
-                if outcome["status"] in ("SUCCEEDED", "FAILED", "CANCELED"):
-                    outcome["error"] = (f'{op.get("errorCode")}: '
-                                        f'{op.get("errorMessage")}'
-                                        if op.get("errorCode") else None)
-                    break
+        # The response body is empty and the async key rides in a response
+        # HEADER, which the transport keeps under `_headers`;
+        # connection_test_outcome reads it from wherever the envelope put it
+        # and polls /asyncOperations/{key} to a verdict. PENDING means the
+        # budget ran out, never "not looked"; a missing key is said to be
+        # missing.
+        outcome = connection_test_outcome(pcall, probe)
         result["test_connection"] = outcome
         print(f'  test-connection: {outcome["status"]}'
-              + (f' — {outcome.get("error")}' if outcome.get("error") else ""))
+              + (f' — {outcome.get("error")}' if outcome.get("error") else "")
+              + (f' — {outcome.get("note")}' if outcome.get("note") else ""))
 
     _write(out, "catalog_result.json", result)
     _write(out, "CATALOG.md", render_catalog(result))
@@ -1283,7 +1320,8 @@ def cmd_provision(args) -> int:
         if not source_config.is_file():
             raise FileNotFoundError(
                 f"--source-config {source_config} not found")
-        plan_files.append(source_config)
+        # Not appended to plan_files: provision() derives the `snowflake:`
+        # block and uploads that; the operator's file itself never travels.
 
     requirements = None
     if not args.skip_libraries:
@@ -1307,9 +1345,20 @@ def cmd_provision(args) -> int:
         target_catalog=args.target_catalog, source_mode=args.source_mode,
         source_config=source_config,
         warehouse_clusters=warehouse_clusters, execute=args.execute,
-        subnet_id=args.subnet_id, reuse_existing=args.reuse_existing)
+        subnet_id=args.subnet_id, reuse_existing=args.reuse_existing,
+        refresh_notebooks=args.refresh_notebooks)
     _write(out, "provision_result.json", res)
     _write(out, "PROVISION.md", render_provision(res))
+
+    for obj in res.get("credential_objects") or []:
+        # Said out loud, dry run or not: this is the one object this plugin
+        # places anywhere that holds a secret.
+        print(f"  CREDENTIAL ON THE WORKSPACE MOUNT: {obj} "
+              f"{'would hold' if res['dry_run'] else 'holds'} the Snowflake "
+              f"connection block, credential included -- readable by every "
+              f"member of workspace {res['workspace']['name']} and every "
+              f"cluster in it via /Workspace. Remove it when the migration "
+              f"is done.", file=sys.stderr)
 
     failed = [s for s in res["steps"] if s["verified"] is False]
     if res["dry_run"]:
@@ -1643,6 +1692,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "default: a migration creates its own environment "
                          "so its blast radius is knowable, and a taken name "
                          "is a collision to resolve, not a shortcut")
+    pv.add_argument("--refresh-notebooks", action="store_true",
+                    help="with --reuse-existing, regenerate the stage "
+                         "notebooks from this run's flags even where they "
+                         "already exist. OFF by default: a notebook already "
+                         "on the workspace is kept, because its PARAMS cell "
+                         "(schema, mode, verify) is edited in the console and "
+                         "an overwrite would discard that silently")
     pv.set_defaults(func=cmd_provision)
 
     rn = sub.add_parser("run", parents=[common],

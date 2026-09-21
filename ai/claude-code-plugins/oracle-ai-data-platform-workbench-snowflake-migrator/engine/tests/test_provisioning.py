@@ -14,8 +14,8 @@ from target.provision_api import (
 )
 from target.stage_notebooks import STAGES, build_stage_notebook
 from target.provisioning import (
-    BACKUP_FOLDER, JOB_SPECS, REPORTS_FOLDER, SCRIPTS_FOLDER, provision,
-    render_provision,
+    BACKUP_FOLDER, JOB_SPECS, PLAN_FOLDER, REPORTS_FOLDER, SCRIPTS_FOLDER,
+    provision, render_provision,
 )
 
 OCID = "ocid1.aidataplatform.oc1.iad.a"
@@ -517,3 +517,453 @@ def test_provisioning_creates_the_backup_folder_the_runbook_writes_into(scripts)
               delays=())
     folders = [kw["path"] for op, kw in fake.ops if op == "create_ws_folder"]
     assert BACKUP_FOLDER in folders, folders
+
+
+# --- pagination on the provisioning transport -------------------------------
+#
+# `oci raw-request` surfaces `opc-next-page` under `headers`; the transport
+# used to drop it, so jobs.in_flight_runs read one page of jobRuns and could
+# miss the very run it exists to guard against.
+
+def _paged_proc(pages):
+    """`pages`: page token (None first) -> (items, next token)."""
+    import types
+    asked = []
+
+    def fake(cmd):
+        uri = cmd[cmd.index("--target-uri") + 1] if "--target-uri" in cmd \
+            else " ".join(cmd)
+        asked.append(uri)
+        token = uri.rsplit("page=", 1)[1] if "page=" in uri else None
+        items, nxt = pages[token]
+        env = {"data": {"items": items}, "status": "200 OK"}
+        if nxt:
+            env["headers"] = {"opc-next-page": nxt}
+        return types.SimpleNamespace(returncode=0, stderr="",
+                                     stdout=json.dumps(env))
+
+    return fake, asked
+
+
+def test_list_job_runs_follows_the_next_page():
+    from target.provisioning import make_provision_call
+    fake, asked = _paged_proc({None: ([{"key": "run-1", "endTime": 1}], "P2"),
+                               "P2": ([{"key": "run-2"}], None)})
+    call = make_provision_call(OCID, run_process=fake)
+    out = call("list_job_runs", workspace="ws", job_key="j")
+    assert [i["key"] for i in out["items"]] == ["run-1", "run-2"]
+    assert len(asked) == 2
+    assert "jobKey=j&sortBy=timeCreated" in asked[0] and "page=" not in asked[0]
+    assert asked[1].endswith("jobKey=j&sortBy=timeCreated&page=P2")
+
+
+def test_in_flight_runs_sees_a_run_on_page_two():
+    from target import jobs
+    from target.provisioning import make_provision_call
+    fake, _ = _paged_proc({None: ([{"key": "run-1", "endTime": 123}], "P2"),
+                           "P2": ([{"key": "run-2", "endTime": None}], None)})
+    call = make_provision_call(OCID, run_process=fake)
+    assert jobs.in_flight_runs(call, workspace="ws", job_key="j") == ["run-2"]
+
+
+def test_a_single_page_listing_is_one_request():
+    from target.provisioning import make_provision_call
+    fake, asked = _paged_proc({None: ([{"key": "ws-1"}], None)})
+    call = make_provision_call(OCID, run_process=fake)
+    assert call("list_workspaces")["items"] == [{"key": "ws-1"}]
+    assert len(asked) == 1 and "page=" not in asked[0]
+
+
+def test_a_repeating_token_is_a_transport_error_not_a_loop():
+    from target.provisioning import ProvisionTransportError, make_provision_call
+    fake, asked = _paged_proc({None: ([{"key": "a"}], "P2"),
+                               "P2": ([{"key": "b"}], "P2")})
+    call = make_provision_call(OCID, run_process=fake)
+    with pytest.raises(ProvisionTransportError, match="list_jobs"):
+        call("list_jobs", workspace="ws")
+    assert len(asked) <= 3
+
+
+def test_a_workspace_object_listing_with_a_next_page_is_refused_not_truncated():
+    """list_ws_objects rides the aidp CLI, whose paging flags are unknown. A
+    truncated listing would read uploads as not visible -- or worse, as
+    absent; refusing names the problem."""
+    import types
+    from target.provisioning import ProvisionTransportError, make_provision_call
+
+    def fake(cmd):
+        assert cmd[0] == "aidp"
+        return types.SimpleNamespace(
+            returncode=0, stderr="",
+            stdout='Response:\n' + json.dumps(
+                {"data": {"items": [{"path": "a/b"}]},
+                 "headers": {"opc-next-page": "P2"}}))
+
+    call = make_provision_call(OCID, run_process=fake)
+    with pytest.raises(ProvisionTransportError, match="page"):
+        call("list_ws_objects", workspace="ws", path="a")
+
+
+def test_provision_list_commands_carry_the_page_token():
+    for op, kw in (("list_workspaces", {}),
+                   ("list_clusters", {"workspace": "ws"}),
+                   ("list_libraries", {"workspace": "ws", "cluster": "cl"}),
+                   ("list_jobs", {"workspace": "ws"}),
+                   ("list_task_runs", {"workspace": "ws", "run_key": "r"})):
+        plain = build_provision_command("oci_raw", op, OCID, **kw)
+        assert "page=" not in " ".join(plain)
+        assert build_provision_command("oci_raw", op, OCID, page=None,
+                                       **kw) == plain
+        uri = build_provision_command("oci_raw", op, OCID, page="T2", **kw)
+        uri = uri[uri.index("--target-uri") + 1]
+        assert uri.endswith("page=T2") and uri.count("?") == 1, (op, uri)
+
+
+# --- the cluster POST fails: the workspace record must survive -------------
+#
+# GAPS.md records that a cluster POSTed before the workspace reports ACTIVE
+# is a 409 "ongoing operation". That POST was not guarded, so the
+# ProvisionTransportError propagated out of provision(), cmd_provision never
+# wrote provision_result.json or PROVISION.md, and the workspace created two
+# seconds earlier was on record nowhere -- the next run halted on name_taken
+# and called it someone else's.
+
+_409 = ("create_cluster failed (exit 0): 409 Conflict ongoing operation on "
+        "workspace")
+
+
+class ClusterConflicts(Fake):
+    """The first `fail_times` cluster POSTs raise `text`, then it works."""
+
+    def __init__(self, fail_times, text=_409, **kw):
+        super().__init__(**kw)
+        self.fail_times = fail_times
+        self.text = text
+
+    def __call__(self, operation, **kw):
+        if operation == "create_cluster" and self.fail_times:
+            self.fail_times -= 1
+            self.ops.append((operation, kw))
+            from target.provisioning import ProvisionTransportError
+            raise ProvisionTransportError(self.text)
+        return super().__call__(operation, **kw)
+
+
+def test_a_409_on_the_cluster_post_is_retried_then_recorded(scripts):
+    fake = ClusterConflicts(2)
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(0, 0))
+    cluster = [s for s in res["steps"] if s["step"] == "cluster"]
+    assert [s["action"] for s in cluster] == ["retried", "retried", "created"]
+    assert [s["verified"] for s in cluster] == [None, None, True]
+    assert [op for op, _ in fake.ops].count("create_cluster") == 3
+    assert any(s["step"] == "job" for s in res["steps"]), \
+        "a retry that succeeds is not a halt"
+
+
+def test_a_cluster_post_that_keeps_failing_returns_the_partial_record(scripts):
+    fake = ClusterConflicts(99)
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(0, 0))          # returns, no raise
+    steps = [(s["step"], s["action"], s["verified"]) for s in res["steps"]]
+    assert ("workspace", "created", True) in steps
+    assert ("cluster", "failed", False) in steps
+    halt = next(s for s in res["steps"] if s["step"] == "halt")
+    assert "--reuse-existing" in halt["detail"]
+    assert "ws-acme" in halt["detail"], "the record names the key"
+    assert res["workspace"]["key"] == "ws-acme"
+    ops = [op for op, _ in fake.ops]
+    assert "upload_ws_file" not in ops and "create_job" not in ops
+
+
+def test_a_non_conflict_cluster_error_is_not_retried(scripts):
+    fake = ClusterConflicts(
+        99, text="create_cluster failed (exit 1): 403 NotAuthorized")
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(0, 0))
+    assert [op for op, _ in fake.ops].count("create_cluster") == 1
+    actions = {(s["step"], s["action"]) for s in res["steps"]}
+    assert ("cluster", "failed") in actions
+    assert ("cluster", "retried") not in actions
+    assert any(s["step"] == "halt" for s in res["steps"])
+
+
+def test_a_failed_cluster_listing_is_recorded_not_raised(scripts):
+    fake = Fake(fail={"list_clusters"})
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=())
+    steps = [(s["step"], s["action"], s["verified"]) for s in res["steps"]]
+    assert ("workspace", "created", True) in steps
+    assert ("cluster", "failed", False) in steps
+    assert any(s["step"] == "halt" for s in res["steps"])
+    assert "create_cluster" not in [op for op, _ in fake.ops], \
+        "could not look is not absent"
+
+
+class Settling(Fake):
+    """A created workspace reports CREATING until the `active_after`-th
+    listing, then ACTIVE -- the way the live API behaves for a few seconds
+    after the POST returns."""
+
+    def __init__(self, active_after):
+        super().__init__()
+        self.active_after = active_after
+        self.lists = 0
+
+    def __call__(self, operation, **kw):
+        if operation == "create_workspace":
+            self.ops.append((operation, kw))
+            name = kw["body"]["displayName"]
+            self.workspaces.append({"displayName": name, "key": f"ws-{name}",
+                                    "lifecycleState": "CREATING"})
+            return {}
+        if operation == "list_workspaces":
+            self.lists += 1
+            if self.lists >= self.active_after:
+                for w in self.workspaces:
+                    w["lifecycleState"] = "ACTIVE"
+        return super().__call__(operation, **kw)
+
+
+def test_the_workspace_is_waited_on_until_active(scripts):
+    fake = Settling(active_after=4)      # 1 look-first + 3 polls
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(0, 0, 0))
+    ops = [op for op, _ in fake.ops]
+    before_cluster = ops[:ops.index("create_cluster")]
+    assert before_cluster.count("list_workspaces") == 4, \
+        "the cluster POST waits for ACTIVE, not just for visibility"
+    ws = next(s for s in res["steps"] if s["step"] == "workspace")
+    assert ws["action"] == "created" and ws["verified"] is True
+
+
+def test_a_workspace_that_stays_creating_is_recorded_and_not_halted(scripts):
+    fake = Settling(active_after=10 ** 6)
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(0,))
+    assert "create_cluster" in [op for op, _ in fake.ops], \
+        "a slow ACTIVE is not a reason to stop; the 409 retry covers it"
+    ws = next(s for s in res["steps"] if s["step"] == "workspace")
+    assert ws["action"] == "created" and "CREATING" in ws["detail"]
+
+
+def test_the_name_taken_halt_names_the_operator_s_own_orphan(scripts):
+    fake = Fake(workspaces=("acme",))
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=())
+    halt = next(s for s in res["steps"] if s["step"] == "halt")
+    assert "previous run" in halt["detail"].lower()
+    assert "--reuse-existing" in halt["detail"]
+
+
+# --- --source-config: only the snowflake: block travels, and it is said so --
+#
+# The operator's whole migration config used to be appended to plan_files and
+# uploaded verbatim: the Snowflake password or PEM AND the aidp: block
+# (DataLake OCID, target coordinates), as a workspace object readable by every
+# member and every cluster, with a PROVISION.md row that said only
+# "snowmig-config.yaml -> .../plan/snowmig-config.yaml". A `key_path:` config
+# went up unchanged too, and failed five minutes later on the cluster with a
+# FileNotFoundError for a laptop path.
+
+_FAKE_PASSWORD = "FAKE-PASSWORD-not-real-123"
+_FAKE_PEM = "-----BEGIN PRIVATE KEY-----\nFAKE\n-----END PRIVATE KEY-----\n"
+
+
+def _config(tmp_path, **snowflake):
+    import yaml
+    block = {"account": "ACME-TEST", "user": "READER", "warehouse": "WH",
+             "database": "DB", "auth": "password", "password": _FAKE_PASSWORD}
+    block.update(snowflake)
+    block = {k: v for k, v in block.items() if v is not None}
+    cfg = tmp_path / "snowmig-config.yaml"
+    cfg.write_text(yaml.safe_dump({
+        "snowflake": block,
+        "aidp": {"datalake_ocid": "ocid1.aidataplatform.oc1.iad.fakefakefake",
+                 "catalog": "lake"}}), encoding="utf-8")
+    return cfg
+
+
+def test_the_source_config_upload_carries_only_the_snowflake_block(scripts,
+                                                                    tmp_path):
+    cfg = _config(tmp_path)
+    fake = Fake()
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    plan_files=[cfg], source_config=cfg, execute=True,
+                    delays=())
+    uploads = [kw for op, kw in fake.ops if op == "upload_ws_file"]
+    assert not any(kw["local_path"] == str(cfg) for kw in uploads), \
+        "the operator's file itself never travels"
+    assert f"{PLAN_FOLDER}/snowmig-config.yaml" not in fake.contents
+    remote = f"{PLAN_FOLDER}/snowmig-config.json"
+    body = json.loads(fake.contents[remote]["body"])
+    assert set(body) == {"snowflake"}
+    assert body["snowflake"]["password"] == _FAKE_PASSWORD
+    blob = json.dumps(body)
+    assert "aidp" not in blob and "datalake_ocid" not in blob
+    assert not pathlib.Path(fake.contents[remote]["local"]).exists(), \
+        "the derived copy does not outlive the upload"
+    assert res["credential_objects"] == [remote]
+    step = next(s for s in res["steps"]
+                if s["step"] == "upload" and remote in s["detail"])
+    assert step["verified"] is True and "CREDENTIAL" in step["detail"]
+    # The notebooks read the derived copy off the mount.
+    nb = json.loads(
+        fake.contents[f"{SCRIPTS_FOLDER}/00_discover_snowflake.ipynb"]["body"])
+    params = "".join(nb["cells"][1]["source"])
+    mount = REPORTS_FOLDER.rsplit("/", 1)[0]
+    assert f"'source-config': '{mount}/plan/snowmig-config.json'" in params
+
+
+def test_the_dry_run_names_the_credential_object(scripts, tmp_path):
+    cfg = _config(tmp_path)
+    res = provision(call=None, workspace_name="acme", scripts=scripts,
+                    plan_files=[cfg], source_config=cfg, execute=False)
+    remote = f"{PLAN_FOLDER}/snowmig-config.json"
+    assert res["credential_objects"] == [remote]
+    details = [s["detail"] for s in res["steps"] if s["step"] == "upload"]
+    assert any("CREDENTIAL" in d and remote in d for d in details), details
+    assert not any(d.endswith("snowmig-config.yaml") for d in details), \
+        "the raw file is not previewed as an upload"
+    md = render_provision(res)
+    assert "Credential placed on the workspace" in md and remote in md
+    assert _FAKE_PASSWORD not in md
+
+
+def test_a_plan_file_that_is_not_the_source_config_has_no_credential_wording(
+        scripts, tmp_path):
+    plan = tmp_path / "plan.json"
+    plan.write_text("{}", encoding="utf-8")
+    res = provision(call=None, workspace_name="acme", scripts=scripts,
+                    plan_files=[plan], execute=False)
+    assert res["credential_objects"] == []
+    assert not any("CREDENTIAL" in s["detail"] for s in res["steps"])
+    assert "Credential placed" not in render_provision(res)
+
+
+def test_a_path_form_secret_is_refused_before_any_upload(scripts, tmp_path):
+    from migration_config import ConfigError
+    pem = tmp_path / "rsa_key.p8"
+    pem.write_text(_FAKE_PEM, encoding="utf-8")
+    cfg = _config(tmp_path, auth="keypair", key_path=str(pem), password=None)
+    fake = Fake()
+    for execute in (False, True):
+        with pytest.raises(ConfigError) as exc:
+            provision(call=fake if execute else None, workspace_name="acme",
+                      scripts=scripts, source_config=cfg, execute=execute,
+                      delays=())
+        message = str(exc.value)
+        assert "key_path" in message and "inline" in message.lower()
+        assert "/Workspace" in message
+    assert fake.ops == [], "refused before anything reached AIDP"
+
+
+def test_an_inline_secret_config_is_accepted(scripts, tmp_path):
+    cfg = _config(tmp_path, auth="keypair", private_key=_FAKE_PEM,
+                  password=None)
+    fake = Fake()
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    source_config=cfg, execute=True, delays=())
+    assert any(s["step"] == "job" for s in res["steps"])
+    body = json.loads(
+        fake.contents[f"{PLAN_FOLDER}/snowmig-config.json"]["body"])
+    assert body["snowflake"]["private_key"] == _FAKE_PEM
+
+
+# --- --reuse-existing keeps the stage notebooks it finds ---------------------
+#
+# Every `provision --execute` used to regenerate all four stage notebooks and
+# upload them with --is-overwrite, before even looking at whether the job
+# existed. Operators set `schema`, `mode`, `verify` and `counts` by editing
+# the PARAMS cell in the console -- provision has no flags for them -- so a
+# later `--reuse-existing` (the documented resume after the workspace/cluster
+# 409) reset them: `schema` back to None, `verify` back to `counts`, the
+# reconcile `counts` back to False, with "reused (stage notebook refreshed)"
+# as the only trace.
+
+def _seeded():
+    fake = Fake(workspaces=("acme",), clusters=("migration_assets",),
+                jobs=tuple(s["name"] for s in JOB_SPECS))
+    for spec in JOB_SPECS:
+        fake.contents[f'{SCRIPTS_FOLDER}/{spec["notebook"]}'] = {
+            "type": "NOTEBOOK", "body": "console-edited"}
+    return fake
+
+
+def test_reuse_existing_keeps_an_existing_stage_notebook(scripts):
+    fake = _seeded()
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(), reuse_existing=True,
+                    target_catalog="mig")
+    uploads = [kw for op, kw in fake.ops
+               if op == "upload_ws_file" and kw.get("object_type") == "NOTEBOOK"]
+    assert uploads == [], "nothing already there is overwritten"
+    assert fake.contents[f"{SCRIPTS_FOLDER}/02_copy_schema.ipynb"]["body"] \
+        == "console-edited"
+    notebooks = [s for s in res["steps"] if s["step"] == "notebook"]
+    assert [s["action"] for s in notebooks] == ["kept"] * len(JOB_SPECS)
+    assert all(s["verified"] is True and "--refresh-notebooks" in s["detail"]
+               for s in notebooks)
+    assert res["notebooks_kept"] == [s["notebook"] for s in JOB_SPECS]
+    jobs = [s for s in res["steps"] if s["step"] == "job"]
+    assert len(jobs) == len(JOB_SPECS)
+    assert all(s["action"] == "reused" and "kept" in s["detail"] for s in jobs)
+    md = render_provision(res)
+    assert "kept" in md and "--refresh-notebooks" in md
+    assert "02_copy_schema.ipynb" in md
+
+
+def test_refresh_notebooks_overwrites_and_says_so(scripts):
+    fake = _seeded()
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(), reuse_existing=True,
+                    refresh_notebooks=True, target_catalog="mig")
+    body = fake.contents[f"{SCRIPTS_FOLDER}/02_copy_schema.ipynb"]["body"]
+    assert body != "console-edited"
+    params = "".join(json.loads(body)["cells"][1]["source"])
+    assert "'target-catalog': 'mig'" in params
+    assert res["notebooks_kept"] == []
+    jobs = [s for s in res["steps"] if s["step"] == "job"]
+    assert all(s["action"] == "reused" and "OVERWRITTEN" in s["detail"]
+               and "console edits" in s["detail"] for s in jobs)
+    assert "kept as found" not in render_provision(res)
+
+
+def test_reuse_existing_still_uploads_a_notebook_that_is_missing(scripts):
+    fake = _seeded()
+    del fake.contents[f"{SCRIPTS_FOLDER}/03_reconcile.ipynb"]
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(), reuse_existing=True)
+    actions = sorted(s["action"] for s in res["steps"]
+                     if s["step"] == "notebook")
+    assert actions == ["kept", "kept", "kept", "uploaded"]
+    assert res["notebooks_kept"] == [s["notebook"] for s in JOB_SPECS[:3]]
+    assert f"{SCRIPTS_FOLDER}/03_reconcile.ipynb" in fake.contents
+
+
+def test_a_fresh_provision_still_uploads_every_notebook(scripts):
+    fake = Fake()
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=())
+    assert [s["action"] for s in res["steps"] if s["step"] == "notebook"] \
+        == ["uploaded"] * len(JOB_SPECS)
+    assert res["notebooks_kept"] == []
+
+
+def test_an_unlistable_scripts_folder_neither_overwrites_nor_creates(scripts):
+    class NoScriptsListing(Fake):
+        def __call__(self, operation, **kw):
+            if operation == "list_ws_objects" and kw["path"] == SCRIPTS_FOLDER:
+                self.ops.append((operation, kw))
+                raise RuntimeError("workspace-object list: 503")
+            return super().__call__(operation, **kw)
+
+    fake = NoScriptsListing(workspaces=("acme",), clusters=("migration_assets",),
+                            jobs=tuple(s["name"] for s in JOB_SPECS))
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(), reuse_existing=True)
+    notebooks = [s for s in res["steps"] if s["step"] == "notebook"]
+    assert [s["action"] for s in notebooks] == ["failed"] * len(JOB_SPECS)
+    assert all("could not list" in s["detail"] for s in notebooks)
+    assert not any(op == "upload_ws_file" and kw.get("object_type") == "NOTEBOOK"
+                   for op, kw in fake.ops), "could not look is not absent"

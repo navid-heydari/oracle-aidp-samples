@@ -55,7 +55,8 @@ TWO BEHAVIOURS LEARNED FROM A LIVE RUN, both of which broke the first attempt:
     are ACCEPTED (202) and then silently dropped. Six tables returned 202 and
     none appeared, while the identical bodies posted against a settled schema
     all landed. So the schema is resolved FIRST, created only if absent, and
-    waited on until ACTIVE.
+    waited on until ACTIVE. A listing that FAILS refuses the deploy before
+    anything is written; it is never read as "absent".
 
   * SCHEMA CREATION IS ASYNCHRONOUS. Creating a table immediately afterwards
     can return 409 Conflict "ongoing operation", so a 409 is retried with a
@@ -68,6 +69,7 @@ with no environment.
 from __future__ import annotations
 
 import datetime
+import re
 from typing import Callable
 
 import time
@@ -112,12 +114,16 @@ def _norm(field_type, precision=None, scale=None) -> str:
 
 
 def _find_schema(call, catalog: str, schema: str) -> dict | None:
-    """The schema as the server holds it, matched case-insensitively."""
+    """The schema as the server holds it, matched case-insensitively; None
+    when it is absent.
+
+    A failed LISTING is raised, not swallowed, as in `_resolve_catalog_type`.
+    Read as "absent" it would re-POST an existing schema -- the write the
+    module docstring says gets the table creates after it accepted and then
+    dropped -- and the 403 or 5xx behind it would be recorded nowhere.
+    """
     wanted = f"{catalog}.{schema}".lower()
-    try:
-        payload = call("list_schemas", catalog=catalog)
-    except Exception:
-        return None
+    payload = call("list_schemas", catalog=catalog)
     for item in payload.get("items") or []:
         if str(item.get("key") or "").lower() == wanted:
             return item
@@ -131,13 +137,12 @@ def _resolve_schema_key(call, catalog: str, schema: str) -> str | None:
 
 def _resolve_object(call, catalog: str, schema_key: str, name: str,
                     is_view: bool) -> dict | None:
-    """The object as the server holds it, matched case-insensitively."""
+    """The object as the server holds it, matched case-insensitively; None
+    when it is absent. A failed listing raises: "could not look" is not
+    "absent", and the two lead to different reports."""
     wanted = f"{schema_key}.{name}".lower()
-    try:
-        payload = call("list_views_in" if is_view else "list_tables_in",
-                       catalog=catalog, schema=schema_key)
-    except Exception:
-        return None
+    payload = call("list_views_in" if is_view else "list_tables_in",
+                   catalog=catalog, schema=schema_key)
     for item in payload.get("items") or []:
         if str(item.get("key") or "").lower() == wanted:
             return item
@@ -170,9 +175,10 @@ def _diagnose_never_appeared(call, catalog: str, schema_key: str,
     fine and the planned names are burned.
 
     Returns True when a novel name succeeds (so the planned names are
-    poisoned). Runs at most once per schema, and cleans up after itself with
-    a name that is unique per run -- a fixed probe name would burn itself on
-    its first failure.
+    poisoned), False when it does not, and None when the read-back itself
+    failed -- unknown, not "the schema refuses everything". Runs at most
+    once per schema, and cleans up after itself with a name that is unique
+    per run -- a fixed probe name would burn itself on its first failure.
     """
     probe = f"snowmig_probe_{uuid.uuid4().hex[:8]}"
     try:
@@ -183,9 +189,17 @@ def _diagnose_never_appeared(call, catalog: str, schema_key: str,
     except Exception:
         return False
 
-    landed = _resolve_object(call, catalog, schema_key, probe, False) is not None
+    try:
+        landed = _resolve_object(call, catalog, schema_key, probe,
+                                 False) is not None
+        list_error = None
+    except Exception as exc:
+        # Could not look. The probe may well exist, so the delete is
+        # attempted anyway -- it is never left behind because the listing
+        # failed -- and the verdict is "unknown".
+        landed, list_error = None, exc
     deleted = False
-    if landed:
+    if landed is not False:
         try:
             call("delete_table", catalog=catalog,
                  schema=schema_key.split(".", 1)[-1], table=probe)
@@ -193,18 +207,35 @@ def _diagnose_never_appeared(call, catalog: str, schema_key: str,
         except Exception:
             deleted = False
     if probes is not None:
-        probes.append({"name": probe, "schema": schema_key,
-                       "created": landed, "deleted": deleted,
-                       "note": ("removed" if deleted else
-                                "NOT removed — deletes are asynchronous and "
-                                "best-effort; remove it manually if it is "
-                                "still there")})
+        entry = {"name": probe, "schema": schema_key,
+                 "created": landed, "deleted": deleted,
+                 "note": ("removed" if deleted else
+                          "NOT removed — deletes are asynchronous and "
+                          "best-effort; remove it manually if it is "
+                          "still there")}
+        if list_error is not None:
+            entry["list_error"] = str(list_error)[:200]
+            entry["note"] = ("existence unknown: the listing failed; delete "
+                             + ("issued" if deleted else "attempted and "
+                                "refused -- remove it manually if it is there"))
+        probes.append(entry)
     return landed
 
 
 def _is_conflict(exc: Exception) -> bool:
     text = str(exc)
     return "409" in text or "ongoing" in text.lower()
+
+
+_TRANSIENT = re.compile(r"\b5\d\d\b|\b429\b|time[d]?[ -]?out", re.IGNORECASE)
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Worth asking again? A 5xx, a 429 or a timeout may clear on the next
+    poll. A 401/403 reads the same on every attempt, and polling it would
+    spend the whole verify budget per table on an answer that was known on
+    the first call."""
+    return bool(_TRANSIENT.search(str(exc)))
 
 
 def _planned(columns: list[dict]) -> list[tuple[str, str]]:
@@ -319,13 +350,36 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
             f"catalog {target.catalog} carries no catalogType in the list "
             f"response; proceeding, but the EXTERNAL guard could not run")
 
-    # 1. schemas: LOOK FIRST. Re-POSTing an existing schema re-triggers async
-    #    work and silently drops the table creates that follow it.
+    # 1. schemas: LOOK FIRST, at all of them, before writing any. Re-POSTing
+    #    an existing schema re-triggers async work and silently drops the
+    #    table creates that follow it -- so a schema that cannot be LISTED
+    #    is not "absent", and the deploy refuses while nothing is written yet.
     resolved: dict[str, str] = {}
-    for catalog, schema in sorted({_split(s["target_fqn"])[:2]
-                                   for s in statements}):
+    schema_pairs = sorted({_split(s["target_fqn"])[:2] for s in statements})
+    try:
+        looked = {pair: _find_schema(call, *pair) for pair in schema_pairs}
+    except Exception as exc:
+        raise RefusedToExecute(
+            f"could not list the schemas of catalog {target.catalog!r} before "
+            f"writing ({str(exc)[:200]}). A schema that cannot be listed is "
+            f"not known to be absent, and re-POSTing one that exists gets "
+            f"the table creates that follow it accepted and then silently "
+            f"dropped, so it refuses rather than guesses.") from exc
+
+    def _look(catalog: str, schema: str) -> dict | None:
+        # Mid-poll, the schema has already been POSTed; refusing would help
+        # nothing, but the error goes on the record instead of reading as
+        # "not visible yet".
+        try:
+            return _find_schema(call, catalog, schema)
+        except Exception as exc:
+            out["errors"].append(
+                f"LIST SCHEMAS {catalog}.{schema}: {str(exc)[:200]}")
+            return None
+
+    for catalog, schema in schema_pairs:
         requested = f"{catalog}.{schema}"
-        found = _find_schema(call, catalog, schema)
+        found = looked[(catalog, schema)]
 
         if found is None:
             try:
@@ -336,7 +390,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 out["errors"].append(f"CREATE SCHEMA {requested}: {exc}")
             # Creation is async: wait for it to exist AND be ACTIVE.
             for attempt in range(len(schema_wait) + 1):
-                found = _find_schema(call, catalog, schema)
+                found = _look(catalog, schema)
                 if found is not None and \
                         str(found.get("lifecycleState") or "ACTIVE").upper() == "ACTIVE":
                     break
@@ -351,7 +405,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                     break
                 if attempt < len(schema_wait):
                     time.sleep(schema_wait[attempt])
-                found = _find_schema(call, catalog, schema) or found
+                found = _look(catalog, schema) or found
 
         if found is None:
             out["errors"].append(
@@ -405,6 +459,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
             continue
 
         # Schema creation is async, so a 409 here means "not settled yet".
+        accepted = False
         for attempt in range(len(retry_delays) + 1):
             try:
                 if is_view:
@@ -414,6 +469,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                     call("create_table", catalog=catalog, schema=server_schema,
                          table=name, body=body)
                 out["executed"] += 1
+                accepted = True
                 break
             except Exception as exc:
                 out["errors"].append(f"CREATE {stmt.get('object_type')} "
@@ -426,13 +482,39 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         # 3. read it back -- this, not the create's return, is the claim.
         # Resolved by listing and matching case-insensitively, because the
         # server's key case is not the one we asked for.
-        listed = None
+        listed, list_error = None, None
         for attempt in range(len(verify_delays) + 1):
-            listed = _resolve_object(call, catalog, schema_key, name, is_view)
+            try:
+                listed = _resolve_object(call, catalog, schema_key, name,
+                                         is_view)
+                list_error = None
+            except Exception as exc:
+                # "Could not look" is not "absent". A 5xx may clear, so it
+                # is polled like a slow create; a permission error reads the
+                # same on every attempt and would only burn the budget.
+                listed, list_error = None, exc
+                if not _is_transient(exc):
+                    break
             if listed is not None:
                 break
             if attempt < len(verify_delays):
                 time.sleep(verify_delays[attempt])
+        if listed is None and list_error is not None:
+            relation = "views" if is_view else "tables"
+            out["errors"].append(
+                f"LIST {relation.upper()} {schema_key}: {str(list_error)[:200]}")
+            out["failed_targets"].append(ident)
+            out["failed"].append({
+                "source_identifier": ident, "target_fqn": stmt["target_fqn"],
+                "reason": (
+                    f"the create "
+                    f"{'returned 202 Accepted' if accepted else 'failed'} and "
+                    f"the object could not be read back: listing {relation} "
+                    f"in {schema_key} failed ({str(list_error)[:200]}). Its "
+                    f"existence is UNKNOWN, not absent -- fix the listing "
+                    f"permission or endpoint and re-run; no diagnosis probe "
+                    f"was written.")})
+            continue
         if listed is None:
             base = (f"the create returned 202 Accepted but no object matching "
                     f"{schema_key}.{name} ever appeared, and the asynchronous "
@@ -459,6 +541,12 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                     "not a burned name: suspect the request itself (an "
                     "unsupported field type is the usual cause) or the "
                     "permissions on this catalog.")
+            elif diagnose:
+                reason = base + (
+                    "Most often an unsupported field type. The diagnosis "
+                    "probe could not be read back either, so a burned name "
+                    "and a bad request cannot be told apart here -- see "
+                    "diagnosis_probes for the listing error.")
             else:
                 reason = base + (
                     "Most often an unsupported field type. Re-run with "
