@@ -286,7 +286,8 @@ def _snowflake_coords(args) -> dict:
         auth = str(config["auth"])
 
     return {"auth": auth or "keypair",
-            "account": pick("account"), "user": pick("user"),
+            "account": pick("account"), "host": pick("host"),
+            "user": pick("user"),
             "role": pick("role"), "warehouse": pick("warehouse"),
             "key_path": pick("key_path"),
             # A secret may be inline now, so it is resolved rather than
@@ -330,6 +331,7 @@ def _run_sql_from_args(args):
     try:
         kwargs = build_connect_kwargs(
             coords["auth"], account=coords["account"], user=coords["user"],
+            host=coords.get("host"),
             role=coords["role"], warehouse=coords["warehouse"],
             key_path=as_path(coords.get("private_key"), coords["key_path"]),
             key_passphrase=coords["key_passphrase"],

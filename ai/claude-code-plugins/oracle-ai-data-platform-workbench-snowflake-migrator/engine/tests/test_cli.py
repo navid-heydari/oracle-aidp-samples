@@ -914,3 +914,44 @@ def test_key_passphrase_is_read_from_the_file_the_config_names(
         ["assess", "--out-dir", str(tmp_path), "--config", cfg])
     snowmig._run_sql_from_args(args)
     assert captured["key_passphrase"] == "from-file"
+
+
+# --- host from the config reaches the laptop-side connector ----------------
+
+def test_run_sql_from_args_threads_host_from_config(tmp_path, monkeypatch):
+    # The same `host:` is what the EXTERNAL catalog body registers, so a
+    # preflight that ignored it PASSed against a different endpoint than
+    # AIDP would then use -- and a wrong host surfaced minutes into a job.
+    import snowmig
+    from migration_config import load_config, snowflake_block
+    from target.snowflake_catalog_connection import (
+        build_snowflake_connection_details)
+    captured = _capture_connect_kwargs(monkeypatch)
+    host = "ORG-ACC.us-east-2.aws.snowflakecomputing.com"
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(f"snowflake:\n  account: ORG-ACC\n  host: {host}\n"
+                   "  user: SVC\n  warehouse: WH\n  database: SALES_DB\n"
+                   "  auth: password\n  password: not-a-real-password\n",
+                   encoding="utf-8")
+    args = snowmig.build_parser().parse_args(
+        ["preflight", "--test-source", "--config", str(cfg),
+         "--out-dir", str(tmp_path)])
+    snowmig._run_sql_from_args(args)
+    assert captured["host"] == host
+    registered = build_snowflake_connection_details(
+        snowflake_block(load_config(cfg)))["SNOWFLAKE_HOST"]
+    assert captured["host"] == registered, "preflight and catalog must agree"
+
+
+def test_run_sql_from_args_leaves_host_unset_when_the_config_has_none(
+        tmp_path, monkeypatch):
+    import snowmig
+    captured = _capture_connect_kwargs(monkeypatch)
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("snowflake:\n  account: ORG-ACC\n  user: SVC\n"
+                   "  auth: password\n  password: not-a-real-password\n",
+                   encoding="utf-8")
+    args = snowmig.build_parser().parse_args(
+        ["assess", "--out-dir", str(tmp_path), "--config", str(cfg)])
+    snowmig._run_sql_from_args(args)
+    assert not captured.get("host")
