@@ -16,6 +16,14 @@ RISK_LEVELS = ("LOW", "MEDIUM", "HIGH")
 # Above this, the later data phase needs a wave/staging plan of its own.
 _LARGE_ROWS = 100_000_000
 
+_RISK_ORDER = {level: i for i, level in enumerate(RISK_LEVELS)}
+
+
+def _raise(level: str, to: str) -> str:
+    """Risk only ever goes up. A VIEW is HIGH; a column warning on the same
+    view is a lesser fact and used to overwrite it down to MEDIUM."""
+    return to if _RISK_ORDER[to] > _RISK_ORDER[level] else level
+
 
 def migration_status(identifier: str, *, deployed: dict | None,
                      blocked: bool = False) -> str:
@@ -67,13 +75,13 @@ def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
 
     omitted = obj.get("omitted_properties") or []
     if omitted:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append("source properties dropped with no AIDP equivalent: "
                      + ", ".join(omitted))
 
     deferred = obj.get("deferred_properties") or []
     if deferred:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append(
             "source maintenance/layout settings not applied on the target: "
             + ", ".join(f'{d["property"]}={d["value"]}' for d in deferred))
@@ -81,16 +89,16 @@ def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
     warnings = obj.get("warnings") or []
     tz = [w for w in warnings if "timezone" in w.lower()]
     if tz:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append("timezone semantics differ for one or more columns")
     other = [w for w in warnings if w not in tz]
     if other:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append(f"{len(other)} column warning(s) recorded")
 
     rows = obj.get("rows")
     if rows is not None and rows >= _LARGE_ROWS:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append(f"{rows:,} rows: the later data phase will need its own "
                      "staging and wave plan")
 

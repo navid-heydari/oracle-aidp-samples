@@ -100,6 +100,36 @@ def test_views_and_tables_are_both_in_the_table():
     assert "TABLE" in md and "VIEW" in md
 
 
+def test_risk_column_reflects_deferred_properties_and_timezone_warnings():
+    # The facts the plan entry carries (see plan.build) must reach the Risk
+    # column: a clustered table with a timezone caveat is MEDIUM, and the
+    # note names both.
+    orders = dict(PLAN["can_migrate"][0],
+                  warnings=["CREATED_AT: TIMESTAMP_NTZ -> TIMESTAMP: "
+                            "TIMEZONE SEMANTICS DIFFER"],
+                  deferred_properties=[{"property": "cluster_by",
+                                        "value": "LINEAR(ORDER_DATE)",
+                                        "aidp_equivalent": "CLUSTER BY / ZORDER"}],
+                  omitted_properties=[])
+    plan = dict(PLAN, can_migrate=[orders, PLAN["can_migrate"][1]])
+    md = render_summary(plan, INV, None, None)
+    row = next(l for l in md.splitlines() if "`D.PUBLIC.ORDERS`" in l)
+    assert "| MEDIUM |" in row
+    assert "cluster_by=LINEAR(ORDER_DATE)" in row
+    assert "timezone" in row.lower()
+    rollup = next(l for l in md.splitlines() if l.startswith("By risk:"))
+    assert "**MEDIUM**" in rollup
+
+
+def test_view_stays_high_when_it_carries_column_warnings():
+    view = dict(PLAN["can_migrate"][1], warnings=[
+        "CUSTOMER: declared length 39 is not enforced by Delta; recorded only"])
+    plan = dict(PLAN, can_migrate=[PLAN["can_migrate"][0], view])
+    md = render_summary(plan, INV, None, None)
+    row = next(l for l in md.splitlines() if "`D.PUBLIC.V`" in l)
+    assert "| HIGH |" in row, row
+
+
 # --- jobs -----------------------------------------------------------------
 
 def test_jobs_appear_in_the_same_summary_format():

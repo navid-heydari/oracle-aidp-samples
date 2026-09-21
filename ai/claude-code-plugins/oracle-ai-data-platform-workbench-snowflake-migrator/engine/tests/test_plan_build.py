@@ -83,6 +83,30 @@ def test_can_migrate_entries_carry_the_target_and_type():
     assert c["target"] == "d.s.t" and c["object_type"] == "TABLE"
 
 
+def test_can_migrate_entries_carry_the_risk_bearing_facts():
+    # SUMMARY.md scores risk from the plan entry alone. The column warnings
+    # and the maintenance settings ddl will defer must therefore travel on
+    # it, or a clustered table with a timezone caveat reads LOW.
+    r = rec("D.S.T")
+    r["warnings"] = ["TS: TIMESTAMP_NTZ -> TIMESTAMP: TIMEZONE SEMANTICS DIFFER"]
+    r["source_metadata"].update({"cluster_by": "LINEAR(ORDER_DATE)",
+                                 "change_tracking": "ON", "is_secure": "false",
+                                 "owner": "SYSADMIN", "retention_time": "7"})
+    plan = build_plan({"inventory": [r]}, {"edges": []})
+    c = plan["can_migrate"][0]
+    assert c["warnings"] == r["warnings"]
+    assert [d["property"] for d in c["deferred_properties"]] == [
+        "cluster_by", "change_tracking", "retention_time"]
+    assert all(d["aidp_equivalent"] for d in c["deferred_properties"])
+    assert c["omitted_properties"] == [], "is_secure=false is unset, owner is informational"
+
+
+def test_a_plain_record_still_carries_empty_facts():
+    c = build_plan({"inventory": [rec("D.S.T")]}, {"edges": []})["can_migrate"][0]
+    assert c["warnings"] == [] and c["deferred_properties"] == []
+    assert c["omitted_properties"] == []
+
+
 def test_every_object_appears_in_exactly_one_of_can_or_cannot():
     inv = {"inventory": [rec("D.S.OK"), rec("D.S.BAD", status="blocked",
                                             blocked=["x: VARIANT"]),

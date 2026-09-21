@@ -137,6 +137,23 @@ def test_the_demo_inventory_labels_its_row_counts_as_metadata(demo):
         "SUMMARY.md must not describe a blank INVENTORY.md does not print"
 
 
+def test_the_demo_summary_rates_the_clustered_table_medium(demo):
+    # ORDERS carries cluster_by / change_tracking / retention_time and a
+    # TIMESTAMP_NTZ downgrade; DDL_PLAN.md lists all four. SUMMARY.md once
+    # rated it LOW with "no properties dropped", because only the object type
+    # and the row count reached the risk assessment.
+    out, _ = demo
+    md = (out / "SUMMARY.md").read_text(encoding="utf-8")
+    orders = next(l for l in md.splitlines() if "`SNOWDEMO.SALES.ORDERS`" in l)
+    assert "| MEDIUM |" in orders, orders
+    assert "cluster_by=LINEAR(ORDER_DATE)" in orders
+    view = next(l for l in md.splitlines()
+                if "`SNOWDEMO.ANALYTICS.ORDER_SUMMARY_VW`" in l)
+    assert "| HIGH |" in view, "a view's column warnings must not pull it down"
+    rollup = next(l for l in md.splitlines() if l.startswith("By risk:"))
+    assert "**MEDIUM**" in rollup
+
+
 def test_the_emulated_snowflake_refuses_a_question_it_cannot_answer():
     # A fake that improvises is how an emulation starts lying.
     with pytest.raises(ValueError, match="no answer"):
