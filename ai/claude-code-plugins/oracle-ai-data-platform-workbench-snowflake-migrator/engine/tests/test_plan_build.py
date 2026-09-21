@@ -264,3 +264,34 @@ def test_views_whose_bases_all_migrate_are_unaffected_by_the_cascade():
     plan = build_plan(inv, {"edges": [_edge("D.S.V", "D.S.T")]})
     assert plan["waves"] == [["D.S.T"], ["D.S.V"]]
     assert plan["cannot_migrate"] == []
+
+
+# --- the plan says whose catalog name its Target column carries -----------
+#
+# The in-AIDP structure job creates <--target-catalog>.<schema>.<table>; the
+# plan's catalog part is the source database mirrored (or a prefix). Reviewers
+# were signing off on names the job never creates, so the plan now states it.
+
+def test_plan_carries_a_target_catalog_note_for_the_default_mirror():
+    plan = build_plan({"inventory": [rec("MYDB.SALES.ORDERS")]}, {"edges": []})
+    note = plan["target_catalog_note"]
+    assert "01_create_structure" in note
+    assert "--target-catalog" in note
+    assert "mydb" in note, "names the mirrored catalog the column carries"
+    assert "source database" in note.lower()
+    assert "external" in note.lower(), "warns that the source-named catalog is the pointer"
+
+
+def test_target_catalog_note_names_the_prefix_when_one_was_given():
+    plan = build_plan({"inventory": [rec("MYDB.SALES.ORDERS")]}, {"edges": []},
+                      bronze_catalog_prefix="lake", bronze_schema_style="db")
+    note = plan["target_catalog_note"]
+    assert "'lake'" in note and "--bronze-catalog-prefix" in note
+    assert "'db'" in note, "names the schema style the column follows"
+    assert "01_create_structure" in note and "--target-catalog" in note
+
+
+def test_target_catalog_note_is_present_even_when_nothing_migrates():
+    inv = {"inventory": [rec("D.S.BAD", status="blocked", blocked=["x: VARIANT"])]}
+    plan = build_plan(inv, {"edges": []})
+    assert plan["target_catalog_note"] and "01_create_structure" in plan["target_catalog_note"]

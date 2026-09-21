@@ -116,6 +116,35 @@ def _cascade_dependency_exclusions(can: list[dict], cannot: list[dict],
     return [c for c in can if c["source_identifier"] in can_ids], cannot
 
 
+def _target_catalog_note(catalogs: list[str], prefix: str | None,
+                         style: str) -> str:
+    """Say whose catalog name the Target column carries.
+
+    The in-AIDP structure job (01_create_structure) creates
+    <--target-catalog>.<source schema>.<name> and never reads the plan's
+    target_fqn; the plan's catalog part is the source database mirrored, or
+    the prefix. Reviewers were approving names the job does not create.
+    """
+    job = ("The in-AIDP structure job (01_create_structure) does not read this "
+           "column: it creates <--target-catalog>.<schema>.<table> under the "
+           "catalog passed to `provision --target-catalog`, keeping the source "
+           "schema and table names.")
+    if prefix is None:
+        mirrored = ", ".join(catalogs) or "the source database"
+        return (f"The catalog part of the Target column is the source database "
+                f"name mirrored 1:1 ({mirrored}); no --bronze-catalog-prefix was "
+                f"given. {job} Read the Target column with that "
+                f"catalog in place of {mirrored}. In the runbook the catalog "
+                f"named after the source database is the read-only EXTERNAL "
+                f"pointer at Snowflake, not the target -- the job refuses "
+                f"source == target.")
+    return (f"The catalog part of the Target column is the --bronze-catalog-prefix "
+            f"{prefix!r}, with the schema part in the {style!r} style. {job} "
+            f"Pass {prefix!r} to `provision --target-catalog` for the catalogs to "
+            f"agree; the schema part the job creates is the source schema, not "
+            f"the {style!r} form shown here.")
+
+
 def build_plan(inventory: dict, dependencies: dict, *,
                restrictions: dict | None = None,
                bronze_catalog_prefix: str | None = None,
@@ -189,6 +218,8 @@ def build_plan(inventory: dict, dependencies: dict, *,
         "bronze_schema_style": bronze_schema_style,
         "bronze_mapping": ("Snowflake database -> AIDP Standard Catalog, "
                            "schema -> schema, table -> table, view -> view"),
+        "target_catalog_note": _target_catalog_note(
+            catalogs, bronze_catalog_prefix, bronze_schema_style),
         "waves": waved["waves"],
         "cycles": waved["cycles"],
         "target_names": targets,
