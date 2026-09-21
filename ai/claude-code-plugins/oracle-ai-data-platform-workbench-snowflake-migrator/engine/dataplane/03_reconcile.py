@@ -12,9 +12,10 @@ into `reconciliation.json` and `MIGRATION_REPORT.md`: one row per table with
 its structure status, copy status, live existence, and live row count. The
 catalog is consulted directly so the report cannot be flattered by a stale
 script report: an object a report calls verified but the catalog no longer
-holds is flagged, and an object in the catalog that no report claims is
-flagged the other way. A script report written for a DIFFERENT target
-catalog is ignored (and said so), not applied to this one.
+holds -- or, with --counts, no longer holds at the verified row count -- is
+flagged, and an object in the catalog that no report claims is flagged the
+other way. A script report written for a DIFFERENT target catalog is
+ignored (and said so), not applied to this one.
 
 "Could not look" never renders as zero: an unreadable schema is marked
 UNREADABLE, distinct from empty.
@@ -43,7 +44,7 @@ MANIFEST_NAME = "discovery_manifest.json"
 # real signal gets ignored.
 PROBLEM_VERDICTS = ("MISSING_DESPITE_REPORT", "STRUCTURE_FAILED",
                     "STRUCTURE_TYPE_DRIFT", "STRUCTURE_ONLY_COPY_FAILED",
-                    "TARGET_UNREADABLE")
+                    "COUNT_DRIFT", "TARGET_UNREADABLE")
 
 
 def q(identifier: str) -> str:
@@ -183,6 +184,21 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                 except Exception as exc:
                     row["target_count"] = None
                     row["count_error"] = str(exc)[:200]
+                # The live count is compared, not just printed: a verified
+                # table emptied or changed out of band since the copy is a
+                # problem, not a pass. A count that could not be read is
+                # not drift, and a report that never recorded one has
+                # nothing to compare against.
+                reported = c_rec.get("target_count")
+                if verdict == "MIGRATED_VERIFIED" \
+                        and row["target_count"] is not None \
+                        and isinstance(reported, int) \
+                        and row["target_count"] != reported:
+                    verdict = row["verdict"] = "COUNT_DRIFT"
+                    row["reason"] = (f"the copy report verified {reported:,} "
+                                     f"row(s); the target now holds "
+                                     f"{row['target_count']:,}. Changed "
+                                     f"since the copy, not by it")
             rows.append(row)
             tally[verdict] = tally.get(verdict, 0) + 1
 
@@ -283,7 +299,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--target-catalog", required=True)
     ap.add_argument("--reports-dir", default=DEFAULT_REPORTS_DIR)
     ap.add_argument("--counts", action="store_true",
-                    help="also read a live COUNT(*) per existing table")
+                    help="also read a live COUNT(*) per existing table, and "
+                         "flag a verified table whose count has changed since "
+                         "the copy verified it (COUNT_DRIFT)")
     args = ap.parse_args(argv)
 
     reports = pathlib.Path(args.reports_dir)

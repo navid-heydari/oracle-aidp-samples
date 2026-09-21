@@ -1216,7 +1216,7 @@ def test_not_migrated_is_pending_not_a_problem(reconcile):
     assert "STRUCTURE_ONLY" not in reconcile.PROBLEM_VERDICTS
     for verdict in ("MISSING_DESPITE_REPORT", "STRUCTURE_FAILED",
                     "STRUCTURE_TYPE_DRIFT", "STRUCTURE_ONLY_COPY_FAILED",
-                    "TARGET_UNREADABLE"):
+                    "COUNT_DRIFT", "TARGET_UNREADABLE"):
         assert verdict in reconcile.PROBLEM_VERDICTS
 
 
@@ -1249,6 +1249,93 @@ def test_a_structure_create_that_raised_is_a_problem_not_pending(reconcile,
     md = reconcile.render(rec)
     assert "1 table(s) need attention" in md
     assert "No table is in a problem state" not in md
+
+
+# --- reconcile --counts: the live count is compared, not just printed ------
+#
+# With --counts the live COUNT(*) was fetched and rendered in the row, but the
+# verdict came solely from the copy report's `verified`: a table emptied or
+# changed out of band after the copy rendered "MIGRATED_VERIFIED (0 rows)"
+# under "No table is in a problem state", exit 0.
+
+def _verified_orders(reports, **extra):
+    _seeded_copy_report(reports, "ORDERS",
+                        {"status": "verified", "source_count": 5,
+                         "target_count": 5, **extra})
+
+
+def _orders_spark(live_count):
+    spark = _CatalogSpark({"`lake`.`SALES`.`ORDERS`": [("A", "string")]})
+    spark.counts = {"`lake`.`SALES`.`ORDERS`": live_count}
+    return spark
+
+
+@pytest.mark.parametrize("live", [0, 7])
+def test_a_verified_table_whose_live_count_drifted_is_a_problem(reconcile,
+                                                                tmp_path, live):
+    _verified_orders(tmp_path)
+    rec = reconcile.reconcile(_orders_spark(live), manifest=_manifest("ORDERS"),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=True)
+    row = rec["schemas"][0]["tables"][0]
+    assert row["verdict"] == "COUNT_DRIFT"
+    assert "COUNT_DRIFT" in reconcile.PROBLEM_VERDICTS
+    assert rec["totals"]["COUNT_DRIFT"] == 1
+    assert "5" in row["reason"] and str(live) in row["reason"]
+    md = reconcile.render(rec)
+    assert "1 table(s) need attention" in md
+    assert "No table is in a problem state" not in md
+
+
+def test_a_verified_table_whose_live_count_matches_stays_verified(reconcile,
+                                                                  tmp_path):
+    _verified_orders(tmp_path)
+    rec = reconcile.reconcile(_orders_spark(5), manifest=_manifest("ORDERS"),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=True)
+    assert rec["schemas"][0]["tables"][0]["verdict"] == "MIGRATED_VERIFIED"
+    assert rec["schemas"][0]["tables"][0]["target_count"] == 5
+    assert "COUNT_DRIFT" not in rec["totals"]
+
+
+def test_counts_off_never_compares(reconcile, tmp_path):
+    # The default job path is unchanged: no COUNT(*) issued, no comparison.
+    _verified_orders(tmp_path)
+    spark = _orders_spark(0)
+    rec = reconcile.reconcile(spark, manifest=_manifest("ORDERS"),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=False)
+    assert rec["schemas"][0]["tables"][0]["verdict"] == "MIGRATED_VERIFIED"
+    assert not any("count(*)" in s.lower() for s in spark.statements)
+
+
+def test_a_report_without_a_verified_count_is_not_drift(reconcile, tmp_path):
+    # A copy report written before counts were recorded has nothing to
+    # compare against: no crash, no false alarm.
+    _seeded_copy_report(tmp_path, "ORDERS", {"status": "verified"})
+    rec = reconcile.reconcile(_orders_spark(0), manifest=_manifest("ORDERS"),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=True)
+    assert rec["schemas"][0]["tables"][0]["verdict"] == "MIGRATED_VERIFIED"
+
+
+def test_an_unreadable_live_count_is_not_drift(reconcile, tmp_path):
+    """Could not look is not the same as wrong."""
+    class NoCount(_CatalogSpark):
+        def sql(self, statement):
+            if "count(*)" in statement.lower():
+                raise RuntimeError("denied")
+            return super().sql(statement)
+
+    _verified_orders(tmp_path)
+    spark = NoCount({"`lake`.`SALES`.`ORDERS`": [("A", "string")]})
+    rec = reconcile.reconcile(spark, manifest=_manifest("ORDERS"),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=True)
+    row = rec["schemas"][0]["tables"][0]
+    assert row["target_count"] is None
+    assert "denied" in row["count_error"]
+    assert row["verdict"] == "MIGRATED_VERIFIED"
 
 
 def test_a_failed_create_whose_table_exists_anyway_is_still_a_problem(
