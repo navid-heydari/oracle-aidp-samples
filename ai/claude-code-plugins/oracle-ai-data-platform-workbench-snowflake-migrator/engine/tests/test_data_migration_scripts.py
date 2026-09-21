@@ -443,3 +443,232 @@ def test_the_structure_stage_does_not_ship_a_default_that_cannot_work():
         assert stage.params["mode"] != "manifest", (
             "connector-built manifests carry Snowflake types; this pair "
             "cannot create a Delta table")
+
+
+# --- discovery: --schemas is a predicate, and a scoped run merges -------------
+#
+# Two defects with one root: `--schemas` was applied AFTER an unfiltered
+# INFORMATION_SCHEMA fetch. So it could not narrow a query that hits
+# Snowflake's result cap, and in connector mode the filtered result was
+# ASSIGNED over the loaded manifest -- following DISCOVERY.md's own advice
+# ("re-run with --force --schemas <name>") deleted every other schema from
+# discovery_manifest.json, in both modes.
+
+def _rel(schema, name, rows=1):
+    return {"TABLE_SCHEMA": schema, "TABLE_NAME": name, "TABLE_TYPE": "BASE TABLE",
+            "ROW_COUNT": rows, "BYTES": 10 * rows}
+
+
+def _colrow(schema, name):
+    return {"TABLE_SCHEMA": schema, "TABLE_NAME": name, "COLUMN_NAME": "ID",
+            "ORDINAL_POSITION": 1, "DATA_TYPE": "NUMBER", "IS_NULLABLE": "NO",
+            "NUMERIC_PRECISION": 38, "NUMERIC_SCALE": 0,
+            "CHARACTER_MAXIMUM_LENGTH": None}
+
+
+def test_wanted_schemas_are_pushed_down_not_filtered_client_side(discover):
+    source = _FakeSource(tables=[_rel("SALES", "ORDERS"), _rel("HR", "EMP")],
+                         columns=[_colrow("SALES", "ORDERS"), _colrow("HR", "EMP")])
+    discover.discover_via_connector(source, wanted=["SALES"], exclude=set())
+    assert len(source.queries) == 2
+    for sql in source.queries:
+        assert "where TABLE_SCHEMA in ('SALES')" in sql, sql
+    # And an unscoped run stays unfiltered: the two-query fast path.
+    source = _FakeSource(tables=[_rel("SALES", "ORDERS")],
+                         columns=[_colrow("SALES", "ORDERS")])
+    discover.discover_via_connector(source, wanted=None, exclude=set())
+    assert not any("where TABLE_SCHEMA" in sql for sql in source.queries)
+
+
+def test_schema_name_with_apostrophe_is_escaped_in_the_predicate(discover):
+    source = _FakeSource(tables=[], columns=[])
+    discover.discover_via_connector(source, wanted=["O'BRIEN", "HR"], exclude=set())
+    assert "where TABLE_SCHEMA in ('O''BRIEN', 'HR')" in source.queries[0]
+
+
+def test_discovery_summary_says_other_schemas_are_kept(discover):
+    md = discover.render_summary({"source": {"mode": "connector"},
+                                  "schemas": [], "generated_at": "now"})
+    assert "kept" in md
+    assert "--force --schemas" not in md, \
+        "the old advice, followed literally, truncated the manifest"
+
+
+# main() end to end, with pyspark and SnowflakeSource stubbed.
+
+class _Estate:
+    """Mutable estate the fakes answer from, so a test can change a row count
+    or drop a schema between runs."""
+    tables = [_rel("HR", "EMP", rows=3), _rel("SALES", "ORDERS", rows=5),
+              _rel("FIN", "LEDGER", rows=7)]
+
+    @classmethod
+    def columns(cls):
+        return [_colrow(t["TABLE_SCHEMA"], t["TABLE_NAME"]) for t in cls.tables]
+
+    @classmethod
+    def schemas(cls):
+        return sorted({t["TABLE_SCHEMA"] for t in cls.tables})
+
+
+class _MainSource:
+    """Stands in for SnowflakeSource inside main(): honours the schema
+    predicate the way Snowflake would."""
+
+    def __init__(self, spark, *, mode, config=None, external_catalog=None,
+                 session_schema=None):
+        self.spark, self.mode = spark, mode
+        self.external_catalog = external_catalog or "ext"
+        self.session_schema = session_schema or "PUBLIC"
+        self.queries: list[str] = []
+
+    def pushdown(self, sql, schema=None):
+        import re
+        self.queries.append(sql)
+        rows = _Estate.columns() if "COLUMNS" in sql else list(_Estate.tables)
+        m = re.search(r"where TABLE_SCHEMA in \((.*?)\)", sql)
+        if m:
+            wanted = {s.strip()[1:-1].replace("''", "'")
+                      for s in m.group(1).split(",")}
+            rows = [r for r in rows if r["TABLE_SCHEMA"] in wanted]
+        return _FakeDF(rows)
+
+    def describe(self):
+        return {"mode": self.mode, "database": "DB", "host": "h", "user": "u",
+                "warehouse": "w", "role": "r", "auth": "KeyPair",
+                "external_catalog": self.external_catalog,
+                "session_schema": self.session_schema}
+
+    def database(self):
+        return "DB"
+
+
+class _CatalogSpark(_FakeSpark):
+    """Answers SHOW SCHEMAS / SHOW TABLES / SHOW VIEWS / DESCRIBE against the
+    same estate, for external-catalog mode."""
+
+    def sql(self, statement):
+        low = statement.lower()
+        if low.startswith("show schemas"):
+            return _FakeDF([{"namespace": s} for s in _Estate.schemas()])
+        if low.startswith("show tables"):
+            schema = statement.rsplit("`", 2)[-2]
+            return _FakeDF([{"tableName": t["TABLE_NAME"]} for t in _Estate.tables
+                            if t["TABLE_SCHEMA"] == schema])
+        if low.startswith("show views"):
+            return _FakeDF([])
+        return super().sql(statement)
+
+
+def _stub_pyspark(monkeypatch, spark):
+    import types
+    pyspark, sql = types.ModuleType("pyspark"), types.ModuleType("pyspark.sql")
+
+    class _Builder:
+        @staticmethod
+        def getOrCreate():
+            return spark
+
+    class SparkSession:
+        builder = _Builder()
+
+    sql.SparkSession = SparkSession
+    pyspark.sql = sql
+    monkeypatch.setitem(sys.modules, "pyspark", pyspark)
+    monkeypatch.setitem(sys.modules, "pyspark.sql", sql)
+
+
+def _manifest_schemas(reports):
+    data = json.loads((reports / "discovery_manifest.json").read_text(encoding="utf-8"))
+    return {s["name"]: s for s in data["schemas"]}
+
+
+@pytest.fixture
+def estate(monkeypatch, discover):
+    monkeypatch.setattr(_Estate, "tables", [_rel("HR", "EMP", rows=3),
+                                            _rel("SALES", "ORDERS", rows=5),
+                                            _rel("FIN", "LEDGER", rows=7)])
+    monkeypatch.setattr(discover, "SnowflakeSource", _MainSource)
+    _stub_pyspark(monkeypatch, _CatalogSpark())
+    return _Estate
+
+
+def test_a_scoped_connector_rerun_keeps_the_other_schemas(discover, estate, tmp_path):
+    base = ["--source-mode", "connector", "--reports-dir", str(tmp_path)]
+    assert discover.main(base) == 0
+    assert sorted(_manifest_schemas(tmp_path)) == ["FIN", "HR", "SALES"]
+
+    estate.tables[1] = _rel("SALES", "ORDERS", rows=500)       # SALES changed
+    assert discover.main(base + ["--force", "--schemas", "SALES"]) == 0
+    got = _manifest_schemas(tmp_path)
+    assert sorted(got) == ["FIN", "HR", "SALES"], "the other schemas are kept"
+    assert got["SALES"]["tables"][0]["source_rows"] == 500, "SALES was refreshed"
+    assert got["HR"]["tables"][0]["source_rows"] == 3
+
+    estate.tables[1] = _rel("SALES", "ORDERS", rows=501)
+    assert discover.main(base + ["--schemas", "SALES"]) == 0   # no --force
+    got = _manifest_schemas(tmp_path)
+    assert sorted(got) == ["FIN", "HR", "SALES"]
+    assert got["SALES"]["tables"][0]["source_rows"] == 501
+
+
+def test_force_without_schemas_rediscovers_the_whole_estate(discover, estate, tmp_path):
+    base = ["--source-mode", "connector", "--reports-dir", str(tmp_path)]
+    assert discover.main(base) == 0
+    del estate.tables[2]                                         # FIN is gone
+    assert discover.main(base + ["--force"]) == 0
+    assert sorted(_manifest_schemas(tmp_path)) == ["HR", "SALES"], \
+        "a full re-discovery is authoritative and drops what no longer exists"
+
+
+def test_a_scoped_external_catalog_force_keeps_the_other_schemas(discover, estate,
+                                                                 tmp_path):
+    base = ["--source-mode", "external-catalog", "--source-catalog", "ext",
+            "--reports-dir", str(tmp_path)]
+    assert discover.main(base) == 0
+    assert sorted(_manifest_schemas(tmp_path)) == ["FIN", "HR", "SALES"]
+    assert discover.main(base + ["--force", "--schemas", "SALES"]) == 0
+    assert sorted(_manifest_schemas(tmp_path)) == ["FIN", "HR", "SALES"]
+
+
+def test_a_manifest_for_a_different_source_is_refused_even_with_force(discover, estate,
+                                                                       tmp_path):
+    # The identity guard used to be skipped under --force, which let a --force
+    # run silently overwrite another database's manifest.
+    (tmp_path / "discovery_manifest.json").write_text(json.dumps(
+        {"schemas": [], "source_identity": "OTHER_DB"}), encoding="utf-8")
+    rc = discover.main(["--source-mode", "connector", "--reports-dir",
+                        str(tmp_path), "--force"])
+    assert rc == 1
+    data = json.loads((tmp_path / "discovery_manifest.json").read_text(encoding="utf-8"))
+    assert data["source_identity"] == "OTHER_DB", "left untouched"
+
+
+def test_zero_schemas_message_points_at_the_traceback_too(discover, estate, tmp_path,
+                                                          monkeypatch, capsys):
+    class Broken(_MainSource):
+        def pushdown(self, sql, schema=None):
+            raise RuntimeError("SQL compilation error: Information schema query "
+                               "returned too much data. Please repeat query with "
+                               "more selective predicates.")
+
+    monkeypatch.setattr(discover, "SnowflakeSource", Broken)
+    rc = discover.main(["--source-mode", "connector", "--reports-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "DISCOVERY FAILED" in out and "too much data" in out
+    assert "DISCOVERY FAILED above" in out, \
+        "the hint must not point only at the credentials"
+
+
+def test_the_committed_discovery_notebook_matches_its_source():
+    """The AIDP job runs the .ipynb, not the .py. A fix to the source that is
+    not regenerated into the notebook ships the old behaviour to the cluster
+    while every test here passes against the new one."""
+    sys.path.insert(0, str(SCRIPTS.parent))
+    from target.stage_notebooks import STAGES, build_stage_notebook
+    stage = next(s for s in STAGES if s.source == "00_discover_snowflake.py")
+    committed = SCRIPTS.parents[1] / "data-migration-scripts" / stage.notebook_name
+    generated = build_stage_notebook(stage)
+    assert json.loads(committed.read_text(encoding="utf-8")) == generated, \
+        "regenerate with `snowmig.py build-notebooks`"
