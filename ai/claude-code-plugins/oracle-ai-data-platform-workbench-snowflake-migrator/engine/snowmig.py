@@ -295,11 +295,12 @@ def _snowflake_coords(args) -> dict:
                          if config else None),
             "private_key": (resolve_secret(config, "private_key", "key_path")
                             if config and config.get("private_key") else None),
-            "key_passphrase": (
-                getattr(args, "key_passphrase", None)
-                or (resolve_secret(config, "key_passphrase",
-                                   "key_passphrase_path")
-                    if config else None)),
+            # From the config only (inline, or a file it names): there is no
+            # flag for it, because a passphrase in argv lands in shell
+            # history and the process table.
+            "key_passphrase": (resolve_secret(config, "key_passphrase",
+                                              "key_passphrase_path")
+                               if config else None),
             "pat_path": pick("pat_path"),
             "password_path": pick("password_path"),
             "database": pick("database")}
@@ -1600,7 +1601,8 @@ def _add_snowflake_args(p) -> None:
     p.add_argument("--auth", default="keypair",
                    choices=["keypair", "pat", "password", "externalbrowser"])
     p.add_argument("--key-path")
-    p.add_argument("--key-passphrase")
+    # No --key-passphrase: every secret is a path or lives in the config.
+    # main() refuses the old spelling by name (see _REMOVED_SECRET_FLAGS).
     p.add_argument("--pat-path")
     p.add_argument("--password-path")
 
@@ -2121,8 +2123,34 @@ def _utf8_streams() -> None:
             pass
 
 
+#: Flags that once took a secret VALUE on the command line. They are refused
+#: by name before argparse sees them, so the answer names where the secret
+#: belongs instead of "unrecognized arguments" -- and never echoes the value.
+_REMOVED_SECRET_FLAGS = {
+    "--key-passphrase": ("key_passphrase", "key_passphrase_path"),
+}
+
+
+def _refuse_inline_secret(argv: list[str]) -> str | None:
+    for arg in argv:
+        flag = arg.split("=", 1)[0]
+        if flag in _REMOVED_SECRET_FLAGS:
+            inline, path_field = _REMOVED_SECRET_FLAGS[flag]
+            return (f"{flag} is not accepted: a secret on the command line "
+                    f"reaches shell history and the process table. Put it in "
+                    f"the migration config instead, as `{inline}:` (inline; "
+                    f"the file is gitignored) or `{path_field}:` (a file "
+                    f"holding it).")
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     _utf8_streams()
+    refused = _refuse_inline_secret(
+        list(sys.argv[1:] if argv is None else argv))
+    if refused:
+        print(f"error: {refused}", file=sys.stderr)
+        return 1
     args = build_parser().parse_args(argv)
     if getattr(args, "out_dir", None) is None:
         args.out_dir = str(default_out_dir())

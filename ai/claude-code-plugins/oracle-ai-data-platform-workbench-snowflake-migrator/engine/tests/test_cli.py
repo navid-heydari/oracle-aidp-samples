@@ -831,3 +831,86 @@ def test_provision_flag_overrides_the_config_catalog(tmp_path, monkeypatch):
     res = json.loads((tmp_path / "provision_result.json").read_text(encoding="utf-8"))
     assert res["target_catalog"] == "flag_cat"
     assert res["external_catalog"] == "cfg_external_cat"
+
+
+# --- no Snowflake secret is ever taken inline on the command line ----------
+
+def _every_option_string():
+    import snowmig
+    subs = snowmig.build_parser()._subparsers._group_actions[0].choices
+    return {o for sp in subs.values() for a in sp._actions
+            for o in a.option_strings}
+
+
+def test_no_stage_accepts_a_secret_inline():
+    # PRIVACY.md: secrets are read from files named by path, never as
+    # inline arguments. Any secret-looking flag must therefore be a *-path.
+    secretish = {o for o in _every_option_string()
+                 if any(w in o for w in ("pass", "token", "secret",
+                                         "private-key", "pat-"))}
+    assert secretish, "the guard found no secret-looking flags at all"
+    assert all(o.endswith("-path") for o in secretish), sorted(secretish)
+    assert "--key-passphrase" not in _every_option_string()
+
+
+def test_the_removed_passphrase_flag_is_refused_and_names_the_config_keys(
+        tmp_path, capsys):
+    rc = main(["assess", "--out-dir", str(tmp_path), "--account", "a",
+               "--user", "u", "--key-path", "/k", "--key-passphrase",
+               "NOT-A-REAL-PASSPHRASE"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "key_passphrase_path" in err and "key_passphrase" in err
+    assert "NOT-A-REAL-PASSPHRASE" not in err, "the value is never echoed"
+    # The = spelling is the same leak.
+    rc = main(["assess", "--out-dir", str(tmp_path), "--account", "a",
+               "--user", "u", "--key-path", "/k",
+               "--key-passphrase=NOT-A-REAL-PASSPHRASE"])
+    assert rc == 1
+    assert "NOT-A-REAL-PASSPHRASE" not in capsys.readouterr().err
+
+
+def _capture_connect_kwargs(monkeypatch):
+    import snowmig
+    captured = {}
+
+    def fake_build(auth, **kw):
+        captured.update(kw)
+        return {}
+    monkeypatch.setattr(snowmig, "build_connect_kwargs", fake_build)
+    monkeypatch.setattr(snowmig, "connect", lambda **kw: "CONN")
+    monkeypatch.setattr(snowmig, "make_run_sql", lambda conn: "CALLABLE")
+    return captured
+
+
+def _keypair_config(tmp_path, *extra_lines):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("snowflake:\n  account: ORG-ACC\n  user: SVC\n"
+                   "  auth: keypair\n  key_path: /k\n"
+                   + "".join(f"  {line}\n" for line in extra_lines),
+                   encoding="utf-8")
+    return str(cfg)
+
+
+def test_key_passphrase_is_read_from_the_config_inline(tmp_path, monkeypatch):
+    import snowmig
+    captured = _capture_connect_kwargs(monkeypatch)
+    cfg = _keypair_config(tmp_path, "key_passphrase: from-config")
+    args = snowmig.build_parser().parse_args(
+        ["assess", "--out-dir", str(tmp_path), "--config", cfg])
+    assert snowmig._run_sql_from_args(args) == "CALLABLE"
+    assert captured["key_passphrase"] == "from-config"
+
+
+def test_key_passphrase_is_read_from_the_file_the_config_names(
+        tmp_path, monkeypatch):
+    import snowmig
+    captured = _capture_connect_kwargs(monkeypatch)
+    pp = tmp_path / "pp"
+    pp.write_text("  from-file\n", encoding="utf-8")
+    cfg = _keypair_config(tmp_path, f"key_passphrase_path: {pp}")
+    args = snowmig.build_parser().parse_args(
+        ["assess", "--out-dir", str(tmp_path), "--config", cfg])
+    snowmig._run_sql_from_args(args)
+    assert captured["key_passphrase"] == "from-file"
