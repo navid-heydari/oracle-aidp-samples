@@ -577,3 +577,28 @@ def test_live_status_register_has_one_home_and_one_wording():
         flat = _flat(text)
         assert "What is actually proven" in flat, f"{rel} must point at the GAPS register"
         assert canonical in flat, f"{rel} must carry the GAPS sentence verbatim"
+
+
+# --------------------------------------------------------------------------
+# The slash commands are the agent's entry points at S4/S10. They must route
+# Standard-catalog structure the way the runbook and the CLI do: the
+# container from `catalog --catalog-type standard --execute`, the tables from
+# `run --job snowmig_01_structure` -- never through `notebook --upload`,
+# whose transport GAPS 13 records as known-bad.
+# --------------------------------------------------------------------------
+
+def test_catalog_command_does_not_call_the_standard_catalog_refused():
+    text = (ROOT / "commands/snowflake-catalog.md").read_text(encoding="utf-8")
+    assert "refused" not in text.lower(), \
+        "the CLI creates the INTERNAL container (S4); the command said it refuses"
+    assert "--catalog-type standard" in text
+    assert "snowmig_01_structure" in text
+    assert "container_only" in text
+
+
+def test_soft_clone_command_routes_standard_structure_to_s10():
+    text = (ROOT / "commands/snowflake-soft-clone.md").read_text(encoding="utf-8")
+    assert "--catalog-type standard" in text
+    assert "snowmig_01_structure" in text
+    assert "/Workspace/Shared/" not in text and "--upload" not in text, \
+        "structure does not go through the notebook upload path"
