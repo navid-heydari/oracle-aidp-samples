@@ -457,6 +457,37 @@ def test_type_drift_is_rechecked_on_resume_but_created_and_existing_are_skipped(
 # created, copied and reconciled nothing. The check is run-wide, not
 # per-schema: a canary plan legitimately leaves the other schemas untouched.
 
+def test_ctas_already_existed_says_the_layout_was_not_compared(
+        monkeypatch, tmp_path):
+    """`--mode ctas` derives types from the source read and has no plan to
+    compare a pre-existing table with, so `already_existed` there is a
+    weaker claim than in ddl-plan mode. The record has to say the layout
+    was NOT compared: the copy takes `already_existed` into its default
+    scope, and reconcile prints the reason beside the verdict."""
+    spark = _CatalogSpark({"`lake`.`SALES`.`ORDERS`": [("A", "string")]})
+
+    class Source:
+        def __init__(self, *args, **kwargs):
+            self.spark = spark
+
+        def register_temp_view(self, schema, name, view):
+            return f"`{view}`"
+
+        def drop_temp_view(self, view):
+            pass
+
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["ORDERS"]})
+    _inject_spark(monkeypatch, spark)
+    module = _load("01_create_structure")
+    monkeypatch.setattr(module, "SnowflakeSource", Source)
+    rc = module.main(["--target-catalog", "lake", "--schema", "SALES",
+                      "--reports-dir", str(reports), "--mode", "ctas"])
+    rec = _report(reports, "structure_report_sales.json")["objects"]["ORDERS"]
+    assert rc == 0
+    assert rec["status"] == "already_existed"
+    assert "not compared" in (rec.get("reason") or "").lower(), rec
+    assert not any("CREATE TABLE" in s for s in spark.statements)
+
 def test_a_structure_run_that_creates_nothing_is_not_a_success(
         structure, monkeypatch, tmp_path, capsys):
     reports = _write_estate(tmp_path / "reports",

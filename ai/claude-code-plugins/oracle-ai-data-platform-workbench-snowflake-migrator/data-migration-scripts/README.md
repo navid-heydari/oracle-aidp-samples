@@ -109,7 +109,7 @@ the stage that records it and is a problem verdict in `MIGRATION_REPORT.md`.
 | Status | Meaning | Problem? |
 |---|---|---|
 | `created` | not there before; reads back as planned | no |
-| `already_existed` | there before, and it matches the plan | no |
+| `already_existed` | there before, and it matches the plan (in `ctas` mode there is no plan: the layout is NOT compared, and the record's reason says so) | no |
 | `type_drift` | there before with a layout the plan did not produce; left as found, differing columns listed; excluded from the copy's default scope | **yes** |
 | `not_in_plan` | the approved plan carries no columns for it; NOT created | no (but a run of nothing else exits 1) |
 | `failed` | the CREATE raised; the error is the reason | **yes** |

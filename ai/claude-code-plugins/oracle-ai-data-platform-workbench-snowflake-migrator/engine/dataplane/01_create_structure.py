@@ -33,7 +33,9 @@ compared with the plan, column by column and in order.
 
 Writes `structure_report_<schema>.json` per schema, one status per table:
   created          it was not there before, and it reads back as planned
-  already_existed  it was there before, and it matches the plan
+  already_existed  it was there before, and it matches the plan (in
+                   --mode ctas there is no plan: the layout is NOT
+                   compared, and the record's reason says so)
   type_drift       it was there with a layout the plan did not produce; it
                    is left as found, listed with the differing columns, and
                    counted as a problem (exit 1) -- the copy is a positional
@@ -417,6 +419,15 @@ def main(argv: list[str] | None = None) -> int:
                                                        args.target_catalog,
                                                        target_schema, name)
                 report["objects"][name] = {"status": status}
+                if args.mode == "ctas" and status == "already_existed":
+                    # CTAS has no plan to compare the layout with: the
+                    # table was there before this run and nobody has
+                    # checked it. Said here, so the copy scope and the
+                    # reconcile report carry it rather than a bare pass.
+                    report["objects"][name]["reason"] = (
+                        "there before this run; --mode ctas has no plan "
+                        "to compare its layout with, so the layout was "
+                        "NOT compared")
                 log(f"{schema}.{name}: {status}")
                 if status in ("created", "already_existed"):
                     created_total += 1
