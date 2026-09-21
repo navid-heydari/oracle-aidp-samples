@@ -450,13 +450,33 @@ def build_ddl_payload(inventory: dict, plan: dict) -> dict:
     Emits in wave order, so a view always follows the tables it reads. Shared
     by the CLI stage and the emulated (demo) pipeline, so the two cannot
     drift apart.
+
+    A member of a dependency cycle is NOT emitted. PLANNED_OBJECTS.md lists
+    those objects as excluded from the ordering pending a human decision, and
+    the ddl stage used to re-add every un-waved clone target -- exactly the
+    cycle members -- so the two artifacts contradicted each other and deploy
+    attempted views whose dependency did not exist.
     """
     by_id = {r["source_identifier"]: r for r in inventory["inventory"]}
     name_map = plan.get("target_names", {})
+    cycles = [list(c) for c in plan.get("cycles", [])]
+    in_cycle = {n for c in cycles for n in c}
     ordered = [i for wave in plan.get("waves", []) for i in wave]
-    ordered += [i for i in plan.get("clone_targets", []) if i not in ordered]
+    ordered += [i for i in plan.get("clone_targets", [])
+                if i not in ordered and i not in in_cycle]
 
     statements, blocked = [], []
+    for ident in sorted(i for i in plan.get("clone_targets", []) if i in in_cycle):
+        rec = by_id.get(ident) or {}
+        others = sorted(n for c in cycles if ident in c for n in c if n != ident)
+        blocked.append({
+            "source_identifier": ident,
+            "object_type": rec.get("object_type"),
+            "reason": ("not emitted: dependency cycle with "
+                       + (", ".join(others) or "itself")
+                       + "; PLANNED_OBJECTS.md lists it under Dependency "
+                       "cycles for a human decision, and no edge was broken "
+                       "to force an order")})
     for ident in ordered:
         rec = by_id.get(ident)
         if rec is None:

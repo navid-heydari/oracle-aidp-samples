@@ -383,3 +383,72 @@ def test_ntz_gate_fires_through_the_payload_for_a_space_named_column():
     payload = ddl.build_ddl_payload(inv, plan)
     assert payload["target_rejected"], "the HALT gate must fire"
     assert payload["target_rejected"][0]["columns"] == ["order date"]
+
+
+# --- members of a dependency cycle are not emitted ---------------------------
+
+def _view(ident, view_ddl):
+    db, schema, _name = ident.split(".")
+    return {"source_identifier": ident, "object_type": "VIEW",
+            "source_database": db, "source_schema": schema,
+            "view_ddl_get_ddl": view_ddl, "source_metadata": {}, "columns": [],
+            "compatibility_status": "supported"}
+
+
+def _cyclic_estate():
+    # PLANNED_OBJECTS.md says cycle members are "excluded from the ordering;
+    # they need a human decision". The ddl stage used to re-add every clone
+    # target that was not in a wave -- which is exactly the cycle members -- so
+    # both artifacts described the same objects in opposite ways and deploy
+    # attempted them.
+    inv = {"inventory": [
+        record([col("A", "NUMBER", "DECIMAL(38,0)")], source_identifier="D.S.T"),
+        _view("D.S.OK_VW", "create view OK_VW as select a from D.S.T"),
+        _view("D.S.A_VW", "create view A_VW as select a from D.S.B_VW"),
+        _view("D.S.B_VW", "create view B_VW as select a from D.S.A_VW"),
+    ]}
+    ids = ["D.S.T", "D.S.OK_VW", "D.S.A_VW", "D.S.B_VW"]
+    plan = {"waves": [["D.S.T"], ["D.S.OK_VW"]],
+            "cycles": [["D.S.A_VW", "D.S.B_VW"]],
+            "clone_targets": sorted(ids),
+            "target_names": {i: i.lower() for i in ids}}
+    return inv, plan
+
+
+def test_cycle_members_are_not_emitted_as_ddl():
+    inv, plan = _cyclic_estate()
+    payload = ddl.build_ddl_payload(inv, plan)
+    assert [s["source_identifier"] for s in payload["statements"]] == [
+        "D.S.T", "D.S.OK_VW"]
+    assert not any("_vw" in s["target_fqn"] and "ok_vw" not in s["target_fqn"]
+                   for s in payload["statements"])
+
+
+def test_cycle_members_are_listed_as_not_emitted_naming_the_other_member():
+    inv, plan = _cyclic_estate()
+    payload = ddl.build_ddl_payload(inv, plan)
+    blocked = {b["source_identifier"]: b for b in payload["blocked"]}
+    assert set(blocked) == {"D.S.A_VW", "D.S.B_VW"}
+    assert blocked["D.S.A_VW"]["reason"].startswith("not emitted: dependency cycle")
+    assert "D.S.B_VW" in blocked["D.S.A_VW"]["reason"]
+    assert "PLANNED_OBJECTS.md" in blocked["D.S.A_VW"]["reason"]
+    assert blocked["D.S.A_VW"]["object_type"] == "VIEW"
+
+
+def test_ddl_plan_report_lists_cycle_members_under_blocked_not_as_statements():
+    from report.render import render_ddl_plan
+    inv, plan = _cyclic_estate()
+    text = render_ddl_plan(ddl.build_ddl_payload(inv, plan))
+    assert "2 statement(s)" in text
+    assert "## `D.S.A_VW`" not in text and "## `D.S.B_VW`" not in text
+    assert "not emitted: dependency cycle" in text
+
+
+def test_a_clone_target_outside_the_waves_but_not_in_a_cycle_is_still_emitted():
+    # The fallback for a plan without waves stays; only cycle members are held.
+    inv, plan = _cyclic_estate()
+    plan["waves"] = [["D.S.T"]]
+    payload = ddl.build_ddl_payload(inv, plan)
+    assert "D.S.OK_VW" in [s["source_identifier"] for s in payload["statements"]]
+    assert {b["source_identifier"] for b in payload["blocked"]} == {
+        "D.S.A_VW", "D.S.B_VW"}
