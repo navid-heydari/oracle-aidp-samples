@@ -15,9 +15,10 @@ from target.provision_api import (
     build_library_items, build_provision_command, build_test_connection_body,
     content_path,
 )
-from target.stage_notebooks import STAGES, build_stage_notebook
+from target.stage_notebooks import (
+    DIAGNOSE_NOTEBOOK_NAME, STAGES, build_stage_notebook)
 from target.provisioning import (
-    BACKUP_FOLDER, JOB_SPECS, REPORTS_FOLDER, SCRIPTS_FOLDER,
+    BACKUP_FOLDER, JOB_SPECS, SCRIPTS_FOLDER,
     ProvisionTransportError, make_provision_call, provision,
     render_provision,
 )
@@ -231,7 +232,67 @@ def test_jobs_point_straight_at_the_stage_notebook(scripts):
     uploaded = [kw for op, kw in fake.ops
                 if op == "upload_ws_file"
                 and kw.get("object_type") == "NOTEBOOK"]
-    assert len(uploaded) == len(JOB_SPECS)
+    # One NOTEBOOK per job, plus the environment diagnosis, which has none.
+    assert {kw["path"].rsplit("/", 1)[-1] for kw in uploaded} == \
+        {s["notebook"] for s in JOB_SPECS} | {DIAGNOSE_NOTEBOOK_NAME}
+
+
+# --- the environment diagnosis rides along, without a job -------------------
+# README step 8 says to open `scripts/diagnose_environment.ipynb` on the
+# cluster. provision uploaded only the four job notebooks, so it was never
+# there; hand-placed, it imported a module that is inlined elsewhere and read a
+# file nothing creates.
+
+def _provisioned_with_config(scripts, fake=None):
+    fake = fake or Fake()
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(), external_catalog="ext",
+                    source_config=pathlib.Path("snowmig-config.yaml"))
+    return fake, res
+
+
+def test_the_diagnose_notebook_is_uploaded_beside_the_stages_without_a_job(
+        scripts):
+    fake, res = _provisioned_with_config(scripts)
+    path = f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}"
+    assert path in fake.contents
+    upload = next(kw for op, kw in fake.ops
+                  if op == "upload_ws_file" and kw["path"] == path)
+    assert upload["object_type"] == "NOTEBOOK"
+    bodies = [kw["body"] for op, kw in fake.ops if op == "create_job"]
+    assert {b["name"] for b in bodies} == {s["name"] for s in JOB_SPECS}, \
+        "no job runs the diagnosis; it is opened by a human"
+    diagnose = [s for s in res["steps"] if s["step"] == "diagnose"]
+    assert len(diagnose) == 1 and diagnose[0]["verified"] is True
+    # The stage-notebook accounting is untouched by the fifth upload.
+    assert len([s for s in res["steps"] if s["step"] == "notebook"]) \
+        == len(JOB_SPECS)
+
+
+def test_the_diagnose_notebook_carries_this_run_s_config_path_and_no_mount_import(
+        scripts):
+    fake, _ = _provisioned_with_config(scripts)
+    body = fake.contents[f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}"]["body"]
+    assert "/Workspace/backup-snowflake-migration/plan/snowmig-config.yaml" \
+        in body, "the same mount path the stage notebooks receive"
+    assert "from snowmig_source import" not in body
+    assert "sys.path.insert" not in body
+    assert "def load_source_config" in body, "helpers inlined, like the stages"
+    assert "EXTERNAL_CATALOG = 'ext'" in body
+
+
+def test_a_failed_diagnose_upload_is_recorded_not_swallowed(scripts):
+    fake, res = _provisioned_with_config(scripts, Fake(fail={"upload_ws_file"}))
+    diagnose = [s for s in res["steps"] if s["step"] == "diagnose"]
+    assert len(diagnose) == 1 and diagnose[0]["verified"] is False
+
+
+def test_the_dry_run_previews_the_diagnose_notebook():
+    out = provision(call=None, workspace_name="ws",
+                    scripts=[pathlib.Path("00_discover_snowflake.py")],
+                    execute=False)
+    uploads = [s["detail"] for s in out["steps"] if s["step"] == "upload"]
+    assert any(DIAGNOSE_NOTEBOOK_NAME in d for d in uploads), uploads
 
 
 def test_this_run_s_coordinates_are_written_into_the_params_cell(scripts):

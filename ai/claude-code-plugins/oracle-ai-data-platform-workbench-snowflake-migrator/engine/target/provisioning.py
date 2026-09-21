@@ -33,7 +33,9 @@ import time
 from typing import Callable
 
 from .naming import translate_name
-from .stage_notebooks import STAGES, build_stage_notebook
+from .stage_notebooks import (
+    DIAGNOSE_NOTEBOOK_NAME, STAGES, build_diagnose_notebook,
+    build_stage_notebook)
 from .provision_api import (
     build_cluster_body, build_job_body,
     build_library_items, build_provision_command, build_workspace_body,
@@ -277,6 +279,9 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
             step("upload", "would upload", None,
                  f'{spec["notebook"]} (generated) -> '
                  f'{SCRIPTS_FOLDER}/{spec["notebook"]}')
+        step("upload", "would upload", None,
+             f"{DIAGNOSE_NOTEBOOK_NAME} (generated, no job) -> "
+             f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}")
         for path in plan_files:
             step("upload", "would upload", None,
                  f"{path.name} -> {PLAN_FOLDER}/{path.name}")
@@ -512,6 +517,35 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                  found is not None, spec["name"])
         except Exception as exc:
             step("job", "failed", False, f'{spec["name"]}: {str(exc)[:200]}')
+
+    # 6 · the environment diagnosis, beside the stages, with NO job --------
+    # README step 8 has the operator open it from scripts/ before the jobs;
+    # only the four job notebooks were uploaded, so it was never there. Built
+    # with this run's config path so it runs unedited, and recorded under its
+    # own step name: it is not one of the job notebooks.
+    diagnose_path = f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}"
+    try:
+        nb = build_diagnose_notebook(overrides=defaults)
+        fd, local = tempfile.mkstemp(prefix="snowmig_diagnose_",
+                                     suffix=".ipynb")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(nb, fh, indent=1)
+        try:
+            call("upload_ws_file", workspace=ws_key, path=diagnose_path,
+                 local_path=local, object_type="NOTEBOOK")
+        finally:
+            os.unlink(local)
+        listed = call("list_ws_objects", workspace=ws_key,
+                      path=SCRIPTS_FOLDER).get("items") or []
+        seen = any(str(i.get("path") or "").endswith("/" + DIAGNOSE_NOTEBOOK_NAME)
+                   or i.get("displayName") == DIAGNOSE_NOTEBOOK_NAME
+                   for i in listed)
+        step("diagnose", "uploaded" if seen else "upload_requested", seen,
+             diagnose_path if seen
+             else f"{diagnose_path}: not visible in the listing")
+    except Exception as exc:
+        step("diagnose", "failed", False,
+             f"{diagnose_path}: {str(exc)[:200]}")
 
     return out
 
