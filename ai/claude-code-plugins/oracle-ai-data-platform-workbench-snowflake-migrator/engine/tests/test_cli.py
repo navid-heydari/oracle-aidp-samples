@@ -248,7 +248,10 @@ def test_data_options_stage_presents_options_and_implements_nothing(tmp_path):
     assert payload["implemented"] is False
     assert len(payload["options"]) >= 3
     md = (tmp_path / "DATA_MOVEMENT_OPTIONS.md").read_text(encoding="utf-8")
-    assert "moves no bytes" in md.lower()
+    # `implemented: False` describes the CLI. The one path the data plane
+    # does implement is named, so the flag cannot be read as "no rows move".
+    assert "control-plane cli moves no bytes" in md.lower()
+    assert "snowmig_02_copy_schema" in md
 
 
 def test_data_options_records_a_choice_without_executing(tmp_path):

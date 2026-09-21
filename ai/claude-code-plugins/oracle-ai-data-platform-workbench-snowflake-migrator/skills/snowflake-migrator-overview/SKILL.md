@@ -11,7 +11,8 @@ sequence. Steps are skipped only when the user explicitly says to skip one, and
 you say out loud which step you skipped and what that costs.
 
 Before S1, two things must exist: the one connection config (copied from
-`snowmig-config.example.yaml`, gitignored, `0600`) and the user's answer to
+`snowmig-config.example.yaml`; `0600` on POSIX; gitignored only inside the
+plugin folder, so the user adds it to their own repo's `.gitignore`) and the user's answer to
 *which database*. `README.md` -> "How to run a migration, from zero" carries
 the prerequisites and the flags; this file is the sequence and the rules.
 
@@ -51,6 +52,16 @@ user — a new name — not an invitation to adopt the existing object.
 At S12 the migration is **done**: the assets exist, the scripts exist, the
 plans and backups exist. **The data migration is not run.** Moving rows is a
 later decision the customer makes, with the scripts already sitting there.
+
+Budget the shake-out from what has actually run, not from what exists. The
+per-stage register is `GAPS.md` → "What is actually proven"; its sentence:
+**What has run live:** the discovery job (`snowmig_00_discover`) ran to
+SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in
+two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
+ran on a cluster from the approved plan, a healthy 23-minute run left alone
+by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
+and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
+authors**. Say so if the user asks whether the copy is proven.
 
 ---
 
@@ -464,8 +475,12 @@ Use `--out-dir` only when the user wants artifacts kept somewhere they chose
    **Nothing is ever written to or dropped from the source**, whatever the
    credential permits and whatever any prompt asks for.
 
-5. **Structure, not data.** S1–S12 create schemas and empty tables. No rows
-   move. Say so plainly whenever the user's language suggests they expect data.
+5. **Structure first; data only by an explicit job.** S1–S12 create schemas
+   and empty tables and move no rows. Rows are copied only when the operator
+   runs `snowmig_02_copy_schema`, one schema per run, after S12 and on their
+   own decision — never as part of the runbook and never on their behalf.
+   Say which of the two the user is asking for whenever their language
+   suggests they expect data.
 
 6. **Dry-run is the default; approval does not carry.** Nothing is created on
    AIDP without `--execute`, a resolved destination, and confirmation **in that

@@ -390,9 +390,9 @@ def test_the_docs_say_where_each_credential_lives():
     """"Where do I put the URL, the user and the password?" is the question
     users actually ask, and answering it wrong once costs a leaked secret.
 
-    Three places, and the plugin holds only one of them: Snowflake
-    coordinates in the config, the Snowflake SECRET in a separate file
-    referenced by path, and AIDP auth in the user's own OCI config.
+    Two places: the Snowflake coordinates AND the Snowflake secret in the
+    one config file (inline is the documented default since 0.19; a `*_path`
+    variant is the opt-in), and AIDP auth in the user's own OCI config.
     """
     for path in ("README.md",
                  "skills/snowflake-migrator-bootstrap/SKILL.md",
@@ -406,6 +406,45 @@ def test_the_docs_say_where_each_credential_lives():
         # And the rule that protects it.
         assert "never" in low and "chat" in low, \
             f"{path}: must say a secret is never asked for in chat"
+    # The skill that drives the catalog stage reads that file too.
+    low = (ROOT / "skills/snowflake-medallion-clone/SKILL.md").read_text(encoding="utf-8").lower()
+    assert "never" in low and "chat" in low, \
+        "medallion-clone: must say a secret is never asked for in chat"
+
+
+def test_no_skill_or_command_claims_the_config_carries_no_secret():
+    # The pre-0.19 contract (credential = a path, so the file is safe to
+    # read and show) survived in one skill after inline became the default.
+    paths = sorted((ROOT / "skills").glob("*/SKILL.md")) + \
+        sorted((ROOT / "commands").glob("*.md")) + \
+        [ROOT / "README.md", ROOT / "ARCHITECTURE.md"]
+    for path in paths:
+        flat = " ".join(path.read_text(encoding="utf-8").lower()
+                        .replace("*", "").split())
+        assert "carries no secret" not in flat, path.name
+        assert "credential itself is a path" not in flat, path.name
+
+
+def test_clone_skill_carries_the_inline_secret_rules():
+    low = (ROOT / "skills/snowflake-medallion-clone/SKILL.md").read_text(encoding="utf-8").lower()
+    flat = " ".join(low.split())
+    assert "inline" in flat
+    assert "ask the user before reading" in flat
+    assert "never print" in flat or "never quote" in flat
+    assert "redact" in flat
+    assert "rotate" in flat
+
+
+def test_no_doc_names_the_nonexistent_aidp_test_connection_verb():
+    # `aidp catalog test-connection` was an inferred shape; the wired command
+    # is `snowmig catalog ... --execute --test-connection`.
+    paths = sorted((ROOT / "skills").glob("*/SKILL.md")) + \
+        sorted((ROOT / "commands").glob("*.md")) + \
+        [ROOT / "README.md", ROOT / "ARCHITECTURE.md"]
+    for path in paths:
+        assert "aidp catalog test-connection" not in path.read_text(encoding="utf-8"), path.name
+    medallion = (ROOT / "skills/snowflake-medallion-clone/SKILL.md").read_text(encoding="utf-8")
+    assert "--test-connection" in medallion
 
 
 def test_the_docs_do_not_assume_the_user_is_inside_this_repo():
@@ -525,3 +564,226 @@ def test_no_operator_surface_mentions_the_nonexistent_notebook_run_command():
     offenders = [str(p.relative_to(ROOT)) for p in paths
                  if "aidp notebook run" in p.read_text(encoding="utf-8")]
     assert offenders == []
+
+
+# --------------------------------------------------------------------------
+# "Copies no data" is true of the control plane and false of the plugin: the
+# in-AIDP job snowmig_02_copy_schema INSERT-SELECTs every row when the
+# operator runs it. Every surface that makes the claim has to scope it.
+# --------------------------------------------------------------------------
+
+_NO_DATA_CLAIM = re.compile(
+    r"copies no data|moves no bytes|no data is moved|no rows\s+move|"
+    r"none implemented|nothing below is implemented|"
+    r"no code path can report that data moved", re.I)
+_DATA_SURFACES = (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json",
+                  "NOTICE", "GAPS.md", "ASSUMPTIONS.md", "README.md",
+                  "references/data-movement-options.md")
+
+
+def test_no_surface_claims_the_plugin_copies_no_data_unscoped():
+    paths = [ROOT / p for p in _DATA_SURFACES]
+    paths += sorted((ROOT / "skills").glob("*/SKILL.md"))
+    offenders = []
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        for para in re.split(r"\n\s*\n", text):
+            hit = _NO_DATA_CLAIM.search(para)
+            if hit and "02_copy_schema" not in para:
+                offenders.append(f"{path.relative_to(ROOT)}: {hit.group(0)!r}")
+    assert not offenders, (
+        "unscoped 'no data' claims (name snowmig_02_copy_schema in the same "
+        "paragraph):\n" + "\n".join(offenders))
+
+
+def test_manifest_and_marketplace_agree_on_the_data_claim():
+    plugin = json.loads((ROOT / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
+    market = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
+    entry = market["plugins"][0]
+    assert entry["version"] == plugin["version"]
+    for desc in (plugin["description"], entry["description"]):
+        assert "snowmig_02_copy_schema" in desc, desc
+        assert "control plane" in desc.lower(), desc
+
+
+# --------------------------------------------------------------------------
+# One order of operations. The overview skill (S1-S12) is the authority and
+# the code enforces it: `catalog --execute` needs the workspace and cluster
+# that `provision` creates. The README once ran them the other way round and
+# bracketed the two coordinates as optional.
+# --------------------------------------------------------------------------
+
+def _runbook(text: str) -> str:
+    start = text.index("## How to run a migration, from zero")
+    end = text.index("\n## ", start + 10)
+    return text[start:end]
+
+
+def test_the_readme_orders_provision_before_catalog_registration():
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    runbook = _runbook(text)
+    assert "Nine steps" not in text
+    assert runbook.index("snowmig provision") < runbook.index("snowmig catalog --catalog")
+    provision = runbook.index("Provision the migration environment")
+    external = runbook.index("EXTERNAL catalog")
+    assert provision < external, "provision (S1/S2) comes before the catalogs (S3/S4)"
+
+
+def test_the_readme_does_not_bracket_workspace_and_cluster_for_catalog_execute():
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    runbook = _runbook(text)
+    catalog_step = runbook[runbook.index("EXTERNAL catalog"):]
+    catalog_step = catalog_step[:catalog_step.index("\n### ", 10)]
+    assert not re.search(r"\[--datalake-ocid <ocid> --workspace <ws> --cluster-id <cl>\]",
+                         catalog_step), "required for --execute; the bracket said optional"
+    # And the hand-off. The keys live in provision_result.json under
+    # workspace.key / cluster.key; PROVISION.md and the CLI output show the
+    # display names, which are NOT the keys. The README must send the
+    # operator to the file, not to the printout.
+    assert "aidp.workspace" in runbook and "aidp.cluster_id" in runbook
+    assert "does not write them back" in runbook
+    assert "provision_result.json" in runbook
+    assert "workspace.key" in runbook and "cluster.key" in runbook
+    assert "`PROVISION.md` and the CLI output print" not in runbook, \
+        "render_provision prints names, not keys; cmd_provision prints a step count"
+
+
+def test_every_hand_off_sends_the_operator_to_provision_result_json_for_the_keys():
+    # render_provision prints `Workspace: <name>` / `Cluster: <name>` and, on
+    # the created path, the display name in the steps table (the key appears
+    # there only with --reuse-existing); cmd_provision prints a step count.
+    # The keys are recorded in provision_result.json under workspace.key /
+    # cluster.key and nowhere else, so every surface that describes the
+    # hand-off must point there. A display name pasted as a key addresses
+    # nothing that exists.
+    arch = (ROOT / "MIGRATION-ARCHITECTURE.md").read_text(encoding="utf-8")
+    row = next(l for l in arch.splitlines() if "Provision the AIDP environment" in l)
+    assert "provision_result.json" in row, row
+    assert "Paste the printed workspace and cluster keys" not in arch
+    for rel in ("skills/snowflake-provision-environment/SKILL.md",
+                "commands/snowflake-provision.md"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert "provision_result.json" in text, rel
+        assert "workspace.key" in text and "cluster.key" in text, rel
+
+
+def test_the_readme_labels_laptop_assess_as_an_optional_preview():
+    runbook = _runbook((ROOT / "README.md").read_text(encoding="utf-8"))
+    step = runbook[runbook.index("Assess the estate"):]
+    step = step[:step.index("\n### ", 10)]
+    low = step.lower()
+    assert "optional" in low and "snowmig_00_discover" in step, \
+        "the laptop assess is a preview; the migration discovers inside AIDP (S6)"
+
+
+def test_the_readme_separates_copy_jobs_from_the_migration_proper():
+    runbook = _runbook((ROOT / "README.md").read_text(encoding="utf-8"))
+    low = " ".join(runbook.lower().split())
+    assert "data migration is not run" in low, \
+        "must share the overview skill's statement: S12 ends with no rows moved"
+    assert runbook.index("snowmig_01_structure") < runbook.index("snowmig_02_copy_schema")
+
+
+def test_the_three_runbooks_agree_on_the_step_order():
+    skill = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text(encoding="utf-8")
+    assert skill.index("| S1 |") < skill.index("| S3 |") < skill.index("| S4 |")
+    arch = (ROOT / "MIGRATION-ARCHITECTURE.md").read_text(encoding="utf-8")
+    table = arch[arch.index("| # | Step | Command | Writes |"):]
+    table = table[:table.index("\n\n", 10)]
+    assert table.index("workspace") < table.index("EXTERNAL") < table.index("INTERNAL")
+    assert "snowmig_01_structure" in table
+    assert "deploy --execute" not in table, \
+        "the control-plane deploy is not the INTERNAL structure step (202 can create nothing)"
+
+
+# --------------------------------------------------------------------------
+# "Which data-plane stages have run live" has one home and one wording.
+# Five documents once gave four answers; the operator budgets the shake-out
+# from this, so it must not drift.
+# --------------------------------------------------------------------------
+
+_LIVE_STATUS_DOCS = ("README.md", "ASSUMPTIONS.md", "MIGRATION-ARCHITECTURE.md",
+                     "data-migration-scripts/README.md",
+                     "skills/snowflake-migrator-overview/SKILL.md")
+_STALE_LIVE_CLAIM = re.compile(
+    r"never run against a live AIDP|(still|remains?) unexecuted|"
+    r"none implemented", re.I)
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_live_status_register_has_one_home_and_one_wording():
+    gaps = (ROOT / "GAPS.md").read_text(encoding="utf-8")
+    assert "## What is actually proven" in gaps
+    register = gaps.split("## What is actually proven", 1)[1].split("\n## ", 1)[0]
+    for stage in ("00_discover", "01_create_structure", "02_copy", "03_reconcile"):
+        assert stage in register, stage
+    statement = re.search(r"\*\*What has run live:\*\*.*?not yet confirmed by "
+                          r"the authors\*\*\.", _flat(register))
+    assert statement, "GAPS.md must carry the canonical live-status sentence"
+    canonical = statement.group(0)
+    for rel in _LIVE_STATUS_DOCS:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        stale = _STALE_LIVE_CLAIM.search(text)
+        assert not stale, f"{rel} carries a stale live-status claim: {stale.group(0)!r}"
+        flat = _flat(text)
+        assert "What is actually proven" in flat, f"{rel} must point at the GAPS register"
+        assert canonical in flat, f"{rel} must carry the GAPS sentence verbatim"
+
+
+# --------------------------------------------------------------------------
+# The slash commands are the agent's entry points at S4/S10. They must route
+# Standard-catalog structure the way the runbook and the CLI do: the
+# container from `catalog --catalog-type standard --execute`, the tables from
+# `run --job snowmig_01_structure` -- never through `notebook --upload`,
+# whose transport GAPS 13 records as known-bad.
+# --------------------------------------------------------------------------
+
+def test_catalog_command_does_not_call_the_standard_catalog_refused():
+    text = (ROOT / "commands/snowflake-catalog.md").read_text(encoding="utf-8")
+    assert "refused" not in text.lower(), \
+        "the CLI creates the INTERNAL container (S4); the command said it refuses"
+    assert "--catalog-type standard" in text
+    assert "snowmig_01_structure" in text
+    assert "container_only" in text
+
+
+def test_soft_clone_command_routes_standard_structure_to_s10():
+    text = (ROOT / "commands/snowflake-soft-clone.md").read_text(encoding="utf-8")
+    assert "--catalog-type standard" in text
+    assert "snowmig_01_structure" in text
+    assert "/Workspace/Shared/" not in text and "--upload" not in text, \
+        "structure does not go through the notebook upload path"
+
+
+def test_the_docs_scope_the_gitignore_claim_to_the_plugin_folder():
+    """The only ignore rule for snowmig-config.* lives in the plugin's own
+    .gitignore, while the documented home of the file is the operator's
+    working directory. "It is gitignored" was therefore a promise the
+    documented location does not keep; `git add .` from another repo stages
+    the password."""
+    for rel in ("README.md", "skills/snowflake-migrator-bootstrap/SKILL.md"):
+        flat = " ".join((ROOT / rel).read_text(encoding="utf-8").lower().split())
+        assert "gitignored only inside" in flat, rel
+        assert "your own `.gitignore`" in flat or "that repo's `.gitignore`" in flat, rel
+        assert "it is **gitignored**, and" not in flat, f"{rel}: unscoped claim"
+        assert "gitignored, `0600`" not in flat, f"{rel}: unscoped claim"
+
+
+def test_the_docs_say_how_the_aidp_clis_authenticate():
+    """"Auth is not configured in this plugin at all" was not true: the
+    engine appends `--auth api_key --region <from the OCID>` to every `aidp`
+    invocation (target/executor.py), and `oci raw-request` runs with the
+    user's ~/.oci/config profile. An operator whose default profile is a
+    session token, or who keeps the right key under another profile, needs
+    to know which profile and which auth mode the plugin actually uses."""
+    for rel in ("README.md", "skills/snowflake-migrator-bootstrap/SKILL.md"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        flat = " ".join(text.lower().split())
+        assert "not configured in this plugin at all" not in flat, rel
+        assert "~/.oci/config" in text, rel
+        assert "`default`" in flat or "default profile" in flat, \
+            f"{rel}: must name the profile `oci` runs with"
+        assert "api_key" in text, f"{rel}: must say the aidp CLI is invoked with api_key auth"

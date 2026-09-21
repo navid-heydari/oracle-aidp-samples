@@ -83,6 +83,44 @@ def test_can_migrate_entries_carry_the_target_and_type():
     assert c["target"] == "d.s.t" and c["object_type"] == "TABLE"
 
 
+def test_can_migrate_entries_carry_the_risk_bearing_facts():
+    # SUMMARY.md scores risk from the plan entry alone. The column warnings
+    # and the maintenance settings ddl will defer must therefore travel on
+    # it, or a clustered table with a timezone caveat reads LOW.
+    r = rec("D.S.T")
+    r["warnings"] = ["TS: TIMESTAMP_NTZ -> TIMESTAMP: TIMEZONE SEMANTICS DIFFER"]
+    r["source_metadata"].update({"cluster_by": "LINEAR(ORDER_DATE)",
+                                 "change_tracking": "ON", "is_secure": "false",
+                                 "owner": "SYSADMIN", "retention_time": "7"})
+    plan = build_plan({"inventory": [r]}, {"edges": []})
+    c = plan["can_migrate"][0]
+    assert c["warnings"] == r["warnings"]
+    assert [d["property"] for d in c["deferred_properties"]] == [
+        "cluster_by", "change_tracking", "retention_time"]
+    assert all(d["aidp_equivalent"] for d in c["deferred_properties"])
+    assert c["omitted_properties"] == [], "is_secure=false is unset, owner is informational"
+
+
+def test_a_view_carries_no_maintenance_facts_because_ddl_reports_none_for_it():
+    # SHOW VIEWS reports change_tracking too and catalog.py records it, but
+    # ddl scans source_metadata only in build_create_table; build_create_view
+    # reads is_secure/is_materialized alone. SUMMARY.md and DDL_PLAN.md must
+    # name the same settings, so a view's plan entry carries none -- or
+    # SUMMARY.md says "change_tracking=ON not applied" for a view whose DDL
+    # plan says nothing of the kind.
+    v = rec("D.PUBLIC.V", kind="VIEW")
+    v["source_metadata"].update({"change_tracking": "ON", "retention_time": "1"})
+    plan = build_plan({"inventory": [rec("D.PUBLIC.T"), v]}, {"edges": []})
+    c = next(c for c in plan["can_migrate"] if c["source_identifier"] == "D.PUBLIC.V")
+    assert c["deferred_properties"] == [] and c["omitted_properties"] == []
+
+
+def test_a_plain_record_still_carries_empty_facts():
+    c = build_plan({"inventory": [rec("D.S.T")]}, {"edges": []})["can_migrate"][0]
+    assert c["warnings"] == [] and c["deferred_properties"] == []
+    assert c["omitted_properties"] == []
+
+
 def test_every_object_appears_in_exactly_one_of_can_or_cannot():
     inv = {"inventory": [rec("D.S.OK"), rec("D.S.BAD", status="blocked",
                                             blocked=["x: VARIANT"]),

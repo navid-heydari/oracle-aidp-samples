@@ -118,6 +118,56 @@ def test_the_stage_board_reads_the_demo_run_as_complete(demo):
         "an optional stage must not be proposed as next"
 
 
+def test_the_demo_inventory_labels_its_row_counts_as_metadata(demo):
+    # The default mode is metadata: SHOW estimates for tables, nothing for
+    # views. INVENTORY.md is the per-object sign-off artifact, and it once
+    # called those numbers exact and printed ERROR for every view.
+    out, _ = demo
+    inv = json.loads((out / "inventory.json").read_text(encoding="utf-8"))
+    assert inv["row_count_mode"] == "metadata"
+    md = (out / "INVENTORY.md").read_text(encoding="utf-8")
+    assert "Rows (exact)" not in md
+    assert "ERROR" not in md
+    assert "metadata" in md
+    view = next(l for l in md.splitlines()
+                if "`SNOWDEMO.ANALYTICS.ORDER_SUMMARY_VW`" in l)
+    assert "not counted" in view
+    summary = (out / "SUMMARY.md").read_text(encoding="utf-8")
+    assert "show `-`" not in summary, \
+        "SUMMARY.md must not describe a blank INVENTORY.md does not print"
+
+
+def test_the_demo_summary_rates_the_clustered_table_medium(demo):
+    # ORDERS carries cluster_by / change_tracking / retention_time and a
+    # TIMESTAMP_NTZ downgrade; DDL_PLAN.md lists all four. SUMMARY.md once
+    # rated it LOW with "no properties dropped", because only the object type
+    # and the row count reached the risk assessment.
+    out, _ = demo
+    md = (out / "SUMMARY.md").read_text(encoding="utf-8")
+    orders = next(l for l in md.splitlines() if "`SNOWDEMO.SALES.ORDERS`" in l)
+    assert "| MEDIUM |" in orders, orders
+    assert "cluster_by=LINEAR(ORDER_DATE)" in orders
+    view = next(l for l in md.splitlines()
+                if "`SNOWDEMO.ANALYTICS.ORDER_SUMMARY_VW`" in l)
+    assert "| HIGH |" in view, "a view's column warnings must not pull it down"
+    rollup = next(l for l in md.splitlines() if l.startswith("By risk:"))
+    assert "**MEDIUM**" in rollup
+
+
+def test_the_stage_board_deploy_row_adds_up(demo):
+    # deploy_result.json: 4 statements, 2 verified, 1 failed (poisoned name),
+    # 1 created with derived type drift. The row once read "verified 2/4,
+    # 1 not verified", which does not sum, and the drift was invisible.
+    out, _ = demo
+    board = build_stage_board(out)
+    deploy = next(s for s in board["stages"] if s["stage"] == "deploy")
+    assert "verified 2/4" in deploy["found"]
+    assert "1 failed" in deploy["found"]
+    assert "1 created with derived type drift" in deploy["found"]
+    assert deploy["attention"] is True
+    assert "deploy" in board["needs_attention"]
+
+
 def test_the_emulated_snowflake_refuses_a_question_it_cannot_answer():
     # A fake that improvises is how an emulation starts lying.
     with pytest.raises(ValueError, match="no answer"):

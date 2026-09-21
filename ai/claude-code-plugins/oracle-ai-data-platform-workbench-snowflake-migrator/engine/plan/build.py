@@ -33,12 +33,38 @@ import json
 from snowflake_source.dialect.views import (
     detect_unsupported_constructs, extract_view_body,
 )
+from target.ddl import DEFERRED_EQUIVALENT_PROPERTIES, SCRUBBED_PROPERTIES
 
 from .medallion import bronze_target, detect_target_collisions, layer_jobs
 from .restrictions import apply_restrictions
 from .waves import compute_waves
 
 __all__ = ["build_plan", "TargetCollision"]
+
+# Values that mean "this property is not set"; the same list ddl.py skips.
+_UNSET = (None, "", "false", "FALSE", "N", "OFF", "null", "NULL")
+
+
+def _maintenance_facts(rec: dict) -> tuple[list[dict], list[str]]:
+    """(deferred_properties, omitted_properties), as `ddl` will report them.
+
+    SUMMARY.md scores risk from the plan entry alone, and it once saw only
+    the object type and the row count -- so a clustered table whose DDL plan
+    listed cluster_by, change_tracking and retention_time as deferred read
+    LOW with "no properties dropped". The tables are ddl.py's own, so the
+    two reports name the same settings.
+    """
+    deferred: list[dict] = []
+    omitted: list[str] = []
+    for prop, value in (rec.get("source_metadata") or {}).items():
+        if value in _UNSET:
+            continue
+        if prop in DEFERRED_EQUIVALENT_PROPERTIES:
+            deferred.append({"property": prop, "value": value,
+                             "aidp_equivalent": DEFERRED_EQUIVALENT_PROPERTIES[prop]})
+        elif prop in SCRUBBED_PROPERTIES:
+            omitted.append(f"{prop}={value}")
+    return deferred, omitted
 
 
 class TargetCollision(RuntimeError):
@@ -248,11 +274,22 @@ def build_plan(inventory: dict, dependencies: dict, *,
         if warning:
             kind_warnings.append(warning)
 
+        # ddl reports maintenance settings for tables only (build_create_view
+        # reads is_secure/is_materialized alone); the plan mirrors that split
+        # so SUMMARY.md and DDL_PLAN.md name the same settings.
+        deferred, omitted = (([], []) if rec.get("object_type") == "VIEW"
+                             else _maintenance_facts(rec))
         can.append({"source_identifier": ident,
                     "object_type": rec.get("object_type"),
                     "target": targets[ident],
                     "rows": rec.get("row_count_exact"),
-                    "columns": len(rec.get("columns") or [])})
+                    "columns": len(rec.get("columns") or []),
+                    # The facts assess_risk reads. Column warnings (timezone,
+                    # semi-structured-as-string, declared lengths) come from
+                    # the type mapper; the maintenance settings from SHOW.
+                    "warnings": list(rec.get("warnings") or []),
+                    "deferred_properties": deferred,
+                    "omitted_properties": omitted})
 
     can, cannot = _cascade_dependency_exclusions(
         can, cannot, dependencies.get("edges", []))

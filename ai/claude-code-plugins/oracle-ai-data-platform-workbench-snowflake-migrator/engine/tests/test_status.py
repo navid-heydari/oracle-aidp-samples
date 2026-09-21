@@ -148,6 +148,22 @@ def test_an_untranslated_view_is_high_risk_not_medium():
     assert "wrong" in note.lower() or "verify" in note.lower()
 
 
+def test_risk_is_never_downgraded():
+    # A view is HIGH because a mistranslation creates successfully and then
+    # returns wrong numbers. A column warning on the same view is a lesser
+    # fact and must not pull it down to MEDIUM.
+    level, note = assess_risk({"object_type": "VIEW", "warnings": [
+        "STATUS: declared length 20 is not enforced by Delta; recorded only"]})
+    assert level == "HIGH"
+    assert "1 column warning" in note
+    level, _ = assess_risk(can(kind="VIEW", warnings=["TS: timezone semantics"],
+                               omitted=["is_secure=false"]))
+    assert level == "HIGH"
+    level, _ = assess_risk({"object_type": "VIEW", "deferred_properties": [
+        {"property": "cluster_by", "value": "(A)", "aidp_equivalent": "x"}]})
+    assert level == "HIGH"
+
+
 def test_a_deferred_maintenance_setting_raises_risk_and_names_itself():
     # A clustering key that does not arrive is a performance regression on the
     # biggest tables. It must not read as LOW.

@@ -120,8 +120,27 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
         return (text, False)
 
     if stage == "deps":
-        return (f'lineage from {data.get("source_used", _UNKNOWN)}',
-                bool(data.get("cycles")))
+        # `cycles` lives in plan.json, never here, so the old rule could not
+        # fire. What dependencies.json does say is WHERE the graph came from:
+        # account_usage is the full graph; parsed_ddl is partial (view DDL
+        # only); not_extracted is "did not look" and must not read as clean.
+        source = data.get("source_used")
+        edges = len(data.get("edges") or [])
+        if not source:
+            # Both producers write the key. Without it, how the graph was got
+            # is unknown, and "view DDL only" would be a guess about it.
+            return (f'lineage source not recorded; {edges} edge(s) -- '
+                    '**completeness unknown**', True)
+        text = f'lineage from {source}; {edges} edge(s)'
+        if source == "not_extracted":
+            return (text + " -- **NOT extracted; view order unchecked**", True)
+        if source != "account_usage":
+            unresolved = len(data.get("unresolved_references") or [])
+            text += " -- **partial graph (view DDL only)**"
+            if unresolved:
+                text += f', {unresolved} unresolved reference(s)'
+            return (text, True)
+        return (text, bool(data.get("cycles")))
 
     if stage == "maintenance":
         flagged = data.get("objects_with_signals")
@@ -142,8 +161,13 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
         return (text, bool(count or secure))
 
     if stage == "compute":
-        return (f'{len(data.get("proposals") or data.get("warehouses") or [])} '
-                f'warehouse(s) sized', False)
+        # compute.json is what propose_all writes: `proposals` and `blocked`.
+        # A warehouse with no proposal is a decision still owed, not clean.
+        blocked = len(data.get("blocked") or [])
+        text = f'{len(data.get("proposals") or [])} warehouse(s) sized'
+        if blocked:
+            return (text + f', **{blocked} blocked (no shape proposed)**', True)
+        return (text, False)
 
     if stage == "plan":
         s = data.get("summary") or {}
@@ -178,11 +202,17 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
             return ("DRY RUN — nothing was provisioned", False)
         steps = data.get("steps") or []
         bad = [s for s in steps if s.get("verified") is False]
+        # None in execute mode is "not confirmed, not assumed" (a library
+        # install awaiting the restart, a folder create that may have hit
+        # an existing one). Pending is pending; it does not read as clean.
+        pending = [s for s in steps if s.get("verified") is None]
         text = (f'{len(steps)} step(s); workspace '
                 f'{(data.get("workspace") or {}).get("name", "?")}')
         if bad:
-            return (text + f' — **{len(bad)} failed/unverified**', True)
-        return (text, False)
+            text += f' — **{len(bad)} failed/unverified**'
+        if pending:
+            text += f' — **{len(pending)} not confirmed**'
+        return (text, bool(bad or pending))
 
     if stage == "catalog":
         if data.get("dry_run"):
@@ -204,10 +234,27 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
                     f'would be created; nothing was', False)
         verified = data.get("verified", 0)
         total = data.get("statement_count", 0)
+        # Every outcome the deploy buckets, so the row adds up to the
+        # statement count. The default transport (catalog_api) is the one
+        # that produces "exists but its structure could not be read" and
+        # derived type drift; neither was counted, so a board could read
+        # "verified 4/7" with no warning and three tables unverified.
         bad = (len(data.get("failed") or [])
                + len(data.get("mismatched_targets") or []))
-        return (f'**verified {verified}/{total}**'
-                + (f', {bad} not verified' if bad else ''), bool(bad))
+        unverified = len(data.get("unverified_structure_targets") or [])
+        drift = len(data.get("derived_type_drift_targets") or [])
+        errors = (len(data.get("errors") or [])
+                  + len(data.get("chunk_errors") or []))
+        text = f'**verified {verified}/{total}**'
+        if bad:
+            text += f', {bad} failed/mismatched'
+        if unverified:
+            text += f', {unverified} structure not verified'
+        if drift:
+            text += f', {drift} created with derived type drift'
+        if errors:
+            text += f', {errors} error(s)'
+        return (text, bool(bad or unverified or drift or errors))
 
     if stage == "data-options":
         choice = data.get("choice")

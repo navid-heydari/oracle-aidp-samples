@@ -100,6 +100,41 @@ def test_views_and_tables_are_both_in_the_table():
     assert "TABLE" in md and "VIEW" in md
 
 
+def test_risk_column_reflects_deferred_properties_and_timezone_warnings():
+    # The facts the plan entry carries (see plan.build) must reach the Risk
+    # column: a clustered table with a timezone caveat is MEDIUM, and the
+    # note names both.
+    # A pass-through guard only: the fixture hand-crafts the facts, so this
+    # passes against a tree where build.py never produced them. The wiring
+    # is pinned by test_plan_build::
+    # test_can_migrate_entries_carry_the_risk_bearing_facts and test_demo::
+    # test_the_demo_summary_rates_the_clustered_table_medium.
+    orders = dict(PLAN["can_migrate"][0],
+                  warnings=["CREATED_AT: TIMESTAMP_NTZ -> TIMESTAMP: "
+                            "TIMEZONE SEMANTICS DIFFER"],
+                  deferred_properties=[{"property": "cluster_by",
+                                        "value": "LINEAR(ORDER_DATE)",
+                                        "aidp_equivalent": "CLUSTER BY / ZORDER"}],
+                  omitted_properties=[])
+    plan = dict(PLAN, can_migrate=[orders, PLAN["can_migrate"][1]])
+    md = render_summary(plan, INV, None, None)
+    row = next(l for l in md.splitlines() if "`D.PUBLIC.ORDERS`" in l)
+    assert "| MEDIUM |" in row
+    assert "cluster_by=LINEAR(ORDER_DATE)" in row
+    assert "timezone" in row.lower()
+    rollup = next(l for l in md.splitlines() if l.startswith("By risk:"))
+    assert "**MEDIUM**" in rollup
+
+
+def test_view_stays_high_when_it_carries_column_warnings():
+    view = dict(PLAN["can_migrate"][1], warnings=[
+        "CUSTOMER: declared length 39 is not enforced by Delta; recorded only"])
+    plan = dict(PLAN, can_migrate=[PLAN["can_migrate"][0], view])
+    md = render_summary(plan, INV, None, None)
+    row = next(l for l in md.splitlines() if "`D.PUBLIC.V`" in l)
+    assert "| HIGH |" in row, row
+
+
 # --- jobs -----------------------------------------------------------------
 
 def test_jobs_appear_in_the_same_summary_format():
@@ -117,11 +152,18 @@ def test_job_risk_notes_it_is_a_placeholder():
 
 # --- the no-data guarantee ------------------------------------------------
 
-def test_summary_states_no_data_was_moved():
+def test_summary_does_not_claim_data_status_and_points_to_reconcile():
+    # The summary reads only the control-plane deploy result. Whether rows
+    # were copied is the in-AIDP reconcile job's report; the summary once
+    # said "the plugin ... moves no data" while snowmig_02_copy_schema
+    # INSERT-SELECTs every row.
     md = render_summary(PLAN, INV, DEPLOYED, None)
     low = md.lower()
-    assert "no data" in low
+    assert "moves no data" not in low and "copies no data" not in low
+    assert "reconcil" in low and "MIGRATION_REPORT.md" in md
+    assert "snowmig_02_copy_schema" in md
     assert "DATA_CLONE" in md, "the vocabulary is shown so the gap is visible"
+    assert "says nothing about rows" in low
 
 
 def test_status_counts_rolled_up():

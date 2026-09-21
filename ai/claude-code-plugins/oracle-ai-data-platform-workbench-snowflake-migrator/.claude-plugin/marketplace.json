@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "oracle-ai-data-platform-workbench-snowflake-migrator",
-      "description": "Deterministic Snowflake to Oracle AI Data Platform migration: scripted discovery, planning, DDL translation and in-AIDP data-migration jobs, driven from one config file. Read-only against Snowflake, enforced at the transport; dry-run by default against AIDP. Structure and scripts, with a report of what translated, what did not, and why.",
+      "description": "Deterministic Snowflake to Oracle AI Data Platform migration: scripted discovery, planning, DDL translation and in-AIDP data-migration jobs, driven from one config file. Read-only against Snowflake, enforced at the transport; dry-run by default against AIDP. The control plane copies no data; rows are copied only by the in-AIDP job snowmig_02_copy_schema (INSERT-SELECT, verified by row count and decimal sums), one schema per run, when the operator runs it. Structure and scripts, with a report of what translated, what did not, and why.",
       "version": "0.25.0",
       "source": "./",
       "category": "data",
