@@ -145,8 +145,13 @@ def test_summary_counts_match_the_lists():
 
 def test_target_collision_still_halts():
     inv = {"inventory": [rec("D.S.T"), rec("D.s.T")]}
-    with pytest.raises(TargetCollision):
+    with pytest.raises(TargetCollision) as exc:
         build_plan(inv, {"edges": []})
+    # The HALT names its one in-tool remedy in the form the JSON file takes:
+    # the twin to defer, spelled exactly, double-quoted.
+    msg = str(exc.value)
+    assert "exclude_objects" in msg
+    assert '\\"D\\".\\"s\\".\\"T\\"' in msg
 
 
 def test_dependency_provenance_carried():
@@ -155,3 +160,14 @@ def test_dependency_provenance_carried():
                        "coverage_note": "view edges ONLY"})
     assert plan["dependency_source"] == "parsed_ddl"
     assert "ONLY" in plan["dependency_coverage_note"]
+
+
+def test_collision_resolved_by_excluding_the_quoted_twin():
+    # The HALT above has exactly one in-tool remedy: name the twin to defer
+    # with its exact, double-quoted spelling. The other twin is then planned.
+    inv = {"inventory": [rec("D.S.T"), rec("D.S.t")]}
+    plan = build_plan(inv, {"edges": []},
+                      restrictions={"exclude_objects": ['"D"."S"."t"']})
+    assert [c["source_identifier"] for c in plan["can_migrate"]] == ["D.S.T"]
+    assert [(c["source_identifier"], c["category"])
+            for c in plan["cannot_migrate"]] == [("D.S.t", "restriction")]

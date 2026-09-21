@@ -65,7 +65,10 @@ def test_exclude_name_pattern():
 def test_explicit_object_exclusion_wins():
     _, excluded = apply_restrictions(RECS, {"exclude_objects": ["D1.PUBLIC.ORDERS"]})
     assert excluded[0]["source_identifier"] == "D1.PUBLIC.ORDERS"
-    assert "explicitly excluded" in excluded[0]["reason"]
+    # An unquoted entry folds, so the reason names the entry and the fold; only
+    # a double-quoted, exact hit is reported as the operator's explicit choice.
+    assert "exclude_objects entry 'D1.PUBLIC.ORDERS'" in excluded[0]["reason"]
+    assert "explicitly" not in excluded[0]["reason"]
 
 
 def test_object_exclusion_is_case_insensitive():
@@ -106,3 +109,46 @@ def test_bad_regex_rejected_early():
 def test_valid_restrictions_pass_validation():
     validate_restrictions({"exclude_databases": ["A"], "max_rows": 10,
                            "exclude_name_patterns": ["^TMP_"]})
+
+
+# --- case-collision twins ---------------------------------------------------
+#
+# `customers` and `"customers"` are DIFFERENT Snowflake objects, and a case
+# collision HALTs the plan rather than being guessed away. The only in-tool
+# remedy is a restriction, so a restriction must be able to name exactly one
+# twin: a double-quoted part is matched case-sensitively, as Snowflake itself
+# resolves it; an unquoted part folds to upper, as before.
+
+TWINS = [rec("D1.PUBLIC.ORDERS"), rec("D1.PUBLIC.orders"), rec("D2.PUBLIC.X")]
+
+
+def test_quoted_exclude_entry_drops_only_the_twin_it_spells():
+    kept, excluded = apply_restrictions(
+        TWINS, {"exclude_objects": ['"D1"."PUBLIC"."orders"']})
+    assert [e["source_identifier"] for e in excluded] == ["D1.PUBLIC.orders"]
+    assert "D1.PUBLIC.ORDERS" in [k["source_identifier"] for k in kept]
+    assert "explicitly excluded" in excluded[0]["reason"]
+
+
+def test_quoted_include_entry_admits_exactly_one_twin():
+    kept, _ = apply_restrictions(
+        TWINS, {"include_objects": ['"D1"."PUBLIC"."ORDERS"']})
+    assert [k["source_identifier"] for k in kept] == ["D1.PUBLIC.ORDERS"]
+
+
+def test_quoting_only_the_last_part_folds_the_others():
+    _, excluded = apply_restrictions(
+        TWINS, {"exclude_objects": ['d1.public."orders"']})
+    assert [e["source_identifier"] for e in excluded] == ["D1.PUBLIC.orders"]
+
+
+def test_unquoted_entry_still_folds_and_the_reason_says_so():
+    # Unchanged behaviour, made honest: both twins go, and each exclusion says
+    # it was a case-insensitive match rather than "explicitly excluded".
+    _, excluded = apply_restrictions(TWINS, {"exclude_objects": ["d1.public.orders"]})
+    assert sorted(e["source_identifier"] for e in excluded) == [
+        "D1.PUBLIC.ORDERS", "D1.PUBLIC.orders"]
+    assert all("case-insensitively" in e["reason"] for e in excluded)
+    assert all("'d1.public.orders'" in e["reason"] for e in excluded)
+    # The twin the operator did not name must not be blamed on the operator.
+    assert all("explicitly" not in e["reason"] for e in excluded)

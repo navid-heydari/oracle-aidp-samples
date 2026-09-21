@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import collections
 import datetime
+import json
 
 from snowflake_source.dialect.views import (
     detect_unsupported_constructs, extract_view_body,
@@ -35,7 +36,16 @@ class TargetCollision(RuntimeError):
     def __init__(self, collisions: dict[str, list[str]]):
         self.collisions = collisions
         detail = "; ".join(f"{t} <- {sorted(s)}" for t, s in collisions.items())
-        super().__init__(f"target name collision, refusing to guess: {detail}")
+        remedy = ""
+        if collisions:
+            # The one in-tool remedy, in the form the restrictions JSON takes:
+            # a quoted part of an exclude_objects entry matches case-sensitively.
+            twin = sorted(next(iter(collisions.values())))[-1]
+            example = json.dumps(".".join(f'"{p}"' for p in twin.split(".")))
+            remedy = (" -- to migrate one twin now, list the other in "
+                      "exclude_objects with its exact double-quoted spelling, "
+                      f'e.g. "exclude_objects": [{example}]')
+        super().__init__(f"target name collision, refusing to guess: {detail}{remedy}")
 
 
 def _view_verdict(rec: dict) -> tuple[bool, str, str]:

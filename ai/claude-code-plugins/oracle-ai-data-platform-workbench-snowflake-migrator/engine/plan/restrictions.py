@@ -8,6 +8,17 @@ indistinguishable from one that was never there.
 
 An unrecognised restriction key is an ERROR, not an ignored line. A typo'd key
 would apply nothing while appearing to succeed.
+
+`include_objects` / `exclude_objects` entries follow Snowflake's own case rule:
+an unquoted part folds to upper (`d.s.orders` is D.S.ORDERS), a double-quoted
+part is case-sensitive (`"D"."S"."orders"` is only the lower-case object). That
+is what lets a restriction resolve an identifier-case collision -- the plan
+HALTs on ORDERS vs "orders" rather than guessing, and the operator defers one
+twin by spelling it exactly. An unquoted entry matches every case-variant, as
+it always did; its exclusion reason names the entry and says the match was
+case-insensitive, and only a quoted, exact hit is reported as the operator's
+explicit choice, so the report never blames a twin the operator did not name
+on the operator.
 """
 from __future__ import annotations
 
@@ -66,6 +77,61 @@ def _upper(values) -> set[str]:
     return {str(v).upper() for v in values or []}
 
 
+def _split_quoted(entry: str) -> list[tuple[str, bool]]:
+    """`d.s."Orders"` -> [("d", False), ("s", False), ("Orders", True)].
+
+    A doubled quote inside a quoted part is not unescaped: assert_safe_identifier
+    forbids `"` in a name, so no inventory object needs one.
+    """
+    parts: list[tuple[str, bool]] = []
+    buf: list[str] = []
+    in_quotes = was_quoted = False
+    for ch in entry:
+        if ch == '"':
+            in_quotes = not in_quotes
+            was_quoted = True
+        elif ch == "." and not in_quotes:
+            parts.append(("".join(buf), was_quoted))
+            buf, was_quoted = [], False
+        else:
+            buf.append(ch)
+    parts.append(("".join(buf), was_quoted))
+    return parts
+
+
+def _object_matcher(entries):
+    """Build ident -> (entry, how) | None for include_objects/exclude_objects.
+
+    An entry with no double quote is folded to upper on both sides, as before.
+    An entry with quotes is compared part by part: a quoted part must match
+    exactly, an unquoted part folds. `how` is the word the exclusion reason
+    uses, so a case-insensitive hit on a collision twin is never reported as
+    the operator's explicit choice.
+    """
+    folded: dict[str, str] = {}
+    quoted: list[tuple[str, list[tuple[str, bool]]]] = []
+    for entry in entries or []:
+        text = str(entry)
+        if '"' in text:
+            quoted.append((text, _split_quoted(text)))
+        else:
+            folded[text.upper()] = text
+
+    def match(ident: str):
+        hit = folded.get(ident.upper())
+        if hit is not None:
+            return hit, "case-insensitively"
+        parts = ident.split(".")
+        for text, spec in quoted:
+            if len(spec) == len(parts) and all(
+                    (have == want) if exact else (have.upper() == want.upper())
+                    for (want, exact), have in zip(spec, parts)):
+                return text, "exactly"
+        return None
+
+    return match
+
+
 def _exclusion(rec: dict, restriction: str, reason: str) -> dict:
     return {"source_identifier": rec["source_identifier"],
             "object_type": rec.get("object_type"),
@@ -82,7 +148,9 @@ def apply_restrictions(records: list[dict],
     inc_db, exc_db = _upper(r.get("include_databases")), _upper(r.get("exclude_databases"))
     inc_sc, exc_sc = _upper(r.get("include_schemas")), _upper(r.get("exclude_schemas"))
     inc_ty, exc_ty = _upper(r.get("include_object_types")), _upper(r.get("exclude_object_types"))
-    inc_ob, exc_ob = _upper(r.get("include_objects")), _upper(r.get("exclude_objects"))
+    match_inc = _object_matcher(r.get("include_objects"))
+    match_exc = _object_matcher(r.get("exclude_objects"))
+    has_inc_ob = bool(r.get("include_objects"))
     inc_pat = [re.compile(p) for p in r.get("include_name_patterns") or []]
     exc_pat = [re.compile(p) for p in r.get("exclude_name_patterns") or []]
     max_rows, max_bytes = r.get("max_rows"), r.get("max_bytes")
@@ -95,11 +163,18 @@ def apply_restrictions(records: list[dict],
         kind = str(rec.get("object_type", "")).upper()
         name = ident.rsplit(".", 1)[-1]
 
-        if exc_ob and ident.upper() in exc_ob:
-            excluded.append(_exclusion(rec, "exclude_objects",
-                                       "explicitly excluded by the user"))
+        hit = match_exc(ident)
+        if hit:
+            entry, how = hit
+            # Only a quoted, exact hit is the operator's explicit choice; a
+            # folded hit may be a case twin the operator never named.
+            reason = (f"explicitly excluded by the user (exclude_objects entry "
+                      f"{entry!r})" if how == "exactly" else
+                      f"excluded by exclude_objects entry {entry!r}, which "
+                      f"matched case-insensitively")
+            excluded.append(_exclusion(rec, "exclude_objects", reason))
             continue
-        if inc_ob and ident.upper() not in inc_ob:
+        if has_inc_ob and not match_inc(ident):
             excluded.append(_exclusion(rec, "include_objects",
                                        "not in the user's include_objects list"))
             continue
