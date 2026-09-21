@@ -748,6 +748,114 @@ def test_reconcile_treats_already_existed_like_created_and_flags_type_drift(
     assert "position 1" in by_name["DRIFT"]["reason"]
 
 
+# --- views: not created by this path, and never omitted from the report ----
+#
+# The plan carries CREATE VIEW statements and the manifest lists views, but
+# the job path creates tables only. Views were absent from every report, so
+# an estate whose every view was missing read "No table is in a problem
+# state"; and a view that WAS deployed (catalog API) was subtracted only
+# against manifest tables and reported as someone else's object.
+
+def test_views_in_the_plan_are_not_counted_as_planned_tables(structure):
+    plan = {"statements": [
+        {"source_identifier": "DB.SALES.ORDERS", "object_type": "TABLE",
+         "expected_columns": [{"name": "ID", "type": "DECIMAL(38,0)"}]},
+        {"source_identifier": "DB.SALES.V_ORDERS", "object_type": "VIEW",
+         "expected_columns": [{"name": "ID", "type": "DECIMAL(38,0)"}],
+         "sql": "CREATE VIEW IF NOT EXISTS `lake`.`sales`.`v_orders` AS SELECT 1"}]}
+    assert list(structure.columns_from_ddl_plan(plan)) == [("SALES", "ORDERS")]
+    assert structure.views_from_ddl_plan(plan) == {("SALES", "V_ORDERS")}
+
+
+def test_the_structure_report_lists_manifest_views_it_did_not_create(
+        structure, monkeypatch, tmp_path, capsys):
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["ORDERS"]},
+                            plan={("SALES", "ORDERS"): _PLAN_COLS},
+                            views={"SALES": ["V_ORDERS"]})
+    spark = _CatalogSpark()
+    _inject_spark(monkeypatch, spark)
+    rc = _load("01_create_structure").main(
+        ["--target-catalog", "lake", "--schema", "SALES",
+         "--reports-dir", str(reports)])
+    assert rc == 0, "a view this path does not create is not a failure"
+    report = _report(reports, "structure_report_sales.json")
+    assert list(report["objects"]) == ["ORDERS"], "objects stays table-only"
+    assert report["views"]["V_ORDERS"]["status"] == "not_created_by_this_path"
+    assert not any("VIEW" in s.upper() for s in spark.statements)
+    assert "V_ORDERS" in capsys.readouterr().out
+
+
+def test_a_manifest_view_present_in_target_is_not_someone_elses_object(
+        reconcile, tmp_path):
+    (tmp_path / "copy_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "tables": {"ORDERS": {"status": "verified"}}}), encoding="utf-8")
+    spark = _CatalogSpark({"`lake`.`SALES`.`ORDERS`": [("A", "string")],
+                           "`lake`.`SALES`.`V_ORDERS`": [("A", "string")]})
+    rec = reconcile.reconcile(spark, manifest=_manifest("ORDERS", views=["V_ORDERS"]),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=False)
+    s = rec["schemas"][0]
+    assert s["in_target_but_not_in_manifest"] == []
+    assert s["tables"][0]["verdict"] == "MIGRATED_VERIFIED"
+    assert rec["totals"]["MIGRATED_VERIFIED"] == 1
+    view = s["views"][0]
+    assert view["view"] == "V_ORDERS"
+    assert view["verdict"] == "VIEW_NOT_CREATED_BY_THIS_PATH"
+    assert view["exists_in_target"] is True
+    md = reconcile.render(rec)
+    assert "V_ORDERS" in md
+    assert "someone else's objects" not in md
+
+
+def test_a_manifest_view_absent_from_target_appears_in_the_report(
+        reconcile, tmp_path):
+    spark = _CatalogSpark({"`lake`.`SALES`.`ORDERS`": [("A", "string")]})
+    rec = reconcile.reconcile(spark, manifest=_manifest("ORDERS", views=["V_ORDERS"]),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=False)
+    view = rec["schemas"][0]["views"][0]
+    assert view["verdict"] == "VIEW_NOT_CREATED_BY_THIS_PATH"
+    # SHOW TABLES lists views on some catalogs only, so "not listed" is not
+    # "absent": could not look never renders as no.
+    assert view["exists_in_target"] is None
+    assert "VIEW_NOT_CREATED_BY_THIS_PATH" not in reconcile.PROBLEM_VERDICTS
+    assert rec["totals"]["VIEW_NOT_CREATED_BY_THIS_PATH"] == 1
+    md = reconcile.render(rec)
+    assert "V_ORDERS" in md
+    assert "deploy --execute" in md, "the report says how views DO get created"
+
+
+def test_views_are_not_counted_as_tables_pending_migration(
+        reconcile, monkeypatch, tmp_path, capsys):
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["ORDERS"]},
+                            views={"SALES": ["V_ORDERS"]})
+    (reports / "copy_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "tables": {"ORDERS": {"status": "verified"}}}), encoding="utf-8")
+    _inject_spark(monkeypatch, _CatalogSpark(
+        {"`lake`.`SALES`.`ORDERS`": [("A", "string")]}))
+    rc = _load("03_reconcile").main(["--target-catalog", "lake",
+                                     "--reports-dir", str(reports)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "not migrated yet" not in out
+    assert "V_ORDERS" in (reports / "MIGRATION_REPORT.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("views", [[], ["V_ORDERS"]])
+def test_a_report_claim_is_checked_the_same_with_views_present(
+        reconcile, tmp_path, views):
+    (tmp_path / "copy_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.sales",
+         "tables": {"ORDERS": {"status": "verified"}}}), encoding="utf-8")
+    rec = reconcile.reconcile(_FakeSpark(), manifest=_manifest("ORDERS", views=views),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=False)
+    assert rec["schemas"][0]["tables"][0]["verdict"] == "MISSING_DESPITE_REPORT"
+    assert rec["totals"]["MISSING_DESPITE_REPORT"] == 1
+
+
 def test_a_table_with_no_target_is_a_finding_not_a_crash(copy_schema):
     """Live, the copy died on the sixth table of a schema: the approved plan
     covered five, the manifest listed a thousand, and the missing target took

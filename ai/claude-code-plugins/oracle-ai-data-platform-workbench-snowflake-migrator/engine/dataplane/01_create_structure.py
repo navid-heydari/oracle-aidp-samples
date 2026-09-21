@@ -247,8 +247,30 @@ def columns_from_ddl_plan(ddl_plan: dict) -> dict[tuple[str, str], list[dict]]:
         parts = ident.split(".")
         if len(parts) != 3 or not stmt.get("expected_columns"):
             continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue                    # views are not created by this path
         out[(parts[1], parts[2])] = stmt["expected_columns"]
     return out
+
+
+def views_from_ddl_plan(ddl_plan: dict) -> set[tuple[str, str]]:
+    """{(source_schema, view)} for every VIEW statement in the plan."""
+    out: set[tuple[str, str]] = set()
+    for stmt in ddl_plan.get("statements") or []:
+        parts = str(stmt.get("source_identifier") or "").split(".")
+        if len(parts) == 3 and str(stmt.get("object_type") or "").upper() == "VIEW":
+            out.add((parts[1], parts[2]))
+    return out
+
+
+# This stage creates TABLES. The plan's CREATE VIEW statements are qualified
+# with the plan-time target and their bodies would need re-qualifying for a
+# run-time --target-catalog, so views are the catalog path's job (`snowmig
+# deploy --execute`). They are still LISTED here, so a view the plan promised
+# can never be absent from every report with exit 0.
+VIEW_NOT_CREATED = ("views are not created by this stage (tables only); "
+                    "create them with `snowmig deploy --execute` and verify "
+                    "them against the source")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -298,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
     spark = SparkSession.builder.getOrCreate()
 
     planned_columns: dict = {}
+    planned_views: set | None = None
     if args.mode == "ddl-plan":
         ddl_path = (pathlib.Path(args.ddl_plan) if args.ddl_plan
                     else reports.parent / "plan" / "ddl_plan.json")
@@ -305,10 +328,13 @@ def main(argv: list[str] | None = None) -> int:
             return fail(f"--mode ddl-plan needs ddl_plan.json; {ddl_path} is "
                         f"not there. Run the migrator's `ddl` stage and let "
                         f"`provision` upload it, or pass --ddl-plan")
-        planned_columns = columns_from_ddl_plan(
-            json.loads(ddl_path.read_text(encoding="utf-8")))
+        ddl_plan = json.loads(ddl_path.read_text(encoding="utf-8"))
+        planned_columns = columns_from_ddl_plan(ddl_plan)
+        planned_views = views_from_ddl_plan(ddl_plan)
         log(f"ddl plan: {len(planned_columns)} table(s) with engine-"
-            f"translated types, from {ddl_path}")
+            f"translated types, from {ddl_path}"
+            + (f"; {len(planned_views)} view(s) it carries are NOT created "
+               f"by this stage" if planned_views else ""))
 
     source = None
     if args.mode == "ctas":
@@ -411,6 +437,23 @@ def main(argv: list[str] | None = None) -> int:
             report["updated_at"] = datetime.datetime.now(
                 datetime.timezone.utc).isoformat()
             path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+        # Views: listed, never created here. Kept apart from `objects` so
+        # the table tally, the resume logic and the copy scope stay table-only.
+        views = [v["name"] for v in record.get("views") or []]
+        if views:
+            report["views"] = {}
+            for view in views:
+                entry = {"status": "not_created_by_this_path",
+                         "reason": VIEW_NOT_CREATED}
+                if planned_views is not None:
+                    entry["in_plan"] = (schema, view) in planned_views
+                report["views"][view] = entry
+            path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            log(f"{schema}: {len(views)} view(s) in the manifest are NOT "
+                f"created by this stage ({', '.join(views[:5])}"
+                f"{', ...' if len(views) > 5 else ''}); use `snowmig deploy "
+                f"--execute` for views")
 
         counts = {}
         for obj in report["objects"].values():

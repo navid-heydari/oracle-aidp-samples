@@ -17,6 +17,10 @@ flagged the other way.
 
 "Could not look" never renders as zero: an unreadable schema is marked
 UNREADABLE, distinct from empty.
+
+Views are listed per schema, never omitted: the job path creates tables
+only, so every manifest view carries VIEW_NOT_CREATED_BY_THIS_PATH (not a
+problem verdict) and the report says how views do get created.
 """
 from __future__ import annotations
 
@@ -139,13 +143,33 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
             rows.append(row)
             tally[verdict] = tally.get(verdict, 0) + 1
 
-        unclaimed = (sorted(live - {t["name"].lower()
-                                    for t in schema_rec["tables"]})
-                     if live is not None else [])
+        # Views: the job path creates tables only, so every manifest view is
+        # listed rather than silently absent. SHOW TABLES lists views on some
+        # catalogs and not others, and nothing here looks for views
+        # specifically, so "not listed" is None (could not look), never "no".
+        view_rows = []
+        for view in schema_rec.get("views") or []:
+            name = view["name"]
+            s_view = ((structure or {}).get("views", {})
+                      .get(name, {}).get("status", "not_attempted"))
+            if live is None:
+                v_exists, v_verdict = None, "TARGET_UNREADABLE"
+            else:
+                v_exists = True if name.lower() in live else None
+                v_verdict = "VIEW_NOT_CREATED_BY_THIS_PATH"
+            view_rows.append({"view": name, "structure": s_view,
+                              "exists_in_target": v_exists,
+                              "verdict": v_verdict})
+            tally[v_verdict] = tally.get(v_verdict, 0) + 1
+
+        known = ({t["name"].lower() for t in schema_rec["tables"]}
+                 | {v["name"].lower() for v in schema_rec.get("views") or []})
+        unclaimed = sorted(live - known) if live is not None else []
         out["schemas"].append({
             "schema": schema, "target_schema": target_schema,
             "target_readable": live is not None,
             "tables": rows,
+            "views": view_rows,
             "in_target_but_not_in_manifest": unclaimed})
 
     out["totals"] = tally
@@ -186,6 +210,18 @@ def render(rec: dict) -> str:
             reason = (t.get("reason") or "").replace("|", "\\|")[:120]
             lines.append(f'| {t["table"]}{count} | {t["structure"]} | '
                          f'{t["copy"]} | {exists} | {t["verdict"]} | {reason} |')
+        if s.get("views"):
+            lines += ["", "### Views (not created by the job path)", "",
+                      "The jobs create tables only; create views with "
+                      "`snowmig deploy --execute` (catalog API) and verify "
+                      "them against the source. \"Listed\" is what SHOW "
+                      "TABLES returned; `?` means it was not looked for.", "",
+                      "| View | Structure | Listed in target | Verdict |",
+                      "|---|---|---|---|"]
+            for v in s["views"]:
+                listed = {True: "yes", None: "?"}.get(v["exists_in_target"], "?")
+                lines.append(f'| {v["view"]} | {v["structure"]} | {listed} | '
+                             f'{v["verdict"]} |')
         if s["in_target_but_not_in_manifest"]:
             lines += ["", f'⚠️ In the target but in no report: '
                           f'{", ".join(s["in_target_but_not_in_manifest"])} — '
@@ -223,7 +259,8 @@ def main(argv: list[str] | None = None) -> int:
     pending = sum(v for k, v in rec["totals"].items()
                   if k not in PROBLEM_VERDICTS
                   and k not in ("MIGRATED_VERIFIED",
-                                "PRESENT_NOT_REVERIFIED"))
+                                "PRESENT_NOT_REVERIFIED",
+                                "VIEW_NOT_CREATED_BY_THIS_PATH"))
     if pending:
         log(f"{pending} table(s) not migrated yet — expected while the "
             f"migration is still running, schema by schema. Not an error.")
