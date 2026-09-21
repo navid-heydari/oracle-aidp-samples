@@ -46,6 +46,517 @@ on its first colon, which is how the file passed before.
 - `--help` no longer opens with "Five subcommands" (there are 24); pyflakes
   is clean apart from one deliberate re-export.
 
+### Fixed — credential handling
+
+- The diagnose notebook redacted only top-level keys while the config nests
+  everything under `snowflake:`, so the nested JSON the README recommends for
+  a PyYAML-less cluster was printed whole — password and PEM — into cell
+  output; as shipped it could not run anyway (`provision` never uploaded it).
+  It is now generated from `engine/dataplane/diagnose_environment.py`,
+  uploaded by `provision` beside the stage notebooks with no job, and echoes
+  key names with `<set>`/`<unset>` only.
+- Two secrets still reached the command line: `catalog --execute
+  --test-connection` put the `testConnection` body (password or whole PEM)
+  inline on the `oci` argv, and `--key-passphrase` took the passphrase inline
+  on every Snowflake stage. The body is spooled to a temp file like the
+  `create_catalog` body; the flag is removed in favour of `key_passphrase:`
+  or `key_passphrase_path:` in the config and refused without echoing.
+- `provision --execute --source-config` uploaded the whole migration config
+  verbatim to `backup-snowflake-migration/plan/`, secret and unread `aidp:`
+  block alike, and accepted a `key_path:` config whose laptop path the job
+  then failed on with a raw `FileNotFoundError`. Only the `snowflake:` block
+  travels now, as `<stem>.json`, announced on stderr and in `PROVISION.md`
+  with the advice to remove it afterwards; a `*_path` secret is refused.
+- The plugin `.gitignore` ignored `*.pem` and `*.key` but not `*.p8`, while
+  the docs generate an unencrypted PKCS#8 key into the working directory, so
+  `git add -A` would have staged a private key. It now covers `*.p8`,
+  `*.pk8`, `rsa_key*`, `*_rsa_key*` and `sf_key*`, pinned by a test that runs
+  `git check-ignore` for every name the docs create.
+- `load_config()` left `yaml.safe_load` unguarded, so a password containing
+  `{`, `[`, `*`, `: ` or a leading quote — unquoted, as the example shows it
+  — escaped `preflight` as a raw traceback quoting the password line. It now
+  raises `ConfigError` with the file and line, never the text; the
+  cluster-side loader in `engine/dataplane/snowmig_source.py` still lacks the
+  guard, so a malformed provisioned config can still quote its line in a log.
+- `PRIVACY.md` still described the structure-only design: path-only secrets,
+  no credential in any artifact, "table data is never read", only `deploy`
+  writes. It now names the two paths that carry the credential to the tenancy
+  (`provision --source-config`, `catalog --execute`), that the data plane
+  reads every row, that `run` has no dry-run flag, and what removal leaves.
+
+### Fixed — the read-only Snowflake transport
+
+- `assert_read_only` judged a statement by its first keyword and `WITH` is
+  allowlisted for CTE-SELECTs, so `WITH x AS (...) INSERT` (or `DELETE`,
+  `UPDATE`, `MERGE`, `CREATE TABLE AS`) passed as a read — nothing in the
+  engine sends a CTE, but the guard failed open. `lexer.cte_body_verb()`
+  finds the keyword after the CTE list; `WITH` is allowed only before a
+  `SELECT`, and the tests assert a refused CTE never reaches `cursor.execute`.
+- `--auth pat` could never log in: the token went in `password` while
+  snowflake-connector-python builds `AuthByPAT` from `token`, so the login
+  body carried `TOKEN: null` and the hint blamed the password or key. It is
+  passed as `token`; a contract test drives the connector's own `AuthByPAT`.
+- The config's `host:` fed the EXTERNAL catalog body and the in-AIDP
+  connector but never the laptop-side driver, so `preflight --test-source`
+  passed a wrong host that failed minutes later inside AIDP.
+  `build_connect_kwargs` takes `host` and `_snowflake_coords` hands it on.
+
+### Fixed — view translation and DDL
+
+- The `::` cast rule matched its literal with `'[^']*'`, so `'don\'t'::string`
+  matched the tail `'t'::string`, spliced `CAST` into the literal and the
+  re-lex raised `UnterminatedLiteral` out of the planner: `plan` and `ddl`
+  exited 1 for the whole estate with no view named. The pattern follows the
+  lexer's escape rules, and a rule that raises blocks only its own construct.
+- T02 emitted `CAST(x AS <snowflake type>)` verbatim as an "exact rewrite":
+  Spark `FLOAT` is single precision, bare `DECIMAL` is `DECIMAL(10,0)`, and
+  `NUMBER`/`TEXT`/`TIME`/`VARIANT` are not Spark types, so views truncated
+  silently or failed on first query. The type now goes through the same
+  `map_type` table DDL uses; a blocked type refuses the statement.
+- `DATEADD` was labelled exact and was not: the amount was interpolated
+  unparenthesised (`a + b * 7`), a column amount on a time unit became
+  `INTERVAL n_hours HOUR`, `date_add` returns `DATE` so a `TIMESTAMP` lost its
+  time of day, and forms the regex missed shipped unreported as portable.
+  Only literal or column amounts are rewritten, the rest refuse by name, the
+  rule carries a DATE-only caveat, and a generic guard reports any rule whose
+  construct survives its own pass.
+- `DATEDIFF`, `TIMESTAMPDIFF`, `TIMESTAMPADD` and `TIMEADD` were documented as
+  blocking but had no rule, so such views were planned migratable and stamped
+  portable; `views.UNSUPPORTED_CONSTRUCTS` was dead. Declared rules
+  `T19_DATEDIFF` and `T20_TIMESTAMPADD` refuse the family, and the table is
+  derived from `translate.RULES` so the two cannot drift.
+- Snowflake quoting shipped verbatim: Spark reads `"Order ID"` as a string
+  literal, so a view returned the constant text on every row while the
+  structure check still matched; `'O''Brien'` is two literals that Spark
+  concatenates, so the predicate matched `OBrien`; `$$...$$` failed at parse
+  time. `T07_QUOTED_IDENTIFIER` rewrites `"x"` to a backtick identifier,
+  `T08_STRING_ESCAPE` rewrites `''` to `\'`, `T09_DOLLAR_QUOTED` refuses.
+- R42 asserted "no Snowflake-only construct present" when only the rule
+  table's regexes had been tried; `GREATEST`/`LEAST`, `SPLIT`, `ZEROIFNULL`
+  and `TO_CHAR` formats ship verbatim. It now reads "no known Snowflake-only
+  construct matched; functions not in the rule table are carried verbatim
+  and may fail or differ at Spark parse time".
+- `build_create_view` rewrote object references with an unanchored `re.sub`
+  over the whole body: it mutated string literals, missed a reference whose
+  parts `GET_DDL` had quoted, hit `DB.S.ORDERS` inside `DB.S.ORDERS_ARCHIVE`,
+  and `DDL_PLAN.md` reported a rewrite that never happened. A lexer-aware
+  `_rewrite_view_refs` matches whole three-part names outside literals and
+  comments; R41 lists only real hits.
+- `unsupported_target_types()` anchored on `` `(\w+)` TIMESTAMP_NTZ ``, which
+  cannot match names the emitter itself backticks (spaces, hyphens, dots), so
+  a plan whose NTZ columns were all so named passed the HALT gate and failed
+  per table on the cluster. The gate reads each statement's `expected_columns`.
+- `PLANNED_OBJECTS.md` lists cycle members as excluded from the ordering, but
+  `build_ddl_payload` re-added every un-waved clone target — exactly those —
+  so both got `CREATE VIEW` statements in arbitrary order and a failed create
+  could burn the name. They are held back and listed under "Blocked — no DDL
+  generated" naming the other members.
+- Snowflake's default `TIMESTAMP` is `TIMESTAMP_NTZ`, the mapper preserves it
+  and the AIDP metastore refuses it, so `ddl` halted (exit 3) on nearly every
+  real estate and the only remedy was a paid re-read through `assess`. `ddl
+  --timestamp-ntz {preserve,timestamp}` re-maps every NTZ column offline from
+  `inventory.json`; `ddl_plan.json` records the mode and the columns.
+
+### Fixed — metadata extraction and in-AIDP discovery
+
+- `_show_all` resumed a SHOW walk with `LIMIT n FROM '<name>'` but
+  LIKE-escaped the name (`ORDER\_ITEMS`); `FROM` takes a plain name, so past
+  one 10k page whose boundary name had an underscore the page repeated, the
+  cursor guard stopped the walk and the tail of the schema silently never
+  entered the inventory. The cursor is embedded with only its quotes doubled.
+- Lineage lost edges two ways: quoted mixed-case identifiers
+  (`DB.S.SalesView` over `DB.S.Orders`) were compared upper-cased against the
+  inventory's exact spelling and dropped, and a readable but empty
+  `OBJECT_DEPENDENCIES` (it lags DDL by hours) was still labelled
+  "authoritative lineage" — so views were emitted before their base tables.
+  Both paths keep the inventory's spelling, views with no ACCOUNT_USAGE edge
+  are parsed from their DDL, and a `warning` names any view still unordered.
+- `_account_usage_summary` reported two ACCOUNT_USAGE reads through one
+  `readable` flag: when clustering history succeeded and `TABLE_DML_HISTORY`
+  then failed, every table got a measured churn of 0 rows. The status carries
+  `clustering_readable` and `dml_readable`; churn becomes `measured: false`.
+- `inventory_from_manifest` wrote the size as `BYTES` while every reader uses
+  `bytes`, so on the in-AIDP path `max_bytes` excluded nothing while
+  `plan.json` recorded the cap as applied and `INVENTORY.md` showed `-` for
+  every size. The bridge writes `rows` and `bytes`.
+- SHOW commands, the INFORMATION_SCHEMA views and
+  `ACCOUNT_USAGE.POLICY_REFERENCES` return nothing, successfully, for what
+  the role cannot see or the view has not caught up with, and every consumer
+  read that as "none exist": a read-only role made the census say "only
+  tables and views ... the whole estate", and the security verdict said
+  "Nothing is protected today" while policy objects had just been listed.
+  Census counts are worded as a lower bound for the recorded `role` with the
+  grants a complete census needs listed, and defined policies with no visible
+  attachment are UNCONFIRMED exposure with the lag named.
+- Connector-mode discovery ran `INFORMATION_SCHEMA.TABLES`/`COLUMNS` with no
+  predicate and applied `--schemas` after the fetch, so an estate over
+  Snowflake's result cap died with an empty manifest and a hint blaming the
+  credentials; a `--schemas` run then overwrote the loaded manifest with its
+  filtered result (and `--force` never loaded it), so `DISCOVERY.md`'s own
+  advice left one schema in `discovery_manifest.json`. `--schemas` is pushed
+  down as `where TABLE_SCHEMA in (...)` and merges into the manifest;
+  `--force` alone rediscovers the whole estate.
+
+### Fixed — planning, restrictions and the smoke test
+
+- `include_objects`/`exclude_objects` upper-cased both sides, so excluding
+  `DB.S.t` to defer the quoted lower-case twin also dropped `DB.S.T`, and
+  `PLANNED_OBJECTS.md` blamed the operator for both. A double-quoted part
+  (`"DB"."S"."t"`) matches exactly, unquoted parts still fold, the reason says
+  which happened, and the `TargetCollision` HALT ends with the remedy.
+- `validate_restrictions()` checked only Python types, so `{"include_objects":
+  []}` planned the whole estate under "Restrictions in force", blank patterns
+  excluded everything, `max_rows: -1` excluded every counted table, and
+  `max_rows`/`max_bytes` silently kept any object whose count or size was
+  unknown — every view under the default `--row-counts metadata`. Degenerate
+  values are rejected (`plan` exits 1, no `plan.json`), and a cap that cannot
+  be evaluated excludes the object with that reason.
+- `build_plan` never consulted dependency edges and handed only planned ids to
+  `compute_waves`, which drops edges to unknown nodes, so a view over a
+  VARIANT-blocked or restriction-excluded table sorted first in wave 1 and
+  got a `CREATE VIEW` over a table that will never exist. Dependents of any
+  non-migrating object cascade to `cannot_migrate` under
+  `dependency_not_migrated`, naming the object and why.
+- `run_smoke` computed `ok` over checks that ran; with no AIDP coordinates the
+  destination was skipped with an empty check list, so CLI, `SMOKE_TEST.md`
+  and the stage board all said PASS — on the default first run, since the
+  example config ships the coordinates commented out. The result carries
+  `verdict` (`PASS`, `PARTIAL`, `FAIL`), `smoke_verdict()` derives it for an
+  older `smoke.json`, and all three surfaces say PARTIAL.
+- The plan names targets `<source_db>.<schema>.<name>`, but the structure job
+  never reads `target_fqn` and creates `<--target-catalog>.<schema>.<name>`,
+  so the sign-off named catalogs the job does not create — by default the
+  very name the runbook registers as the EXTERNAL pointer. Naming is
+  unchanged; `plan.json` carries `target_catalog_note` explaining both, and
+  `PLANNED_OBJECTS.md` renders it.
+- `SHOW TABLES` flags dynamic, external, Iceberg, event and hybrid tables and
+  the extractor kept the flags, but `build_plan` never read them: a dynamic
+  table was "Can migrate" and "never migrates" in two reports at once, and a
+  one-time copy would have stopped refreshing after cutover unannounced.
+  Those kinds are `cannot_migrate` with a kind-specific reason;
+  `TRANSIENT`/`TEMPORARY` stay migratable, listed in `table_kind_warnings`.
+
+### Fixed — AIDP control-plane calls, jobs and provisioning
+
+- `_find_schema`/`_resolve_object` swallowed every listing error as `None`, so
+  a 403 on `list_schemas` re-POSTed an existing schema and a 403 on
+  `list_tables_in` reported every created table as "never appeared" after
+  33 s of polling each, leaving a probe behind. Schemas are listed before any
+  write and a failure refuses; on read-back a permission error stops at once
+  and the table is reported UNKNOWN, not absent.
+- Every AIDP list read was a single GET with no `page=`, and the parser
+  dropped the `headers` block carrying `opc-next-page`, so every existence
+  decision read page one: a catalog past it was re-created, a table created
+  past it "never appeared" and was called burned, and `in_flight_runs` missed
+  the run it guards against. Both transports follow the token via
+  `collect_pages`; the `aidp` CLI, which cannot request a second page,
+  refuses a truncated listing instead of returning page one as the whole.
+- `TERMINAL_STATES` omitted `INTERNAL_ERROR`, `SKIPPED`, `UPSTREAM_CANCELED`
+  and `EXCLUDED`, so a run that died that way was polled for the whole budget,
+  cancelled and resubmitted by the cold-start watchdog, reported STILL
+  RUNNING and exited 0; `cancel_run` also swallowed its own failure, so the
+  resubmit went into the occupied slot and was discarded. The four states are
+  terminal (exit 1, no resubmit), an unknown status exits 1 as
+  `unrecognised`, and a resubmit needs a confirmed cancel — otherwise the
+  original run is kept and `run` exits 1 saying so.
+- After `create_workspace`, `provision()` waited only for the name to be
+  visible and POSTed the cluster at once; the 409 "ongoing operation" that
+  `GAPS.md` records as expected escaped as `ProvisionTransportError`, so no
+  `provision_result.json` or `PROVISION.md` was written and the next run
+  halted on `name_taken` calling the workspace someone else's. The workspace
+  is polled to `ACTIVE`, the POST retries 409 with bounded delays, and both
+  artifacts are written on failure with exit 1 and a `--reuse-existing` hint.
+- `POST /actions/testConnection` answers 202 with an empty body and the async
+  key in a response header; the parser dropped headers and `cmd_catalog`
+  looked in the body, so the poll was dead code, the outcome always `PENDING`
+  and `CATALOG.md` silent. Results keep their headers under `_headers`,
+  `connection_test_outcome` polls `GET /asyncOperations/{key}` to a verdict,
+  and `CATALOG.md` gains a "Connection test" section; the exit code stays 0
+  on `FAILED` — reported, not enforced.
+- Every `provision --execute` regenerated all four stage notebooks and
+  uploaded them with `--is-overwrite`, so `--reuse-existing` (the documented
+  resume) silently reset console-edited PARAMS — `schema` to `None`, `verify`
+  to `counts`, the reconcile `counts` to `False`. With `--reuse-existing` a
+  notebook already on the workspace is kept and `PROVISION.md` says so;
+  `--refresh-notebooks` asks for the overwrite explicitly.
+
+### Fixed — the in-AIDP structure, copy and reconcile jobs
+
+- Views in the plan and manifest were created by no job and appeared in no
+  report: an estate with every view missing read "No table is in a problem
+  state", and a view deployed via the catalog API was flagged "someone else's
+  object". Neither job creates views and both say so: `01` records them as
+  `not_created_by_this_path`, `03` emits a `VIEW_NOT_CREATED_BY_THIS_PATH`
+  row each (not a problem, not pending) and names `deploy --execute`.
+- `01_create_structure` recorded `created` right after `CREATE TABLE IF NOT
+  EXISTS`, a no-op on a table already there, so a stale layout was certified
+  as the plan's and the copy INSERTed positionally into it (same column
+  count: wrong columns, matching counts). The stage DESCRIBEs every table and
+  compares names and types in order — `created`, `already_existed` or
+  `type_drift` (left as found, exit 1); the copy never takes a drifted table
+  and reconcile reports `STRUCTURE_TYPE_DRIFT`, which outranks a verified copy.
+- A structure run in which every table was `not_in_plan` created nothing and
+  exited 0, the copy recorded every table `target_missing` and exited 0, and
+  reconcile exited 0 — three SUCCESS jobs for a migration that did nothing.
+  The structure job exits 1 saying the plan and the requested schemas do not
+  overlap when nothing was created (a canary plan over one schema still
+  passes), and the copy's scope log says how many were `not_in_plan`.
+- A table whose copy ended `count_mismatch` was re-attempted on the next run;
+  skip-existing saw rows, returned `skipped_nonempty`, overwrote the failure,
+  and reconcile rendered `PRESENT_NOT_REVERIFIED` under "No table is in a
+  problem state" — re-running the failed job erased the signal. Skip-existing
+  now compares counts, a re-run that copied nothing keeps a prior failure,
+  and `--force` with the default mode is refused, naming `--mode overwrite`
+  or `--mode append`.
+- `--verify counts+sums` took the DECIMAL column set and cast scale from the
+  target's DESCRIBE: a `NUMBER(18,2)` landing in a `bigint` column was never
+  summed (cents lost, counts equal, `verified`), and a `decimal(18,0)` target
+  rounded both sides to scale 0 and passed. Before any row moves the copy
+  DESCRIBEs source and target and records `type_drift` (not copied) when a
+  source DECIMAL would lose type, integer digits or scale; sums use the
+  source's columns at the source's scale on both sides.
+- Only the INSERT was guarded, so one transient connector login timeout on a
+  source read, `COUNT(*)`, DESCRIBE or SUM ended a 200-table schema with a
+  traceback, the failing table unrecorded and the rest never attempted. Any
+  exception is recorded as `failed` and the loop continues (the stage still
+  exits 1); a failure after the INSERT landed records `insert_completed:
+  true` and says to re-copy with `--mode overwrite`, not `append`.
+- Reconcile trusted the wrong evidence three ways: it kept only the schema
+  half of a report's `target`, so a copy report verified against a test
+  catalog was applied to production and empty tables rendered
+  `MIGRATED_VERIFIED`; a `CREATE` that raised reconciled as `NOT_MIGRATED`,
+  the same as never attempted; and with `--counts` it fetched a live
+  `COUNT(*)` but never compared it. A report for another catalog is ignored
+  and recorded, a failed create is `STRUCTURE_FAILED`, and a live count that
+  differs from the verified one is `COUNT_DRIFT` — all problem verdicts.
+- The committed stage notebooks had drifted from their `engine/dataplane/`
+  sources and were written with CRLF on Windows, so whole-file diffs hid the
+  real changes. All five are regenerated LF-only, one test pins each notebook
+  to its generator and another fails on any CRLF byte; the reconcile headline
+  counts "object(s)" when views are tallied under an unreadable target.
+
+### Fixed — CLI wiring and configuration
+
+- Root-level `--out-dir X <stage>` (the placement the usage line advertises)
+  was silently discarded: the same parent parser sat on the root and every
+  subparser, and argparse re-applied the subparser's `None` default, so
+  `snowmig --out-dir X clean` deleted the default artifact directory — the
+  live run's evidence — with exit 0. The subparser copy uses
+  `argparse.SUPPRESS`, so it can only add, never overwrite.
+- Four operator inputs produced raw tracebacks or nameless messages:
+  `--out-dir` naming an existing file, a restrictions file holding a JSON
+  list, unparseable restrictions JSON, and a corrupt JSON artifact read by
+  `_read()`. Each is one `error:` line naming the file, exit 1.
+- `catalog --execute` with the name only in the config announced the
+  destination, then passed `args.catalog` (`None`) into `ensure_catalog` and
+  crashed with an `AttributeError`; the dry run wrote `"catalog": null`. The
+  name is resolved once by catalog type (`aidp.external_catalog` for
+  EXTERNAL, `aidp.catalog` for `--catalog-type standard`; `--catalog` wins),
+  and a missing name is one `error:` line before any API call.
+- `deploy`, `catalog` and `provision` wrote the same result artifact whether
+  executed or rehearsed, so re-running one without `--execute` replaced the
+  `dry_run: false` record — verified counts, burned names, catalog key — and
+  `STAGES.md`/`SUMMARY.md` then said nothing had been created. A dry run that
+  finds an executed record prints one `error:` line and exits 1 without
+  writing.
+- `smoke --write-probe` and `notebook --upload` wrote to AIDP on their own
+  flag with no `--execute`, and `--upload` drove the Jupyter contents API that
+  `GAPS.md` 13 records as known-bad (PUT returns 200, file unreadable),
+  reported "Uploaded" with no read-back, and pointed at `aidp notebook run`,
+  which does not exist. Both flags are dry runs without `--execute`; with it
+  the probe runs as before and the upload is refused (exit 1) naming the
+  verified path, `provision --execute` then `run --job snowmig_01_structure`.
+- `AIDP_FIELDS` accepted `oci_profile`, `external_catalog`, `target_catalog`
+  and `subnet_id` under `aidp:` and the CLI announced them, but nothing read
+  them: every `oci raw-request` ran under `DEFAULT` and config-only catalogs
+  never reached the jobs' PARAMS defaults. `aidp.oci_profile` reaches every
+  `oci` argv as `--profile <p>` (the `aidp` argv is left alone); `provision`
+  takes the two catalogs from the config; `subnet_id` is announced as unused.
+
+### Fixed — reports, the stage board and the documentation
+
+- `INVENTORY.md` hard-coded "Row counts are exact", labelled the column `Rows
+  (exact)` and rendered every missing count as `ERROR` regardless of
+  `row_count_mode`, so in the default metadata mode SHOW estimates read as
+  verified and every view as an extraction failure. The header follows the
+  mode, blank cells read `not counted`, and `ERROR` means `source=error`.
+- `render_summary` scored risk from plan entries carrying only
+  id/type/target/rows/columns, so the MEDIUM rules for deferred maintenance
+  settings, dropped properties and column warnings never fired and the
+  demo's clustered `ORDERS` table read LOW. Each `can_migrate` entry carries
+  `warnings`, `deferred_properties` and `omitted_properties`, and
+  `assess_risk` only raises, so a view with column warnings stays HIGH.
+- The stage board broke its own "could not look is flagged" rule on four
+  rows: `deps` flagged on a key `dependencies.json` never has, `compute`
+  ignored blocked warehouses, `provision` ignored steps left `verified=None`,
+  and `deploy` summed only failed+mismatched so unverified structure, type
+  drift and transport errors were invisible. Each row now raises the marker
+  for what it could not confirm; the deploy row is split by cause.
+- The manifest, `NOTICE`, `GAPS.md`, `ASSUMPTIONS.md` D3, the data-movement
+  reference, two skill descriptions and runtime text said the plugin copies
+  no data or moves no bytes, while it provisions `snowmig_02_copy_schema`,
+  which INSERT-SELECTs every row. Every surface now says the control plane
+  copies no data and rows are copied only by the operator-run in-AIDP job;
+  `SUMMARY.md` reads the deploy result only and points at reconcile.
+- README ran `catalog --execute` before `provision` with `--workspace
+  --cluster-id` bracketed as optional, made laptop `assess` a migration step
+  and ran the copy jobs as part of the sequence; `MIGRATION-ARCHITECTURE.md`
+  had a third order. All three runbooks share one order — provision, paste
+  the keys, EXTERNAL registration and INTERNAL container, workflows — and the
+  hand-off sends the operator to `provision_result.json` for the keys, since
+  `PROVISION.md` shows display names, which used as keys create unrunnable
+  objects.
+- Five documents gave four answers to which data-plane stages have run live.
+  `GAPS.md` "What is actually proven" is the one home (`00_discover` and
+  `01_create_structure` live-verified; `02_copy_schema` and `03_reconcile`
+  not yet confirmed), repeated verbatim in README, `ASSUMPTIONS.md`,
+  `MIGRATION-ARCHITECTURE.md`, the data-plane README and the overview skill.
+  This supersedes the 0.25.0 line below that called the copy and reconcile
+  stages unexecuted: the data-plane README had described a five-table copy
+  verified row for row, and which account is right is recorded as open.
+- `/snowflake-catalog` said a Standard catalog "is refused here by design"
+  and routed its tables to `snowmig.py notebook`; `/snowflake-soft-clone`
+  routed them through the known-bad clone-notebook upload. Both route the way
+  the runbook and CLI do: the container from `catalog --catalog-type standard
+  --execute`, the tables from `run --job snowmig_01_structure`.
+- Three doc claims about secrets and auth were false: the medallion-clone
+  skill said the config "carries no secret" and had none of the redaction
+  rules, so an agent had licence to show a file holding the password inline;
+  README and two skills said the config "is gitignored" when the rule lives
+  only inside the plugin folder, so `init-config` in another repository and
+  `git add .` stages the password; the bootstrap skill said AIDP auth is "not
+  configured in this plugin at all" while every `aidp` call gets `--auth
+  api_key` and `oci raw-request` uses the shell's `~/.oci/config` profile.
+  Each surface now states the inline default and the redaction rules, the
+  scoped gitignore claim, and the auth mechanism.
+
+### Changed — behaviour an operator will notice
+
+- `smoke` reports `PARTIAL` and exits 1 when AIDP was not checked.
+- `run` exits 1 on any non-success terminal state, on a state it cannot
+  classify and on an unconfirmed cold-start cancel; a job still running when
+  the poll budget ends keeps exit 0.
+- `snowmig_01_structure` exits 1 when it created nothing and something was
+  `not_in_plan`, and on any `type_drift`.
+- `snowmig_02_copy_schema` records `count_mismatch` (exit 1) on a pre-loaded
+  target whose count differs, refuses a DECIMAL that would narrow on the
+  target, and refuses `--force` without `--mode overwrite` or `--mode append`.
+- `snowmig_03_reconcile` exits 1 on `STRUCTURE_FAILED`, `STRUCTURE_TYPE_DRIFT`
+  and (with `--counts`) `COUNT_DRIFT`; a report for another catalog is
+  ignored.
+- `smoke --write-probe` and `notebook --upload` need `--execute`; without it
+  they are dry runs. `notebook --upload --execute` is refused and points at
+  `provision --execute` and `run --job snowmig_01_structure`.
+- `--key-passphrase` is removed in favour of `key_passphrase:` or
+  `key_passphrase_path:` in the config.
+- `provision --source-config` uploads only the `snowflake:` block, as
+  `<stem>.json`, and refuses a block naming a `*_path` secret.
+- `provision --execute --reuse-existing` keeps stage notebooks already on the
+  workspace unless `--refresh-notebooks`; `provision` also uploads
+  `diagnose_environment.ipynb`.
+- A dry run of `deploy`, `catalog` or `provision` refuses to overwrite an
+  executed result; rehearse into another `--out-dir`.
+- `max_rows`/`max_bytes` exclude objects whose count or size is unknown —
+  under the default `--row-counts metadata` that is every view, so pair
+  `max_rows` with `exclude_object_types: ["VIEW"]` or use `--row-counts exact`.
+- Empty `include_*`/`exclude_*` lists, blank or non-string entries, boolean
+  or negative caps and object types outside `TABLE`/`VIEW` are errors; a
+  double-quoted part in `include_objects`/`exclude_objects` matches exactly.
+- Dynamic, external, Iceberg, event and hybrid tables are planned as
+  `cannot_migrate`, as is a view over a base that does not migrate.
+- Plans built from estates with quoted mixed-case views or an empty
+  `OBJECT_DEPENDENCIES` must be regenerated: views move to later waves.
+- `00_discover_snowflake --schemas` merges into the existing manifest;
+  `--force` alone rediscovers the whole estate.
+- `WITH` is allowed on the read-only transport only before a `SELECT`.
+- `--auth pat` sends the token in the connector's `token` field.
+- `DATEADD` forms outside the exact set, `$$...$$` strings and the
+  `DATEDIFF`/`TIMESTAMPDIFF`/`TIMESTAMPADD`/`TIMEADD` family are refused;
+  view casts emit Spark types, quoted identifiers become backticks and `''`
+  becomes `\'`.
+- `ddl --timestamp-ntz timestamp` re-maps `TIMESTAMP_NTZ` offline; the
+  default stays `preserve`.
+- `aidp.oci_profile` reaches every `oci` call as `--profile`; `provision`
+  takes `external_catalog`/`target_catalog` from the config when the flags
+  are absent.
+- `--out-dir` before the subcommand is honoured; a value after it still wins.
+- AIDP list reads follow `opc-next-page`; on the `aidp` CLI backend a
+  truncated listing raises instead of passing as the whole.
+- `catalog --execute --test-connection` reports a real verdict in
+  `CATALOG.md`; the exit code stays 0 on `FAILED`.
+
+### Fixed — after the merge of the fixes above
+
+- The `::` cast rule matched its operand against the raw view text, so an
+  operand could end inside a `$$...$$` string or a line comment and the
+  rewrite was spliced into it (`select $$a$$::string` became `select
+  $$CAST(a$$ AS STRING)`, recorded as an exact rewrite). The operand must now
+  be wholly code or exactly one whole string or identifier segment, and `$`
+  cannot precede it, so dollar-quoted operands and `$1` positional references
+  are refused rather than mangled.
+- The VARIANT-path detector wanted an identifier after the colon, so
+  `v:"Field Name"` slipped past it, the quoted-identifier rule turned the
+  field into a backtick and the view was stamped an exact rewrite with a
+  colon path still in the body. The detector is an identifier followed by one
+  colon that is not `::`; the view is refused, named.
+- The copy's manifest fallback re-admitted every table the structure report
+  recorded as `type_drift` (the `created` filter only ran when at least one
+  table had been created), so an all-drift schema was copied positionally
+  into the drifted layout. Drifted tables are excluded, the scope line says
+  how many, and a schema with nothing left refuses with exit 1.
+- The diagnose notebook's default config path named a `.yaml` under `plan/`
+  that nothing creates; `provision` uploads the `snowflake:` block as
+  `plan/<stem>.json`. Default, header and the comment in the shared source
+  say so; the notebooks that inline them are regenerated.
+- Two calls past the cluster still escaped `provision()`: the job listing and
+  the cluster listing inside the warehouse loop. An expired session token on
+  either lost `provision_result.json` and `PROVISION.md` with the workspace
+  and cluster already created. Both are recorded steps; the job listing halts
+  with the resume hint, the warehouse listing moves on to the next warehouse.
+- The STANDARD-catalog note in `catalog_result.json` still routed the operator
+  to `snowmig.py notebook`, whose upload is refused, and called the INTERNAL
+  create runbook S3 where the overview says S4. It names `run --job
+  snowmig_01_structure` and GAPS 13, and the labels agree.
+- `STAGES.md` said every stage but three is read-only "except the narrow
+  opt-ins `smoke --write-probe` and `notebook --upload`"; the probe writes
+  only with `--execute` and `--upload` never writes. The preamble, the board
+  module docstring and the smoke stage's default note name the `--execute`
+  gate; the demo's `NOTEBOOK.md` routes to `provision` and `run`.
+- The board's `deps` row labelled every non-`account_usage` graph "partial
+  graph (view DDL only)" although the extractor now also writes
+  `account_usage+parsed_ddl` and `account_usage_empty`; it surfaces the
+  producer's own warning for those, keeps the unresolved-reference count on
+  every partial branch, and flags a provenance it does not recognise.
+- The board's `security` row, and the console line, read "0 policy
+  exposure(s)" with no hedge when policy objects existed but
+  `POLICY_REFERENCES` showed no attachment, or when the policy listing was
+  denied. Both now say UNCONFIRMED, as `SECURITY.md` already did.
+- `PLAN.md` stated "views follow their base tables" unconditionally. A view
+  with no edge from either lineage source sorts by size and can land ahead of
+  its base; `plan.json` carries `dependency_warning`, `dependency_edge_count`
+  and `views_without_dependency_edge`, and `PLANNED_OBJECTS.md` names the
+  views ordered by size only.
+- TRANSIENT/TEMPORARY tables were recorded as planned "as permanent Delta
+  tables" and rendered nowhere; `SUMMARY.md` scored them LOW. Each plan entry
+  carries `kind_warning`, the risk becomes MEDIUM with the sentence, and
+  `PLANNED_OBJECTS.md` lists them under "Planned, but not as what they were".
+- "Target structure to exist first" told the reader in three lines to create
+  catalog `d`, that `d` is the EXTERNAL pointer and not the target, and that
+  the clone creates `d.public`, a schema the structure job never creates. The
+  section is split per path: the source schemas the S10 job creates under
+  `--target-catalog`, and the plan's names for the older `deploy`/`notebook`
+  path only.
+- Documentation that had fallen behind the merged behaviour was brought back
+  in line: `PRIVACY.md` (the derived `plan/<stem>.json` copy, the `--execute`
+  gate on the write probe, `notebook --upload` no longer a writer), README
+  (`aidp.oci_profile` reaches every `oci` call; the view-translation
+  paragraph counts the implemented and refused rules from `translate.RULES`),
+  `ARCHITECTURE.md`, `MIGRATION-ARCHITECTURE.md` (rule counts, S10 route),
+  `ASSUMPTIONS.md` B2, the smoke, migration-plan, bootstrap, overview and
+  stage-board skills, the `/snowflake-notebook` command, and the data-plane
+  README's config path. `references/env-coords.template.md`, which described
+  environment variables nothing reads, is removed.
+
 ## [0.25.0] — 2026-09-19
 
 ### Fixed — the data plane could not read the one config file it is given
