@@ -436,3 +436,36 @@ def test_the_router_forbids_doing_the_engine_s_work_by_hand():
     assert "cannot be found, stop" in low
     assert "${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py" in text
     assert "never a reason to improvise" in low
+
+
+# --- the key files the docs tell the operator to create -----------------------
+# `snowmig-config.example.yaml` and the bootstrap skill both generate an
+# UNENCRYPTED PKCS#8 key into the working directory (`./migrator_rsa_key.p8`,
+# `./sf_key.p8`), and the plugin folder is the documented "convenient spot"
+# to work from inside a checkout. `.gitignore` covered `*.pem` and `*.key`
+# but not `*.p8`, so a `git add -A` for a doc fix would have staged the key.
+
+KEY_FILES_THE_DOCS_CREATE = ["migrator_rsa_key.p8", "sf_key.p8", "rsa_key.p8",
+                             "engine/anything.pk8", "x.pem", "x.key"]
+
+
+def test_gitignore_names_every_private_key_spelling():
+    rules = [line.strip() for line in
+             (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()]
+    for pattern in ("*.pem", "*.key", "*.p8", "*.pk8", "rsa_key*",
+                    "*_rsa_key*", "sf_key*"):
+        assert pattern in rules, f".gitignore must carry {pattern!r}"
+
+
+@pytest.mark.parametrize("name", KEY_FILES_THE_DOCS_CREATE)
+def test_gitignore_covers_every_key_file_the_docs_tell_you_to_create(name):
+    import shutil
+    import subprocess
+    if shutil.which("git") is None:
+        pytest.skip("git is not on PATH")
+    proc = subprocess.run(["git", "check-ignore", "-q", "--", name],
+                          cwd=ROOT, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    if proc.returncode == 128:
+        pytest.skip("the plugin is not inside a git work tree")
+    assert proc.returncode == 0, f"{name} would be committed by `git add -A`"
