@@ -285,6 +285,50 @@ def test_show_results_are_paginated_so_a_large_estate_is_not_truncated():
     assert "T99999" in names
 
 
+def test_pagination_cursor_is_a_plain_name_not_a_like_pattern(monkeypatch):
+    # `SHOW ... LIMIT n FROM '<name>'` takes a NAME STRING, and SHOW resumes
+    # strictly after it. `_` and `%` are literal there, not wildcards, so a
+    # LIKE-escaped cursor (`ORDER\_ITEMS`) names an object that does not
+    # exist and the walk resumes in the wrong place: pages repeat and the
+    # tail of the schema never enters the inventory. Nearly every real name
+    # contains an underscore, so the 10k-name test above cannot see this.
+    import re
+    from snowflake_source.extract import catalog as catalog_module
+
+    all_names = sorted(["ACCOUNTS_2019", "O'BRIEN_T", "ORDER_ITEMS_FACT",
+                        "ORDER_ITEMS_STG", "ORDER_LINES", "PCT%DONE",
+                        "ZZ_LAST"])
+    monkeypatch.setattr(catalog_module, "SHOW_PAGE_SIZE", 2)
+
+    class Seeking(FakeSql):
+        """Emulates the live-verified FROM semantics: resume after the
+        literal name given, exclusive; an unknown name seeks to wherever it
+        would sort."""
+        def __call__(self, sql, params=None):
+            flat = " ".join(sql.split())
+            if flat.lower().startswith("show tables in schema"):
+                self.calls.append(sql)
+                m = re.search(r" from '((?:[^']|'')*)'$", flat)
+                after = m.group(1).replace("''", "'") if m else None
+                names = [n for n in all_names if after is None or n > after]
+                return [{"name": n, "rows": 0} for n in names[:2]]
+            return super().__call__(sql, params)
+
+    fake = Seeking(_base_responses(tables=[], columns=[]))
+    inv = build_inventory(fake, row_counts="none")
+    names = [r["source_identifier"].rsplit(".", 1)[1] for r in inv["inventory"]]
+    assert names == all_names, "every object exactly once: no repeat, no loss"
+
+    resumes = [c for c in fake.calls if " from '" in c]
+    assert len(resumes) == 3
+    assert not any("\\" in c for c in resumes), \
+        "the cursor is a plain name; LIKE escaping does not belong here"
+    assert resumes[0].endswith("from 'O''BRIEN_T'"), \
+        "only the quote is doubled, so a name with ' cannot break the literal"
+    assert resumes[1].endswith("from 'ORDER_ITEMS_STG'")
+    assert resumes[2].endswith("from 'PCT%DONE'")
+
+
 def test_columns_are_read_per_schema_so_one_query_cannot_be_unbounded():
     fake = FakeSql(_base_responses(tables=[{"name": "T", "rows": 0}],
                                   columns=[_col("T")]))

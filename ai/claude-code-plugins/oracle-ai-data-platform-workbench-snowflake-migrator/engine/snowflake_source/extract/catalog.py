@@ -83,13 +83,21 @@ def _show_all(run_sql: Callable[..., list[dict]], statement: str) -> list[dict]:
     SHOW returns at most 10k rows. `LIMIT n FROM '<name>'` resumes after a
     given name, and SHOW orders by name, so paging is exact rather than
     best-effort.
+
+    The FROM argument is a plain NAME STRING, not a LIKE pattern: `_` and
+    `%` are literal there. LIKE-escaping the cursor put a backslash before
+    every underscore, naming an object that does not exist, and the walk
+    resumed wherever that sorted -- repeating a page and silently dropping
+    the tail of any schema with more than one page. Only the quote needs
+    doubling.
     """
     rows: list[dict] = []
     cursor: str | None = None
     while True:
         page_sql = f"{statement} limit {SHOW_PAGE_SIZE}"
         if cursor is not None:
-            page_sql += f" from '{lexer.like_literal(cursor)}'"
+            literal = cursor.replace("'", "''")
+            page_sql += f" from '{literal}'"
         page = run_sql(page_sql)
         rows.extend(page)
         if len(page) < SHOW_PAGE_SIZE:
