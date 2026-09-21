@@ -14,9 +14,16 @@ Runs on AIDP compute. Per table:
        overwrite:               INSERT OVERWRITE ... SELECT * (rewrites ROWS,
                                 never drops the table);
   3. VERIFY: target count == source count (both read AFTER the copy), and
-     with --verify counts+sums an exact SUM over every DECIMAL column,
-     cast to DECIMAL(38,s) on both sides. Floats are never summed for
-     equality — float tolerance is wrong for money.
+     with --verify counts+sums an exact SUM over every DECIMAL column OF
+     THE SOURCE, cast to DECIMAL(38,s) with the SOURCE's scale on both
+     sides. Floats are never summed for equality — float tolerance is
+     wrong for money.
+
+Before any row moves, and in both verify modes, the source's DECIMAL
+columns are checked against the target's types: a target column that is not
+DECIMAL, or a DECIMAL with fewer integer digits or a smaller scale, would be
+rounded or truncated by the INSERT with the row count intact. That table is
+recorded `type_drift` and NOT copied.
 
 The copy's claim is the verification, not the INSERT returning: exactly the
 discipline the control-plane deploy learned from live AIDP (a 2xx is not the
@@ -55,7 +62,7 @@ _DECIMAL = re.compile(r"^decimal\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
 
 # Copy statuses that mean the table is NOT verified. A later run that copies
 # nothing (skip-existing over a table with rows) never softens one of these.
-_COPY_FAILURES = ("count_mismatch", "sum_mismatch", "failed")
+_COPY_FAILURES = ("count_mismatch", "sum_mismatch", "type_drift", "failed")
 
 
 def q(identifier: str) -> str:
@@ -85,17 +92,49 @@ def _count(spark, fqn: str) -> int:
     return spark.sql(f"SELECT COUNT(*) AS n FROM {fqn}").collect()[0]["n"]
 
 
-def _decimal_columns(spark, fqn: str) -> list[tuple[str, int]]:
-    """[(column, scale)] for every DECIMAL column of `fqn`."""
-    out = []
+def _column_types(spark, fqn: str) -> dict[str, str]:
+    """{column: data_type} from DESCRIBE, in column order; lower-cased types.
+
+    Columns end at the first blank or `#` row (Delta's metadata section).
+    """
+    out: dict[str, str] = {}
     for row in spark.sql(f"DESCRIBE {fqn}").collect():
         name = str(row["col_name"] or "").strip()
         if not name or name.startswith("#"):
             break
-        m = _DECIMAL.match(str(row["data_type"] or "").strip())
-        if m:
-            out.append((name, int(m.group(2))))
+        out[name] = str(row["data_type"] or "").strip().lower()
     return out
+
+
+def _decimal_columns(types: dict[str, str]) -> list[tuple[str, int, int]]:
+    """[(column, precision, scale)] for every DECIMAL column in `types`."""
+    out = []
+    for name, data_type in types.items():
+        m = _DECIMAL.match(data_type)
+        if m:
+            out.append((name, int(m.group(1)), int(m.group(2))))
+    return out
+
+
+def _type_drift(src_types: dict[str, str], tgt_types: dict[str, str]) -> dict:
+    """Source DECIMAL columns the target cannot hold without silent loss.
+
+    Keyed off the SOURCE: a source decimal whose target column is not a
+    decimal, or a decimal with fewer integer digits (precision - scale) or a
+    smaller scale, would be rounded, truncated or overflowed by the INSERT's
+    store-assignment cast -- with the row count intact. A wider target is
+    fine. Non-decimal columns are the structure stage's business.
+    """
+    by_lower = {k.lower(): v for k, v in tgt_types.items()}
+    drift = {}
+    for name, precision, scale in _decimal_columns(src_types):
+        target = by_lower.get(name.lower())
+        m = _DECIMAL.match(target or "")
+        if not m or int(m.group(2)) < scale or \
+                int(m.group(1)) - int(m.group(2)) < precision - scale:
+            drift[name] = {"source": src_types[name],
+                           "target": target or "<missing>"}
+    return drift
 
 
 def _decimal_sums(spark, fqn: str, columns: list[tuple[str, int]]) -> dict:
@@ -153,6 +192,19 @@ def _copy(spark, src: str, tgt: str, *, mode: str, verify: str,
     if source_count is None:
         source_count = _count(spark, src)
 
+    # Pre-flight, before anything is written and in both verify modes:
+    # metadata only (DESCRIBE on the registered source and on the target).
+    src_types = _column_types(spark, src)
+    tgt_types = _column_types(spark, tgt)
+    drift = _type_drift(src_types, tgt_types)
+    if drift:
+        return {"status": "type_drift", "type_drift": drift,
+                "source_count": source_count, "started_at": started,
+                "reason": f"{len(drift)} DECIMAL column(s) are narrower or "
+                          f"not DECIMAL on the target; an INSERT would round "
+                          f"or truncate them silently. NOT copied. Recreate "
+                          f"the table from the approved plan."}
+
     target_rows = _count(spark, tgt)
     if mode == "skip-existing" and target_rows > 0:
         # A verification, not a bypass: a target that holds rows but not the
@@ -207,16 +259,22 @@ def _copy(spark, src: str, tgt: str, *, mode: str, verify: str,
         return out
 
     if verify == "counts+sums":
-        columns = _decimal_columns(spark, tgt)
+        # The SOURCE's decimal columns, cast to the SOURCE's scale on both
+        # sides: the target is at least as wide (checked above), so the
+        # comparison is exact rather than rounded to whatever the target is.
+        columns = [(c, s) for c, _p, s in _decimal_columns(src_types)]
         src_sums = _decimal_sums(spark, src, columns)
         tgt_sums = _decimal_sums(spark, tgt, columns)
-        drift = {c: {"source": src_sums[c], "target": tgt_sums[c]}
-                 for c, _ in columns if src_sums[c] != tgt_sums[c]}
+        sum_drift = {c: {"source": src_sums[c], "target": tgt_sums[c]}
+                     for c, _ in columns if src_sums[c] != tgt_sums[c]}
         out["decimal_columns_checked"] = [c for c, _ in columns]
-        if drift:
+        if not columns:
+            out["decimal_columns_note"] = ("the source has no DECIMAL "
+                                           "columns; counts are the whole check")
+        if sum_drift:
             out["status"] = "sum_mismatch"
-            out["sum_drift"] = drift
-            out["reason"] = (f"{len(drift)} decimal column(s) do not sum "
+            out["sum_drift"] = sum_drift
+            out["reason"] = (f"{len(sum_drift)} decimal column(s) do not sum "
                              f"equal. NOT verified.")
             return out
 

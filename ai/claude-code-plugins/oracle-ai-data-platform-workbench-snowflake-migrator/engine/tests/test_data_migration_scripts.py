@@ -167,6 +167,7 @@ class _CatalogSpark(_FakeSpark):
         super().__init__()
         self.catalog: dict[str, list[tuple[str, str]]] = dict(catalog or {})
         self.insert_lands: int | None = None
+        self.sums: dict[str, dict[str, str]] = {}   # fqn -> {column: sum}
 
     def sql(self, statement):
         flat = " ".join(statement.split())
@@ -177,6 +178,11 @@ class _CatalogSpark(_FakeSpark):
                 if fqn in flat:
                     return _FakeDF([{"n": n}])
             return _FakeDF([{"n": 0}])
+        if low.startswith("select") and "sum(" in low:
+            fqn = flat.rsplit(" FROM ", 1)[1]
+            cols = re.findall(r"AS STRING\) AS `([^`]+)`", flat)
+            return _FakeDF([{c: self.sums.get(fqn, {}).get(c, "0")
+                             for c in cols}])
         if low.startswith("describe"):
             fqn = flat.split(None, 1)[1].strip()
             if fqn not in self.catalog:
@@ -562,8 +568,8 @@ def test_the_copy_scope_excludes_a_drifted_table(copy_schema, monkeypatch,
                      "B": {"status": "already_existed"},
                      "C": {"status": "type_drift", "reason": "x"}}}),
         encoding="utf-8")
-    spark = _CatalogSpark({f"`lake`.`SALES`.`{t}`": [("A", "string")]
-                           for t in "ABC"})
+    spark = _CatalogSpark({f"`{cat}`.`SALES`.`{t}`": [("A", "string")]
+                           for t in "ABC" for cat in ("lake", "ext")})
     spark.counts = {f"`ext`.`SALES`.`{t}`": 3 for t in "ABC"}
     rc, report = _copy_run(monkeypatch, reports, spark, argv=["--mode", "append"])
     assert rc == 0
@@ -677,13 +683,19 @@ def _seeded_copy_report(reports, table, record):
          "tables": {table: record}}), encoding="utf-8")
 
 
+def _both_sides(table, columns=(("A", "string"),)):
+    """The same table on the source (`ext`) and target (`lake`) side."""
+    return {f"`ext`.`SALES`.`{table}`": list(columns),
+            f"`lake`.`SALES`.`{table}`": list(columns)}
+
+
 def test_a_rerun_does_not_downgrade_a_prior_count_mismatch(
         copy_schema, monkeypatch, tmp_path):
     reports = _write_estate(tmp_path / "reports", {"SALES": ["T"]})
     _seeded_copy_report(reports, "T", {"status": "count_mismatch",
                                        "source_count": 91, "target_count": 90,
                                        "reason": "target has 90 row(s), source has 91. NOT verified."})
-    spark = _CatalogSpark({"`lake`.`SALES`.`T`": [("A", "string")]})
+    spark = _CatalogSpark(_both_sides("T"))
     spark.counts = {"`ext`.`SALES`.`T`": 91, "`lake`.`SALES`.`T`": 90}
     rc, report = _copy_run(monkeypatch, reports, spark)
     assert rc == 1
@@ -699,7 +711,7 @@ def test_a_rerun_keeps_a_prior_sum_mismatch_when_only_counts_now_agree(
     _seeded_copy_report(reports, "T", {"status": "sum_mismatch",
                                        "source_count": 91, "target_count": 91,
                                        "reason": "1 decimal column(s) do not sum equal. NOT verified."})
-    spark = _CatalogSpark({"`lake`.`SALES`.`T`": [("A", "string")]})
+    spark = _CatalogSpark(_both_sides("T"))
     spark.counts = {"`ext`.`SALES`.`T`": 91, "`lake`.`SALES`.`T`": 91}
     rc, report = _copy_run(monkeypatch, reports, spark)
     assert rc == 1
@@ -718,7 +730,7 @@ def test_force_under_the_default_mode_is_refused_not_a_silent_downgrade(
     reports = _write_estate(tmp_path / "reports", {"SALES": ["T"]})
     _seeded_copy_report(reports, "T", {"status": "verified",
                                        "source_count": 91, "target_count": 91})
-    spark = _CatalogSpark({"`lake`.`SALES`.`T`": [("A", "string")]})
+    spark = _CatalogSpark(_both_sides("T"))
     spark.counts = {"`ext`.`SALES`.`T`": 91, "`lake`.`SALES`.`T`": 91}
     rc, report = _copy_run(monkeypatch, reports, spark, argv=["--force"])
     assert rc == 1
@@ -741,6 +753,107 @@ def test_reconcile_reads_the_counts_a_skipped_record_carries(
                               target_catalog="lake", reports=tmp_path,
                               counts=False)
     assert rec["schemas"][0]["tables"][0]["verdict"] == verdict
+
+
+# --- copy: the DECIMAL check is keyed off the SOURCE, not the target -------
+#
+# `--verify counts+sums` derived both the DECIMAL column set and the cast
+# scale from the TARGET's DESCRIBE. A source NUMBER(18,2) whose target column
+# was bigint (a pre-existing or hand-made layout) was simply not summed:
+# INSERT cast 12.99 -> 12 on every row, counts matched, and the record read
+# `verified` with `decimal_columns_checked: []` -- which looks like "no
+# decimals", not "could not compare". A target decimal(18,0) rounded BOTH
+# sides to scale 0 before comparing and passed with the column listed.
+
+_SRC, _TGT = "`ext`.`SALES`.`ORDERS`", "`lake`.`SALES`.`ORDERS`"
+_SRC_TYPES = [("ORDER_ID", "decimal(38,0)"), ("AMOUNT", "decimal(18,2)"),
+              ("NOTE", "string")]
+
+
+def _typed(target_types, *, src_sum="38.97", tgt_sum="38.97"):
+    spark = _CatalogSpark({_SRC: _SRC_TYPES, _TGT: target_types})
+    spark.counts = {_SRC: 3, _TGT: 0}
+    spark.sums = {_SRC: {"ORDER_ID": "6", "AMOUNT": src_sum},
+                  _TGT: {"ORDER_ID": "6", "AMOUNT": tgt_sum}}
+    return spark
+
+
+def _copy_typed(copy_schema, spark, verify="counts+sums", mode="append"):
+    return copy_schema._copy(spark, _SRC, _TGT, mode=mode, verify=verify,
+                             retries=0, retry_wait=0, started="now")
+
+
+@pytest.mark.parametrize("verify", ["counts", "counts+sums"])
+def test_a_source_decimal_that_is_not_decimal_on_the_target_is_type_drift(
+        copy_schema, verify):
+    spark = _typed([("ORDER_ID", "bigint"), ("AMOUNT", "bigint"),
+                    ("NOTE", "string")])
+    out = _copy_typed(copy_schema, spark, verify=verify)
+    assert out["status"] == "type_drift"
+    assert set(out["type_drift"]) == {"ORDER_ID", "AMOUNT"}
+    assert out["type_drift"]["AMOUNT"] == {"source": "decimal(18,2)",
+                                           "target": "bigint"}
+    assert "NOT copied" in out["reason"]
+    assert not any("INSERT" in s for s in spark.statements), \
+        "the pre-flight runs before the write, in both verify modes"
+
+
+@pytest.mark.parametrize("target_type,why", [
+    ("decimal(18,0)", "scale narrowed: cents are rounded away"),
+    ("decimal(10,2)", "precision narrowed: large values overflow"),
+    ("decimal(19,4)", "integer digits narrowed: 15 where the source has 16")])
+def test_a_narrower_target_decimal_is_type_drift(copy_schema, target_type, why):
+    spark = _typed([("ORDER_ID", "decimal(38,0)"), ("AMOUNT", target_type),
+                    ("NOTE", "string")])
+    out = _copy_typed(copy_schema, spark)
+    assert out["status"] == "type_drift", why
+    assert list(out["type_drift"]) == ["AMOUNT"]
+
+
+def test_decimal_sums_use_the_source_column_set_and_scale(copy_schema):
+    # A WIDER target (more integer digits AND more scale) is fine, and the
+    # cast scale stays the source's on both sides, so the comparison is exact
+    # rather than rounded to whatever the target happens to be.
+    spark = _typed([("ORDER_ID", "decimal(38,0)"), ("AMOUNT", "decimal(20,4)"),
+                    ("NOTE", "string")])
+    out = _copy_typed(copy_schema, spark)
+    assert out["status"] == "verified"
+    assert out["decimal_columns_checked"] == ["ORDER_ID", "AMOUNT"]
+    sums = [s for s in spark.statements if "SUM(" in s]
+    assert len(sums) == 2 and any(s.endswith(_SRC) for s in sums) \
+        and any(s.endswith(_TGT) for s in sums)
+    for s in sums:
+        assert "CAST(`AMOUNT` AS DECIMAL(38,2))" in s, s
+        assert "DECIMAL(38,4)" not in s
+
+
+def test_a_sum_mismatch_is_not_verified(copy_schema):
+    spark = _typed([("ORDER_ID", "decimal(38,0)"), ("AMOUNT", "decimal(18,2)"),
+                    ("NOTE", "string")], tgt_sum="36.00")
+    out = _copy_typed(copy_schema, spark)
+    assert out["status"] == "sum_mismatch"
+    assert out["sum_drift"] == {"AMOUNT": {"source": "38.97", "target": "36.00"}}
+    assert "NOT verified" in out["reason"]
+
+
+def test_a_source_with_no_decimal_columns_says_so(copy_schema):
+    spark = _CatalogSpark({_SRC: [("NOTE", "string")], _TGT: [("NOTE", "string")]})
+    spark.counts = {_SRC: 3, _TGT: 0}
+    out = _copy_typed(copy_schema, spark)
+    assert out["status"] == "verified"
+    assert out["decimal_columns_checked"] == []
+    assert "no DECIMAL" in out["decimal_columns_note"], \
+        "an empty list must read as 'none to check', not 'could not compare'"
+
+
+def test_type_drift_reconciles_as_a_copy_failure(reconcile, tmp_path):
+    _seeded_copy_report(tmp_path, "T", {"status": "type_drift",
+                                        "reason": "1 DECIMAL column(s) ..."})
+    spark = _CatalogSpark({"`lake`.`SALES`.`T`": [("A", "string")]})
+    rec = reconcile.reconcile(spark, manifest=_manifest("T"),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=False)
+    assert rec["schemas"][0]["tables"][0]["verdict"] == "STRUCTURE_ONLY_COPY_FAILED"
 
 
 def test_a_count_mismatch_is_not_verified(copy_schema):

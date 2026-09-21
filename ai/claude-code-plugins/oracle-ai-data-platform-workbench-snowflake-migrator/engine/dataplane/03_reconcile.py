@@ -120,7 +120,8 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                 verdict = "STRUCTURE_TYPE_DRIFT"
             elif c_status == "verified":
                 verdict = "MIGRATED_VERIFIED"
-            elif c_status in ("count_mismatch", "sum_mismatch", "failed"):
+            elif c_status in ("count_mismatch", "sum_mismatch", "type_drift",
+                              "failed"):
                 verdict = "STRUCTURE_ONLY_COPY_FAILED"
             elif c_status == "skipped_nonempty" and \
                     c_rec.get("source_count") is not None and \
