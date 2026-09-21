@@ -143,6 +143,55 @@ def test_an_unreadable_account_usage_is_not_measured_rather_than_zero():
     assert any("ACCOUNT_USAGE" in u for u in m["unreadable"])
 
 
+def test_a_dml_history_failure_after_clustering_history_succeeded_is_not_zero_churn():
+    # The two ACCOUNT_USAGE reads degrade independently. TABLE_DML_HISTORY is
+    # the larger view and the one that hits a statement timeout on a big
+    # account; when it fails AFTER the clustering read succeeded, churn is
+    # "not measured", never a measured zero -- a table rewriting 50M rows a
+    # day must not land under "no measured churn above the threshold".
+    class DmlTimesOut(FakeSql):
+        def __call__(self, sql, params=None):
+            if "table_dml_history" in sql.lower():
+                raise RuntimeError("000630 (57014): Statement reached its "
+                                   "statement or warehouse timeout")
+            return super().__call__(sql, params)
+
+    m = build_maintenance(
+        DmlTimesOut(_responses(**{"automatic_clustering_history": [
+            {"TABLE_NAME": "T", "SCHEMA_NAME": "PUBLIC", "DATABASE_NAME": "DB",
+             "EVENTS": 3, "CREDITS": 1.5, "BYTES": 10, "ROWS_RECLUSTERED": 5}]})),
+        _inv(_table("T", cluster_by="(A)", automatic_clustering="ON"),
+             _table("U")))
+    acct = m["account_usage"]
+    assert acct["readable"] is False
+    assert acct["clustering_readable"] is True
+    assert acct["dml_readable"] is False
+    assert "DML history failed" in acct["note"]
+
+    by = {t["source_identifier"]: t for t in m["tables"]}
+    # The reclustering read succeeded, so its data is real and kept.
+    assert by["DB.PUBLIC.T"]["reclustering"]["measured"] is True
+    assert by["DB.PUBLIC.T"]["reclustering"]["credits"] == 1.5
+    assert by["DB.PUBLIC.U"]["reclustering"]["measured"] is True
+    assert by["DB.PUBLIC.U"]["reclustering"]["events"] == 0
+    # The DML read failed, so churn is not measured -- for every table.
+    for t in m["tables"]:
+        assert t["dml_churn"]["measured"] is False
+        assert t["dml_churn"]["rows_rewritten"] is None
+        assert not any("churn" in s["signal"] for s in t["signals"])
+    assert any("TABLE_DML_HISTORY" in u for u in m["unreadable"])
+
+    # And the consumers follow: the report and the stage board say so.
+    from report.render import render_maintenance
+    from report.stages import _finding
+    md = render_maintenance(m)
+    assert "no measured churn above the threshold" not in md
+    row = next(line for line in md.splitlines() if "`DB.PUBLIC.T`" in line)
+    assert "not measured" in row, row
+    text, attention = _finding("maintenance", m)
+    assert "NOT measured" in text and attention is True
+
+
 def test_a_readable_but_empty_history_is_measured_zero():
     # Distinct from the above: we looked, and there was nothing.
     m = build_maintenance(FakeSql(_responses()), _inv(_table()))

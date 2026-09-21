@@ -93,10 +93,18 @@ def _account_usage_summary(run_sql, history_days: int,
                            notes: list[str]) -> tuple[dict, dict, dict]:
     """(reclustering_by_table, churn_by_table, status).
 
-    On failure the status says so and BOTH maps come back empty, so callers
-    report "not measured" rather than fabricating zeros.
+    The two views are read in turn and degrade independently. On a total
+    failure the status says so and BOTH maps come back empty. When only the
+    second read (TABLE_DML_HISTORY, the larger view and the one that hits a
+    statement timeout on a big account) fails, the reclustering map is kept
+    -- it is real data -- the churn map is empty, and `dml_readable` is
+    False. `readable` is the aggregate every consumer keys on, so it is
+    False whenever either read failed: callers then report "not measured"
+    for the view that was never read rather than fabricating zeros.
     """
-    status = {"readable": True, "note": f"summarised over {history_days} day(s)"}
+    status = {"readable": True, "clustering_readable": True,
+              "dml_readable": True,
+              "note": f"summarised over {history_days} day(s)"}
     reclustering: dict[str, dict] = {}
     churn: dict[str, dict] = {}
     try:
@@ -116,7 +124,8 @@ def _account_usage_summary(run_sql, history_days: int,
                 "bytes_reclustered": _int(r.get("BYTES")),
                 "rows_reclustered": _int(r.get("ROWS_RECLUSTERED"))}
     except Exception as exc:
-        status = {"readable": False, "note": str(exc)[:200]}
+        status = {"readable": False, "clustering_readable": False,
+                  "dml_readable": False, "note": str(exc)[:200]}
         notes.append(f"ACCOUNT_USAGE.AUTOMATIC_CLUSTERING_HISTORY: {str(exc)[:160]}")
         return {}, {}, status
 
@@ -143,7 +152,11 @@ def _account_usage_summary(run_sql, history_days: int,
                 "windows": _int(r.get("WINDOWS"))}
     except Exception as exc:
         notes.append(f"ACCOUNT_USAGE.TABLE_DML_HISTORY: {str(exc)[:160]}")
-        status = {"readable": True,
+        # `readable` is False so every consumer keyed on the aggregate flag
+        # degrades to "not measured". A True here once turned a DML-history
+        # timeout into a measured zero churn for every table.
+        status = {"readable": False, "clustering_readable": True,
+                  "dml_readable": False,
                   "note": f"reclustering read; DML history failed: {str(exc)[:120]}"}
     return reclustering, churn, status
 
@@ -264,13 +277,20 @@ def build_maintenance(run_sql: Callable[..., list[dict]], inventory: dict, *,
             "retention_inherited_value": inherited,
             "rows": _int(meta.get("rows")),
             "bytes": _int(meta.get("bytes")),
+            # Each default is keyed on ITS view's flag (falling back to the
+            # aggregate for an older maintenance.json): a table absent from
+            # a history that was read is a measured zero; a table absent
+            # from a history that failed is not measured.
             "reclustering": reclustering.get(ident, dict(_NOT_MEASURED_RECLUSTER)
-                                             if not acct_status["readable"]
+                                             if not acct_status.get(
+                                                 "clustering_readable",
+                                                 acct_status["readable"])
                                              else {**_NOT_MEASURED_RECLUSTER,
                                                    "measured": True,
                                                    "events": 0, "credits": 0.0}),
             "dml_churn": churn.get(ident, dict(_NOT_MEASURED_CHURN)
-                                   if not acct_status["readable"]
+                                   if not acct_status.get(
+                                       "dml_readable", acct_status["readable"])
                                    else {**_NOT_MEASURED_CHURN,
                                          "measured": True, "rows_added": 0,
                                          "rows_removed": 0, "rows_updated": 0,

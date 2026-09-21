@@ -62,3 +62,15 @@ def test_metering_denial_is_noted_not_fatal():
     assert out["warehouse_count"] == 2
     assert out["metering_source"] == "unavailable"
     assert "not authorized" in out["metering_note"]
+
+
+def test_no_visible_warehouse_is_noted_as_role_filtered():
+    # SHOW WAREHOUSES needs no special privilege, but it returns only the
+    # warehouses the role holds a privilege on. An empty list is a finding
+    # about the role before it is a finding about the account.
+    out = extract_warehouses(FakeSql({"show warehouses": []}))
+    assert out["warehouse_count"] == 0
+    assert "visible" in out["visibility_note"]
+    assert "0 warehouse" in out["visibility_note"]
+    seen = extract_warehouses(FakeSql({"show warehouses": SHOW}))
+    assert seen["visibility_note"] == ""

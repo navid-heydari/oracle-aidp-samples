@@ -108,8 +108,14 @@ def _record(db: str, schema: str, kind: str, obj: dict, *,
         "type_notes": type_notes,
         "evidence_location": "discovery_manifest.json (in-AIDP workflow)",
         "columns": enriched,
+        # The keys are catalog._META_KEYS, spelled exactly as a live `assess`
+        # writes them: restrictions.max_bytes, render_inventory, maintenance
+        # and ddl all read the lowercase form. Under any other spelling the
+        # size is invisible to every consumer and a size cap excludes nothing
+        # while plan.json records it as applied.
         "source_metadata": {k: v for k, v in (
-            ("BYTES", obj.get("source_bytes")),) if v is not None},
+            ("rows", obj.get("source_rows")),
+            ("bytes", obj.get("source_bytes"))) if v is not None},
     }
 
     rows = obj.get("source_rows")

@@ -365,3 +365,28 @@ def test_plan_stdout_names_a_custom_architecture(tmp_path, capsys):
     main(["plan", "--out-dir", str(tmp_path)])
     out = capsys.readouterr().out
     assert "Their Pattern" in out and "not assessed" in out
+
+
+def test_deps_warns_when_views_lack_account_usage_lineage(tmp_path, monkeypatch,
+                                                          capsys):
+    # OBJECT_DEPENDENCIES is readable but has not caught up with a fresh view.
+    # The operator running `deps` must be told on stderr, not left to read
+    # dependencies.json to find out that the lineage is not authoritative.
+    import snowmig
+    from fake_sql import FakeSql
+    inv = dict(INV)
+    inv["inventory"] = INV["inventory"] + [{
+        "source_identifier": "D.PUBLIC.V", "object_type": "VIEW",
+        "source_database": "D", "source_schema": "PUBLIC",
+        "compatibility_status": "supported", "blocked_reasons": [],
+        "warnings": [], "columns": [],
+        "view_ddl_get_ddl": "create view V as select * from D.PUBLIC.ORDERS"}]
+    write(tmp_path, "inventory.json", inv)
+    monkeypatch.setattr(snowmig, "_run_sql_from_args",
+                        lambda args: FakeSql({"object_dependencies": []}))
+    rc = main(["deps", "--out-dir", str(tmp_path)])
+    assert rc == 0, "a warning, not a halt: the parsed edges make the plan right"
+    assert "no ACCOUNT_USAGE lineage edge" in capsys.readouterr().err
+    deps = json.loads((tmp_path / "dependencies.json").read_text(encoding="utf-8"))
+    assert deps["source_used"] == "account_usage_empty"
+    assert deps["edges"][0]["source"] == "parsed_ddl"
