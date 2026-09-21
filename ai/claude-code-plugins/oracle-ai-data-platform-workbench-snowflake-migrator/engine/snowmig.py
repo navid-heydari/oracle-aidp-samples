@@ -37,6 +37,7 @@ Exit codes: 0 ok | 1 error | 3 HALT (identifier-case or target-name collision)
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import json
 import os
@@ -71,7 +72,7 @@ from snowflake_source.extract.maintenance import build_maintenance
 from snowflake_source.extract.census import build_census
 from snowflake_source.extract.security import build_security
 from snowflake_source.dialect.types import (
-    GEOSPATIAL_MODES, SEMI_STRUCTURED_MODES, TIMESTAMP_NTZ_MODES)
+    GEOSPATIAL_MODES, SEMI_STRUCTURED_MODES, TIMESTAMP_NTZ_MODES, map_type)
 from snowflake_source.extract.dependencies import extract_dependencies
 from snowflake_source.extract.warehouses import extract_warehouses
 from sizing.warehouse_map import propose_all
@@ -653,11 +654,70 @@ def cmd_plan(args) -> int:
     return 0
 
 
+def _remap_timestamp_ntz(inv: dict, mode: str) -> tuple[dict, list[str]]:
+    """Re-map every TIMESTAMP_NTZ column of `inv` under `mode`, offline.
+
+    Snowflake's default TIMESTAMP is TIMESTAMP_NTZ, the default mapping
+    preserves it, and the AIDP metastore refuses it at CREATE TABLE -- so
+    almost every real estate halts at `ddl`. The mapping is a decision, not
+    an observation, and flipping it must not cost a Snowflake re-read: this
+    applies the same mapper `assess`/`ingest` call, so the type and the
+    timezone caveat come out identical. A deep copy is returned; the
+    inventory on disk is the record of what was observed and stays as it is.
+    """
+    out = copy.deepcopy(inv)
+    changed: list[str] = []
+    for rec in out.get("inventory") or []:
+        for col in rec.get("columns") or []:
+            if str(col.get("DATA_TYPE") or "").strip().upper() != "TIMESTAMP_NTZ":
+                continue
+            mapped = map_type("TIMESTAMP_NTZ", timestamp_ntz=mode)
+            if col.get("target_type") == mapped.spark_type:
+                continue
+            col["target_type"] = mapped.spark_type
+            if mapped.warning:
+                # build_create_table lifts "COL: ..." warnings onto the
+                # statement, which is how the caveat reaches DDL_PLAN.md.
+                caveat = f'{col["COLUMN_NAME"]}: {mapped.warning}'
+                rec.setdefault("warnings", []).append(caveat)
+            changed.append(f'{rec["source_identifier"]}.{col["COLUMN_NAME"]}')
+    out["timestamp_ntz_mode"] = mode
+    return out, changed
+
+
 def cmd_ddl(args) -> int:
     out = pathlib.Path(args.out_dir)
     inv = _read(out, "inventory.json")
     built = _read(out, "plan.json")
+
+    # The TIMESTAMP_NTZ decision can be taken (or re-taken) here, offline.
+    # Only the downgrade is applied: `preserve` on an inventory already
+    # recorded as `timestamp` is a no-op, because the target refuses NTZ
+    # whichever way it was recorded, and re-upgrading would only rebuild
+    # the halt.
+    remapped: list[str] | None = None
+    mode = getattr(args, "timestamp_ntz", None)
+    recorded = inv.get("timestamp_ntz_mode")
+    if mode == "timestamp" and recorded != "timestamp":
+        inv, remapped = _remap_timestamp_ntz(inv, "timestamp")
+        print(f"  re-mapped {len(remapped)} TIMESTAMP_NTZ column(s) to "
+              f"TIMESTAMP offline (inventory.json and INVENTORY.md are "
+              f"untouched and still show the preserved type)")
+    elif mode == "timestamp":
+        remapped = []
+    elif mode == "preserve":
+        remapped = []
+        if recorded == "timestamp":
+            print("  note: inventory.json was recorded with --timestamp-ntz "
+                  "timestamp; `preserve` does not re-upgrade it here. The "
+                  "target refuses TIMESTAMP_NTZ either way -- not "
+                  "re-upgraded.", file=sys.stderr)
+
     payload = build_ddl_payload(inv, built)
+    if remapped is not None:
+        payload["timestamp_ntz_mode"] = (
+            "timestamp" if mode == "timestamp" else recorded)
+        payload["remapped_columns"] = remapped
     _write(out, "ddl_plan.json", payload)
     _write(out, "DDL_PLAN.md", render_ddl_plan(payload))
 
@@ -678,8 +738,9 @@ def cmd_ddl(args) -> int:
                   file=sys.stderr)
         for remedy in dict.fromkeys(r["remedy"] for r in rejected):
             print(f"  {remedy}", file=sys.stderr)
-        print("  Nothing was created. Fix the INPUT and re-run `ddl` -- do "
-              "not hand this plan to the structure workflow.", file=sys.stderr)
+        print("  Nothing was created. Re-run `ddl --timestamp-ntz timestamp` "
+              "(offline), or fix the INPUT and re-run `ddl` -- do not hand "
+              "this plan to the structure workflow.", file=sys.stderr)
         return 3
     return 0
 
@@ -1661,6 +1722,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_plan)
 
     g = sub.add_parser("ddl", parents=[common], help="generate target DDL (offline)")
+    g.add_argument("--timestamp-ntz", choices=list(TIMESTAMP_NTZ_MODES),
+                   default=None,
+                   help="re-map Snowflake TIMESTAMP_NTZ offline, from "
+                        "inventory.json, without re-reading Snowflake. "
+                        "timestamp: downgrade to Spark TIMESTAMP (the only "
+                        "form the AIDP metastore accepts) and record the "
+                        "timezone caveat on every affected column. Default: "
+                        "keep whatever `assess`/`ingest` recorded")
     g.set_defaults(func=cmd_ddl)
 
     dep = sub.add_parser("deploy", parents=[common], help="dry-run by default")

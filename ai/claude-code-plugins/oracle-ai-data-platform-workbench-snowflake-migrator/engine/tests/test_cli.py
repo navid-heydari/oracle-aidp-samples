@@ -660,3 +660,77 @@ def test_every_writing_subcommand_accepts_execute():
                  ["smoke", "--write-probe", "--execute"],
                  ["notebook", "--upload", "--execute"]):
         assert parser.parse_args(argv).execute is True, argv
+
+
+# --- ddl --timestamp-ntz: the mapping decision, made offline ----------------
+
+NTZ_COLUMN = {"COLUMN_NAME": "CREATED_AT", "DATA_TYPE": "TIMESTAMP_NTZ",
+              "target_type": "TIMESTAMP_NTZ", "IS_NULLABLE": "YES",
+              "ORDINAL_POSITION": 2, "COMMENT": None}
+
+
+def _inv_with_ntz(mode="preserve", target_type="TIMESTAMP_NTZ"):
+    inv = json.loads(json.dumps(INV))
+    col = dict(NTZ_COLUMN, target_type=target_type)
+    inv["inventory"][0]["columns"].append(col)
+    inv["timestamp_ntz_mode"] = mode
+    return inv
+
+
+def _plan_ntz(tmp_path, inv):
+    write(tmp_path, "inventory.json", inv)
+    write(tmp_path, "dependencies.json", DEPS)
+    assert main(["plan", "--out-dir", str(tmp_path)]) == 0
+    return (tmp_path / "inventory.json").read_bytes()
+
+
+def _ddl_plan(tmp_path):
+    return json.loads((tmp_path / "ddl_plan.json").read_text(encoding="utf-8"))
+
+
+def test_ddl_halts_on_timestamp_ntz_and_names_the_offline_remedy(tmp_path, capsys):
+    _plan_ntz(tmp_path, _inv_with_ntz())
+    assert main(["ddl", "--out-dir", str(tmp_path)]) == 3
+    err = capsys.readouterr().err
+    assert "CREATED_AT -> TIMESTAMP_NTZ" in err
+    assert "ddl --timestamp-ntz timestamp" in err
+    assert _ddl_plan(tmp_path)["target_rejected"]
+
+
+def test_ddl_timestamp_ntz_flag_remaps_offline_without_touching_inventory(
+        tmp_path, capsys):
+    before = _plan_ntz(tmp_path, _inv_with_ntz())
+    rc = main(["ddl", "--out-dir", str(tmp_path), "--timestamp-ntz", "timestamp"])
+    assert rc == 0
+    plan = _ddl_plan(tmp_path)
+    stmt = plan["statements"][0]
+    assert "`CREATED_AT` TIMESTAMP\n" in stmt["sql"]
+    assert "TIMESTAMP_NTZ" not in stmt["sql"]
+    assert {"name": "CREATED_AT", "type": "TIMESTAMP"} in stmt["expected_columns"]
+    caveats = [w for w in stmt["warnings"] if w.startswith("CREATED_AT:")]
+    assert len(caveats) == 1 and "timezone" in caveats[0].lower()
+    assert plan["timestamp_ntz_mode"] == "timestamp"
+    assert plan["remapped_columns"] == ["D.PUBLIC.ORDERS.CREATED_AT"]
+    assert plan["target_rejected"] == []
+    # inventory.json is the record of what `assess` observed; it is not
+    # rewritten by a mapping decision taken at `ddl`.
+    assert (tmp_path / "inventory.json").read_bytes() == before
+    assert "re-mapped 1" in capsys.readouterr().out
+
+
+def test_ddl_timestamp_ntz_preserve_never_reupgrades(tmp_path, capsys):
+    _plan_ntz(tmp_path, _inv_with_ntz(mode="timestamp", target_type="TIMESTAMP"))
+    rc = main(["ddl", "--out-dir", str(tmp_path), "--timestamp-ntz", "preserve"])
+    assert rc == 0
+    stmt = _ddl_plan(tmp_path)["statements"][0]
+    assert "`CREATED_AT` TIMESTAMP\n" in stmt["sql"]
+    assert "not re-upgraded" in capsys.readouterr().err
+
+
+def test_ddl_remap_is_a_noop_when_no_ntz_columns(tmp_path):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    rc = main(["ddl", "--out-dir", str(tmp_path), "--timestamp-ntz", "timestamp"])
+    assert rc == 0
+    assert _ddl_plan(tmp_path)["remapped_columns"] == []

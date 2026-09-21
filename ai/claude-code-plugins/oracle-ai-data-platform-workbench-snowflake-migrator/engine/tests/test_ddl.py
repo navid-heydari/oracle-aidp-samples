@@ -298,6 +298,9 @@ def test_timestamp_ntz_is_flagged_because_the_metastore_refuses_it():
     assert len(found) == 1
     assert found[0]["columns"] == ["EVENT_AT", "CREATED_AT"]
     assert "--timestamp-ntz timestamp" in found[0]["remedy"]
+    # The remedy must offer the OFFLINE re-map first: re-reading Snowflake
+    # to flip a mapping choice is warehouse time nobody needs to spend.
+    assert "ddl --timestamp-ntz timestamp" in found[0]["remedy"]
     assert "SEMANTIC DOWNGRADE" in found[0]["remedy"]
 
 

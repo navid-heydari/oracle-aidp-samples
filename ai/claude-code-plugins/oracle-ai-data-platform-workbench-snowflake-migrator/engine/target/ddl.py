@@ -44,7 +44,10 @@ TARGET_REJECTED_COLUMN_TYPES: dict[str, str] = {
     "TIMESTAMP_NTZ":
         "the AIDP Hive metastore refuses it with `InvalidObjectException: "
         "Invalid column type: timestamp_ntz` (live-verified 2026-09-19). "
-        "Re-run `ingest`/`assess` with `--timestamp-ntz timestamp`. That is a "
+        "Re-run `ddl --timestamp-ntz timestamp` (offline, re-mapped from "
+        "inventory.json, no Snowflake re-read), or `assess`/`ingest` with "
+        "`--timestamp-ntz timestamp` if INVENTORY.md should show the "
+        "downgraded type too. That is a "
         "SEMANTIC DOWNGRADE, not a rename: Spark TIMESTAMP is an instant read "
         "through the session timezone, while TIMESTAMP_NTZ is wall-clock with "
         "no zone, so the same value can read back differently under a "
