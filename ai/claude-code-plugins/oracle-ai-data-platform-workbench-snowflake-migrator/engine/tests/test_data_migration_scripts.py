@@ -1247,7 +1247,7 @@ def test_a_structure_create_that_raised_is_a_problem_not_pending(reconcile,
         "an intentional engine block is not done yet, not broken"
     assert by_name["GOOD"]["verdict"] == "STRUCTURE_ONLY"
     md = reconcile.render(rec)
-    assert "1 table(s) need attention" in md
+    assert "1 object(s) need attention" in md
     assert "No table is in a problem state" not in md
 
 
@@ -1283,7 +1283,7 @@ def test_a_verified_table_whose_live_count_drifted_is_a_problem(reconcile,
     assert rec["totals"]["COUNT_DRIFT"] == 1
     assert "5" in row["reason"] and str(live) in row["reason"]
     md = reconcile.render(rec)
-    assert "1 table(s) need attention" in md
+    assert "1 object(s) need attention" in md
     assert "No table is in a problem state" not in md
 
 
@@ -1367,8 +1367,39 @@ def test_the_report_leads_with_the_count_that_needs_attention(reconcile):
                            "totals": {"MISSING_DESPITE_REPORT": 2,
                                       "MIGRATED_VERIFIED": 1},
                            "schemas": []})
-    assert "2 table(s) need attention" in md
+    assert "2 object(s) need attention" in md
 
+
+def test_views_under_an_unreadable_target_are_not_counted_as_tables(
+        reconcile, monkeypatch, tmp_path, capsys):
+    """With SHOW TABLES failing, every manifest view is TARGET_UNREADABLE
+    beside the tables -- a problem verdict, rightly: nobody could look. The
+    headline then counted them as tables, so 1 table + 2 views read
+    '3 table(s) need attention'. The count was right; the noun was not."""
+    class NoList(_CatalogSpark):
+        def sql(self, statement):
+            if statement.lower().startswith("show tables"):
+                raise RuntimeError("denied")
+            return super().sql(statement)
+
+    rec = reconcile.reconcile(NoList(), manifest=_manifest("ORDERS",
+                                                           views=["V_A", "V_B"]),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=False)
+    assert rec["totals"] == {"TARGET_UNREADABLE": 3}
+    md = reconcile.render(rec)
+    assert "3 object(s) need attention" in md
+    assert "table(s) need attention" not in md
+
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["ORDERS"]},
+                            views={"SALES": ["V_A", "V_B"]})
+    _inject_spark(monkeypatch, NoList())
+    rc = _load("03_reconcile").main(["--target-catalog", "lake",
+                                     "--reports-dir", str(reports)])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "3 object(s) in a PROBLEM state" in out
+    assert "table(s) in a PROBLEM state" not in out
 
 # --- the source config as it actually arrives on the mount -----------------
 

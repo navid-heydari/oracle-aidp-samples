@@ -247,7 +247,7 @@ def render(rec: dict) -> str:
         "Verdicts: " + ", ".join(f'{k} = {v}'
                                  for k, v in sorted(totals.items())),
         "",
-        (f'**{problems} table(s) need attention** '
+        (f'**{problems} object(s) need attention** '
          f'({", ".join(PROBLEM_VERDICTS)}).' if problems else
          "No table is in a problem state. Anything below that is not "
          "migrated simply has not been attempted yet — a migration runs "
@@ -331,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
         log(f"{pending} table(s) not migrated yet — expected while the "
             f"migration is still running, schema by schema. Not an error.")
     if problems:
-        log(f"{problems} table(s) in a PROBLEM state "
+        log(f"{problems} object(s) in a PROBLEM state "
             f"({', '.join(PROBLEM_VERDICTS)}) — see the report.")
     return 1 if problems else 0
 
