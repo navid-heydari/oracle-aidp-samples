@@ -128,7 +128,12 @@ def test_view_lands_after_its_base_tables(out):
 
 
 def test_ddl_generates_delta_tables_and_views_and_no_replace(out):
-    assert main(["ddl", "--out-dir", str(out)]) == 0
+    # `assess` above ran with the preserved default, and the estate carries
+    # TIMESTAMP_NTZ columns (asserted earlier), so a bare `ddl` halts on the
+    # type the metastore refuses. The offline re-map is the documented way
+    # through; without it this module could not pass end to end.
+    assert main(["ddl", "--out-dir", str(out),
+                 "--timestamp-ntz", "timestamp"]) == 0
     ddl = json.loads((out / "ddl_plan.json").read_text(encoding="utf-8"))
     assert ddl["statements"]
     kinds = {s["object_type"] for s in ddl["statements"]}
