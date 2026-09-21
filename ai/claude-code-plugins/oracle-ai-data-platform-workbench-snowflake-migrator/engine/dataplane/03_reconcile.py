@@ -36,8 +36,8 @@ MANIFEST_NAME = "discovery_manifest.json"
 # normal state of most of the estate for most of the project -- exiting
 # non-zero on it would make every partial run look broken, which is how a
 # real signal gets ignored.
-PROBLEM_VERDICTS = ("MISSING_DESPITE_REPORT", "STRUCTURE_ONLY_COPY_FAILED",
-                    "TARGET_UNREADABLE")
+PROBLEM_VERDICTS = ("MISSING_DESPITE_REPORT", "STRUCTURE_TYPE_DRIFT",
+                    "STRUCTURE_ONLY_COPY_FAILED", "TARGET_UNREADABLE")
 
 
 def q(identifier: str) -> str:
@@ -106,8 +106,14 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                 verdict = "TARGET_UNREADABLE"
             elif not exists:
                 verdict = ("MISSING_DESPITE_REPORT"
-                           if s_status == "created" or c_status == "verified"
+                           if s_status in ("created", "already_existed")
+                           or c_status == "verified"
                            else "NOT_MIGRATED")
+            elif s_status == "type_drift":
+                # The table is there with a layout the plan did not produce.
+                # A copy into it can verify counts and still have landed rows
+                # in the wrong columns, so this outranks any copy status.
+                verdict = "STRUCTURE_TYPE_DRIFT"
             elif c_status == "verified":
                 verdict = "MIGRATED_VERIFIED"
             elif c_status in ("count_mismatch", "sum_mismatch", "failed"):

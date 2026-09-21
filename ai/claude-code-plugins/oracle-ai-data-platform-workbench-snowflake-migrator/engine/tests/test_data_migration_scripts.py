@@ -13,7 +13,9 @@ gets refused, and what the reports record.
 import importlib.util
 import json
 import pathlib
+import re
 import sys
+import types
 
 import pytest
 
@@ -150,6 +152,123 @@ class _FakeSpark:
         return _FakeDF([])
 
 
+class _CatalogSpark(_FakeSpark):
+    """A fake with a CATALOG, so the scripts' read-backs mean something.
+
+    `catalog` maps a backticked three-part name to its [(column, type)] list.
+    DESCRIBE answers from it (and raises for a name it lacks, as Spark does);
+    CREATE TABLE IF NOT EXISTS adds a table only when absent, with the types
+    lower-cased the way Delta reports them; SHOW TABLES lists a schema; an
+    INSERT lands the source count on the target (or `insert_lands` rows, to
+    fake a short copy); COUNT(*) reads `counts`.
+    """
+
+    def __init__(self, catalog=None):
+        super().__init__()
+        self.catalog: dict[str, list[tuple[str, str]]] = dict(catalog or {})
+        self.insert_lands: int | None = None
+
+    def sql(self, statement):
+        flat = " ".join(statement.split())
+        self.statements.append(flat)
+        low = flat.lower()
+        if "count(*)" in low:
+            for fqn, n in self.counts.items():
+                if fqn in flat:
+                    return _FakeDF([{"n": n}])
+            return _FakeDF([{"n": 0}])
+        if low.startswith("describe"):
+            fqn = flat.split(None, 1)[1].strip()
+            if fqn not in self.catalog:
+                raise RuntimeError(f"[TABLE_OR_VIEW_NOT_FOUND] {fqn}")
+            return _FakeDF([{"col_name": n, "data_type": t}
+                            for n, t in self.catalog[fqn]])
+        if low.startswith("create table if not exists"):
+            m = re.match(r"create table if not exists (\S+) \((.*)\) using delta$",
+                         flat, re.IGNORECASE)
+            if m:
+                fqn, cols = m.group(1), m.group(2)
+                if fqn not in self.catalog:
+                    self.catalog[fqn] = [
+                        (part.split(None, 1)[0].strip("`"),
+                         part.split(None, 1)[1].strip().lower())
+                        for part in re.split(r",\s*(?=`)", cols)]
+            else:                                    # CTAS: types unknown
+                fqn = flat.split()[5]
+                self.catalog.setdefault(fqn, [("A", "string")])
+            return _FakeDF([])
+        if low.startswith("show tables in"):
+            prefix = re.split(r"\s+in\s+", flat, maxsplit=1,
+                              flags=re.IGNORECASE)[1] + "."
+            return _FakeDF([{"namespace": "x",
+                             "tableName": fqn[len(prefix):].strip("`"),
+                             "isTemporary": False}
+                            for fqn in self.catalog if fqn.startswith(prefix)])
+        if low.startswith("insert"):
+            m = re.match(r"insert (?:into|overwrite) (\S+) select \* from (\S+)",
+                         flat, re.IGNORECASE)
+            tgt, src = m.group(1), m.group(2)
+            landed = (self.counts.get(src, 0) if self.insert_lands is None
+                      else self.insert_lands)
+            if low.startswith("insert into"):
+                landed += self.counts.get(tgt, 0)
+            self.counts[tgt] = landed
+            return _FakeDF([])
+        return _FakeDF([])
+
+
+def _inject_spark(monkeypatch, spark):
+    """The scripts do `from pyspark.sql import SparkSession` inside main();
+    pyspark is not installed here, so a stub module hands them `spark`."""
+    class _Builder:
+        @staticmethod
+        def getOrCreate():
+            return spark
+
+    class SparkSession:
+        builder = _Builder()
+
+    pyspark = types.ModuleType("pyspark")
+    pyspark_sql = types.ModuleType("pyspark.sql")
+    pyspark_sql.SparkSession = SparkSession
+    pyspark.sql = pyspark_sql
+    monkeypatch.setitem(sys.modules, "pyspark", pyspark)
+    monkeypatch.setitem(sys.modules, "pyspark.sql", pyspark_sql)
+
+
+def _write_estate(reports: pathlib.Path, schemas: dict, plan: dict | None = None,
+                  views: dict | None = None) -> pathlib.Path:
+    """discovery_manifest.json under `reports`, and plan/ddl_plan.json beside
+    it. `schemas` is {schema: [table, ...]}; `plan` is {(schema, table):
+    [{name, type}]}; `views` is {schema: [view, ...]}."""
+    reports.mkdir(parents=True, exist_ok=True)
+    manifest = {"schemas": [
+        {"name": s, "tables": [{"name": t, "columns": []} for t in tables],
+         "views": [{"name": v} for v in (views or {}).get(s, [])],
+         "errors": []}
+        for s, tables in schemas.items()]}
+    (reports / "discovery_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8")
+    if plan is not None:
+        statements = [{"source_identifier": f"DB.{s}.{t}", "object_type": "TABLE",
+                       "expected_columns": cols}
+                      for (s, t), cols in plan.items()]
+        plan_dir = reports.parent / "plan"
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        (plan_dir / "ddl_plan.json").write_text(
+            json.dumps({"statements": statements}), encoding="utf-8")
+    return reports
+
+
+def _report(reports: pathlib.Path, name: str) -> dict:
+    return json.loads((reports / name).read_text(encoding="utf-8"))
+
+
+_PLAN_COLS = [{"name": "ID", "type": "DECIMAL(38,0)"},
+              {"name": "AMOUNT", "type": "DECIMAL(18,2)"},
+              {"name": "NOTE", "type": "STRING"}]
+
+
 def test_discovery_reads_the_whole_estate_in_two_queries(discover):
     source = _FakeSource(
         tables=[{"TABLE_SCHEMA": "SALES", "TABLE_NAME": "ORDERS",
@@ -215,14 +334,174 @@ def test_snowflake_types_in_a_manifest_are_refused_not_translated(structure):
 
 
 def test_create_table_from_columns_is_if_not_exists_and_delta(structure):
-    spark = _FakeSpark()
-    structure.create_table_from_columns(
+    spark = _CatalogSpark()
+    status = structure.create_table_from_columns(
         spark, [{"name": "ID", "type": "DECIMAL(38,0)"}], "lake", "sales", "t")
-    statement = spark.statements[0]
+    statement = next(s for s in spark.statements if "CREATE TABLE" in s)
     assert "CREATE TABLE IF NOT EXISTS" in statement
     assert "USING DELTA" in statement
     assert "`lake`.`sales`.`t`" in statement
     assert "DROP" not in statement.upper()
+    assert status == "created"
+
+
+# --- structure: the read-back after CREATE TABLE IF NOT EXISTS -------------
+#
+# `CREATE TABLE IF NOT EXISTS` on a table that is already there is a silent
+# no-op, so recording `created` after it certified layouts this run never
+# applied -- and the copy then INSERTs positionally into whatever was there.
+# The claim is the read-back (invariant I2), as it already was for `deploy`.
+
+def _structure_run(monkeypatch, tmp_path, spark, *, plan=None, argv=()):
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["ORDERS"]},
+                            plan={("SALES", "ORDERS"): _PLAN_COLS}
+                            if plan is None else plan)
+    _inject_spark(monkeypatch, spark)
+    module = _load("01_create_structure")
+    rc = module.main(["--target-catalog", "lake", "--schema", "SALES",
+                      "--reports-dir", str(reports), *argv])
+    return rc, _report(reports, "structure_report_sales.json")
+
+
+def test_a_fresh_table_is_created_and_read_back(structure, monkeypatch, tmp_path):
+    spark = _CatalogSpark()
+    rc, report = _structure_run(monkeypatch, tmp_path, spark)
+    assert rc == 0
+    assert report["objects"]["ORDERS"]["status"] == "created"
+    create = next(i for i, s in enumerate(spark.statements)
+                  if s.startswith("CREATE TABLE"))
+    assert any(s.startswith("DESCRIBE `lake`.`SALES`.`ORDERS`")
+               for s in spark.statements[create + 1:]), \
+        "the claim is the read-back, not the CREATE returning"
+
+
+def test_a_pre_existing_table_with_a_different_layout_is_type_drift_not_created(
+        structure, monkeypatch, tmp_path, capsys):
+    spark = _CatalogSpark({"`lake`.`SALES`.`ORDERS`": [("ID", "bigint"),
+                                                      ("AMOUNT", "bigint")]})
+    rc, report = _structure_run(monkeypatch, tmp_path, spark)
+    assert rc == 1, "a layout the plan did not produce is a problem state"
+    rec = report["objects"]["ORDERS"]
+    assert rec["status"] == "type_drift"
+    assert "column count differs: planned 3, found 2" in rec["reason"]
+    assert "TYPE DRIFT" in capsys.readouterr().out
+    # Left as found: nothing here drops or alters.
+    assert spark.catalog["`lake`.`SALES`.`ORDERS`"] == [("ID", "bigint"),
+                                                        ("AMOUNT", "bigint")]
+
+
+def test_same_count_reordered_columns_is_type_drift(structure, monkeypatch,
+                                                    tmp_path):
+    # The silent false-PASS: same column count, same types, different order.
+    # A positional INSERT lands every row in the wrong columns and the row
+    # counts still match.
+    spark = _CatalogSpark({"`lake`.`SALES`.`ORDERS`": [
+        ("AMOUNT", "decimal(18,2)"), ("ID", "decimal(38,0)"), ("NOTE", "string")]})
+    rc, report = _structure_run(monkeypatch, tmp_path, spark)
+    assert rc == 1
+    rec = report["objects"]["ORDERS"]
+    assert rec["status"] == "type_drift"
+    assert "position 1" in rec["reason"]
+
+
+def test_a_pre_existing_matching_table_is_already_existed(structure, monkeypatch,
+                                                          tmp_path):
+    spark = _CatalogSpark({"`lake`.`SALES`.`ORDERS`": [
+        ("ID", "decimal(38,0)"), ("AMOUNT", "decimal(18,2)"), ("NOTE", "string")]})
+    rc, report = _structure_run(monkeypatch, tmp_path, spark)
+    assert rc == 0
+    assert report["objects"]["ORDERS"]["status"] == "already_existed"
+    assert not any(s.startswith("CREATE TABLE") for s in spark.statements), \
+        "a table that is already there and matches the plan needs no CREATE"
+
+
+def test_type_drift_is_rechecked_on_resume_but_created_and_existing_are_skipped(
+        structure, monkeypatch, tmp_path):
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["T1", "T2", "T3"]},
+                            plan={("SALES", t): _PLAN_COLS
+                                  for t in ("T1", "T2", "T3")})
+    (reports / "structure_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "objects": {"T1": {"status": "created"},
+                     "T2": {"status": "already_existed"},
+                     "T3": {"status": "type_drift", "reason": "old"}}}),
+        encoding="utf-8")
+    spark = _CatalogSpark({f"`lake`.`SALES`.`{t}`": [
+        ("ID", "decimal(38,0)"), ("AMOUNT", "decimal(18,2)"), ("NOTE", "string")]
+        for t in ("T1", "T2", "T3")})
+    _inject_spark(monkeypatch, spark)
+    rc = _load("01_create_structure").main(
+        ["--target-catalog", "lake", "--schema", "SALES",
+         "--reports-dir", str(reports)])
+    touched = {s.split("`")[5] for s in spark.statements
+               if s.startswith("DESCRIBE")}
+    assert touched == {"T3"}, "only the drifted table is looked at again"
+    report = _report(reports, "structure_report_sales.json")
+    assert report["objects"]["T3"]["status"] == "already_existed", \
+        "the operator fixed the table; the record follows what is there now"
+    assert rc == 0
+
+
+class _MainSource:
+    """Stands in for `SnowflakeSource` when 02_copy_schema.main() builds one:
+    external-catalog shaped, so a source table is a three-part name the fake
+    catalog can count. `fail_on` names tables whose source read raises."""
+    fail_on: tuple = ()
+    counts_raise = False
+
+    def __init__(self, spark, *, mode="connector", config=None,
+                 external_catalog=None):
+        self.spark = spark
+        self.mode = "external-catalog"
+        self.external_catalog = "ext"
+
+    def describe(self):
+        return {"mode": "fake"}
+
+    def source_counts(self, schema, tables):
+        if self.counts_raise:
+            raise RuntimeError("no batched counts today")
+        return {t: self.spark.counts.get(f"`ext`.`{schema}`.`{t}`", 0)
+                for t in tables}
+
+    def register_temp_view(self, schema, table, view):
+        if table in self.fail_on:
+            raise RuntimeError("DATA_ACCESS_LAYER_0007 - Login has timed out")
+        return f"`ext`.`{schema}`.`{table}`"
+
+    def drop_temp_view(self, view):
+        pass
+
+
+def _copy_run(monkeypatch, reports, spark, *, argv=(), source_cls=_MainSource):
+    _inject_spark(monkeypatch, spark)
+    module = _load("02_copy_schema")
+    monkeypatch.setattr(module, "SnowflakeSource", source_cls)
+    rc = module.main(["--target-catalog", "lake", "--schema", "SALES",
+                      "--reports-dir", str(reports), *argv])
+    return rc, _report(reports, "copy_report_sales.json")
+
+
+def test_the_copy_scope_excludes_a_drifted_table(copy_schema, monkeypatch,
+                                                 tmp_path, capsys):
+    """A `type_drift` table has a layout the plan did not produce, and the
+    copy is a positional INSERT INTO ... SELECT *: it must never be in the
+    default scope. A matching pre-existing table is the approved layout."""
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["A", "B", "C"]})
+    (reports / "structure_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "objects": {"A": {"status": "created"},
+                     "B": {"status": "already_existed"},
+                     "C": {"status": "type_drift", "reason": "x"}}}),
+        encoding="utf-8")
+    spark = _CatalogSpark({f"`lake`.`SALES`.`{t}`": [("A", "string")]
+                           for t in "ABC"})
+    spark.counts = {f"`ext`.`SALES`.`{t}`": 3 for t in "ABC"}
+    rc, report = _copy_run(monkeypatch, reports, spark, argv=["--mode", "append"])
+    assert rc == 0
+    assert sorted(report["tables"]) == ["A", "B"]
+    assert not any("`C`" in s for s in spark.statements if "INSERT" in s)
+    assert "scope: 2 table(s)" in capsys.readouterr().out
 
 
 def test_an_empty_column_list_raises_rather_than_creating_nothing(structure):
@@ -342,6 +621,38 @@ def test_a_table_a_report_claims_but_the_catalog_lacks_is_flagged(reconcile,
     row = rec["schemas"][0]["tables"][0]
     assert row["verdict"] == "MISSING_DESPITE_REPORT"
     assert rec["totals"]["MISSING_DESPITE_REPORT"] == 1
+
+
+def _manifest(*tables, views=()):
+    return {"schemas": [{"name": "SALES",
+                         "tables": [{"name": t, "columns": []} for t in tables],
+                         "views": [{"name": v} for v in views],
+                         "errors": []}]}
+
+
+def test_reconcile_treats_already_existed_like_created_and_flags_type_drift(
+        reconcile, tmp_path):
+    (tmp_path / "structure_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "objects": {"GONE": {"status": "already_existed"},
+                     "DRIFT": {"status": "type_drift",
+                               "reason": "position 1: planned ID ..."}}}),
+        encoding="utf-8")
+    (tmp_path / "copy_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "tables": {"DRIFT": {"status": "verified"}}}), encoding="utf-8")
+    spark = _CatalogSpark({"`lake`.`SALES`.`DRIFT`": [("A", "string")]})
+    rec = reconcile.reconcile(spark, manifest=_manifest("GONE", "DRIFT"),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=False)
+    by_name = {t["table"]: t for t in rec["schemas"][0]["tables"]}
+    assert by_name["GONE"]["verdict"] == "MISSING_DESPITE_REPORT", \
+        "a table the structure report says was there must still be there"
+    # The copy verified row counts into a layout the plan did not produce;
+    # counts match when data lands in the wrong columns, so this is not a pass.
+    assert by_name["DRIFT"]["verdict"] == "STRUCTURE_TYPE_DRIFT"
+    assert "STRUCTURE_TYPE_DRIFT" in reconcile.PROBLEM_VERDICTS
+    assert "position 1" in by_name["DRIFT"]["reason"]
 
 
 def test_a_table_with_no_target_is_a_finding_not_a_crash(copy_schema):

@@ -27,9 +27,23 @@ replaced here. The target catalog must be INTERNAL — this script REFUSES to
 address the source catalog as its target, and AIDP refuses DDL on external
 catalogs anyway (documented), so the failure would be loud, not silent.
 
-Writes `structure_report_<schema>.json` per schema: created / already-existed
-/ failed, each with a reason. Resumable: an object already recorded as created
-is skipped (--force re-issues the IF NOT EXISTS create, which is idempotent).
+The CREATE returning is not the claim: IF NOT EXISTS is a silent no-op on a
+table that is already there, so every table is DESCRIBEd afterwards and
+compared with the plan, column by column and in order.
+
+Writes `structure_report_<schema>.json` per schema, one status per table:
+  created          it was not there before, and it reads back as planned
+  already_existed  it was there before, and it matches the plan
+  type_drift       it was there with a layout the plan did not produce; it
+                   is left as found, listed with the differing columns, and
+                   counted as a problem (exit 1) -- the copy is a positional
+                   INSERT, so a mismatched layout would land rows in the
+                   wrong columns with matching counts
+  not_in_plan      the approved plan carries no columns for it; NOT created
+  failed           the CREATE raised; the error is the reason
+Resumable: `created` and `already_existed` are skipped on a re-run (--force
+re-checks them); `type_drift`, `failed` and `not_in_plan` are looked at
+again every run, so fixing the table or the plan is enough.
 """
 from __future__ import annotations
 
@@ -95,36 +109,114 @@ def _load_report(path: pathlib.Path, schema: str, target: str) -> dict:
     return prior
 
 
+class TypeDrift(Exception):
+    """The table was already there with a layout the plan did not produce."""
+
+
+def _describe_columns(spark, fqn: str) -> list[tuple[str, str]] | None:
+    """(name, type) pairs from DESCRIBE, or None when the table is not there.
+
+    Columns end at the first blank or `#` row (Delta's metadata section).
+    """
+    try:
+        rows = spark.sql(f"DESCRIBE {fqn}").collect()
+    except Exception:
+        return None
+    out: list[tuple[str, str]] = []
+    for row in rows:
+        name = str(row["col_name"] or "").strip()
+        if not name or name.startswith("#"):
+            break
+        out.append((name, str(row["data_type"] or "")))
+    return out
+
+
+def _norm_type(value: str) -> str:
+    """Compare types ignoring case and internal spacing only."""
+    return "".join(str(value).split()).upper()
+
+
+def _compare_columns(expected: list[dict],
+                     actual: list[tuple[str, str]]) -> str | None:
+    """None if the structures match, else a one-line description of the diff.
+
+    Same rule as the control-plane deploy: names and types, in order. A
+    same-count layout in another order is a diff -- the copy is a positional
+    INSERT, so that is the case that lands rows in the wrong columns with
+    matching counts.
+    """
+    want = [(str(c.get("name", "")).upper(), _norm_type(c.get("type", "")))
+            for c in expected]
+    got = [(n.upper(), _norm_type(ty)) for n, ty in actual]
+    if want == got:
+        return None
+    if len(want) != len(got):
+        return (f"column count differs: planned {len(want)}, found {len(got)} "
+                f"(planned {[n for n, _ in want]}, found {[n for n, _ in got]})")
+    diffs = [f"position {i + 1}: planned {w[0]} {w[1]}, found {g[0]} {g[1]}"
+             for i, (w, g) in enumerate(zip(want, got)) if w != g]
+    return "; ".join(diffs)
+
+
 def create_table_ctas(source: SnowflakeSource, schema: str, name: str,
-                      target_catalog: str, target_schema: str) -> None:
+                      target_catalog: str, target_schema: str) -> str:
     """Empty table whose columns Spark derives from the SOURCE read.
 
     The source is addressed through `SnowflakeSource`, so this works in
     connector mode (a temp view over the connector read) as well as against
-    an external catalog's three-part name.
+    an external catalog's three-part name. Returns `created`, or
+    `already_existed` when the table was there before this run -- CTAS has
+    no plan to compare that layout with, so it is reported, not checked.
     """
+    fqn = three(target_catalog, target_schema, name)
+    if _describe_columns(source.spark, fqn) is not None:
+        return "already_existed"
     view = f"snowmig_src_{schema}_{name}".lower()[:120]
     ref = source.register_temp_view(schema, name, view)
     try:
         source.spark.sql(
-            f"CREATE TABLE IF NOT EXISTS "
-            f"{three(target_catalog, target_schema, name)} "
+            f"CREATE TABLE IF NOT EXISTS {fqn} "
             f"USING DELTA AS SELECT * FROM {ref} WHERE 1=0")
     finally:
         source.drop_temp_view(view)
+    return "created"
 
 
 def create_table_from_columns(spark, columns: list[dict],
                               target_catalog: str, target_schema: str,
-                              name: str) -> None:
-    """CREATE TABLE from an explicit column list. Types are used verbatim."""
+                              name: str) -> str:
+    """CREATE TABLE from an explicit column list, then READ IT BACK.
+
+    Types are used verbatim. `CREATE TABLE IF NOT EXISTS` is a silent no-op
+    on a table that is already there, so the CREATE returning is not the
+    claim: the table is DESCRIBEd afterwards and compared with the plan.
+    Returns `created` (it was not there before and now matches),
+    `already_existed` (it was there and matches), or raises TypeDrift when
+    what is there differs from the plan -- the table is left as found.
+    """
     if not columns:
         raise ValueError("no column list for this table; rediscover it or "
                          "use --mode ctas")
-    cols = ", ".join(f'{q(c["name"])} {c["type"]}' for c in columns)
-    spark.sql(
-        f"CREATE TABLE IF NOT EXISTS {three(target_catalog, target_schema, name)} "
-        f"({cols}) USING DELTA")
+    fqn = three(target_catalog, target_schema, name)
+    before = _describe_columns(spark, fqn)
+    if before is None:
+        cols = ", ".join(f'{q(c["name"])} {c["type"]}' for c in columns)
+        spark.sql(f"CREATE TABLE IF NOT EXISTS {fqn} ({cols}) USING DELTA")
+        after = _describe_columns(spark, fqn)
+        if after is None:
+            raise RuntimeError("CREATE TABLE returned but the table does not "
+                               "DESCRIBE afterwards; NOT created")
+    else:
+        after = before
+    diff = _compare_columns(columns, after)
+    if diff is None:
+        return "created" if before is None else "already_existed"
+    if before is None:
+        raise TypeDrift(f"created by this run, but it reads back differently "
+                        f"from the plan -- {diff}")
+    raise TypeDrift(f"already there with a layout the plan did not produce -- "
+                    f"{diff}. CREATE TABLE IF NOT EXISTS left it as found; "
+                    f"NOT created from the plan")
 
 
 # Types Snowflake reports but Spark/Delta does not accept verbatim. Their
@@ -185,7 +277,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="print every statement; execute nothing")
     ap.add_argument("--force", action="store_true",
-                    help="re-issue creates the report already records")
+                    help="re-check tables the report already records as "
+                         "created or already_existed")
     args = ap.parse_args(argv)
 
     if args.source_catalog and \
@@ -251,8 +344,9 @@ def main(argv: list[str] | None = None) -> int:
         for table in record["tables"]:
             name = table["name"]
             prior = report["objects"].get(name, {})
-            if prior.get("status") == "created" and not args.force:
-                log(f"skip {schema}.{name}: already created")
+            if prior.get("status") in ("created", "already_existed") \
+                    and not args.force:
+                log(f"skip {schema}.{name}: already {prior['status']}")
                 continue
             try:
                 if args.dry_run:
@@ -261,9 +355,9 @@ def main(argv: list[str] | None = None) -> int:
                         f"({args.mode})")
                     status = "dry_run"
                 elif args.mode == "ctas":
-                    create_table_ctas(source, schema, name,
-                                      args.target_catalog, target_schema)
-                    status = "created"
+                    status = create_table_ctas(source, schema, name,
+                                               args.target_catalog,
+                                               target_schema)
                 elif args.mode == "ddl-plan":
                     columns = planned_columns.get((schema, name))
                     if not columns:
@@ -276,10 +370,9 @@ def main(argv: list[str] | None = None) -> int:
                         path.write_text(json.dumps(report, indent=2), encoding="utf-8")
                         log(f"{schema}.{name}: not in the approved plan")
                         continue
-                    create_table_from_columns(spark, columns,
-                                              args.target_catalog,
-                                              target_schema, name)
-                    status = "created"
+                    status = create_table_from_columns(spark, columns,
+                                                       args.target_catalog,
+                                                       target_schema, name)
                 else:
                     columns = table.get("columns") or []
                     if _looks_like_snowflake_types(columns):
@@ -288,12 +381,20 @@ def main(argv: list[str] | None = None) -> int:
                             "built in connector mode), which Delta will not "
                             "accept verbatim. Use --mode ddl-plan (engine-"
                             "translated types) or --mode ctas.")
-                    create_table_from_columns(spark, columns,
-                                              args.target_catalog,
-                                              target_schema, name)
-                    status = "created"
+                    status = create_table_from_columns(spark, columns,
+                                                       args.target_catalog,
+                                                       target_schema, name)
                 report["objects"][name] = {"status": status}
                 log(f"{schema}.{name}: {status}")
+            except TypeDrift as exc:
+                # A problem state, not a failure of THIS run: the table is
+                # there, it is not what the plan says, and a positional copy
+                # into it would land rows in the wrong columns with matching
+                # counts. Re-checked on every run until it matches.
+                failures += 1
+                report["objects"][name] = {"status": "type_drift",
+                                           "reason": str(exc)[:400]}
+                log(f"{schema}.{name}: TYPE DRIFT — {str(exc)[:200]}")
             except Exception as exc:
                 failures += 1
                 report["objects"][name] = {"status": "failed",

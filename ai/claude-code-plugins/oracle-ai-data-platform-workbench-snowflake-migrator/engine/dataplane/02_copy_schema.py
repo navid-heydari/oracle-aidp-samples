@@ -282,14 +282,17 @@ def main(argv: list[str] | None = None) -> int:
     else:
         # Default to what the structure step created for THIS target, when it
         # left a report: the manifest is the whole estate, and copying into
-        # tables nobody approved is not a default worth having.
+        # tables nobody approved is not a default worth having. A table it
+        # found already there WITH the planned layout counts; one it recorded
+        # as `type_drift` never does -- the copy below is a positional INSERT
+        # INTO ... SELECT *, and that layout is not the plan's.
         structure_path = reports / f"structure_report_{args.schema.lower()}.json"
         created = []
         if structure_path.is_file():
             prior = json.loads(structure_path.read_text(encoding="utf-8"))
             if prior.get("target") in (None, target):
                 created = [n for n, rec in (prior.get("objects") or {}).items()
-                           if rec.get("status") == "created"]
+                           if rec.get("status") in ("created", "already_existed")]
         if created:
             names = created
             log(f"scope: {len(names)} table(s) the structure step created for "
