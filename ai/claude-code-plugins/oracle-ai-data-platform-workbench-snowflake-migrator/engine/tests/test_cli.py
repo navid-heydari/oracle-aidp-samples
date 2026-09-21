@@ -1014,3 +1014,40 @@ def test_run_sql_from_args_leaves_host_unset_when_the_config_has_none(
         ["assess", "--out-dir", str(tmp_path), "--config", str(cfg)])
     snowmig._run_sql_from_args(args)
     assert not captured.get("host")
+
+
+# --- security: the console line hedges like SECURITY.md does ---------------
+
+def test_security_console_hedges_when_a_policy_exists_but_no_attachment_shows(
+        tmp_path, monkeypatch, capsys):
+    # SHOW lists a masking policy; ACCOUNT_USAGE.POLICY_REFERENCES (which lags
+    # ~2 h) shows nothing attached. SECURITY.md and the board call that
+    # UNCONFIRMED; the console printed a bare "0 policy exposure(s)".
+    import snowmig
+    write(tmp_path, "inventory.json", INV)
+
+    def fake(sql, params=None):
+        low = " ".join(sql.split()).lower()
+        if "masking policies" in low:
+            return [{"name": "MASK_SSN", "database_name": "D",
+                     "schema_name": "PUBLIC", "kind": "MASKING_POLICY"}]
+        return []
+
+    monkeypatch.setattr(snowmig, "_run_sql_from_args", lambda args: fake)
+    rc = main(["security", "--out-dir", str(tmp_path), "--no-grants"])
+    out, err = capsys.readouterr()
+    assert rc == 0
+    assert "0 policy exposure(s)" in out
+    assert "UNCONFIRMED" in err and "POLICY_REFERENCES" in err
+
+
+def test_security_console_stays_quiet_when_nothing_is_defined(
+        tmp_path, monkeypatch, capsys):
+    import snowmig
+    write(tmp_path, "inventory.json", INV)
+    monkeypatch.setattr(snowmig, "_run_sql_from_args",
+                        lambda args: (lambda sql, params=None: []))
+    rc = main(["security", "--out-dir", str(tmp_path), "--no-grants"])
+    out, err = capsys.readouterr()
+    assert rc == 0 and "0 policy exposure(s)" in out
+    assert "UNCONFIRMED" not in err and "UNCORROBORATED" not in err

@@ -100,6 +100,14 @@ def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
         level = _raise(level, "MEDIUM")
         notes.append(f"{len(other)} column warning(s) recorded")
 
+    kind_warning = obj.get("kind_warning")
+    if kind_warning:
+        # A TRANSIENT/TEMPORARY table planned as a permanent Delta table. The
+        # sentence itself travels, not a count: the row must say what to
+        # confirm.
+        level = _raise(level, "MEDIUM")
+        notes.append(kind_warning)
+
     rows = obj.get("rows")
     if rows is not None and rows >= _LARGE_ROWS:
         level = _raise(level, "MEDIUM")

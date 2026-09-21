@@ -248,17 +248,43 @@ def render_planned_objects(plan: dict) -> str:
         out += [f"- `{k}`: {v}" for k, v in plan["restrictions_applied"].items()]
         out.append("")
 
-    out += ["## Target structure to exist first", "",
-            "Catalogs (create these, or confirm they exist and are INTERNAL): "
-            + ", ".join(f'`{c}`' for c in plan.get("catalogs_to_create") or []),
-            ""]
-    # How the target catalog comes to exist (container at S4, structure at
-    # S10), when the plan records it. An older plan.json carries no note.
-    if plan.get("target_catalog_note"):
-        out += [plan["target_catalog_note"], ""]
-    out += ["Schemas the clone will create: "
-            + ", ".join(f'`{a}.{b}`' for a, b in plan.get("schemas_to_create") or []),
-            ""]
+    out += ["## Target structure to exist first", ""]
+    catalogs = ", ".join(f'`{c}`' for c in plan.get("catalogs_to_create") or [])
+    schemas = ", ".join(f'`{a}.{b}`'
+                        for a, b in plan.get("schemas_to_create") or [])
+    note = plan.get("target_catalog_note")
+    if not note:
+        # An older plan.json carries no note; its two lines stay as they were.
+        out += ["Catalogs (create these, or confirm they exist and are "
+                f"INTERNAL): {catalogs}", "",
+                f"Schemas the clone will create: {schemas}", ""]
+    else:
+        # Two paths create the structure and they name things differently.
+        # The in-AIDP structure job (S10) creates <--target-catalog>.<SOURCE
+        # schema>.<table> and never reads the plan's target_fqn; the older
+        # `deploy`/`notebook` path creates the plan's names as they stand.
+        # Labelled per path, or the section tells the reader to create `d`,
+        # that `d` is the EXTERNAL pointer, and that the clone creates
+        # `d.public` -- in three consecutive lines.
+        src_schemas = ", ".join(f'`{s}`' for s in sorted(
+            {c["source_identifier"].split(".")[1].lower()
+             for c in plan.get("can_migrate") or []})) or "none"
+        if plan.get("bronze_catalog_prefix") is None:
+            out += [f"Catalogs: the Target column's catalog part ({catalogs}) "
+                    "is the source database mirrored, not a catalog to create "
+                    "-- under the runbook that name is the EXTERNAL pointer; "
+                    "the INTERNAL target is the one created at S4 and passed "
+                    "to `provision --target-catalog`.", ""]
+            older = (f"Older `deploy`/`notebook` path only: {schemas} "
+                     f"(requires {catalogs} to exist as INTERNAL)")
+        else:
+            out += ["Catalogs (create these, or confirm they exist and are "
+                    f"INTERNAL): {catalogs}", ""]
+            older = f"Older `deploy`/`notebook` path only: {schemas}"
+        out += [note, "",
+                "Schemas the structure job (S10) creates under that target "
+                f"catalog: {src_schemas}", "",
+                older, ""]
 
     out += ["## Can migrate", "",
             "| Object | Type | Target | Rows | Cols |", "|---|---|---|---:|---:|"]
@@ -267,6 +293,17 @@ def render_planned_objects(plan: dict) -> str:
                    f'| `{c["target"]}` | {c.get("rows") if c.get("rows") is not None else "-"} '
                    f'| {c.get("columns", "-")} |')
     out.append("")
+
+    # TRANSIENT/TEMPORARY tables planned as permanent Delta tables. An older
+    # plan.json carries no list and renders unchanged.
+    kinds = plan.get("table_kind_warnings") or []
+    if kinds:
+        out += ["## Planned, but not as what they were", "",
+                "These migrate as permanent Delta tables; confirm each is "
+                "meant to persist.", ""]
+        out += [f'- `{w["source_identifier"]}` ({w.get("kind")}) — {w["warning"]}'
+                for w in kinds]
+        out.append("")
 
     cannot = plan.get("cannot_migrate") or []
     if cannot:
@@ -287,9 +324,22 @@ def render_planned_objects(plan: dict) -> str:
                 "an arbitrary broken edge.", ""]
         out += [f'- {", ".join(f"`{n}`" for n in c)}' for c in plan["cycles"]] + [""]
 
-    out += ["## Order of creation", "",
-            "Dependencies land before their dependents, so views follow their base "
-            "tables.", ""]
+    out += ["## Order of creation", ""]
+    unordered = plan.get("views_without_dependency_edge") or []
+    if unordered:
+        # A view with no edge from either source sorts by size and can land
+        # in wave 1 ahead of its base table; the plan must not assert an
+        # order it does not have.
+        out += ["Objects are ordered by dependency where an edge is known. "
+                "These views have no edge from ACCOUNT_USAGE or parsed DDL, are "
+                "ordered by size only, and are NOT guaranteed to follow their "
+                "base tables: " + ", ".join(f"`{v}`" for v in unordered) + ".",
+                ""]
+        if plan.get("dependency_warning"):
+            out += [plan["dependency_warning"], ""]
+    else:
+        out += ["Dependencies land before their dependents, so views follow "
+                "their base tables.", ""]
     for i, wave in enumerate(plan.get("waves") or [], 1):
         out.append(f'### Wave {i} — {len(wave)} object(s)')
         out += [f'- `{n}` → `{plan.get("target_names", {}).get(n, "?")}`'
@@ -313,6 +363,8 @@ def render_planned_objects(plan: dict) -> str:
         out += ['---', "",
                 f'Lineage source: **{plan["dependency_source"]}** — '
                 f'{plan.get("dependency_coverage_note") or ""}']
+        if plan.get("dependency_warning"):
+            out += ["", plan["dependency_warning"]]
     return "\n".join(out) + "\n"
 
 
@@ -1306,8 +1358,11 @@ def render_stages(board: dict) -> str:
            "scripts, jobs), **`catalog`** (registers the target catalog) "
            "**and `deploy`** (creates schemas, tables and views). All three "
            "are a dry run unless `--execute` is passed with the target "
-           "coordinates. Every other stage is read-only, except the narrow "
-           "opt-ins `smoke --write-probe` and `notebook --upload`.", "",
+           "coordinates. Every other stage is read-only. The one further "
+           "write is `smoke --write-probe --execute`, which creates one probe "
+           "schema and removes it again; `--write-probe` alone is a dry run. "
+           "`notebook --upload` sends nothing: without `--execute` it is a "
+           "dry run, with `--execute` it is refused (GAPS.md 13).", "",
            "| Stage | Needs | Status | What it found |", "|---|---|---|---|"]
     for r in rows:
         mark = " ⚠️" if r.get("attention") else ""

@@ -15,7 +15,8 @@ standard ones, and the extractor keeps the is_* flags. None of those is a table
 this plugin can copy: each lands in `cannot_migrate` with a reason specific to
 its kind, so the plan agrees with CENSUS.md instead of contradicting it.
 TRANSIENT and TEMPORARY tables do migrate, as permanent Delta tables, and the
-plan carries a warning per object saying so.
+plan carries a warning per object saying so, which PLANNED_OBJECTS.md lists and
+SUMMARY.md scores MEDIUM.
 
 An object that depends on one that is not migrating cannot migrate either --
 a view over a blocked or excluded table would be created over nothing. The
@@ -288,6 +289,10 @@ def build_plan(inventory: dict, dependencies: dict, *,
                     # semi-structured-as-string, declared lengths) come from
                     # the type mapper; the maintenance settings from SHOW.
                     "warnings": list(rec.get("warnings") or []),
+                    # Kept apart from the column warnings: assess_risk counts
+                    # those, but a TRANSIENT/TEMPORARY table planned as a
+                    # permanent one is a sentence about the object itself.
+                    "kind_warning": warning["warning"] if warning else None,
                     "deferred_properties": deferred,
                     "omitted_properties": omitted})
 
@@ -303,8 +308,18 @@ def build_plan(inventory: dict, dependencies: dict, *,
     migratable = [r for r in kept if r["source_identifier"] in can_ids]
     sizes = {r["source_identifier"]: (r.get("row_count_exact") or 0)
              for r in migratable}
-    waved = compute_waves(sorted(can_ids), dependencies.get("edges", []),
+    edges = dependencies.get("edges", [])
+    waved = compute_waves(sorted(can_ids), edges,
                           sort_key=lambda n: (sizes.get(n, 0), n))
+    # A planned view with no edge from either source sits at indegree 0 and
+    # sorts by size, so it can land ahead of its base table. Derived from the
+    # planned views against the edges rather than from the producer's label,
+    # so account_usage_empty, account_usage+parsed_ddl, parsed_ddl (ACCOUNT_
+    # USAGE denied) and not_extracted are all covered alike.
+    ordered = {e["from"] for e in edges}
+    unordered_views = sorted(c["source_identifier"] for c in can
+                             if c["object_type"] == "VIEW"
+                             and c["source_identifier"] not in ordered)
 
     catalogs = sorted({targets[i].split(".", 1)[0] for i in can_ids})
     schemas = sorted({tuple(targets[i].split(".")[:2]) for i in can_ids})
@@ -337,6 +352,10 @@ def build_plan(inventory: dict, dependencies: dict, *,
         "silver_gold_jobs": layer_jobs(scopes),
         "dependency_source": dependencies.get("source_used"),
         "dependency_coverage_note": dependencies.get("coverage_note"),
+        "dependency_warning": dependencies.get("warning"),
+        "dependency_edge_count": len(edges),
+        # Ordered by size only; NOT guaranteed to follow their base tables.
+        "views_without_dependency_edge": unordered_views,
         # Carried so every report can state the architecture decision. None means
         # undecided, which the reports say out loud rather than defaulting.
         "architecture_choice": architecture_choice,

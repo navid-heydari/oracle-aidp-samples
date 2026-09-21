@@ -303,3 +303,107 @@ def test_a_fully_verified_deploy_is_clean(tmp_path):
     row = _row(tmp_path, "deploy")
     assert row["attention"] is False
     assert row["found"] == "**verified 3/3**"
+
+
+# --------------------------------------------------------------------------
+# The preamble must agree with the CLI it describes: `smoke --write-probe`
+# writes only with `--execute`, and `notebook --upload` never writes (a dry
+# run without `--execute`, refused with it). The old carve-out named both as
+# "narrow opt-ins" that can write, while the board's own rows carried no
+# (writes) marker for either.
+# --------------------------------------------------------------------------
+
+def test_the_preamble_does_not_call_smoke_and_notebook_opt_in_writers(tmp_path):
+    md = render_stages(build_stage_board(tmp_path))
+    preamble = md.split("| Stage |", 1)[0]
+    assert "narrow opt-ins" not in preamble
+    assert "read-only" in preamble.lower()
+    assert "`smoke --write-probe --execute`" in preamble, \
+        "the probe writes only with --execute, and the preamble must say so"
+    assert "`notebook --upload`" in preamble and "refused" in preamble, \
+        "--upload sends nothing; the preamble must say it is refused"
+
+
+# --------------------------------------------------------------------------
+# deps: the producer now writes four source_used values. "view DDL only" is a
+# statement about parsed_ddl and must not be applied to a merged graph whose
+# edges came mostly from ACCOUNT_USAGE; a value the board does not recognise
+# is flagged, not read as clean.
+# --------------------------------------------------------------------------
+
+def test_merged_account_usage_and_parsed_lineage_is_flagged_but_not_called_view_ddl_only(tmp_path):
+    _write(tmp_path, "dependencies.json",
+           {"edges": [{"from": "DB.S.V1", "to": "DB.S.T", "source": "account_usage"},
+                      {"from": "DB.S.V", "to": "DB.S.V1", "source": "parsed_ddl"}],
+            "source_used": "account_usage+parsed_ddl",
+            "coverage_note": "partly lagged",
+            "unresolved_references": ["OTHER.S.X"],
+            "views_without_account_usage_edge": ["DB.S.V"],
+            "warning": "1 view(s) have no ACCOUNT_USAGE lineage edge (the view "
+                       "lags DDL by up to ~3 h); their DDL was parsed instead. "
+                       "Re-run `deps` after the lag before relying on the wave "
+                       "order."})
+    row = _row(tmp_path, "deps")
+    assert row["attention"] is True
+    assert "view ddl only" not in row["found"].lower(), row["found"]
+    assert "1 view(s)" in row["found"]
+    assert "1 unresolved" in row["found"]
+
+
+def test_empty_account_usage_lineage_is_flagged(tmp_path):
+    _write(tmp_path, "dependencies.json",
+           {"edges": [{"from": "DB.S.V", "to": "DB.S.T", "source": "parsed_ddl"}],
+            "source_used": "account_usage_empty", "coverage_note": "empty",
+            "unresolved_references": [],
+            "views_without_account_usage_edge": ["DB.S.V"],
+            "warning": "1 view(s) have no ACCOUNT_USAGE lineage edge; their DDL "
+                       "was parsed instead. Re-run `deps` after the lag."})
+    row = _row(tmp_path, "deps")
+    assert row["attention"] is True
+    assert "view ddl only" not in row["found"].lower(), row["found"]
+    assert "1 view(s)" in row["found"]
+
+
+def test_unrecognised_lineage_source_is_flagged_not_guessed(tmp_path):
+    _write(tmp_path, "dependencies.json", {"edges": [], "source_used": "x"})
+    row = _row(tmp_path, "deps")
+    assert row["attention"] is True
+    assert "view ddl only" not in row["found"].lower(), row["found"]
+
+
+# --------------------------------------------------------------------------
+# security: a policy object that exists while POLICY_REFERENCES shows no
+# attachment is UNCONFIRMED, not clean (security.py's own invariant). So is
+# an empty attachment list when SHOW MASKING/ROW ACCESS POLICIES was denied.
+# --------------------------------------------------------------------------
+
+def test_a_defined_but_unattached_policy_is_flagged(tmp_path):
+    _write(tmp_path, "security.json",
+           {"exposure_count": 0, "secure_views": [], "grants": {},
+            "policies_defined_without_attachment": 1})
+    sec = _row(tmp_path, "security")
+    assert sec["attention"] is True
+    assert "unconfirmed" in sec["found"].lower(), sec["found"]
+    assert "security" in build_stage_board(tmp_path)["needs_attention"]
+
+
+def test_unenumerable_policy_objects_are_flagged(tmp_path):
+    _write(tmp_path, "security.json",
+           {"exposure_count": 0, "secure_views": [], "grants": {},
+            "policies": {"masking": {"count": None, "readable": False},
+                         "row_access": {"count": 0, "readable": True},
+                         "tags": {"count": 0, "readable": True}}})
+    sec = _row(tmp_path, "security")
+    assert sec["attention"] is True
+    assert "could not be enumerated" in sec["found"].lower(), sec["found"]
+
+
+def test_enumerated_and_unattached_policies_read_clean(tmp_path):
+    _write(tmp_path, "security.json",
+           {"exposure_count": 0, "secure_views": [], "grants": {},
+            "policies_defined_without_attachment": 0,
+            "policies": {"masking": {"count": 0, "readable": True},
+                         "row_access": {"count": 0, "readable": True},
+                         "tags": {"count": 0, "readable": True}}})
+    sec = _row(tmp_path, "security")
+    assert sec["attention"] is False

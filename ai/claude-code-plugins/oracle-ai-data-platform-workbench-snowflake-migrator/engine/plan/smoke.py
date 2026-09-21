@@ -12,10 +12,10 @@ probe schema there is correct rather than forbidden. An earlier version applied
 the source rule to the destination and therefore could not clean up, which is
 why the probe had to stay off.
 
-It is still opt-in, because it writes. The DROP names exactly one constant
-schema, is never CASCADE, and is skipped if the schema was already there -- a
-pre-existing schema is not ours to remove. If cleanup fails, the report names
-what was left.
+It is still opt-in, because it writes. The DROP names exactly the one schema
+this run created, under a per-run unique name (a failed create permanently
+poisons the name, and DELETE does not recover it), and is never CASCADE. If
+cleanup fails, the report names what was left.
 
 The probe is also skipped, with a note, when the target catalog is EXTERNAL:
 a read-only pointer at the live Snowflake source accepts no writes by design,
@@ -167,7 +167,7 @@ def run_smoke(*, source_run_sql, target=None, dest_call=None,
             destination["write_note"] = (
                 "not verified: the write probe is opt-in because it writes. It "
                 "creates one schema and removes it again. Re-run with "
-                "--write-probe to prove write access.")
+                "--write-probe --execute to prove write access.")
         elif catalog_type == "EXTERNAL":
             destination["write_note"] = (
                 f"not applicable: {target.catalog} is an EXTERNAL catalog — a "

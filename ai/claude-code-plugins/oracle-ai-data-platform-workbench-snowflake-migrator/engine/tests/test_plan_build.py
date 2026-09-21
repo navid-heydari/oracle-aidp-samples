@@ -405,6 +405,12 @@ def test_transient_and_temporary_tables_migrate_with_a_warning(kind):
     assert warnings[0]["kind"] == kind.upper()
     assert kind.upper() in warnings[0]["warning"]
     assert "permanent" in warnings[0]["warning"].lower()
+    # The same sentence travels on the can entry, where SUMMARY.md scores
+    # it; the plan-level list is what PLANNED_OBJECTS.md renders.
+    entries = {c["source_identifier"]: c for c in plan["can_migrate"]}
+    assert entries["D.S.T"]["kind_warning"] == warnings[0]["warning"]
+    assert entries["D.S.PLAIN"]["kind_warning"] is None
+    assert entries["D.S.T"]["warnings"] == [], "column warnings stay separate"
 
 
 def test_a_plain_table_carries_no_kind_warning():
@@ -412,3 +418,66 @@ def test_a_plain_table_carries_no_kind_warning():
     r["source_metadata"]["kind"] = "TABLE"
     plan = build_plan({"inventory": [r]}, {"edges": []})
     assert plan["table_kind_warnings"] == []
+
+
+# --- the plan says which views it could NOT order -------------------------
+#
+# "Views follow their base tables" holds only for views with an edge. A view
+# with no edge from ACCOUNT_USAGE or parsed DDL sorts by size and can land in
+# wave 1 ahead of its base; the plan must carry that list, derived from the
+# planned views against the edges, so every provenance is covered alike.
+
+def _unordered_view_inventory():
+    view = rec("D.S.V", kind="VIEW", ddl="create view V as select a from OTHERDB.S.T")
+    view["row_count_exact"] = None
+    return {"inventory": [rec("D.S.T", rows=1000), view]}
+
+
+def test_plan_names_views_with_no_edge_when_account_usage_was_empty():
+    from fake_sql import FakeSql
+    from snowflake_source.extract.dependencies import extract_dependencies
+    inv = _unordered_view_inventory()
+    plan = build_plan(inv, extract_dependencies(FakeSql({"object_dependencies": []}), inv))
+    assert plan["dependency_source"] == "account_usage_empty"
+    assert plan["views_without_dependency_edge"] == ["D.S.V"]
+    assert plan["dependency_warning"] and "D.S.V" in plan["dependency_warning"]
+    assert plan["dependency_edge_count"] == 0
+
+
+def test_plan_names_views_with_no_edge_when_account_usage_was_denied():
+    # parsed_ddl with warning None: the producer had nothing to warn about,
+    # but the view still has no edge and is still ordered by size only.
+    from snowflake_source.extract.dependencies import extract_dependencies
+
+    def denied(sql, params=None):
+        raise RuntimeError("insufficient privileges")
+
+    inv = _unordered_view_inventory()
+    plan = build_plan(inv, extract_dependencies(denied, inv))
+    assert plan["dependency_source"] == "parsed_ddl"
+    assert plan["views_without_dependency_edge"] == ["D.S.V"]
+    assert plan["dependency_warning"] is None
+    assert plan["dependency_edge_count"] == 0
+
+
+def test_plan_lists_no_unordered_views_when_account_usage_covers_them_all():
+    from fake_sql import FakeSql
+    from snowflake_source.extract.dependencies import extract_dependencies
+    inv = {"inventory": [rec("D.S.T"), rec("D.S.V", kind="VIEW",
+                                           ddl="create view V as select a from D.S.T")]}
+    run = FakeSql({"object_dependencies": [
+        {"REFERENCING": "D.S.V", "REFERENCED": "D.S.T",
+         "REFERENCING_TYPE": "VIEW", "REFERENCED_TYPE": "TABLE"}]})
+    plan = build_plan(inv, extract_dependencies(run, inv))
+    assert plan["dependency_source"] == "account_usage"
+    assert plan["views_without_dependency_edge"] == []
+    assert plan["dependency_warning"] is None
+    assert plan["dependency_edge_count"] == 1
+    assert plan["waves"] == [["D.S.T"], ["D.S.V"]]
+
+
+def test_unordered_views_are_listed_only_if_they_are_planned():
+    # A view that cannot migrate is not "unordered"; it is not in the order.
+    inv = {"inventory": [rec("D.S.T"), rec("D.S.V2", kind="VIEW", ddl=SNOWFLAKE_VIEW)]}
+    plan = build_plan(inv, {"edges": []})
+    assert plan["views_without_dependency_edge"] == []

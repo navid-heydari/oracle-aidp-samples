@@ -265,3 +265,23 @@ def test_smoke_report_never_says_pass_for_a_legacy_skipped_result():
                                        "reason": "coordinates not supplied"}})
     assert "Verdict: **PASS**" not in md
     assert "PARTIAL" in md
+
+
+def test_a_transient_table_is_scored_medium_with_the_reason_in_its_row():
+    # plan.build records that a TRANSIENT/TEMPORARY table is planned as a
+    # permanent Delta table. SUMMARY.md once scored it LOW with "structure
+    # clones cleanly", which is the opposite of a caveat.
+    scratch = dict(PLAN["can_migrate"][0], source_identifier="D.PUBLIC.SCRATCH",
+                   target="D.PUBLIC.SCRATCH",
+                   kind_warning="TRANSIENT table in Snowflake (no Fail-safe, "
+                                "short Time Travel); it is planned as a "
+                                "permanent Delta table, so confirm it is meant "
+                                "to persist")
+    plan = dict(PLAN, can_migrate=[scratch, PLAN["can_migrate"][1]])
+    md = render_summary(plan, INV, None, None)
+    row = next(l for l in md.splitlines() if "`D.PUBLIC.SCRATCH`" in l)
+    assert "| MEDIUM |" in row, row
+    assert "TRANSIENT" in row and "permanent" in row
+    assert "column warning" not in row
+    rollup = next(l for l in md.splitlines() if l.startswith("By risk:"))
+    assert "**MEDIUM**" in rollup

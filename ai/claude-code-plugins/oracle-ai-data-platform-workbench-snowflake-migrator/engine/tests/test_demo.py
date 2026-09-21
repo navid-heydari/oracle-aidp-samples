@@ -178,3 +178,12 @@ def test_the_demo_narrative_is_printable_and_nonempty(demo):
     _, result = demo
     assert len(result["narrative"]) >= 10
     assert all(isinstance(line, str) and line for line in result["narrative"])
+
+
+def test_the_demo_notebook_note_routes_to_the_verified_path(demo):
+    # `notebook --upload` is refused; the demo must not tell the reader that
+    # production uploads through it.
+    out, _ = demo
+    text = (out / "NOTEBOOK.md").read_text(encoding="utf-8")
+    assert "`notebook --upload` places" not in text
+    assert "run --job snowmig_01_structure" in text

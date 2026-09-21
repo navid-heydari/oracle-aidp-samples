@@ -174,3 +174,27 @@ def test_a_deferred_maintenance_setting_raises_risk_and_names_itself():
                                  "aidp_equivalent": "CLUSTER BY / ZORDER"}]})
     assert level == "MEDIUM"
     assert "cluster_by" in note
+
+
+def test_a_kind_warning_raises_risk_to_medium_and_carries_the_sentence():
+    # A TRANSIENT/TEMPORARY table planned as a permanent Delta table is a
+    # caveat about the object, not about a column, and the row must carry
+    # the sentence rather than a count.
+    warning = ("TRANSIENT table in Snowflake (no Fail-safe, short Time Travel); "
+               "it is planned as a permanent Delta table, so confirm it is "
+               "meant to persist")
+    level, note = assess_risk({"object_type": "TABLE", "kind_warning": warning})
+    assert level == "MEDIUM"
+    assert warning in note
+    assert "column warning" not in note
+    assert "clones cleanly" not in note
+
+
+def test_a_kind_warning_never_lowers_a_view_from_high():
+    level, _ = assess_risk({"object_type": "VIEW", "kind_warning": "TEMPORARY ..."})
+    assert level == "HIGH"
+
+
+def test_a_missing_or_empty_kind_warning_leaves_risk_alone():
+    assert assess_risk(can())[0] == "LOW"
+    assert assess_risk(dict(can(), kind_warning=None))[0] == "LOW"

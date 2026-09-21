@@ -644,6 +644,20 @@ def cmd_security(args) -> int:
         return 0
     extra = len(sec["secure_views"])
     print(f'  {count} policy exposure(s), {extra} secure view(s) losing SECURE')
+    unattached = sec.get("policies_defined_without_attachment") or 0
+    policies = sec.get("policies") or {}
+    if unattached:
+        # SECURITY.md and the stage board already say UNCONFIRMED; the one
+        # line the operator reads on the console has to say it too.
+        print(f'  {unattached} policy object(s) defined but no attachment '
+              'visible (ACCOUNT_USAGE.POLICY_REFERENCES lags ~2 h) - '
+              'exposure UNCONFIRMED, re-run before relying on 0',
+              file=sys.stderr)
+    elif any(not (policies.get(k) or {}).get("readable", True)
+             for k in ("masking", "row_access")):
+        print('  policy objects could not be enumerated - the empty '
+              'attachment list is UNCORROBORATED, see SECURITY.md',
+              file=sys.stderr)
     if count or extra:
         print("  these objects are created WITHOUT their protection - see "
               "SECURITY.md", file=sys.stderr)
@@ -1067,7 +1081,8 @@ def _render_run(result: dict) -> str:
 def cmd_catalog(args) -> int:
     """Register the target catalog. EXTERNAL/SNOWFLAKE by default.
 
-    STANDARD is allowed and is step S3 of the runbook. Creating the catalog
+    STANDARD is allowed and is step S4 of the runbook (S3 registers the
+    EXTERNAL source). Creating the catalog
     is not the same as creating its tables: the catalog is ONE control-plane
     object, while a table create through the same API can return 202 Accepted
     and silently create nothing. So the container is made here and the tables
@@ -1999,7 +2014,7 @@ def build_parser() -> argparse.ArgumentParser:
                      default="external",
                      help="external (default): register a read-only pointer at "
                           "the live Snowflake source, copying nothing. standard "
-                          "(runbook S3): create the managed target catalog as a "
+                          "(runbook S4): create the managed target catalog as a "
                           "CONTAINER -- its schemas and tables are created on "
                           "AIDP compute by the structure workflow (S10), never "
                           "through the control-plane CRUD API")

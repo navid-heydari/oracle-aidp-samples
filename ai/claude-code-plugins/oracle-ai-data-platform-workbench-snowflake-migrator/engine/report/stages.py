@@ -10,8 +10,10 @@ Two rules it holds to, both learned the hard way elsewhere in this plugin:
     exposures" and "we could not read the policy references" are opposite
     findings and must not render the same.
   * Three stages write to AIDP -- `provision`, `catalog` and `deploy` -- and
-    the board says which. (`smoke --write-probe` and `notebook --upload` can
-    write too, narrowly and opt-in, and say so in their own reports.)
+    the board says which. The one further write is `smoke --write-probe
+    --execute`: one probe schema, created and removed; `--write-probe` alone
+    is a dry run. `notebook --upload` sends nothing -- a dry run without
+    `--execute`, refused with it (GAPS.md 13).
 """
 from __future__ import annotations
 
@@ -120,10 +122,13 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
         return (text, False)
 
     if stage == "deps":
-        # `cycles` lives in plan.json, never here, so the old rule could not
-        # fire. What dependencies.json does say is WHERE the graph came from:
-        # account_usage is the full graph; parsed_ddl is partial (view DDL
-        # only); not_extracted is "did not look" and must not read as clean.
+        # `cycles` lives in plan.json, never here. What dependencies.json
+        # does say is WHERE the graph came from: account_usage is the full
+        # graph; parsed_ddl is partial (view DDL only); account_usage_empty
+        # and account_usage+parsed_ddl mean ACCOUNT_USAGE was readable but
+        # lagged behind the DDL for some or all views, whose DDL was parsed
+        # instead; not_extracted is "did not look" and must not read as
+        # clean. A value the board does not know is flagged, not guessed at.
         source = data.get("source_used")
         edges = len(data.get("edges") or [])
         if not source:
@@ -134,13 +139,24 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
         text = f'lineage from {source}; {edges} edge(s)'
         if source == "not_extracted":
             return (text + " -- **NOT extracted; view order unchecked**", True)
-        if source != "account_usage":
-            unresolved = len(data.get("unresolved_references") or [])
-            text += " -- **partial graph (view DDL only)**"
-            if unresolved:
-                text += f', {unresolved} unresolved reference(s)'
-            return (text, True)
-        return (text, bool(data.get("cycles")))
+        unresolved = len(data.get("unresolved_references") or [])
+        tail = f', {unresolved} unresolved reference(s)' if unresolved else ''
+        if source == "account_usage":
+            return (text, False)
+        if source == "parsed_ddl":
+            return (text + " -- **partial graph (view DDL only)**" + tail, True)
+        if source in ("account_usage+parsed_ddl", "account_usage_empty"):
+            # The producer writes a per-run warning naming the lagged views
+            # and the ones still unordered; surface it rather than restate
+            # a weaker version.
+            missing = len(data.get("views_without_account_usage_edge") or [])
+            note = data.get("warning") or (
+                f"{missing} view(s) had no ACCOUNT_USAGE edge; their DDL was "
+                "parsed (OBJECT_DEPENDENCIES lags DDL up to ~3 h) -- re-run "
+                "deps before relying on the wave order")
+            return (text + f" -- **{note}**" + tail, True)
+        return (text + " -- **provenance not recognised; completeness unknown**",
+                True)
 
     if stage == "maintenance":
         flagged = data.get("objects_with_signals")
@@ -158,6 +174,21 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
             return ("**policy attachments unreadable — exposure UNKNOWN, "
                     "not zero**", True)
         text = f'{count} policy exposure(s), {secure} secure view(s)'
+        # A policy object that exists while POLICY_REFERENCES (which lags
+        # ~2 h) lists no attachment is UNCONFIRMED, not zero; and an empty
+        # attachment list is uncorroborated when SHOW MASKING/ROW ACCESS
+        # POLICIES was denied. `readable` defaults to True so an artefact
+        # written before the `policies` block existed stays unflagged.
+        unattached = data.get("policies_defined_without_attachment") or 0
+        if unattached:
+            return (text + f'; **{unattached} policy object(s) defined, '
+                    'attachment UNCONFIRMED (ACCOUNT_USAGE.POLICY_REFERENCES '
+                    'lags ~2 h)**', True)
+        pol = data.get("policies") or {}
+        if any(not (pol.get(k) or {}).get("readable", True)
+               for k in ("masking", "row_access")):
+            return (text + '; **policy objects could not be enumerated — '
+                    'empty attachment list uncorroborated**', True)
         return (text, bool(count or secure))
 
     if stage == "compute":

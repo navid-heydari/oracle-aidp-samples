@@ -322,3 +322,11 @@ def test_a_denied_destination_read_is_fail_not_partial():
     r = run_smoke(source_run_sql=sf_ok, target=_target(),
                   dest_call=DestCall(fail={"list_schemas"}))
     assert r["verdict"] == "FAIL"
+
+
+def test_the_default_write_note_names_the_execute_gate():
+    # The CLI runs the probe only with `--write-probe --execute`; a plain
+    # `smoke` run must not tell the reader that `--write-probe` alone proves
+    # write access.
+    r = run_smoke(source_run_sql=sf_ok, target=_target(), dest_call=DestCall())
+    assert "--write-probe --execute" in r["destination"]["write_note"]

@@ -441,3 +441,146 @@ def test_planned_objects_without_the_note_still_renders():
     md = render_planned_objects(plan)
     assert "Target structure to exist first" in md
     assert "None" not in md.split("## Target structure to exist first", 1)[1].split("\n## ", 1)[0]
+
+
+# --------------------------------------------------------------------------
+# plan.json carries `table_kind_warnings` (TRANSIENT/TEMPORARY tables planned
+# as permanent Delta tables). The sign-off artifact must show them; a warning
+# nobody renders is not a warning.
+# --------------------------------------------------------------------------
+
+_KIND_WARNING = {"source_identifier": "D.PUBLIC.SCRATCH", "kind": "TRANSIENT",
+                 "warning": "TRANSIENT table in Snowflake (no Fail-safe, short "
+                            "Time Travel); it is planned as a permanent Delta "
+                            "table, so confirm it is meant to persist"}
+
+
+def test_planned_objects_lists_tables_planned_as_something_else():
+    md = render_planned_objects(dict(PLAN, table_kind_warnings=[_KIND_WARNING]))
+    assert "## Planned, but not as what they were" in md
+    section = md.split("## Planned, but not as what they were", 1)[1].split("\n## ", 1)[0]
+    assert "`D.PUBLIC.SCRATCH`" in section and "TRANSIENT" in section
+    assert "permanent" in section
+
+
+def test_planned_objects_has_no_kind_section_when_nothing_changes_kind():
+    assert "Planned, but not as what they were" not in render_planned_objects(PLAN)
+    assert "Planned, but not as what they were" not in render_planned_objects(
+        dict(PLAN, table_kind_warnings=[]))
+
+
+# --------------------------------------------------------------------------
+# "Dependencies land before their dependents, so views follow their base
+# tables" is only true of views that HAVE an edge. A view with no edge from
+# either source sorts by size and can land before its base table; the plan
+# must say so instead of asserting an order it does not have.
+# --------------------------------------------------------------------------
+
+def _order_section(md):
+    return md.split("## Order of creation", 1)[1].split("\n## ", 1)[0]
+
+
+def test_order_of_creation_names_views_with_no_dependency_edge():
+    warning = ("1 view(s) have no ACCOUNT_USAGE lineage edge (the view lags "
+               "DDL by up to ~3 h); their DDL was parsed instead. 1 still have "
+               "no edge from either source and are ordered by size only: "
+               "D.PUBLIC.ORDERS_VW. Re-run `deps` after the lag before relying "
+               "on the wave order.")
+    md = render_planned_objects(dict(
+        PLAN, dependency_source="account_usage_empty",
+        views_without_dependency_edge=["D.PUBLIC.ORDERS_VW"],
+        dependency_warning=warning, dependency_edge_count=0))
+    section = _order_section(md)
+    assert "so views follow their base tables" not in md
+    assert "`D.PUBLIC.ORDERS_VW`" in section
+    assert "size only" in section
+    assert "NOT guaranteed" in section
+    assert warning in md
+
+
+def test_order_of_creation_flags_unordered_views_even_without_a_producer_warning():
+    # ACCOUNT_USAGE denied -> parsed_ddl with warning None, and a view whose
+    # only reference lies outside the inventory still has no edge.
+    md = render_planned_objects(dict(
+        PLAN, dependency_source="parsed_ddl",
+        views_without_dependency_edge=["D.PUBLIC.ORDERS_VW"],
+        dependency_warning=None))
+    assert "so views follow their base tables" not in md
+    assert "`D.PUBLIC.ORDERS_VW`" in _order_section(md)
+    assert "None" not in _order_section(md)
+
+
+def test_order_of_creation_keeps_the_plain_sentence_when_every_view_has_an_edge():
+    assert "so views follow their base tables" in render_planned_objects(PLAN)
+    assert "so views follow their base tables" in render_planned_objects(
+        dict(PLAN, views_without_dependency_edge=[], dependency_warning=None))
+
+
+# --------------------------------------------------------------------------
+# "## Target structure to exist first" must not tell the reader, in three
+# consecutive lines, to create catalog `d`, that `d` is the EXTERNAL pointer
+# and not the target, and that the clone creates `d.public` -- a schema the
+# structure job never creates. The lines are labelled per path.
+# --------------------------------------------------------------------------
+
+_DEFAULT_NOTE = ("The catalog part of the Target column is the source database "
+                 "name mirrored 1:1 (d); no --bronze-catalog-prefix was given. "
+                 "The in-AIDP structure job (01_create_structure) does not read "
+                 "this column: it creates <--target-catalog>.<schema>.<table> "
+                 "under the catalog passed to `provision --target-catalog`. In "
+                 "the runbook the catalog named after the source database is "
+                 "the read-only EXTERNAL pointer at Snowflake, not the target "
+                 "-- the job refuses source == target.")
+_PREFIX_NOTE = ("The catalog part of the Target column is the "
+                "--bronze-catalog-prefix 'lake', with the schema part in the "
+                "'db_schema' style. The in-AIDP structure job "
+                "(01_create_structure) does not read this column: it creates "
+                "<--target-catalog>.<schema>.<table> under the catalog passed to "
+                "`provision --target-catalog`. Pass 'lake' to `provision "
+                "--target-catalog` for the catalogs to agree; the schema part "
+                "the job creates is the source schema, not the 'db_schema' form "
+                "shown here.")
+
+
+def _structure_section(md):
+    return md.split("## Target structure to exist first", 1)[1].split("\n## ", 1)[0]
+
+
+def test_default_mode_target_structure_does_not_ask_for_the_mirrored_catalog():
+    md = render_planned_objects(dict(PLAN, target_catalog_note=_DEFAULT_NOTE,
+                                     catalogs_to_create=["d"],
+                                     schemas_to_create=[["d", "public"]]))
+    section = _structure_section(md)
+    assert "create these" not in section, section
+    assert "Catalogs" in section, "the word test :94 pins must survive"
+    assert "not a catalog to create" in section
+    assert "`provision --target-catalog`" in section
+    assert _DEFAULT_NOTE in section
+    structure_line = next(l for l in section.splitlines()
+                          if l.startswith("Schemas the structure job"))
+    assert "`public`" in structure_line and "d.public" not in structure_line
+    assert "Older `deploy`/`notebook` path only: `d.public`" in section
+    assert "exist as INTERNAL" in section
+    assert "Schemas the clone will create" not in section
+
+
+def test_prefix_mode_target_structure_names_the_catalog_to_create_and_the_source_schema():
+    md = render_planned_objects(dict(PLAN, bronze_catalog_prefix="lake",
+                                     target_catalog_note=_PREFIX_NOTE,
+                                     catalogs_to_create=["lake"],
+                                     schemas_to_create=[["lake", "d_public"]]))
+    section = _structure_section(md)
+    assert "create these" in section and "`lake`" in section
+    assert _PREFIX_NOTE in section
+    structure_line = next(l for l in section.splitlines()
+                          if l.startswith("Schemas the structure job"))
+    assert "`public`" in structure_line and "d_public" not in structure_line
+    assert "Older `deploy`/`notebook` path only: `lake.d_public`" in section
+    assert "Schemas the clone will create" not in section
+
+
+def test_a_plan_without_the_note_keeps_the_legacy_two_lines():
+    plan = {k: v for k, v in PLAN.items() if k != "target_catalog_note"}
+    section = _structure_section(render_planned_objects(plan))
+    assert "create these" in section
+    assert "Schemas the clone will create: `D.PUBLIC`" in section
