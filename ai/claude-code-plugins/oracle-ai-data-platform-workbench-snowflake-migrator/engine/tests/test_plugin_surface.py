@@ -655,3 +655,20 @@ def test_the_docs_scope_the_gitignore_claim_to_the_plugin_folder():
         assert "your own `.gitignore`" in flat or "that repo's `.gitignore`" in flat, rel
         assert "it is **gitignored**, and" not in flat, f"{rel}: unscoped claim"
         assert "gitignored, `0600`" not in flat, f"{rel}: unscoped claim"
+
+
+def test_the_docs_say_how_the_aidp_clis_authenticate():
+    """"Auth is not configured in this plugin at all" was not true: the
+    engine appends `--auth api_key --region <from the OCID>` to every `aidp`
+    invocation (target/executor.py), and `oci raw-request` runs with the
+    user's ~/.oci/config profile. An operator whose default profile is a
+    session token, or who keeps the right key under another profile, needs
+    to know which profile and which auth mode the plugin actually uses."""
+    for rel in ("README.md", "skills/snowflake-migrator-bootstrap/SKILL.md"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        flat = " ".join(text.lower().split())
+        assert "not configured in this plugin at all" not in flat, rel
+        assert "~/.oci/config" in text, rel
+        assert "`default`" in flat or "default profile" in flat, \
+            f"{rel}: must name the profile `oci` runs with"
+        assert "api_key" in text, f"{rel}: must say the aidp CLI is invoked with api_key auth"

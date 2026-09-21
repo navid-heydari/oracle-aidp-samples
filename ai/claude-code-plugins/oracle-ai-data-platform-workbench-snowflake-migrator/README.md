@@ -100,9 +100,15 @@ Any field can still be overridden per run with a flag (`--role`,
 
 #### What is *not* in that file
 
-**AIDP authentication.** The plugin drives the `oci` and `aidp` CLIs, which
-use your normal OCI setup (`~/.oci/config`, from `oci setup config`). The
-config only names *which* AIDP resources to use — never how to authenticate.
+**AIDP authentication.** The plugin drives the `oci` and `aidp` CLIs with
+your normal OCI setup (`~/.oci/config`, from `oci setup config`), and this
+is exactly how: `oci raw-request` runs with that file's `DEFAULT` profile
+(or whatever `OCI_CLI_PROFILE` selects in your shell; the config's
+`aidp.oci_profile` key is accepted but not yet passed through), and every
+`aidp` invocation is given `--auth api_key` plus `--region` derived from the
+DataLake OCID, because the `aidp` CLI's own default is a session token. So
+the API key the plugin uses is the one in that profile. The config only
+names *which* AIDP resources to use — never a credential for them.
 
 #### The rules that go with an inline secret
 

@@ -85,7 +85,7 @@ one file to fill in, and the secret goes *in that file*, not into the chat:
 | Snowflake account/host, user, warehouse, database, role, schema | `snowmig-config.yaml`, under `snowflake:` | created from the template; `0600` on POSIX; gitignored only inside the plugin folder — tell the user to add it to their own `.gitignore` when it lives elsewhere |
 | The Snowflake **password or private key** | the same file — `password:` or `private_key: |` inline | inline is the default; `*_path` variants exist but are not what you propose first |
 | Which AIDP resources to use (DataLake OCID, workspace, cluster, catalog) | the same file, under `aidp:` | any of them can also be passed as a flag, and a flag wins |
-| AIDP **authentication** | `~/.oci/config` (`oci setup config`) | **not configured in this plugin at all** — it drives the `oci`/`aidp` CLIs with the user's normal OCI setup |
+| AIDP **authentication** | `~/.oci/config` (`oci setup config`) | never a value in the config file. `oci raw-request` runs with that file's `DEFAULT` profile (or `OCI_CLI_PROFILE` from the shell; `aidp.oci_profile` is accepted but not yet passed through); every `aidp` call gets `--auth api_key --region <from the OCID>` appended, because the `aidp` CLI defaults to a session token. If a call fails with an auth error, that profile's API key is what to check |
 
 Rules that come with an inline secret, and they are not optional:
 
