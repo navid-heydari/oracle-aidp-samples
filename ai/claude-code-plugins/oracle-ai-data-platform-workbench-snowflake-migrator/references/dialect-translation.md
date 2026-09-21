@@ -24,7 +24,7 @@ worse than a blocked object.
 | `T05_DATEADD` | `DATEADD(unit, n, col)` | `date_add` / `add_months` / `+ INTERVAL`, chosen by unit. Argument order differs and the unit decides the function, so a rename would be wrong. Only the exact forms are rewritten: `n` an integer literal or a column (a column is parenthesised where it meets the `* 7` / `* 12` multiplier; for hour/minute/second only a literal, because Spark's `INTERVAL` takes a constant). An expression amount, an unrecognised unit, a quoted unit or a nested call such as `CURRENT_DATE()` is refused, never guessed or carried over. **Caveat, recorded on every application:** exact for `DATE` operands only — Spark `date_add`/`add_months` return `DATE`, so a `TIMESTAMP` operand is truncated to `DATE`; the DDL plan says so instead of calling the view exact |
 | `T06_LISTAGG` | `LISTAGG(x, sep)` | `concat_ws(sep, collect_list(x))`. Refused with `WITHIN GROUP (ORDER BY …)`, because `collect_list` does not guarantee ordering and the semantics would be lost silently |
 
-## Declared — recognised, not rewritten (9)
+## Declared — recognised, not rewritten (11)
 
 | Rule | Why a substitution is not safe |
 |---|---|
@@ -37,6 +37,8 @@ worse than a blocked object.
 | `T16_VARIANT_PATH` | Needs the VARIANT column given a concrete struct type first |
 | `T17_DECODE` | Variable argument count with a positional default; needs the argument list parsed |
 | `T18_NVL2` | Simple in shape, but operands may contain commas, so it needs argument parsing |
+| `T19_DATEDIFF` | `DATEDIFF` / `TIMESTAMPDIFF`: Snowflake counts unit-boundary crossings while Spark's `datediff` / `months_between` truncate, and the Snowflake unit abbreviations (`dd`, `yy`, `mm`, `hh`, `mi`, `ss`) are not Spark datetime units. Needs a per-unit expression and a decision for sub-day units |
+| `T20_TIMESTAMPADD` | `TIMESTAMPADD` / `TIMEADD`: aliases of `DATEADD`, but their operands are `TIMESTAMP` or `TIME` by construction, exactly where the `DATEADD` rewrite is not exact. Refused until decided |
 
 ## Where it is used
 

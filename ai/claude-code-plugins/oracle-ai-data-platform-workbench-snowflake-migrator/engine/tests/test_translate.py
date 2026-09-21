@@ -16,7 +16,8 @@ def test_registry_declares_every_known_construct():
     ids = {r.rule_id for r in RULES}
     for expected in ("T01_IFF", "T02_CAST_SHORTHAND", "T03_ARRAY_CONSTRUCT",
                      "T05_DATEADD", "T06_LISTAGG", "T10_QUALIFY",
-                     "T11_LATERAL_FLATTEN", "T12_GENERATOR"):
+                     "T11_LATERAL_FLATTEN", "T12_GENERATOR", "T19_DATEDIFF",
+                     "T20_TIMESTAMPADD"):
         assert expected in ids, expected
 
 
@@ -420,3 +421,36 @@ def test_a_rule_whose_output_still_matches_its_own_detector_is_reported(monkeypa
     r = translate.translate_sql("select FAKE(x) from t")
     assert r.applied == []
     assert [u["rule_id"] for u in r.unsupported] == ["T99_FAKE"]
+
+
+# --------------------------------------------------------------------------
+# DATEDIFF / TIMESTAMPDIFF / TIMESTAMPADD / TIMEADD were documented as
+# blocking but had no rule at all, so a view using them was stamped portable
+# and carried verbatim.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("sql", [
+    "select DATEDIFF(dd, a, b) from t",
+    "select DATEDIFF('day', a, b) from t",
+    "select TIMESTAMPDIFF(hour, a, b) from t",
+    "select TIMESTAMPADD(day, 1, ts) from t",
+    "select TIMEADD(hour, 1, ts) from t",
+])
+def test_datediff_family_is_declared_not_rewritten(sql):
+    r = t(sql)
+    assert r.sql == sql
+    assert r.applied == []
+    assert {u["rule_id"] for u in r.unsupported} & {"T19_DATEDIFF", "T20_TIMESTAMPADD"}, (
+        r.unsupported)
+
+
+def test_dateadd_still_translates_when_datediff_is_present():
+    # Guards against the DATEADD pattern being widened by mistake.
+    r = t("select DATEADD(dd, 1, d), DATEDIFF(dd, a, b) from t")
+    assert "T05_DATEADD" in [a["rule_id"] for a in r.applied]
+    assert "T19_DATEDIFF" in [u["rule_id"] for u in r.unsupported]
+
+
+def test_datediff_in_a_comment_or_literal_does_not_block():
+    r = t("select 'DATEDIFF(dd,a,b)' as s, a -- DATEDIFF(dd, x, y)\n from t")
+    assert r.unsupported == []

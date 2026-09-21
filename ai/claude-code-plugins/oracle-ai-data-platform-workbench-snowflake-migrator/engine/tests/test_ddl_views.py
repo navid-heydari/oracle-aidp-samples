@@ -66,6 +66,8 @@ def test_portable_view_has_no_unsupported_constructs():
     ("select system$current_user() from t", "SYSTEM$"),
     ("select * from t at(timestamp => x)", "Time Travel"),
     ("select j:field from t", "VARIANT path"),
+    ("select datediff(day, a, b) from t", "DATEDIFF / TIMESTAMPDIFF"),
+    ("select timestampadd(day, 1, ts) from t", "TIMESTAMPADD / TIMEADD"),
 ])
 def test_snowflake_only_constructs_detected(sql, construct):
     found = [c["construct"] for c in detect_unsupported_constructs(sql)]
@@ -337,3 +339,23 @@ def test_a_view_with_a_nested_dateadd_is_blocked_not_stamped_portable():
     assert "DATEADD" in res.blocked_reason
     assert not any(r.rule_id in ("R42_VIEW_PORTABLE_SQL", "R43_VIEW_DIALECT_TRANSLATED")
                    for r in res.rules_applied)
+
+
+# --- the constructs table is derived from the rules, not hand-maintained ---
+
+def test_unsupported_constructs_table_is_derived_from_rules():
+    from snowflake_source.dialect.translate import RULES
+    assert set(UNSUPPORTED_CONSTRUCTS) == {
+        r.construct for r in RULES if r.status == "declared"}
+
+
+def test_datediff_view_is_blocked_end_to_end():
+    from plan.build import _view_verdict
+    ddl = ("create view V as select DATEDIFF(dd, order_date, ship_date) as d "
+           "from D.S.T")
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is True
+    assert "DATEDIFF" in res.blocked_reason
+    ok, category, reason = _view_verdict(view_record(ddl=ddl))
+    assert ok is False and category == "snowflake_only_sql"
+    assert "DATEDIFF" in reason

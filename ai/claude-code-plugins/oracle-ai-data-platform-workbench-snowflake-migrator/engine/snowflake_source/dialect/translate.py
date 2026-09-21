@@ -324,6 +324,24 @@ RULES: tuple[TranslationRule, ...] = (
         "declared", r"\bNVL2\s*\(", None,
         "Mechanically simple but the operands may themselves contain commas, so "
         "it needs argument parsing to split safely."),
+    TranslationRule(
+        "T19_DATEDIFF", "DATEDIFF / TIMESTAMPDIFF",
+        "DATEDIFF(unit, a, b) / TIMESTAMPDIFF(unit, a, b) -> unit-specific "
+        "Spark expression", "declared",
+        r"\b(?:DATEDIFF|TIMESTAMPDIFF)\s*\(", None,
+        "Snowflake counts unit-boundary crossings (DATEDIFF(day, '23:59', "
+        "'00:01') is 1) while Spark's datediff / months_between truncate, and "
+        "the Snowflake unit abbreviations (dd, yy, mm, hh, mi, ss) are not Spark "
+        "datetime units. An exact rewrite needs a per-unit expression and a "
+        "decision for sub-day units. Not guessed."),
+    TranslationRule(
+        "T20_TIMESTAMPADD", "TIMESTAMPADD / TIMEADD",
+        "TIMESTAMPADD(unit, n, ts) / TIMEADD(unit, n, ts) -> DATEADD-equivalent",
+        "declared", r"\b(?:TIMESTAMPADD|TIMEADD)\s*\(", None,
+        "Aliases of DATEADD in Snowflake. Routing them through the DATEADD unit "
+        "table would inherit its DATE-return caveat on operands that are "
+        "TIMESTAMP or TIME by construction (Spark has no TIME type), so they "
+        "are refused until that is decided."),
 )
 
 

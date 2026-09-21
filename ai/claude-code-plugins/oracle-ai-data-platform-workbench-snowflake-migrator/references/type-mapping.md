@@ -34,30 +34,35 @@ the inventory and reported, not emitted as DDL.
 
 # View SQL portability
 
-A view migrates only if its body contains no Snowflake-only construct. Detected
-constructs **block** the view with the construct named — they are never rewritten
-on a guess, because a view that ships a subtly wrong translation returns numbers.
+A view migrates only if every Snowflake-only construct in its body has an exact
+rewrite. A construct with one is **translated** and the rule id is recorded; a
+construct without one **blocks** the view with the construct named — it is never
+rewritten on a guess, because a view that ships a subtly wrong translation
+returns numbers. The authoritative list is `translate.RULES`, documented in
+[dialect-translation.md](dialect-translation.md); the table below summarises it.
 
 Because Bronze mirrors the source 1:1, object references inside a view body need
 no rewriting; the only question is dialect.
 
-| Construct | Why it blocks |
+| Construct | What happens |
 |---|---|
-| `QUALIFY` | No Spark equivalent; needs a subquery with `WHERE` on the window result |
-| `LATERAL FLATTEN` / `FLATTEN(` | Maps to `explode` / `LATERAL VIEW`, but the mapping depends on the VARIANT shape |
-| `IFF(` | Spark uses `IF()`; a rename is safe but is not applied automatically |
-| `DECODE(` | Must become `CASE` |
-| `NVL2(` | No Spark equivalent; must become `CASE` |
-| `::` cast shorthand | Spark requires `CAST(x AS t)` |
-| `LISTAGG(` | Becomes `collect_list` + `concat_ws` |
-| `GENERATOR(` / `SEQ4(` / `SEQ8(` | Spark uses `range()` |
-| `ARRAY_CONSTRUCT(` | Spark uses `array()` |
-| `OBJECT_CONSTRUCT(` | Spark uses `named_struct()` or `map()` |
-| `SYSTEM$…` | Snowflake-internal, no target |
-| `AT(TIMESTAMP…)` / `BEFORE(` | Time Travel has no Delta equivalent in this form |
-| `col:field` | VARIANT path access; needs an explicit struct design |
-| `DATEADD` / `DATEDIFF` | Argument order and unit strings differ; needs a signature mapping, not a rename |
-| `PIVOT` / `UNPIVOT` | Spark syntax differs materially |
+| `IFF(` | **Translated** to `IF()` (`T01`) |
+| `::` cast shorthand | **Translated** to `CAST(x AS <mapped type>)` through the type mapper (`T02`); an unmappable type blocks with the mapper's reason |
+| `ARRAY_CONSTRUCT(` | **Translated** to `array()` (`T03`) |
+| `OBJECT_CONSTRUCT(` | **Translated** to `named_struct()` (`T04`) |
+| `DATEADD(unit, n, col)` | **Translated** per unit (`T05`) when `n` is an integer literal or a column; any other form blocks. Exact for `DATE` operands only, and the plan says so |
+| `LISTAGG(x, sep)` | **Translated** to `concat_ws(sep, collect_list(x))` (`T06`); `WITHIN GROUP` blocks |
+| `QUALIFY` | Blocks: no Spark equivalent; needs a subquery with `WHERE` on the window result |
+| `LATERAL FLATTEN` / `FLATTEN(` | Blocks: maps to `explode` / `LATERAL VIEW`, but the mapping depends on the VARIANT shape |
+| `GENERATOR(` / `SEQ4(` / `SEQ8(` | Blocks: Spark uses `range()`, and `SEQ4()` has no gapless equivalent |
+| `PIVOT` / `UNPIVOT` | Blocks: Spark syntax differs materially |
+| `SYSTEM$…` | Blocks: Snowflake-internal, no target |
+| `AT(TIMESTAMP…)` / `BEFORE(` | Blocks: Time Travel has no Delta equivalent in this form |
+| `col:field` | Blocks: VARIANT path access; needs an explicit struct design |
+| `DECODE(` | Blocks: must become `CASE` |
+| `NVL2(` | Blocks: no Spark equivalent; must become `CASE` |
+| `DATEDIFF` / `TIMESTAMPDIFF` | Blocks: Snowflake counts unit-boundary crossings, Spark truncates, and `dd`/`yy`/`mm` are not Spark units |
+| `TIMESTAMPADD` / `TIMEADD` | Blocks: `DATEADD` aliases whose operands are `TIMESTAMP`/`TIME` by construction, where the `DATEADD` rewrite is not exact |
 
 `MAX_BY` / `MIN_BY` are **not** blocked — Spark supports them.
 
