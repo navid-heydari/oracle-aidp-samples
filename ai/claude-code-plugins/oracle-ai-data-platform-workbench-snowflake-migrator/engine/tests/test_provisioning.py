@@ -517,3 +517,103 @@ def test_provisioning_creates_the_backup_folder_the_runbook_writes_into(scripts)
               delays=())
     folders = [kw["path"] for op, kw in fake.ops if op == "create_ws_folder"]
     assert BACKUP_FOLDER in folders, folders
+
+
+# --- pagination on the provisioning transport -------------------------------
+#
+# `oci raw-request` surfaces `opc-next-page` under `headers`; the transport
+# used to drop it, so jobs.in_flight_runs read one page of jobRuns and could
+# miss the very run it exists to guard against.
+
+def _paged_proc(pages):
+    """`pages`: page token (None first) -> (items, next token)."""
+    import types
+    asked = []
+
+    def fake(cmd):
+        uri = cmd[cmd.index("--target-uri") + 1] if "--target-uri" in cmd \
+            else " ".join(cmd)
+        asked.append(uri)
+        token = uri.rsplit("page=", 1)[1] if "page=" in uri else None
+        items, nxt = pages[token]
+        env = {"data": {"items": items}, "status": "200 OK"}
+        if nxt:
+            env["headers"] = {"opc-next-page": nxt}
+        return types.SimpleNamespace(returncode=0, stderr="",
+                                     stdout=json.dumps(env))
+
+    return fake, asked
+
+
+def test_list_job_runs_follows_the_next_page():
+    from target.provisioning import make_provision_call
+    fake, asked = _paged_proc({None: ([{"key": "run-1", "endTime": 1}], "P2"),
+                               "P2": ([{"key": "run-2"}], None)})
+    call = make_provision_call(OCID, run_process=fake)
+    out = call("list_job_runs", workspace="ws", job_key="j")
+    assert [i["key"] for i in out["items"]] == ["run-1", "run-2"]
+    assert len(asked) == 2
+    assert "jobKey=j&sortBy=timeCreated" in asked[0] and "page=" not in asked[0]
+    assert asked[1].endswith("jobKey=j&sortBy=timeCreated&page=P2")
+
+
+def test_in_flight_runs_sees_a_run_on_page_two():
+    from target import jobs
+    from target.provisioning import make_provision_call
+    fake, _ = _paged_proc({None: ([{"key": "run-1", "endTime": 123}], "P2"),
+                           "P2": ([{"key": "run-2", "endTime": None}], None)})
+    call = make_provision_call(OCID, run_process=fake)
+    assert jobs.in_flight_runs(call, workspace="ws", job_key="j") == ["run-2"]
+
+
+def test_a_single_page_listing_is_one_request():
+    from target.provisioning import make_provision_call
+    fake, asked = _paged_proc({None: ([{"key": "ws-1"}], None)})
+    call = make_provision_call(OCID, run_process=fake)
+    assert call("list_workspaces")["items"] == [{"key": "ws-1"}]
+    assert len(asked) == 1 and "page=" not in asked[0]
+
+
+def test_a_repeating_token_is_a_transport_error_not_a_loop():
+    from target.provisioning import ProvisionTransportError, make_provision_call
+    fake, asked = _paged_proc({None: ([{"key": "a"}], "P2"),
+                               "P2": ([{"key": "b"}], "P2")})
+    call = make_provision_call(OCID, run_process=fake)
+    with pytest.raises(ProvisionTransportError, match="list_jobs"):
+        call("list_jobs", workspace="ws")
+    assert len(asked) <= 3
+
+
+def test_a_workspace_object_listing_with_a_next_page_is_refused_not_truncated():
+    """list_ws_objects rides the aidp CLI, whose paging flags are unknown. A
+    truncated listing would read uploads as not visible -- or worse, as
+    absent; refusing names the problem."""
+    import types
+    from target.provisioning import ProvisionTransportError, make_provision_call
+
+    def fake(cmd):
+        assert cmd[0] == "aidp"
+        return types.SimpleNamespace(
+            returncode=0, stderr="",
+            stdout='Response:\n' + json.dumps(
+                {"data": {"items": [{"path": "a/b"}]},
+                 "headers": {"opc-next-page": "P2"}}))
+
+    call = make_provision_call(OCID, run_process=fake)
+    with pytest.raises(ProvisionTransportError, match="page"):
+        call("list_ws_objects", workspace="ws", path="a")
+
+
+def test_provision_list_commands_carry_the_page_token():
+    for op, kw in (("list_workspaces", {}),
+                   ("list_clusters", {"workspace": "ws"}),
+                   ("list_libraries", {"workspace": "ws", "cluster": "cl"}),
+                   ("list_jobs", {"workspace": "ws"}),
+                   ("list_task_runs", {"workspace": "ws", "run_key": "r"})):
+        plain = build_provision_command("oci_raw", op, OCID, **kw)
+        assert "page=" not in " ".join(plain)
+        assert build_provision_command("oci_raw", op, OCID, page=None,
+                                       **kw) == plain
+        uri = build_provision_command("oci_raw", op, OCID, page="T2", **kw)
+        uri = uri[uri.index("--target-uri") + 1]
+        assert uri.endswith("page=T2") and uri.count("?") == 1, (op, uri)

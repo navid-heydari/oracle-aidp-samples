@@ -85,11 +85,13 @@ def make_call(target, *, backend: str, run_process=None):
     Separate from `make_run_sql` because the catalog API is not SQL: it takes
     an operation plus a JSON body and returns one object, not rows.
     """
-    from .executor import build_command, parse_cli_json
+    from .executor import build_command, collect_pages, parse_cli_envelope
 
     runner = run_process or _default_run_process
 
-    def call(operation: str, **kwargs) -> dict:
+    def _once(operation: str, kwargs: dict) -> tuple[list[dict], str | None]:
+        """One request: its rows, and the next-page token if the server sent
+        one in `opc-next-page`."""
         body = kwargs.get("body")
         spooled = None
         # A create_catalog body carries the credential. In argv it is visible
@@ -110,19 +112,40 @@ def make_call(target, *, backend: str, run_process=None):
                 raise RuntimeError(
                     f"{operation} failed (exit {proc.returncode}): "
                     f"{(proc.stderr or proc.stdout or '')[:300]}")
-            rows = parse_cli_json(proc.stdout)
+            rows, headers = parse_cli_envelope(proc.stdout)
         finally:
             if spooled:
                 try:
                     os.unlink(spooled)
                 except OSError:
                     pass
+        next_page = headers.get("opc-next-page")
+        if next_page and cmd[0] == "aidp":
+            # The CLI's paging flags are undocumented, so the rest cannot be
+            # asked for. Page one handed back as the whole collection would
+            # make every object past it "absent"; say so instead.
+            raise RuntimeError(
+                f"{operation}: the aidp CLI answered with a next-page token "
+                f"({str(next_page)[:40]!r}), so this listing is only its "
+                f"first page and the rest cannot be requested through that "
+                f"CLI. Use the oci CLI (backend oci_raw), which follows "
+                f"opc-next-page.")
+        return rows, next_page
+
+    def call(operation: str, **kwargs) -> dict:
         # A list operation returns a COLLECTION; a create/get returns ONE
         # object. Collapsing both to rows[0] made key resolution see a single
         # schema instead of the list, so every read-back failed while the
-        # objects had in fact been created.
+        # objects had in fact been created. A collection may also span
+        # PAGES: `opc-next-page` is followed until the server stops sending
+        # one, so an object past page one is not read as absent either.
         if operation.startswith("list_"):
-            return {"items": rows}
+            items = collect_pages(
+                lambda page: _once(operation, {**kwargs, "page": page}
+                                   if page else kwargs),
+                operation)
+            return {"items": items}
+        rows, _ = _once(operation, kwargs)
         return rows[0] if rows else {}
 
     return call

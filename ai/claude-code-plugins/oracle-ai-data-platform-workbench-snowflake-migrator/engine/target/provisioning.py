@@ -101,14 +101,15 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
     import subprocess
 
     from .runner import _printable
-    from .executor import parse_cli_json
+    from .executor import collect_pages, parse_cli_envelope
 
     def _run(cmd):
         return subprocess.run(cmd, capture_output=True, text=True, check=False, encoding="utf-8", errors="replace")
 
     runner = run_process or _run
 
-    def call(operation: str, **kwargs) -> dict:
+    def _once(operation: str, kwargs: dict) -> tuple[list[dict], dict]:
+        """One request: its rows and its response headers (lower-cased)."""
         spooled = None
         # File CONTENT never goes through this transport at all: uploads use
         # the `workspace-object` surface, which takes a local path. A body
@@ -129,19 +130,45 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
                 raise ProvisionTransportError(
                     f"{operation} failed (exit {proc.returncode}): "
                     f"{(proc.stderr or proc.stdout or '')[:300]}")
-            stdout = proc.stdout or ""
-            # The aidp CLI prefixes its JSON with a literal "Response:" line.
-            if stdout.lstrip().startswith("Response:"):
-                stdout = stdout.lstrip()[len("Response:"):]
-            rows = parse_cli_json(stdout)
+            # The aidp CLI's literal "Response:" prefix is stripped by the
+            # parser; the headers come back with the rows because a list
+            # endpoint names its next page in one of them.
+            rows, headers = parse_cli_envelope(proc.stdout or "")
         finally:
             if spooled:
                 try:
                     os.unlink(spooled)
                 except OSError:
                     pass
+        if headers.get("opc-next-page") and cmd[0] == "aidp":
+            # The workspace-object listing rides the aidp CLI, whose paging
+            # flags are undocumented. Page one handed back as the whole would
+            # read every object past it as absent; refuse and say why.
+            raise ProvisionTransportError(
+                f"{operation}: the aidp CLI answered with a next-page token, "
+                f"so this listing is only its first page and the rest cannot "
+                f"be requested through that CLI; the listing is incomplete "
+                f"and was not used.")
+        return rows, headers
+
+    def call(operation: str, **kwargs) -> dict:
         if operation.startswith("list_"):
-            return {"items": rows}
+            # A collection may span pages: `opc-next-page` is followed until
+            # the server stops sending one, so jobs.in_flight_runs and every
+            # look-first check see the whole collection.
+            def fetch(page):
+                rows, headers = _once(operation, {**kwargs, "page": page}
+                                      if page else kwargs)
+                return rows, headers.get("opc-next-page")
+
+            try:
+                items = collect_pages(fetch, operation)
+            except ProvisionTransportError:
+                raise
+            except RuntimeError as exc:
+                raise ProvisionTransportError(str(exc)) from exc
+            return {"items": items}
+        rows, _ = _once(operation, kwargs)
         return rows[0] if rows else {}
 
     return call
