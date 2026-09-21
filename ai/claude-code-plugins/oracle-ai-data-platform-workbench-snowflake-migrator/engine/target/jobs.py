@@ -117,18 +117,28 @@ def task_started(call: Callable[..., dict], *, workspace: str,
 
 def cancel_run(call: Callable[..., dict], *, workspace: str, run_key: str,
                poll_seconds: float = 5.0, max_polls: int = 12,
-               sleep: Callable[[float], None] = time.sleep) -> str:
-    """Cancel a run and poll it to a terminal state; returns that state.
+               sleep: Callable[[float], None] = time.sleep,
+               on_cancel_error: Callable[[str], None] | None = None) -> str:
+    """Cancel a run and poll it to a terminal state; returns the last state
+    read, which the CALLER must check against TERMINAL_STATES.
 
     The cancel answers 202, which is acceptance and not completion, so the
     run is read back. This is polled to terminal rather than fired and
     forgotten because `maxConcurrentRuns: 1` means a resubmit while the old
     run still holds the slot is accepted and then silently discarded.
+
+    A cancel that raises is not swallowed silently: the poll below is still
+    the real answer (the run may already have ended), but the error text
+    goes to `on_cancel_error`, because "the cancel never happened" -- the
+    `aidp` CLI missing on an oci-only machine is the realistic case, it
+    being the one job operation routed through that CLI -- must reach the
+    report rather than read as a slow cancel.
     """
     try:
         call("cancel_job_run", workspace=workspace, run_key=run_key)
-    except Exception:
-        pass  # it may already have ended; the poll below is the real answer
+    except Exception as exc:
+        if on_cancel_error:
+            on_cancel_error(f"{type(exc).__name__}: {str(exc)[:200]}")
     status = "UNKNOWN"
     for _ in range(max_polls):
         try:
@@ -225,6 +235,15 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
     is deliberately generous to measure only the pick-up, not the work: it
     checks whether the cluster TOOK the task, which is independent of how
     long the task then runs. Set `cold_start_restarts=0` to disable.
+
+    The resubmit happens ONLY once the cancel is confirmed terminal. If the
+    cancel raises or the run never leaves CANCELING within the cancel poll,
+    the slot is still held; a resubmit would be accepted and discarded, and
+    the watch would then describe the discarded run. So the original run
+    is kept and watched, the failed attempt is recorded in `restarts` with
+    `new_run: None`, and the result carries `cancel_unconfirmed: True` so
+    the caller can say "cold start suspected; cancel unconfirmed" and exit
+    non-zero instead of STILL RUNNING.
     """
     # A job created with `maxConcurrentRuns: 1` still ACCEPTS a second run
     # while the first is going -- and then never executes it: the run is
@@ -275,18 +294,30 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
             # The cluster has not taken the task. Let this run go and submit
             # another -- polling the cancel to terminal first, because the
             # slot must be free or the resubmit is accepted and discarded.
+            cancel_errors: list[str] = []
             ended = cancel_run(call, workspace=workspace, run_key=run_key,
-                               sleep=sleep)
+                               sleep=sleep, on_cancel_error=cancel_errors.append)
+            restarts_left -= 1
+            after, waited = waited, 0.0
+            if ended not in TERMINAL_STATES:
+                # The slot is NOT free. Keep watching the run we have; the
+                # attempt is on the record and the caller reports it.
+                restarts.append({"abandoned_run": None, "cancel_state": ended,
+                                 "cancel_error": (cancel_errors[0]
+                                                  if cancel_errors else None),
+                                 "new_run": None, "kept_run": run_key,
+                                 "after_seconds": after})
+                continue
             stale = run_key
             run_key = run_job(call, workspace=workspace, job_key=job_key,
                               parameters=parameters)
             restarts.append({"abandoned_run": stale, "cancel_state": ended,
+                             "cancel_error": (cancel_errors[0]
+                                              if cancel_errors else None),
                              "new_run": run_key,
-                             "after_seconds": waited})
+                             "after_seconds": after})
             if on_restart:
                 on_restart(stale, run_key)
-            restarts_left -= 1
-            waited = 0.0
             status, message = "UNKNOWN", ""
     output = ""
     try:
@@ -297,4 +328,6 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
             "output": output, "terminal": terminal, "restarts": restarts,
             "polls": attempt,
             "unrecognised": (not terminal) and status not in ACTIVE_STATES,
+            "cancel_unconfirmed": any(r.get("new_run") is None
+                                      for r in restarts),
             "ok": terminal and status in SUCCESS_STATES}

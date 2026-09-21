@@ -792,6 +792,17 @@ def cmd_run(args) -> int:
                   f'in the console and report the status so it can be '
                   f'classified.')
             return 1
+        if result.get("cancel_unconfirmed"):
+            # The watchdog fired but the cancel never reached a terminal
+            # state, so nothing was resubmitted: the slot is still held by a
+            # run the cluster may never pick up. That is not "still running"
+            # in the healthy sense, and not a verdict either.
+            print(f'  {slug}: cold start suspected; cancel unconfirmed after '
+                  f'{args.max_polls} poll(s). Run {result["run_key"]} was '
+                  f'never confirmed cancelled, so nothing was resubmitted. '
+                  f'Cancel it by hand (`aidp workflow cancel-job-run '
+                  f'{args.workspace} {result["run_key"]}`), then re-run.')
+            return 1
         print(f"  {slug}: STILL RUNNING after {args.max_polls} poll(s) — "
               f"not failed, not done. Re-check with the run key above.")
         return 0
@@ -808,6 +819,14 @@ def _render_run(result: dict) -> str:
                    f'{polls} poll(s) the run reports a status this plugin '
                    f'classifies as neither running nor ended. This is neither '
                    f'success nor failure; check the run in the console.')
+    elif not result.get("terminal") and result.get("cancel_unconfirmed"):
+        verdict = (f"**STILL RUNNING — cold start suspected; cancel "
+                   f"unconfirmed.** The cluster had not picked up run "
+                   f"`{result.get('run_key')}`, the cancel did not reach a "
+                   f"terminal state (see below), so nothing was resubmitted "
+                   f"and the poll budget ({polls} poll(s)) ran out with it "
+                   f"still `{result.get('status')}`. Cancel it by hand and "
+                   f"re-run; this is neither success nor failure.")
     elif not result.get("terminal"):
         verdict = (f"**STILL RUNNING** — the poll budget ({polls} poll(s)) "
                    f"ran out with the job still `{result.get('status')}`. "
@@ -843,18 +862,27 @@ def _render_run(result: dict) -> str:
             "## Cold-start restarts",
             "",
             "The cluster did not pick up the run(s) below — the job run sat "
-            "at `RUNNING` with its task never started. Each was cancelled "
-            "and resubmitted. **The output below belongs to the last run "
-            "key, not the first.**",
+            "at `RUNNING` with its task never started. A run whose cancel "
+            "reached a terminal state was resubmitted, and **the output "
+            "below then belongs to the last run key, not the first.** A "
+            "run whose cancel did NOT (it raised, or never left CANCELING) "
+            "was kept: resubmitting into a slot that is still held gets "
+            "the new run accepted and discarded.",
             "",
-            "| Abandoned run | Cancelled to | Waited | Resubmitted as |",
+            "| Run | Cancelled to | Waited | Outcome |",
             "|---|---|---|---|",
         ]
-        lines += [
-            f'| `{r.get("abandoned_run")}` | `{r.get("cancel_state")}` | '
-            f'{r.get("after_seconds"):.0f}s | `{r.get("new_run")}` |'
-            for r in result["restarts"]
-        ]
+        for r in result["restarts"]:
+            if r.get("new_run"):
+                outcome = f'resubmitted as `{r.get("new_run")}`'
+                run = r.get("abandoned_run")
+            else:
+                outcome = ("kept — cancel unconfirmed"
+                           + (f': {r.get("cancel_error")}'
+                              if r.get("cancel_error") else ""))
+                run = r.get("kept_run")
+            lines.append(f'| `{run}` | `{r.get("cancel_state")}` | '
+                         f'{r.get("after_seconds"):.0f}s | {outcome} |')
         lines.append("")
     lines += ["## Output", "", "```", (result.get("output") or "(none)").strip(),
               "```", ""]

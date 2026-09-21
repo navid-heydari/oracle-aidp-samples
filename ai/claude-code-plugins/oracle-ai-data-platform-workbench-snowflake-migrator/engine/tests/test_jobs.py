@@ -470,3 +470,86 @@ def test_every_terminal_state_ends_a_cancel_poll(state):
     assert jobs.cancel_run(call, workspace="ws", run_key="r",
                            sleep=lambda s: None) == state
     assert seen["n"] == 1
+
+
+# --- a cancel that never lands must not be followed by a resubmit ----------
+#
+# The watchdog used to call run_job whatever cancel_run came back with, and
+# cancel_run swallowed every exception from the cancel itself. So on a machine
+# with only the `oci` CLI (the cancel is the one job operation routed through
+# `aidp`), or when the cancel sat in CANCELING past the poll, run-2 went into
+# the slot run-1 still held, was accepted and discarded, and the report then
+# described the discarded run -- as SUCCESS with no output if AIDP marks it so.
+
+
+class CancelNeverLands(ColdStart):
+    """`missing_cli`: cancel_job_run raises like a missing binary.
+    `canceling`: the cancel is accepted and the run never leaves CANCELING."""
+
+    def __init__(self, mode):
+        super().__init__(ignore_runs=99)
+        self.mode = mode
+        self.cancel_attempts = 0
+
+    def __call__(self, operation, **kw):
+        if operation == "cancel_job_run":
+            self.cancel_attempts += 1
+            if self.mode == "missing_cli":
+                raise FileNotFoundError(2, "aidp not found")
+            self.cancelled.append(kw["run_key"])
+            return {}
+        if operation == "get_job_run" and self.mode == "canceling" \
+                and kw["key"] in self.cancelled:
+            return {"state": {"status": "CANCELING"}}
+        return super().__call__(operation, **kw)
+
+
+def test_a_cancel_that_raises_is_recorded_and_nothing_is_resubmitted():
+    fake = CancelNeverLands("missing_cli")
+    res = watch_job(fake, workspace="ws", job_key="j", poll_seconds=30,
+                    cold_start_seconds=60, max_polls=10, sleep=lambda s: None)
+    assert fake.submitted == ["run-1"], "the slot was never freed"
+    assert res["run_key"] == "run-1"
+    assert res["terminal"] is False and res["ok"] is False
+    assert res["cancel_unconfirmed"] is True
+    entry = res["restarts"][0]
+    assert entry["new_run"] is None and entry["kept_run"] == "run-1"
+    assert "FileNotFoundError" in entry["cancel_error"]
+    assert fake.cancel_attempts == 1, "the one restart was spent on it"
+
+
+def test_a_cancel_stuck_in_canceling_is_not_followed_by_a_resubmit():
+    fake = CancelNeverLands("canceling")
+    res = watch_job(fake, workspace="ws", job_key="j", poll_seconds=30,
+                    cold_start_seconds=60, max_polls=10, sleep=lambda s: None)
+    assert fake.submitted == ["run-1"]
+    entry = res["restarts"][0]
+    assert entry["cancel_state"] == "CANCELING"
+    assert entry["new_run"] is None
+    assert res["cancel_unconfirmed"] is True
+
+
+def test_a_confirmed_cancel_still_resubmits_and_is_not_flagged():
+    fake = ColdStart(ignore_runs=1)
+    res = watch_job(fake, workspace="ws", job_key="j", poll_seconds=30,
+                    cold_start_seconds=60, max_polls=10, sleep=lambda s: None)
+    assert fake.submitted == ["run-1", "run-2"]
+    assert res["cancel_unconfirmed"] is False
+    assert res["restarts"][0]["cancel_error"] is None
+
+
+def test_cancel_run_reports_the_cancel_error_instead_of_swallowing_it():
+    seen = []
+
+    def call(op, **kw):
+        if op == "cancel_job_run":
+            raise FileNotFoundError(2, "aidp not found")
+        if op == "get_job_run":
+            return {"state": {"status": "RUNNING"}}
+        raise AssertionError(op)
+
+    state = jobs.cancel_run(call, workspace="ws", run_key="r", max_polls=2,
+                            sleep=lambda s: None, on_cancel_error=seen.append)
+    assert state == "RUNNING"
+    assert len(seen) == 1 and "FileNotFoundError" in seen[0]
+    assert "aidp not found" in seen[0]

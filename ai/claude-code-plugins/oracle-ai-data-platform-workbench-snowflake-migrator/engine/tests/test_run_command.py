@@ -117,3 +117,36 @@ def test_an_unrecognised_state_exits_1_rather_than_still_running(
     assert "STILL RUNNING" not in md
     assert "unrecognised" in md.lower()
     assert fake.submitted == 1
+
+
+def test_an_unconfirmed_cold_start_cancel_exits_1_and_says_so(
+        tmp_path, monkeypatch, capsys):
+    """Only the `oci` CLI on this machine: the cancel (the one job operation
+    routed through `aidp`) raises. Nothing may be resubmitted into the slot
+    run-1 still holds, and the report must say what happened."""
+    fake = Runs("RUNNING", started=False,
+                cancel=FileNotFoundError(2, "aidp not found"))
+    _install(monkeypatch, fake)
+    rc = snowmig.cmd_run(_args(tmp_path, max_polls=6, poll_seconds=30))
+    assert rc == 1
+    assert fake.submitted == 1
+    md = _run_md(tmp_path)
+    assert "cold start suspected" in md and "cancel unconfirmed" in md
+    assert "FileNotFoundError" in md
+    assert "resubmitted as" not in md.lower()
+    assert "`None`" not in md
+    assert "cancel unconfirmed" in capsys.readouterr().out
+
+
+def test_a_confirmed_restart_still_renders_the_resubmitted_run():
+    md = snowmig._render_run({
+        "job": "j", "job_key": "k", "workspace": "ws", "run_key": "run-2",
+        "status": "SUCCESS", "message": "", "output": "ok", "terminal": True,
+        "ok": True, "polls": 3, "unrecognised": False,
+        "cancel_unconfirmed": False,
+        "restarts": [{"abandoned_run": "run-1", "cancel_state": "CANCELED",
+                      "cancel_error": None, "new_run": "run-2",
+                      "after_seconds": 60.0}]})
+    assert "**SUCCESS**" in md
+    assert "`run-1`" in md and "`run-2`" in md
+    assert "CANCELED" in md
