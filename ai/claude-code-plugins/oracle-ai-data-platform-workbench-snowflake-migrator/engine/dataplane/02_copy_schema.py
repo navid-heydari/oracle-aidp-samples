@@ -288,10 +288,12 @@ def main(argv: list[str] | None = None) -> int:
         # INTO ... SELECT *, and that layout is not the plan's.
         structure_path = reports / f"structure_report_{args.schema.lower()}.json"
         created = []
+        objects = None
         if structure_path.is_file():
             prior = json.loads(structure_path.read_text(encoding="utf-8"))
             if prior.get("target") in (None, target):
-                created = [n for n, rec in (prior.get("objects") or {}).items()
+                objects = prior.get("objects") or {}
+                created = [n for n, rec in objects.items()
                            if rec.get("status") in ("created", "already_existed")]
         if created:
             names = created
@@ -300,8 +302,21 @@ def main(argv: list[str] | None = None) -> int:
                 f'{len(record["tables"])} for this schema)')
         else:
             names = [t["name"] for t in record["tables"]]
+            if objects is None:
+                why = f"no structure report for {target} was found"
+            else:
+                # The report IS there; saying it was not pointed the operator
+                # away from the real cause (a plan that never covered this
+                # schema). Tables it created nothing for will come back
+                # `target_missing` below.
+                nip = sum(1 for r in objects.values()
+                          if r.get("status") == "not_in_plan")
+                why = (f"the structure report for {target} records 0 created "
+                       f"table(s) ({nip} not_in_plan, {len(objects) - nip} "
+                       f"other) -- re-run 01_create_structure with the right "
+                       f"ddl_plan.json, or pass --tables")
             log(f"scope: all {len(names)} table(s) the manifest lists for "
-                f"this schema; no structure report for {target} was found")
+                f"this schema; {why}")
 
     todo = [n for n in names
             if args.force

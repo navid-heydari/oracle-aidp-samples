@@ -322,6 +322,10 @@ def main(argv: list[str] | None = None) -> int:
             return fail(f"error: {exc}")
 
     failures = 0
+    # Run-wide, not per schema: a canary plan scoped to one schema
+    # legitimately leaves every other schema all-`not_in_plan`.
+    created_total = 0
+    not_in_plan_total = 0
     for schema in schemas:
         record = by_name.get(schema)
         if record is None:
@@ -347,6 +351,7 @@ def main(argv: list[str] | None = None) -> int:
             if prior.get("status") in ("created", "already_existed") \
                     and not args.force:
                 log(f"skip {schema}.{name}: already {prior['status']}")
+                created_total += 1
                 continue
             try:
                 if args.dry_run:
@@ -369,6 +374,7 @@ def main(argv: list[str] | None = None) -> int:
                                       "the plan's scope. NOT created."}
                         path.write_text(json.dumps(report, indent=2), encoding="utf-8")
                         log(f"{schema}.{name}: not in the approved plan")
+                        not_in_plan_total += 1
                         continue
                     status = create_table_from_columns(spark, columns,
                                                        args.target_catalog,
@@ -386,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
                                                        target_schema, name)
                 report["objects"][name] = {"status": status}
                 log(f"{schema}.{name}: {status}")
+                if status in ("created", "already_existed"):
+                    created_total += 1
             except TypeDrift as exc:
                 # A problem state, not a failure of THIS run: the table is
                 # there, it is not what the plan says, and a positional copy
@@ -409,7 +417,21 @@ def main(argv: list[str] | None = None) -> int:
             counts[obj["status"]] = counts.get(obj["status"], 0) + 1
         log(f"{schema}: {counts} -> {path}")
 
-    return 1 if failures else 0
+    log(f"run: created or already there {created_total}, not in plan "
+        f"{not_in_plan_total}, failed or drifted {failures}")
+    if failures:
+        return 1
+    if args.mode == "ddl-plan" and not args.dry_run and not created_total \
+            and not_in_plan_total:
+        # Every per-table record above is right; the RUN still did nothing.
+        # Exit 0 here gave three SUCCESS jobs (structure, copy, reconcile)
+        # for a plan that never overlapped the requested schema.
+        return fail(f"error: created 0 table(s); {not_in_plan_total} were not "
+                    f"in the approved plan ({ddl_path}). The plan and the "
+                    f"requested schema(s) do not overlap -- is this the "
+                    f"ddl_plan.json for THIS estate and wave? Nothing was "
+                    f"created, so 02_copy_schema has nothing to copy.")
+    return 0
 
 
 if __name__ == "__main__":

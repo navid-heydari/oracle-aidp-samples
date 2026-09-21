@@ -442,6 +442,74 @@ def test_type_drift_is_rechecked_on_resume_but_created_and_existing_are_skipped(
     assert rc == 0
 
 
+# --- structure: a run that creates nothing is not a success ---------------
+#
+# `not_in_plan` is the right per-table record, but a run in which EVERY table
+# is not_in_plan created nothing -- the plan and the requested schema do not
+# overlap (a plan for another estate, another wave, or a plan in which the
+# engine blocked every table). Exit 0 there gave three SUCCESS jobs that
+# created, copied and reconciled nothing. The check is run-wide, not
+# per-schema: a canary plan legitimately leaves the other schemas untouched.
+
+def test_a_structure_run_that_creates_nothing_is_not_a_success(
+        structure, monkeypatch, tmp_path, capsys):
+    reports = _write_estate(tmp_path / "reports",
+                            {"SALES": ["ORDERS", "CUSTOMERS"]},
+                            plan={("FINANCE", "LEDGER"): _PLAN_COLS})
+    spark = _CatalogSpark()
+    _inject_spark(monkeypatch, spark)
+    rc = _load("01_create_structure").main(
+        ["--target-catalog", "lake", "--reports-dir", str(reports)])
+    assert rc == 1
+    assert not any(s.startswith("CREATE TABLE") for s in spark.statements)
+    report = _report(reports, "structure_report_sales.json")
+    assert {r["status"] for r in report["objects"].values()} == {"not_in_plan"}
+    out = capsys.readouterr().out
+    assert "created 0" in out
+    assert "do not overlap" in out
+
+
+def test_a_canary_plan_covering_one_schema_still_exits_zero(
+        structure, monkeypatch, tmp_path):
+    reports = _write_estate(tmp_path / "reports",
+                            {"SALES": ["ORDERS"], "FINANCE": ["LEDGER"]},
+                            plan={("FINANCE", "LEDGER"): _PLAN_COLS})
+    spark = _CatalogSpark()
+    _inject_spark(monkeypatch, spark)
+    rc = _load("01_create_structure").main(
+        ["--target-catalog", "lake", "--reports-dir", str(reports)])
+    assert rc == 0, "a scoped first wave is the documented way to start"
+    assert sum(1 for s in spark.statements if s.startswith("CREATE TABLE")) == 1
+    sales = _report(reports, "structure_report_sales.json")
+    assert sales["objects"]["ORDERS"]["status"] == "not_in_plan"
+
+
+def test_a_resumed_structure_run_with_everything_created_exits_zero(
+        structure, monkeypatch, tmp_path):
+    reports = _write_estate(tmp_path / "reports",
+                            {"SALES": ["ORDERS", "CUSTOMERS"]}, plan={})
+    (reports / "structure_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "objects": {"ORDERS": {"status": "created"},
+                     "CUSTOMERS": {"status": "already_existed"}}}),
+        encoding="utf-8")
+    _inject_spark(monkeypatch, _CatalogSpark())
+    rc = _load("01_create_structure").main(
+        ["--target-catalog", "lake", "--reports-dir", str(reports)])
+    assert rc == 0, "skipping work already done is not creating nothing"
+
+
+def test_dry_run_is_not_failed_for_an_empty_plan(structure, monkeypatch,
+                                                 tmp_path):
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["ORDERS"]},
+                            plan={("FINANCE", "LEDGER"): _PLAN_COLS})
+    _inject_spark(monkeypatch, _CatalogSpark())
+    rc = _load("01_create_structure").main(
+        ["--target-catalog", "lake", "--reports-dir", str(reports),
+         "--dry-run"])
+    assert rc == 0
+
+
 class _MainSource:
     """Stands in for `SnowflakeSource` when 02_copy_schema.main() builds one:
     external-catalog shaped, so a source table is a three-part name the fake
@@ -502,6 +570,31 @@ def test_the_copy_scope_excludes_a_drifted_table(copy_schema, monkeypatch,
     assert sorted(report["tables"]) == ["A", "B"]
     assert not any("`C`" in s for s in spark.statements if "INSERT" in s)
     assert "scope: 2 table(s)" in capsys.readouterr().out
+
+
+def test_copy_says_the_truth_when_the_structure_report_created_nothing(
+        copy_schema, monkeypatch, tmp_path, capsys):
+    """The structure report exists and records every table `not_in_plan`;
+    the scope log used to say "no structure report ... was found", which is
+    false and points the operator away from the actual cause (the plan)."""
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["A", "B"]})
+    (reports / "structure_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "objects": {"A": {"status": "not_in_plan"},
+                     "B": {"status": "not_in_plan"}}}), encoding="utf-8")
+    rc, report = _copy_run(monkeypatch, reports, _CatalogSpark())
+    out = capsys.readouterr().out
+    assert "no structure report" not in out
+    assert "0 created" in out and "not_in_plan" in out
+    assert {r["status"] for r in report["tables"].values()} == {"target_missing"}
+
+
+def test_copy_still_falls_back_to_the_manifest_when_no_report_exists(
+        copy_schema, monkeypatch, tmp_path, capsys):
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["A", "B"]})
+    rc, report = _copy_run(monkeypatch, reports, _CatalogSpark())
+    assert "no structure report" in capsys.readouterr().out
+    assert sorted(report["tables"]) == ["A", "B"]
 
 
 def test_an_empty_column_list_raises_rather_than_creating_nothing(structure):
