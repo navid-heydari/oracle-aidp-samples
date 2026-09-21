@@ -59,6 +59,12 @@ class TranslationRule:
     # with every application of the rule, so the DDL plan cannot call the
     # result "exact" without the condition next to it.
     caveat: str = ""
+    # Which lexer segments `detect` is matched against. "code" is the default
+    # and is what every construct rule wants. A rule about the QUOTING of an
+    # identifier or a literal has to look at the "ident" or "string" segments
+    # themselves -- code_only() blanks exactly those, so a code rule can never
+    # see a `"` or a `''`.
+    scope: str = "code"              # "code" | "ident" | "string"
 
 
 # --------------------------------------------------------------------------
@@ -75,12 +81,16 @@ def _iff(sql: str) -> tuple[str, str | None]:
 # was spliced into the middle of the literal.
 _LITERAL = r"'(?:[^'\\]|\\.|'')*'"
 
-# Only a bare identifier, qualified column or literal. Anything else (a closing
-# paren, an operator) means the operand's left edge is ambiguous. A preceding
-# backslash is excluded too: that is the inside of a literal, never an operand.
+# A double-quoted Snowflake identifier, `""` being an escaped quote.
+_QUOTED_IDENT = r'"(?:[^"]|"")*"'
+
+# Only a bare identifier, qualified column, quoted identifier or literal.
+# Anything else (a closing paren, an operator) means the operand's left edge is
+# ambiguous. A preceding backslash is excluded too: that is the inside of a
+# literal, never an operand.
 _CAST_SIMPLE = (
-    r"(?<![\w).\"'\\])([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*|" + _LITERAL
-    + r"|\d+(?:\.\d+)?)"
+    r"(?<![\w).\"'\\])([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*|" + _QUOTED_IDENT
+    + "|" + _LITERAL + r"|\d+(?:\.\d+)?)"
     r"\s*(?P<op>::)\s*((?:DOUBLE\s+PRECISION|[A-Za-z_][\w$]*)"
     r"(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)")
 
@@ -243,6 +253,50 @@ def _listagg(sql: str) -> tuple[str, str | None]:
 
 
 # --------------------------------------------------------------------------
+# quoting rules -- operate on the lexer's ident / string segments, not on code
+# --------------------------------------------------------------------------
+
+def _quoted_identifiers(sql: str) -> tuple[str, str | None]:
+    # Snowflake "..." and Spark `...` are both exact, case-preserving quoted
+    # identifiers, so the rewrite is exact. Spark reads "..." as a STRING
+    # LITERAL by default (spark.sql.ansi.doubleQuotedIdentifiers=false), so
+    # `select "Order ID" from t` returned the constant text on every row.
+    parts: list[str] = []
+    for kind, text in lexer.segments(sql):
+        if kind == "ident" and text.startswith('"'):
+            inner = text[1:-1].replace('""', '"').replace("`", "``")
+            parts.append("`" + inner + "`")
+        else:
+            parts.append(text)
+    return "".join(parts), None
+
+
+def _string_escapes(sql: str) -> tuple[str, str | None]:
+    # Spark escapes with a backslash; `''` is not an escape there but two
+    # adjacent literals, which Spark concatenates -- 'O''Brien' read as
+    # 'OBrien'. Existing backslash escapes are Spark's own and stay as they are.
+    parts: list[str] = []
+    for kind, text in lexer.segments(sql):
+        if kind != "string" or not text.startswith("'"):
+            parts.append(text)
+            continue
+        inner, out, i = text[1:-1], [], 0
+        while i < len(inner):
+            ch = inner[i]
+            if ch == "\\":
+                out.append(inner[i:i + 2])
+                i += 2
+            elif ch == "'" and inner[i:i + 2] == "''":
+                out.append("\\'")
+                i += 2
+            else:
+                out.append(ch)
+                i += 1
+        parts.append("'" + "".join(out) + "'")
+    return "".join(parts), None
+
+
+# --------------------------------------------------------------------------
 # registry
 # --------------------------------------------------------------------------
 
@@ -273,6 +327,28 @@ RULES: tuple[TranslationRule, ...] = (
         "T06_LISTAGG", "LISTAGG",
         "LISTAGG(x, sep) -> concat_ws(sep, collect_list(x))", "implemented",
         r"\bLISTAGG\s*\(", _listagg),
+    # The quoting rules run AFTER the construct rules above, so those still see
+    # the original Snowflake text (T02's operand pattern reads `"c"`, not a
+    # backtick), and before the declared rules, whose detection is code-only
+    # and unaffected either way.
+    TranslationRule(
+        "T07_QUOTED_IDENTIFIER", '"quoted identifier"',
+        '"x" -> `x`: Spark reads "..." as a string literal, so every '
+        "double-quoted identifier becomes a backtick-quoted one; case is kept",
+        "implemented", r'^"', _quoted_identifiers, scope="ident"),
+    TranslationRule(
+        "T08_STRING_ESCAPE", "'' in a literal",
+        "'it''s' -> 'it\\'s': Spark reads a doubled quote as two adjacent "
+        "literals and concatenates them", "implemented",
+        r"^'(?:[^'\\]|\\.)*''", _string_escapes, scope="string"),
+    TranslationRule(
+        "T09_DOLLAR_QUOTED", "$$...$$ string",
+        "$$...$$ dollar-quoted string -> single-quoted literal", "declared",
+        r"^\$\$", None,
+        "Spark has no dollar quoting. The content is raw text, so a rewrite to "
+        "a single-quoted, backslash-escaped literal is possible but is not "
+        "applied: it is refused with the construct named, per the "
+        "never-approximate rule, until an owner decides.", scope="string"),
 
     TranslationRule(
         "T10_QUALIFY", "QUALIFY", "QUALIFY <predicate on a window function>",
@@ -357,14 +433,23 @@ def coverage() -> dict:
     }
 
 
+def _detected(rule: TranslationRule, sql: str) -> bool:
+    # A construct rule is detected over CODE only. Otherwise a row containing
+    # the text "QUALIFY", or a JSON-ish literal like '{"a": 1}' matching the
+    # VARIANT path rule, blocks a view that has no such construct in it. A
+    # quoting rule is detected over the ident / string segments it is about.
+    if rule.scope == "code":
+        return bool(lexer.find_code(rule.detect, sql))
+    return any(kind == rule.scope
+               and re.search(rule.detect, text, re.IGNORECASE | re.DOTALL)
+               for kind, text in lexer.segments(sql))
+
+
 def translate_sql(sql: str) -> TranslationResult:
     """Apply every implemented rule; report every declared one that matches."""
     result = TranslationResult(sql=sql)
     for rule in RULES:
-        # Detection runs over CODE only. Otherwise a row containing the text
-        # "QUALIFY", or a JSON-ish literal like '{"a": 1}' matching the VARIANT
-        # path rule, blocks a view that has no such construct in it.
-        if not lexer.find_code(rule.detect, result.sql):
+        if not _detected(rule, result.sql):
             continue
         if rule.status == "declared" or rule.translate is None:
             result.unsupported.append({
@@ -387,7 +472,7 @@ def translate_sql(sql: str) -> TranslationResult:
                 "rule_id": rule.rule_id, "construct": rule.construct,
                 "detail": problem})
             continue
-        if lexer.find_code(rule.detect, new_sql):
+        if rule.scope == "code" and lexer.find_code(rule.detect, new_sql):
             # The rule ran and its construct is still there: a form it does
             # not cover. Left in place it would be carried over verbatim and
             # the view stamped portable, so it is a refusal.

@@ -376,3 +376,53 @@ def test_r42_wording_does_not_claim_a_clean_check():
     assert "carried verbatim" in r42[0].detail
     assert "no Snowflake-only construct present" not in r42[0].detail
     assert any("not in the rule table" in w for w in res.warnings), res.warnings
+
+
+# --- quoted identifiers, string escapes and $$ strings in view bodies -------
+
+def test_view_with_quoted_identifiers_is_backticked_and_its_body_survives():
+    from target import ddl as ddl_mod
+    ddl = 'create view V as select "Order ID", "we""ird" from DB.SC."Orders"'
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is False, res.blocked_reason
+    assert "`Order ID`" in res.sql and "DB.SC.`Orders`" in res.sql
+    assert '"Order ID"' not in res.sql
+    ids = {r.rule_id for r in res.rules_applied}
+    assert "T07_QUOTED_IDENTIFIER" in ids and "R43_VIEW_DIALECT_TRANSLATED" in ids
+    assert "R42_VIEW_PORTABLE_SQL" not in ids
+    # The catalog API takes the body separately; it is re-lexed from the
+    # emitted statement and must survive the `we"ird` identifier.
+    body = ddl_mod._view_text(res.sql)
+    assert body == 'select `Order ID`, `we"ird` from DB.SC.`Orders`'
+
+
+def test_view_with_a_doubled_quote_literal_is_escaped_for_spark():
+    ddl = "create view V as select * from D.S.CUST where last_name = 'O''Brien'"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is False
+    assert "'O\\'Brien'" in res.sql
+    assert "''Brien" not in res.sql
+    ids = {r.rule_id for r in res.rules_applied}
+    assert "R43_VIEW_DIALECT_TRANSLATED" in ids and "R42_VIEW_PORTABLE_SQL" not in ids
+
+
+def test_view_with_a_dollar_quoted_string_is_blocked_naming_it():
+    ddl = "create view V as select $$it's$$ as note, id from D.S.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is True
+    assert "dollar" in res.blocked_reason.lower()
+
+
+@pytest.mark.parametrize("body", [
+    'select "Order ID" from DB.SC."Orders"',
+    'select IFF(a, 1, 2) as "F", "we""ird" from t',
+    "select 'O''Brien' as who from t",
+    'select "c"::int from t',
+])
+def test_no_double_quoted_identifier_survives_into_emitted_spark_sql(body):
+    from snowflake_source.dialect import lexer
+    res = build_create_view(view_record(ddl=f"create view V as {body}"), "D.S.V")
+    assert res.blocked is False, res.blocked_reason
+    emitted = extract_view_body(res.sql)
+    assert not any(kind == "ident" and text.startswith('"')
+                   for kind, text in lexer.segments(emitted)), emitted

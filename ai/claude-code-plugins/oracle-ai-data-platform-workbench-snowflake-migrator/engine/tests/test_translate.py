@@ -254,7 +254,8 @@ def test_cast_shorthand_honours_doubled_quote_in_literal():
     r = t("select 'it''s'::varchar as v from t")
     assert "::" not in r.sql
     assert r.fully_translated is True
-    assert r.sql.startswith("select CAST('it")
+    # The literal is then re-escaped for Spark, where '' is not an escape.
+    assert r.sql == "select CAST('it\\'s' AS STRING) as v from t"
 
 
 def test_a_rule_that_raises_unterminated_literal_blocks_only_that_construct(monkeypatch):
@@ -454,3 +455,90 @@ def test_dateadd_still_translates_when_datediff_is_present():
 def test_datediff_in_a_comment_or_literal_does_not_block():
     r = t("select 'DATEDIFF(dd,a,b)' as s, a -- DATEDIFF(dd, x, y)\n from t")
     assert r.unsupported == []
+
+
+# --------------------------------------------------------------------------
+# Quoted identifiers and string escapes. Spark reads "..." as a STRING LITERAL
+# by default, so `select "Order ID" from t` returned the constant 'Order ID'
+# on every row; and Spark reads 'it''s' as two adjacent literals concatenated,
+# so 'O''Brien' became 'OBrien'. Both shipped as "portable". $$...$$ has no
+# Spark equivalent at all.
+# --------------------------------------------------------------------------
+
+def test_quoted_identifiers_become_backticks():
+    r = t('select "Order ID", "Amount" from DB.SC."Orders"')
+    assert r.sql == 'select `Order ID`, `Amount` from DB.SC.`Orders`'
+    assert "T07_QUOTED_IDENTIFIER" in [a["rule_id"] for a in r.applied]
+    assert r.unsupported == []
+
+
+@pytest.mark.parametrize("sql,expected", [
+    ('select "we""ird" from t', 'select `we"ird` from t'),
+    ('select "a`b" from t', 'select `a``b` from t'),
+    # A quoted identifier is exact-case in both dialects: it keeps its case.
+    ('select "lower", "MiXed" from t', 'select `lower`, `MiXed` from t'),
+])
+def test_quoted_identifier_unescapes_doubles_backticks_and_keeps_case(sql, expected):
+    assert t(sql).sql == expected
+
+
+def test_double_quotes_inside_a_literal_and_a_comment_are_untouched():
+    sql = "select x from t where x = 'say \"hi\"' -- \"not me\""
+    r = t(sql)
+    assert r.sql == sql
+    assert r.applied == [] and r.unsupported == []
+
+
+def test_iff_and_a_quoted_alias_translate_together():
+    r = t('select IFF(a,1,2) as "F" from t')
+    assert r.sql == 'select IF(a,1,2) as `F` from t'
+    assert {a["rule_id"] for a in r.applied} == {"T01_IFF", "T07_QUOTED_IDENTIFIER"}
+
+
+def test_cast_of_a_quoted_identifier_is_not_left_with_a_bare_operator():
+    r = t('select "c"::int from t')
+    assert r.sql == 'select CAST(`c` AS DECIMAL(38,0)) from t'
+    assert r.fully_translated is True
+
+
+def test_doubled_quote_in_a_literal_becomes_a_backslash_escape():
+    r = t("select * from CUST where last_name = 'O''Brien'")
+    assert r.sql == "select * from CUST where last_name = 'O\\'Brien'"
+    assert "T08_STRING_ESCAPE" in [a["rule_id"] for a in r.applied]
+    assert r.fully_translated is True
+
+
+def test_empty_literal_and_quote_only_literal():
+    r = t("select '' as e, '''' as q from t")
+    assert r.sql == "select '' as e, '\\'' as q from t"
+
+
+def test_existing_backslash_escapes_are_left_alone():
+    sql = "select 'a\\'b', 'x\\\\' from t"
+    r = t(sql)
+    assert r.sql == sql
+    assert r.applied == []
+
+
+def test_doubled_quote_inside_a_comment_or_quoted_identifier_is_not_an_escape():
+    r = t("select \"it''s\" from t -- 'x''y'")
+    assert r.sql == "select `it''s` from t -- 'x''y'"
+    assert "T08_STRING_ESCAPE" not in [a["rule_id"] for a in r.applied]
+
+
+def test_dollar_quoted_string_is_refused_not_guessed():
+    sql = "select $$it's$$ as note, id from T"
+    r = t(sql)
+    assert r.sql == sql
+    assert "T09_DOLLAR_QUOTED" in [u["rule_id"] for u in r.unsupported]
+    assert "dollar" in r.unsupported[0]["detail"].lower()
+
+
+def test_a_translated_body_never_carries_a_double_quoted_identifier():
+    from snowflake_source.dialect import lexer
+    for sql in ('select "a", b from "S"."T" where c = \'"\'',
+                'select "x"::varchar as "y" from t'):
+        r = t(sql)
+        assert r.fully_translated, r.unsupported
+        assert not any(kind == "ident" and text.startswith('"')
+                       for kind, text in lexer.segments(r.sql)), r.sql

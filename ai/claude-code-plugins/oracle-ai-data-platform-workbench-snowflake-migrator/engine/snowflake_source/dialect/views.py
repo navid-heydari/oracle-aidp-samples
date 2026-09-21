@@ -7,6 +7,11 @@ here: both the planner (deciding what can migrate) and the DDL generator
 A Snowflake-only construct is DETECTED AND REPORTED, never rewritten on a
 guess. A view that ships with a subtly wrong translation is worse than one
 reported as needing manual work, because the wrong one returns numbers.
+
+Quoting is normalised on the way through (see translate.py): "quoted
+identifiers" become `backticked`, `''` inside a literal becomes `\\'`, and a
+$$...$$ string is refused. Spark reads "..." as a string literal and `''` as
+two adjacent literals, so a body carried verbatim returned wrong data.
 """
 from __future__ import annotations
 

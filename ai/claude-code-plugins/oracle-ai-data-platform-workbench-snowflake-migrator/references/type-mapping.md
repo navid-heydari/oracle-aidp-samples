@@ -52,6 +52,9 @@ no rewriting; the only question is dialect.
 | `OBJECT_CONSTRUCT(` | **Translated** to `named_struct()` (`T04`) |
 | `DATEADD(unit, n, col)` | **Translated** per unit (`T05`) when `n` is an integer literal or a column; any other form blocks. Exact for `DATE` operands only, and the plan says so |
 | `LISTAGG(x, sep)` | **Translated** to `concat_ws(sep, collect_list(x))` (`T06`); `WITHIN GROUP` blocks |
+| `"quoted identifier"` | **Translated** to `` `backticked` `` (`T07`): Spark reads `"..."` as a string literal. Case is kept |
+| `'it''s'` doubled quote in a literal | **Translated** to `'it\'s'` (`T08`): Spark reads `''` as two adjacent literals and concatenates them |
+| `$$...$$` dollar-quoted string | Blocks: Spark has no dollar quoting (`T09`) |
 | `QUALIFY` | Blocks: no Spark equivalent; needs a subquery with `WHERE` on the window result |
 | `LATERAL FLATTEN` / `FLATTEN(` | Blocks: maps to `explode` / `LATERAL VIEW`, but the mapping depends on the VARIANT shape |
 | `GENERATOR(` / `SEQ4(` / `SEQ8(` | Blocks: Spark uses `range()`, and `SEQ4()` has no gapless equivalent |

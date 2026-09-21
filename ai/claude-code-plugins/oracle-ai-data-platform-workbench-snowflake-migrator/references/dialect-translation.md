@@ -13,7 +13,7 @@ the same thing, or it reports what a real implementation needs and leaves the
 input untouched. SQL that "mostly works" returns numbers, and wrong numbers are
 worse than a blocked object.
 
-## Implemented (6)
+## Implemented (8)
 
 | Rule | Snowflake | AIDP / Spark |
 |---|---|---|
@@ -23,11 +23,14 @@ worse than a blocked object.
 | `T04_OBJECT_CONSTRUCT` | `OBJECT_CONSTRUCT('k', v)` | `named_struct('k', v)` |
 | `T05_DATEADD` | `DATEADD(unit, n, col)` | `date_add` / `add_months` / `+ INTERVAL`, chosen by unit. Argument order differs and the unit decides the function, so a rename would be wrong. Only the exact forms are rewritten: `n` an integer literal or a column (a column is parenthesised where it meets the `* 7` / `* 12` multiplier; for hour/minute/second only a literal, because Spark's `INTERVAL` takes a constant). An expression amount, an unrecognised unit, a quoted unit or a nested call such as `CURRENT_DATE()` is refused, never guessed or carried over. **Caveat, recorded on every application:** exact for `DATE` operands only — Spark `date_add`/`add_months` return `DATE`, so a `TIMESTAMP` operand is truncated to `DATE`; the DDL plan says so instead of calling the view exact |
 | `T06_LISTAGG` | `LISTAGG(x, sep)` | `concat_ws(sep, collect_list(x))`. Refused with `WITHIN GROUP (ORDER BY …)`, because `collect_list` does not guarantee ordering and the semantics would be lost silently |
+| `T07_QUOTED_IDENTIFIER` | `"Order ID"` | `` `Order ID` ``. Spark reads `"..."` as a **string literal** by default, so a quoted column reference carried verbatim returns the constant text on every row. Both forms are exact, case-preserving identifiers, so the rewrite is exact: `""` → `"`, an embedded backtick is doubled, and the case is kept — `"lower"` stays `` `lower` ``. Runs after the construct rules, over the lexer's identifier segments; literals and comments are untouched |
+| `T08_STRING_ESCAPE` | `'O''Brien'` | `'O\'Brien'`. Spark reads a doubled quote as two adjacent literals and concatenates them (`'OBrien'`), so the escape is rewritten to Spark's backslash form. Existing `\'` and `\\` escapes are left alone; the empty literal `''` is untouched; `''''` becomes `'\''`. Runs over the lexer's string segments only |
 
-## Declared — recognised, not rewritten (11)
+## Declared — recognised, not rewritten (12)
 
 | Rule | Why a substitution is not safe |
 |---|---|
+| `T09_DOLLAR_QUOTED` | `$$...$$` has no Spark equivalent. The content is raw text, so an exact rewrite to a single-quoted literal is possible, but it is refused with the construct named until an owner decides — never approximate |
 | `T10_QUALIFY` | Needs statement restructuring: project the window expression into a subquery and move the predicate to an outer `WHERE`. Changes the select list |
 | `T11_LATERAL_FLATTEN` | Target shape depends on the VARIANT structure and on which of value/index/key is read |
 | `T12_GENERATOR` | Replaces a FROM-clause table function, and `SEQ4()` has no gapless Spark equivalent, so row identity would change |
