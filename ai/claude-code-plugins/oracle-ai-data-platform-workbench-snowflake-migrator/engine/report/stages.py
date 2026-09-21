@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import pathlib
 
+from plan.smoke import smoke_verdict
+
 __all__ = ["STAGES", "build_stage_board"]
 
 STAGES: tuple[dict, ...] = (
@@ -155,8 +157,12 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
                 f'{blocked} blocked', bool(blocked))
 
     if stage == "smoke":
-        ok = data.get("ok")
-        return ("PASS" if ok else "**FAIL**", not ok)
+        verdict = smoke_verdict(data)
+        if verdict == "PASS":
+            return ("PASS", False)
+        if verdict == "PARTIAL":
+            return ("**PARTIAL** — destination not checked", True)
+        return ("**FAIL**", True)
 
     if stage == "preflight":
         cfg = data.get("config") or {}

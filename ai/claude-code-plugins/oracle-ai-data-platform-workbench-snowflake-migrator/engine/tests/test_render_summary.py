@@ -201,3 +201,25 @@ def test_a_count_error_is_named_in_the_summary():
          "target": "C.S.T"}]}, inv, None, {})
     assert "No active warehouse selected" in md
     assert "D.S.T" in md
+
+
+def test_smoke_report_header_is_partial_when_destination_skipped():
+    from report.render import render_smoke
+    md = render_smoke({"ok": True, "complete": False, "verdict": "PARTIAL",
+                       "source": {"reachable": True, "checks": []},
+                       "destination": {"skipped": True,
+                                       "reason": "coordinates not supplied"}})
+    assert "PARTIAL" in "\n".join(md.splitlines()[:3])
+    assert "Verdict: **PASS**" not in md
+    assert "not a pass" in md.lower()
+
+
+def test_smoke_report_never_says_pass_for_a_legacy_skipped_result():
+    # smoke.json written before the verdict key existed: ok True + skipped.
+    from report.render import render_smoke
+    md = render_smoke({"ok": True,
+                       "source": {"reachable": True, "checks": []},
+                       "destination": {"skipped": True,
+                                       "reason": "coordinates not supplied"}})
+    assert "Verdict: **PASS**" not in md
+    assert "PARTIAL" in md

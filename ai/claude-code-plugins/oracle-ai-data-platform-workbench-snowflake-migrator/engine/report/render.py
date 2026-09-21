@@ -6,6 +6,7 @@ anything that halted or was skipped rather than burying it.
 from __future__ import annotations
 
 from plan.data_movement import MAINTENANCE_TRAPS, architecture_decision
+from plan.smoke import smoke_verdict
 from plan.status import assess_risk, migration_status
 
 __all__ = ["render_stages", "render_preflight", "render_census", "census_scope",
@@ -615,8 +616,14 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
 
 def render_smoke(result: dict) -> str:
     src, dest = result.get("source", {}), result.get("destination", {})
-    out = ["# Smoke test — connectivity and permissions", "",
-           f'Verdict: **{"PASS" if result.get("ok") else "FAIL"}**', "",
+    verdict = smoke_verdict(result)
+    header = {
+        "PASS": "Verdict: **PASS**",
+        "FAIL": "Verdict: **FAIL**",
+        "PARTIAL": ("Verdict: **PARTIAL** — the Snowflake source was checked; the "
+                    "AIDP destination was not. This is not a pass."),
+    }[verdict]
+    out = ["# Smoke test — connectivity and permissions", "", header, "",
            "## Source (Snowflake)", ""]
     if not src.get("reachable"):
         out += [f'**Unreachable.** {src.get("error", "")}', ""]
