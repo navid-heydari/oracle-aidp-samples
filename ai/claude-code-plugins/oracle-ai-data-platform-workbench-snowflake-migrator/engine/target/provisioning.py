@@ -32,6 +32,9 @@ import tempfile
 import time
 from typing import Callable
 
+from migration_config import ConfigError, load_config, snowflake_block
+from plan.preflight import SECRET_PATH_FIELDS
+
 from .naming import translate_name
 from .stage_notebooks import STAGES, build_stage_notebook
 from .provision_api import (
@@ -42,6 +45,7 @@ from .provision_api import (
 __all__ = ["JOB_SPECS", "SCRIPTS_FOLDER", "PLAN_FOLDER", "REPORTS_FOLDER",
            "BACKUP_FOLDER", "ProvisionTransportError",
            "make_provision_call", "provision", "render_provision",
+           "source_config_payload",
            "async_operation_key", "connection_test_outcome"]
 
 
@@ -322,6 +326,44 @@ def _key(item: dict, fallback: str) -> str:
     return str(item.get("key") or item.get("id") or fallback)
 
 
+def source_config_payload(path: pathlib.Path) -> dict:
+    """What `--source-config` places on the workspace: the `snowflake:` block
+    of the operator's migration config, and nothing else.
+
+    The in-AIDP scripts read only that block (the data-plane loader unwraps
+    it), so the `aidp:` half -- the DataLake OCID and the target
+    coordinates -- has no business on the mount and is not copied. The
+    block carries the credential, which is why the upload is opt-in; a
+    copy that carries MORE than the scripts read is exposure for nothing.
+    It is written as JSON, which the loader reads without PyYAML.
+
+    A `*_path` secret is refused here, before anything is uploaded. The
+    path names a file on THIS machine; the copy is read on the cluster from
+    /Workspace/..., where that path does not exist. That failure used to
+    surface five minutes later, as a raw FileNotFoundError in the job log,
+    after `preflight` had called the path "readable" -- on the laptop.
+    """
+    block = snowflake_block(load_config(path))
+    laptop_only = [f for f in SECRET_PATH_FIELDS if block.get(f)]
+    if laptop_only:
+        raise ConfigError(
+            f"--source-config {path} carries {', '.join(laptop_only)}: a "
+            f"path to a file on this machine. The copy placed on the "
+            f"workspace is read on the cluster from /Workspace/{PLAN_FOLDER}/, "
+            f"where that path does not exist, so connector mode cannot use "
+            f"it. Inline the secret under `snowflake:` instead (private_key: "
+            f"| for a PEM, password: for a password, token: for a PAT), "
+            f"then re-run.")
+    return {"snowflake": dict(block)}
+
+
+def _credential_line(source_name: str, remote: str) -> str:
+    return (f"{source_name} -> {remote} — CARRIES THE SNOWFLAKE CREDENTIAL "
+            f"(the snowflake: block only; aidp: is not copied). Readable by "
+            f"every member of the workspace and by every cluster in it via "
+            f"/Workspace; remove it when the migration is done")
+
+
 def _pypi_from_requirements(path: pathlib.Path | None) -> list[str]:
     if path is None or not path.is_file():
         return []
@@ -360,6 +402,18 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     ws_name = translate_name(workspace_name, kind="workspace")
     cl_name = translate_name(cluster_name, kind="cluster")
     pypi = _pypi_from_requirements(requirements)
+    # The source config, when given, is the ONE credential-bearing object
+    # this stage places on the workspace. Only its `snowflake:` block goes,
+    # as JSON under the same stem; the operator's file itself never travels,
+    # whoever put it in plan_files. A laptop-only `*_path` secret is refused
+    # here, before anything -- dry run or not -- is written.
+    source_payload = None
+    credential_object = None
+    if source_config is not None:
+        source_payload = source_config_payload(source_config)
+        credential_object = f"{PLAN_FOLDER}/{source_config.stem}.json"
+        plan_files = [p for p in plan_files
+                      if pathlib.Path(p).resolve() != source_config.resolve()]
     # One cluster per Snowflake warehouse, named after it. Sizing is NOT
     # carried over: the user asked for same-name clusters on the AIDP default
     # config, and the `compute` stage's proposal stays a proposal until
@@ -388,6 +442,9 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         "external_catalog": external_catalog,
         "target_catalog": target_catalog,
         "source_mode": source_mode,
+        # Workspace objects that hold a credential, so the report can say so
+        # in one place and the operator knows what to remove afterwards.
+        "credential_objects": [credential_object] if credential_object else [],
         "steps": [],
     }
 
@@ -421,6 +478,9 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         for path in plan_files:
             step("upload", "would upload", None,
                  f"{path.name} -> {PLAN_FOLDER}/{path.name}")
+        if credential_object:
+            step("upload", "would upload", None,
+                 _credential_line(source_config.name, credential_object))
         for spec in JOB_SPECS:
             step("job", "would create", None, spec["name"])
         return out
@@ -630,6 +690,37 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                 step("upload", "failed", False,
                      f"{remote}: {str(exc)[:200]}")
 
+    if credential_object:
+        # The derived `snowflake:` block, written to a temp file for the
+        # CLI to read and removed right after -- the copy on the mount is
+        # the only one meant to outlive this call.
+        name = credential_object.rsplit("/", 1)[-1]
+        fd, local = tempfile.mkstemp(prefix="snowmig_source_", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(source_payload, fh)
+            try:
+                call("upload_ws_file", workspace=ws_key,
+                     path=credential_object, local_path=local)
+                items = call("list_ws_objects", workspace=ws_key,
+                             path=PLAN_FOLDER).get("items") or []
+                found = any(
+                    str(i.get("path") or "").endswith("/" + name)
+                    or i.get("displayName") == name for i in items)
+                step("upload", "uploaded" if found else "upload_requested",
+                     found,
+                     _credential_line(source_config.name, credential_object)
+                     + ("" if found else "; not visible in listing"))
+            except Exception as exc:
+                step("upload", "failed", False,
+                     f"{credential_object}: {str(exc)[:200]} (it carries "
+                     f"the credential; check whether it landed)")
+        finally:
+            try:
+                os.unlink(local)
+            except OSError:
+                pass
+
     # 5 · stage notebooks + jobs ---------------------------------------------
     # Job `parameters` reach the notebook neither as argv nor as environment
     # (probed live), so this run's coordinates are written into each stage
@@ -640,11 +731,10 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         defaults["source-catalog"] = external_catalog
     if target_catalog:
         defaults["target-catalog"] = target_catalog
-    if source_config is not None:
-        # The scripts read the credential from this file ON THE MOUNT, so the
-        # path they receive is the /Workspace one, not the local one.
-        defaults["source-config"] = \
-            f"{REPORTS_FOLDER.rsplit('/', 1)[0]}/plan/{source_config.name}"
+    if credential_object:
+        # The scripts read the credential from the derived copy ON THE MOUNT,
+        # so the path they receive is the /Workspace one, not the local one.
+        defaults["source-config"] = f"/Workspace/{credential_object}"
     existing = call("list_jobs", workspace=ws_key).get("items") or []
     stages_by_notebook = {st.notebook_name: st for st in STAGES}
     for spec in JOB_SPECS:
@@ -745,6 +835,22 @@ def render_provision(res: dict) -> str:
                          f'{target.get("source_size") or "unknown"} | '
                          f'`{target["name"]}` | {note} |')
         lines.append("")
+
+    if res.get("credential_objects"):
+        lines += [
+            "## Credential placed on the workspace", "",
+            "`--source-config` puts the Snowflake connection -- the "
+            "`snowflake:` block of the migration config, **credential "
+            "included**; the `aidp:` block is not copied -- on the workspace "
+            "mount so the in-AIDP scripts can reach Snowflake themselves. It "
+            "is readable by **every member of this workspace and every "
+            "cluster in it** via `/Workspace`, for as long as it stays "
+            "there:", ""]
+        lines += [f"- `{obj}`" for obj in res["credential_objects"]]
+        lines += ["",
+                  "Remove it from the workspace once the migration is done, "
+                  "and rotate the Snowflake credential if anyone who must "
+                  "not hold it can read this workspace.", ""]
 
     lines += [
         "| Step | Action | Verified | Detail |", "|---|---|---|---|"]

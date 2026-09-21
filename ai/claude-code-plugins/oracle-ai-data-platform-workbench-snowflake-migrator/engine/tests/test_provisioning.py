@@ -14,8 +14,8 @@ from target.provision_api import (
 )
 from target.stage_notebooks import STAGES, build_stage_notebook
 from target.provisioning import (
-    BACKUP_FOLDER, JOB_SPECS, REPORTS_FOLDER, SCRIPTS_FOLDER, provision,
-    render_provision,
+    BACKUP_FOLDER, JOB_SPECS, PLAN_FOLDER, REPORTS_FOLDER, SCRIPTS_FOLDER,
+    provision, render_provision,
 )
 
 OCID = "ocid1.aidataplatform.oc1.iad.a"
@@ -754,3 +754,117 @@ def test_the_name_taken_halt_names_the_operator_s_own_orphan(scripts):
     halt = next(s for s in res["steps"] if s["step"] == "halt")
     assert "previous run" in halt["detail"].lower()
     assert "--reuse-existing" in halt["detail"]
+
+
+# --- --source-config: only the snowflake: block travels, and it is said so --
+#
+# The operator's whole migration config used to be appended to plan_files and
+# uploaded verbatim: the Snowflake password or PEM AND the aidp: block
+# (DataLake OCID, target coordinates), as a workspace object readable by every
+# member and every cluster, with a PROVISION.md row that said only
+# "snowmig-config.yaml -> .../plan/snowmig-config.yaml". A `key_path:` config
+# went up unchanged too, and failed five minutes later on the cluster with a
+# FileNotFoundError for a laptop path.
+
+_FAKE_PASSWORD = "FAKE-PASSWORD-not-real-123"
+_FAKE_PEM = "-----BEGIN PRIVATE KEY-----\nFAKE\n-----END PRIVATE KEY-----\n"
+
+
+def _config(tmp_path, **snowflake):
+    import yaml
+    block = {"account": "ACME-TEST", "user": "READER", "warehouse": "WH",
+             "database": "DB", "auth": "password", "password": _FAKE_PASSWORD}
+    block.update(snowflake)
+    block = {k: v for k, v in block.items() if v is not None}
+    cfg = tmp_path / "snowmig-config.yaml"
+    cfg.write_text(yaml.safe_dump({
+        "snowflake": block,
+        "aidp": {"datalake_ocid": "ocid1.aidataplatform.oc1.iad.fakefakefake",
+                 "catalog": "lake"}}), encoding="utf-8")
+    return cfg
+
+
+def test_the_source_config_upload_carries_only_the_snowflake_block(scripts,
+                                                                    tmp_path):
+    cfg = _config(tmp_path)
+    fake = Fake()
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    plan_files=[cfg], source_config=cfg, execute=True,
+                    delays=())
+    uploads = [kw for op, kw in fake.ops if op == "upload_ws_file"]
+    assert not any(kw["local_path"] == str(cfg) for kw in uploads), \
+        "the operator's file itself never travels"
+    assert f"{PLAN_FOLDER}/snowmig-config.yaml" not in fake.contents
+    remote = f"{PLAN_FOLDER}/snowmig-config.json"
+    body = json.loads(fake.contents[remote]["body"])
+    assert set(body) == {"snowflake"}
+    assert body["snowflake"]["password"] == _FAKE_PASSWORD
+    blob = json.dumps(body)
+    assert "aidp" not in blob and "datalake_ocid" not in blob
+    assert not pathlib.Path(fake.contents[remote]["local"]).exists(), \
+        "the derived copy does not outlive the upload"
+    assert res["credential_objects"] == [remote]
+    step = next(s for s in res["steps"]
+                if s["step"] == "upload" and remote in s["detail"])
+    assert step["verified"] is True and "CREDENTIAL" in step["detail"]
+    # The notebooks read the derived copy off the mount.
+    nb = json.loads(
+        fake.contents[f"{SCRIPTS_FOLDER}/00_discover_snowflake.ipynb"]["body"])
+    params = "".join(nb["cells"][1]["source"])
+    mount = REPORTS_FOLDER.rsplit("/", 1)[0]
+    assert f"'source-config': '{mount}/plan/snowmig-config.json'" in params
+
+
+def test_the_dry_run_names_the_credential_object(scripts, tmp_path):
+    cfg = _config(tmp_path)
+    res = provision(call=None, workspace_name="acme", scripts=scripts,
+                    plan_files=[cfg], source_config=cfg, execute=False)
+    remote = f"{PLAN_FOLDER}/snowmig-config.json"
+    assert res["credential_objects"] == [remote]
+    details = [s["detail"] for s in res["steps"] if s["step"] == "upload"]
+    assert any("CREDENTIAL" in d and remote in d for d in details), details
+    assert not any(d.endswith("snowmig-config.yaml") for d in details), \
+        "the raw file is not previewed as an upload"
+    md = render_provision(res)
+    assert "Credential placed on the workspace" in md and remote in md
+    assert _FAKE_PASSWORD not in md
+
+
+def test_a_plan_file_that_is_not_the_source_config_has_no_credential_wording(
+        scripts, tmp_path):
+    plan = tmp_path / "plan.json"
+    plan.write_text("{}", encoding="utf-8")
+    res = provision(call=None, workspace_name="acme", scripts=scripts,
+                    plan_files=[plan], execute=False)
+    assert res["credential_objects"] == []
+    assert not any("CREDENTIAL" in s["detail"] for s in res["steps"])
+    assert "Credential placed" not in render_provision(res)
+
+
+def test_a_path_form_secret_is_refused_before_any_upload(scripts, tmp_path):
+    from migration_config import ConfigError
+    pem = tmp_path / "rsa_key.p8"
+    pem.write_text(_FAKE_PEM, encoding="utf-8")
+    cfg = _config(tmp_path, auth="keypair", key_path=str(pem), password=None)
+    fake = Fake()
+    for execute in (False, True):
+        with pytest.raises(ConfigError) as exc:
+            provision(call=fake if execute else None, workspace_name="acme",
+                      scripts=scripts, source_config=cfg, execute=execute,
+                      delays=())
+        message = str(exc.value)
+        assert "key_path" in message and "inline" in message.lower()
+        assert "/Workspace" in message
+    assert fake.ops == [], "refused before anything reached AIDP"
+
+
+def test_an_inline_secret_config_is_accepted(scripts, tmp_path):
+    cfg = _config(tmp_path, auth="keypair", private_key=_FAKE_PEM,
+                  password=None)
+    fake = Fake()
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    source_config=cfg, execute=True, delays=())
+    assert any(s["step"] == "job" for s in res["steps"])
+    body = json.loads(
+        fake.contents[f"{PLAN_FOLDER}/snowmig-config.json"]["body"])
+    assert body["snowflake"]["private_key"] == _FAKE_PEM

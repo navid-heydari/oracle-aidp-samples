@@ -60,3 +60,66 @@ def test_a_cluster_409_still_writes_the_provision_record(tmp_path,
     md = (tmp_path / "PROVISION.md").read_text(encoding="utf-8")
     assert "--reuse-existing" in md and "ws-acme" in md
     assert fake.workspaces, "the workspace really was created server-side"
+
+
+# --- --source-config through the CLI -----------------------------------------
+
+_FAKE_PASSWORD = "FAKE-PASSWORD-not-real-123"
+
+
+def _source_config(tmp_path, **snowflake):
+    import yaml
+    block = {"account": "ACME-TEST", "user": "READER", "warehouse": "WH",
+             "database": "DB", "auth": "password", "password": _FAKE_PASSWORD}
+    block.update(snowflake)
+    block = {k: v for k, v in block.items() if v is not None}
+    cfg = tmp_path / "snowmig-config.yaml"
+    cfg.write_text(yaml.safe_dump({"snowflake": block,
+                                   "aidp": {"datalake_ocid": OCID}}),
+                   encoding="utf-8")
+    return cfg
+
+
+def test_the_dry_run_says_out_loud_that_a_credential_would_be_placed(
+        tmp_path, monkeypatch, capsys):
+    cfg = _source_config(tmp_path)
+    rc = _provision(tmp_path, "--source-config", str(cfg))
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "CREDENTIAL ON THE WORKSPACE MOUNT" in err
+    assert "backup-snowflake-migration/plan/snowmig-config.json" in err
+    md = (tmp_path / "PROVISION.md").read_text(encoding="utf-8")
+    assert "Credential placed on the workspace" in md
+    assert _FAKE_PASSWORD not in md and _FAKE_PASSWORD not in err
+
+
+def test_the_execute_path_uploads_only_the_block_and_says_so(
+        tmp_path, monkeypatch, capsys):
+    cfg = _source_config(tmp_path)
+    fake = Fake()
+    _install(monkeypatch, fake)
+    rc = _provision(tmp_path, "--source-config", str(cfg), "--execute")
+    assert rc == 0
+    assert "backup-snowflake-migration/plan/snowmig-config.json" in fake.contents
+    assert "backup-snowflake-migration/plan/snowmig-config.yaml" not in fake.contents
+    body = json.loads(fake.contents[
+        "backup-snowflake-migration/plan/snowmig-config.json"]["body"])
+    assert set(body) == {"snowflake"} and "datalake_ocid" not in json.dumps(body)
+    err = capsys.readouterr().err
+    assert "CREDENTIAL ON THE WORKSPACE MOUNT" in err and "holds" in err
+
+
+def test_a_path_form_secret_is_refused_by_the_cli_before_anything_is_written(
+        tmp_path, monkeypatch, capsys):
+    pem = tmp_path / "rsa_key.p8"
+    pem.write_text("-----BEGIN PRIVATE KEY-----\nFAKE\n", encoding="utf-8")
+    cfg = _source_config(tmp_path, auth="keypair", key_path=str(pem),
+                         password=None)
+    fake = Fake()
+    _install(monkeypatch, fake)
+    rc = _provision(tmp_path, "--source-config", str(cfg), "--execute")
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "key_path" in err and "inline" in err.lower()
+    assert fake.ops == []
+    assert not (tmp_path / "provision_result.json").exists()

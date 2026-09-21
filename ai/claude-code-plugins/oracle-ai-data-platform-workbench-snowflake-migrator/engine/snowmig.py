@@ -1311,7 +1311,8 @@ def cmd_provision(args) -> int:
         if not source_config.is_file():
             raise FileNotFoundError(
                 f"--source-config {source_config} not found")
-        plan_files.append(source_config)
+        # Not appended to plan_files: provision() derives the `snowflake:`
+        # block and uploads that; the operator's file itself never travels.
 
     requirements = None
     if not args.skip_libraries:
@@ -1338,6 +1339,16 @@ def cmd_provision(args) -> int:
         subnet_id=args.subnet_id, reuse_existing=args.reuse_existing)
     _write(out, "provision_result.json", res)
     _write(out, "PROVISION.md", render_provision(res))
+
+    for obj in res.get("credential_objects") or []:
+        # Said out loud, dry run or not: this is the one object this plugin
+        # places anywhere that holds a secret.
+        print(f"  CREDENTIAL ON THE WORKSPACE MOUNT: {obj} "
+              f"{'would hold' if res['dry_run'] else 'holds'} the Snowflake "
+              f"connection block, credential included -- readable by every "
+              f"member of workspace {res['workspace']['name']} and every "
+              f"cluster in it via /Workspace. Remove it when the migration "
+              f"is done.", file=sys.stderr)
 
     failed = [s for s in res["steps"] if s["verified"] is False]
     if res["dry_run"]:
