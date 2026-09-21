@@ -734,3 +734,100 @@ def test_ddl_remap_is_a_noop_when_no_ntz_columns(tmp_path):
     rc = main(["ddl", "--out-dir", str(tmp_path), "--timestamp-ntz", "timestamp"])
     assert rc == 0
     assert _ddl_plan(tmp_path)["remapped_columns"] == []
+
+
+# --- accepted `aidp:` keys are consumed, not just accepted -----------------
+
+def _cwd_config(tmp_path, monkeypatch, aidp_lines):
+    """A discoverable config in the working directory: `provision` and
+    `catalogs` take no --config flag, so this is how the file reaches them."""
+    cfg = tmp_path / "snowmig-config.yaml"
+    body = ("snowflake:\n  account: ORG-ACC\n  user: SVC\n  warehouse: WH\n"
+            "  database: SALES_DB\n  auth: password\n"
+            "  password: not-a-real-password\naidp:\n")
+    body += "".join(f"  {line}\n" for line in aidp_lines)
+    cfg.write_text(body, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    return cfg
+
+
+def test_oci_profile_from_config_reaches_oci_calls_only(
+        tmp_path, monkeypatch, capsys):
+    import subprocess
+    import types
+
+    import snowmig
+    _cwd_config(tmp_path, monkeypatch,
+                [f"datalake_ocid: {OCID}", "oci_profile: FAKE_PROFILE"])
+    seen = []
+
+    def fake_run(argv, **kw):
+        seen.append(list(argv))
+        return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    args = snowmig.build_parser().parse_args(["catalogs", "--out-dir", str(tmp_path)])
+    runner = snowmig._oci_runner(args)
+    assert runner is not None
+    runner(["oci", "raw-request", "--http-method", "GET",
+            "--target-uri", "https://example.invalid/x"])
+    runner(["aidp", "workspace", "list"])
+    assert seen[0][:3] == ["oci", "--profile", "FAKE_PROFILE"]
+    assert seen[0][3:] == ["raw-request", "--http-method", "GET",
+                           "--target-uri", "https://example.invalid/x"]
+    # The aidp CLI's flag set is unverified: its argv is left alone.
+    assert seen[1] == ["aidp", "workspace", "list"]
+    out = capsys.readouterr().out
+    assert "FAKE_PROFILE" in out and "oci" in out
+
+
+def test_no_oci_profile_means_the_default_transport(tmp_path, monkeypatch):
+    import snowmig
+    _cwd_config(tmp_path, monkeypatch, [f"datalake_ocid: {OCID}"])
+    args = snowmig.build_parser().parse_args(["catalogs", "--out-dir", str(tmp_path)])
+    assert snowmig._oci_runner(args) is None
+
+
+def test_catalogs_hands_the_profile_runner_to_the_transport(tmp_path, monkeypatch):
+    import snowmig
+    _cwd_config(tmp_path, monkeypatch,
+                [f"datalake_ocid: {OCID}", "oci_profile: FAKE_PROFILE"])
+    captured = {}
+
+    def fake_make_call(target, *, backend, run_process=None):
+        captured["run_process"] = run_process
+        return lambda operation, **kw: {"items": []}
+    monkeypatch.setattr(snowmig, "make_call", fake_make_call)
+    monkeypatch.setattr(snowmig, "detect_backend", lambda: "oci_raw")
+    assert main(["catalogs", "--out-dir", str(tmp_path)]) == 0
+    assert captured["run_process"] is not None
+
+
+def test_provision_dry_run_takes_the_catalogs_from_the_config(
+        tmp_path, monkeypatch, capsys):
+    _cwd_config(tmp_path, monkeypatch,
+                [f"datalake_ocid: {OCID}", "external_catalog: cfg_external_cat",
+                 "target_catalog: cfg_target_cat",
+                 "subnet_id: ocid1.subnet.oc1.iad.fakesubnet"])
+    rc = main(["provision", "--workspace-name", "w", "--out-dir", str(tmp_path),
+               "--skip-libraries"])
+    assert rc == 0
+    res = json.loads((tmp_path / "provision_result.json").read_text(encoding="utf-8"))
+    assert res["external_catalog"] == "cfg_external_cat"
+    assert res["target_catalog"] == "cfg_target_cat"
+    out = capsys.readouterr().out
+    assert "external_catalog=cfg_external_cat" in out
+    assert "target_catalog=cfg_target_cat" in out
+    assert "subnet_id=ocid1.subnet.oc1.iad.fakesubnet (not used by any stage yet)" in out
+
+
+def test_provision_flag_overrides_the_config_catalog(tmp_path, monkeypatch):
+    _cwd_config(tmp_path, monkeypatch,
+                [f"datalake_ocid: {OCID}", "external_catalog: cfg_external_cat",
+                 "target_catalog: cfg_target_cat"])
+    rc = main(["provision", "--workspace-name", "w", "--out-dir", str(tmp_path),
+               "--skip-libraries", "--target-catalog", "flag_cat"])
+    assert rc == 0
+    res = json.loads((tmp_path / "provision_result.json").read_text(encoding="utf-8"))
+    assert res["target_catalog"] == "flag_cat"
+    assert res["external_catalog"] == "cfg_external_cat"

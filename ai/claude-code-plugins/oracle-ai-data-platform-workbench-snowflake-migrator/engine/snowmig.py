@@ -212,11 +212,55 @@ def _aidp_from_config(args) -> dict:
     taken = {k: v for k, v in block.items()
              if not getattr(args, k.replace("-", "_"), None)}
     if taken:
-        shown = ", ".join(f"{k}={v}" for k, v in sorted(taken.items())
-                          if k != "oci_profile")
+        # `oci_profile` has its own line (see _oci_profile). `subnet_id` is
+        # accepted so a typo is still reported, but no stage reads it from
+        # the file yet -- said here rather than left to be assumed.
+        shown = ", ".join(
+            f"{k}={v}" + (" (not used by any stage yet)"
+                          if k == "subnet_id" else "")
+            for k, v in sorted(taken.items()) if k != "oci_profile")
         if shown:
             print(f"  destination from the config file: {shown}")
     return block
+
+
+def _oci_profile(args) -> str | None:
+    """`aidp.oci_profile` from the config, announced once.
+
+    It reaches the `oci` CLI as `--profile`, a documented flag. The `aidp`
+    CLI's flag set is unverified, so its argv is left alone and the line
+    says so -- an operator on a non-default profile then knows which calls
+    the file covered.
+    """
+    cached = getattr(args, "_oci_profile", None)
+    if cached is not None:
+        return cached or None
+    profile = str(aidp_block(_load_migration_config(args))
+                  .get("oci_profile") or "").strip()
+    args._oci_profile = profile  # "" when absent, so this runs once
+    if profile:
+        print(f"  oci profile from the config file: {profile} (passed as "
+              f"--profile to every `oci` call; the `aidp` CLI is not given "
+              f"a profile flag)")
+    return profile or None
+
+
+def _oci_runner(args):
+    """The `run_process` for the transports: adds `--profile <p>` to every
+    `oci` argv when the config names a profile, else None (the transport's
+    own default runner)."""
+    profile = _oci_profile(args)
+    if not profile:
+        return None
+    import subprocess
+
+    def run(cmd):
+        argv = list(cmd)
+        if argv and argv[0] == "oci" and "--profile" not in argv:
+            argv[1:1] = ["--profile", profile]
+        return subprocess.run(argv, capture_output=True, text=True,
+                              check=False, encoding="utf-8", errors="replace")
+    return run
 
 
 def _snowflake_coords(args) -> dict:
@@ -492,7 +536,8 @@ def cmd_catalogs(args) -> int:
     target = resolve_target(**coords, require=("datalake_ocid",))
     backend = args.backend or detect_backend()
     print(f"  backend: {backend}")
-    payload = make_call(target, backend=backend)("list_catalogs")
+    payload = make_call(target, backend=backend,
+                        run_process=_oci_runner(args))("list_catalogs")
     cats = [{"name": i.get("displayName"), "key": i.get("key"),
              "catalog_type": i.get("catalogType"),
              "source_type": i.get("sourceType")}
@@ -779,13 +824,16 @@ def cmd_deploy(args) -> int:
     if args.transport == "catalog_api":
         # The working transport. `POST .../sql/execute` returns 404, and a
         # structure-only clone needs no Spark cluster anyway.
-        call = (make_call(target, backend=args.backend or detect_backend())
+        call = (make_call(target, backend=args.backend or detect_backend(),
+                          run_process=_oci_runner(args))
                 if args.execute else None)
         result = deploy_catalog(ddl_plan, target=target,
                                 execute=args.execute, call=call,
                                 diagnose=not args.no_diagnose)
     else:
-        run_sql = (make_aidp_run_sql(target, backend=args.backend or detect_backend())
+        run_sql = (make_aidp_run_sql(target,
+                                     backend=args.backend or detect_backend(),
+                                     run_process=_oci_runner(args))
                    if args.execute else None)
         result = deploy(ddl_plan, target=target, execute=args.execute,
                         run_sql=run_sql, chunk_size=args.chunk_size)
@@ -848,7 +896,7 @@ def cmd_run(args) -> int:
             "make it cover less.")
 
 
-    call = make_provision_call(ocid)
+    call = make_provision_call(ocid, run_process=_oci_runner(args))
 
     job_key = args.job_key
     if not job_key:
@@ -1037,7 +1085,8 @@ def cmd_catalog(args) -> int:
         print(f"  backend: {backend}")
         result = ensure_catalog(
             display_name=name,
-            call=make_call(target, backend=backend),
+            call=make_call(target, backend=backend,
+                           run_process=_oci_runner(args)),
             catalog_type=catalog_type, source_type=args.source_type.upper(),
             connection=connection,
             description=args.description or
@@ -1066,7 +1115,7 @@ def cmd_catalog(args) -> int:
         from target.provision_api import build_test_connection_body
         from target.provisioning import make_provision_call
         import time as _time
-        pcall = make_provision_call(ocid)
+        pcall = make_provision_call(ocid, run_process=_oci_runner(args))
         # The API resolves the catalog KEY (RBAC DESCCATALOG), which is what
         # ensure_catalog reported back -- not necessarily the display name.
         probe = pcall("test_connection",
@@ -1152,7 +1201,8 @@ def cmd_smoke(args) -> int:
         print(f"  destination backend: {backend}")
         # The catalog API, not SQL: `POST .../sql/execute` returns 404, so a
         # SQL-based check reported FAIL against a working destination.
-        dest_call = make_call(target, backend=backend)
+        dest_call = make_call(target, backend=backend,
+                              run_process=_oci_runner(args))
     # The probe WRITES (one schema, created and removed), so it is gated
     # like every other write: `--write-probe` alone is a dry run that says
     # what it would create; `--write-probe --execute` creates it.
@@ -1375,7 +1425,8 @@ def cmd_preflight(args) -> int:
             workspace=coords["workspace"] or "unused",
             cluster_id=coords["cluster_id"] or "unused",
             catalog=catalog)
-        call = make_call(target, backend=args.backend or detect_backend())
+        call = make_call(target, backend=args.backend or detect_backend(),
+                         run_process=_oci_runner(args))
 
     result = run_preflight(config, run_sql=run_sql, call=call,
                            catalog=catalog)
@@ -1458,14 +1509,22 @@ def cmd_provision(args) -> int:
         requirements = (pathlib.Path(args.requirements) if args.requirements
                         else scripts_dir / "requirements-aidp.txt")
 
+    # The catalogs baked into the jobs' PARAMS defaults may come from the
+    # config's `aidp:` block (announced by _aidp_from_config like every
+    # other config-derived value); a flag still wins. Read for the dry run
+    # too, so PROVISION.md previews the defaults --execute will bake in.
+    aidp = _aidp_from_config(args)
+    external_catalog = args.external_catalog or aidp.get("external_catalog")
+    target_catalog = args.target_catalog or aidp.get("target_catalog")
+
     call = None
     if args.execute:
-        ocid = _target_coords(args)["datalake_ocid"]
+        ocid = args.datalake_ocid or aidp.get("datalake_ocid")
         if not ocid:
             raise MissingTarget(
                 "--execute needs the aiDataPlatform OCID: put it under "
                 "`aidp:` in the config, or pass --datalake-ocid.")
-        call = make_provision_call(ocid)
+        call = make_provision_call(ocid, run_process=_oci_runner(args))
     elif _executed_record_exists(out, "provision_result.json"):
         return _refuse_dry_run_overwrite(out, "provision_result.json",
                                          "provision")
@@ -1474,8 +1533,8 @@ def cmd_provision(args) -> int:
         call=call, workspace_name=args.workspace_name,
         cluster_name=args.cluster_name, scripts=list(scripts),
         plan_files=plan_files, requirements=requirements,
-        maven=args.maven or [], external_catalog=args.external_catalog,
-        target_catalog=args.target_catalog, source_mode=args.source_mode,
+        maven=args.maven or [], external_catalog=external_catalog,
+        target_catalog=target_catalog, source_mode=args.source_mode,
         source_config=source_config,
         warehouse_clusters=warehouse_clusters, execute=args.execute,
         subnet_id=args.subnet_id, reuse_existing=args.reuse_existing)
