@@ -358,3 +358,35 @@ def test_the_census_report_says_nothing_is_migratable():
 def test_a_task_gets_the_cutover_warning():
     md = render_census(_CENSUS)
     assert "stops being populated" in md or "stops being" in md
+
+
+# --------------------------------------------------------------------------
+# SECURITY.md: a policy object that exists while POLICY_REFERENCES (up to
+# ~2 h stale) shows no attachment must not be rendered as an all-clear.
+# --------------------------------------------------------------------------
+
+def _security(**over):
+    base = {"statement": "s", "exposures": [], "exposure_count": 0,
+            "secure_views": [], "unreadable": [],
+            "policy_references_readable": True,
+            "policies": {"masking": {"count": 1, "readable": True, "note": ""},
+                         "row_access": {"count": 0, "readable": True, "note": ""},
+                         "tags": {"count": 0, "readable": True, "note": ""}},
+            "grants": {"measured": False}}
+    base.update(over)
+    return base
+
+
+def test_security_report_flags_a_defined_but_unattached_policy():
+    from report.render import render_security
+    md = render_security(_security(policies_defined_without_attachment=1))
+    assert "Defined is not the same as attached" not in md, \
+        "that sentence tells the reader to disregard the only contradicting signal"
+    assert "not seen attached" in md and "all-clear" in md
+
+
+def test_security_report_keeps_the_plain_sentence_when_attachments_are_accounted_for():
+    from report.render import render_security
+    md = render_security(_security(policies_defined_without_attachment=0))
+    assert "Defined is not the same as attached" in md
+    assert "all-clear" not in md

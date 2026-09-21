@@ -1028,9 +1028,17 @@ def render_security(sec: dict) -> str:
 
     pol = sec.get("policies") or {}
     if pol:
-        out += ["## Policy objects defined in the source", "",
-                "Defined is not the same as attached — an unattached policy "
-                "protects nothing, and an attached one is listed above.", "",
+        unattached = sec.get("policies_defined_without_attachment") or 0
+        if unattached:
+            lead = (f"> **Defined, but not seen attached.** {unattached} policy "
+                    "object(s) exist and `ACCOUNT_USAGE.POLICY_REFERENCES` "
+                    "(up to ~2 h stale) shows no attachment to anything. Do "
+                    "not read the table below as an all-clear.")
+        else:
+            lead = ("Defined is not the same as attached — an unattached "
+                    "policy protects nothing, and an attached one is listed "
+                    "above.")
+        out += ["## Policy objects defined in the source", "", lead, "",
                 "| Kind | Count | Read |", "|---|---:|---|"]
         for label, key in (("Masking", "masking"),
                            ("Row access", "row_access"), ("Tags", "tags")):

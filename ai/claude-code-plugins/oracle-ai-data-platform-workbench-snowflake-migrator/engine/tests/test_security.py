@@ -169,3 +169,82 @@ def test_when_policy_references_cannot_be_read_the_answer_is_unknown():
     assert s["exposure_count"] is None
     assert "could not" in s["statement"].lower() or "unknown" in s["statement"].lower()
     assert "no masking" not in s["statement"].lower()
+
+
+# ------------------------------------------------- defined, but not seen attached
+#
+# The only attachment source is ACCOUNT_USAGE.POLICY_REFERENCES, which lags
+# up to ~2 hours. A policy attached inside that window is invisible there
+# while SHOW MASKING/ROW ACCESS POLICIES already lists the policy object. An
+# estate prepared shortly before the run is exactly this case, and the
+# statement must not read "nothing is protected" on it.
+
+def _table_only_inv():
+    return {"databases_in_scope": ["DB"],
+            "inventory": [{"source_identifier": "DB.PUBLIC.CUSTOMERS",
+                           "object_type": "TABLE", "source_database": "DB",
+                           "source_schema": "PUBLIC", "source_metadata": {}}]}
+
+
+def _masking_policy(name="MASK_SSN"):
+    return {"name": name, "database_name": "DB", "schema_name": "PUBLIC",
+            "kind": "MASKING_POLICY"}
+
+
+def test_a_defined_policy_with_no_visible_attachment_is_not_reported_clean():
+    s = build_security(FakeSql(_responses(**{
+        "show masking policies": [_masking_policy()]})), _table_only_inv())
+    assert s["exposure_count"] == 0, "still an int: nothing was SEEN attached"
+    assert s["policies_defined_without_attachment"] == 1
+    st = s["statement"].lower()
+    assert "no masking" not in st
+    assert "unconfirmed" in st
+    assert "lag" in st
+    assert "nothing is protected" not in st
+
+
+def test_a_defined_row_access_policy_triggers_the_same_hedge():
+    s = build_security(FakeSql(_responses(**{
+        "show row access policies": [{"name": "RAP_REGION", "database_name": "DB",
+                                      "schema_name": "PUBLIC",
+                                      "kind": "ROW_ACCESS_POLICY"}]})),
+        _table_only_inv())
+    assert s["policies_defined_without_attachment"] == 1
+    assert "unconfirmed" in s["statement"].lower()
+
+
+def test_the_clean_statement_names_the_source_and_its_lag():
+    s = build_security(FakeSql(_responses()), _table_only_inv())
+    st = s["statement"].lower()
+    assert "no masking" in st
+    assert "policy_references" in st and "lag" in st, \
+        "a clean verdict says where it looked and how stale that can be"
+    assert s["policies_defined_without_attachment"] == 0
+    assert "lag" in s["attachment_source"].lower()
+
+
+def test_a_policy_attached_out_of_scope_does_not_trigger_the_hedge():
+    # The defined policy IS accounted for: it is attached to something we are
+    # not migrating, so the empty in-scope list is corroborated.
+    s = build_security(FakeSql(_responses(**{
+        "show masking policies": [_masking_policy()],
+        "policy_references": [_policy_ref(obj="NOT_MIGRATING")]})),
+        _table_only_inv())
+    assert s["exposure_count"] == 0
+    assert s["policy_references_out_of_scope"] == 1
+    assert s["policies_defined_without_attachment"] == 0
+    assert "unconfirmed" not in s["statement"].lower()
+
+
+def test_unenumerable_policy_objects_cannot_corroborate_an_empty_attachment_list():
+    class Denied(FakeSql):
+        def __call__(self, sql, params=None):
+            if "show masking policies" in sql.lower():
+                raise RuntimeError("denied")
+            return super().__call__(sql, params)
+
+    s = build_security(Denied(_responses()), _table_only_inv())
+    assert s["exposure_count"] == 0
+    st = s["statement"].lower()
+    assert "no masking" not in st
+    assert "could not be enumerated" in st or "cannot corroborate" in st
