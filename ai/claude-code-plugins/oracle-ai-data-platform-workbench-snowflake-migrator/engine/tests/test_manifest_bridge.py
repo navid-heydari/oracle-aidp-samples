@@ -132,3 +132,43 @@ def test_the_inventory_shape_matches_what_the_planning_stages_read():
                 "columns"):
         assert key in rec, key
     assert rec["source_identifier"] == "DB.SALES.ORDERS"
+
+
+# --- source_metadata: the keys every consumer reads ------------------------
+
+def test_manifest_metadata_uses_the_same_keys_as_a_live_assess():
+    """Agreement extends past types to metadata: `restrictions.max_bytes`,
+    `render_inventory`, `maintenance` and `ddl` all read `source_metadata`
+    under the keys a live `assess` writes. A manifest-built record that spells
+    them differently is invisible to every one of them."""
+    from snowflake_source.extract.catalog import _META_KEYS
+    rec = inventory_from_manifest(_manifest(), database="DB")["inventory"][0]
+    assert set(rec["source_metadata"]) <= set(_META_KEYS), rec["source_metadata"]
+    assert rec["source_metadata"]["bytes"] == 100
+    assert rec["source_metadata"]["rows"] == 10
+
+
+def test_a_max_bytes_restriction_excludes_an_ingested_table():
+    # The runbook path: discover in AIDP, ingest, plan a first wave with a size
+    # cap. The cap used to exclude nothing while plan.json recorded it as
+    # applied, so the largest tables entered the canary.
+    from plan.restrictions import apply_restrictions
+    big = {"name": "ORDERS", "source_rows": 10, "source_bytes": 4096,
+           "columns": [_col("ID", "NUMBER", precision=38, scale=0)]}
+    tiny = {"name": "TINY", "source_rows": 1, "source_bytes": 8,
+            "columns": [_col("ID", "NUMBER", precision=38, scale=0)]}
+    inv = inventory_from_manifest(
+        {"schemas": [{"name": "SALES", "tables": [big, tiny], "views": [],
+                      "errors": []}]}, database="DB")
+    kept, excluded = apply_restrictions(inv["inventory"], {"max_bytes": 100})
+    assert [e["source_identifier"] for e in excluded] == ["DB.SALES.ORDERS"]
+    assert "exceeds max_bytes" in excluded[0]["reason"]
+    assert [k["source_identifier"] for k in kept] == ["DB.SALES.TINY"]
+
+
+def test_an_ingested_inventory_renders_its_sizes():
+    from report.render import render_inventory
+    inv = inventory_from_manifest(_manifest(source_bytes=4096), database="DB")
+    row = next(line for line in render_inventory(inv).splitlines()
+               if "`DB.SALES.ORDERS`" in line)
+    assert "4.0 KB" in row, row
