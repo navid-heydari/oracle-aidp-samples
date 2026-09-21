@@ -390,9 +390,9 @@ def test_the_docs_say_where_each_credential_lives():
     """"Where do I put the URL, the user and the password?" is the question
     users actually ask, and answering it wrong once costs a leaked secret.
 
-    Three places, and the plugin holds only one of them: Snowflake
-    coordinates in the config, the Snowflake SECRET in a separate file
-    referenced by path, and AIDP auth in the user's own OCI config.
+    Two places: the Snowflake coordinates AND the Snowflake secret in the
+    one config file (inline is the documented default since 0.19; a `*_path`
+    variant is the opt-in), and AIDP auth in the user's own OCI config.
     """
     for path in ("README.md",
                  "skills/snowflake-migrator-bootstrap/SKILL.md",
@@ -406,6 +406,45 @@ def test_the_docs_say_where_each_credential_lives():
         # And the rule that protects it.
         assert "never" in low and "chat" in low, \
             f"{path}: must say a secret is never asked for in chat"
+    # The skill that drives the catalog stage reads that file too.
+    low = (ROOT / "skills/snowflake-medallion-clone/SKILL.md").read_text(encoding="utf-8").lower()
+    assert "never" in low and "chat" in low, \
+        "medallion-clone: must say a secret is never asked for in chat"
+
+
+def test_no_skill_or_command_claims_the_config_carries_no_secret():
+    # The pre-0.19 contract (credential = a path, so the file is safe to
+    # read and show) survived in one skill after inline became the default.
+    paths = sorted((ROOT / "skills").glob("*/SKILL.md")) + \
+        sorted((ROOT / "commands").glob("*.md")) + \
+        [ROOT / "README.md", ROOT / "ARCHITECTURE.md"]
+    for path in paths:
+        flat = " ".join(path.read_text(encoding="utf-8").lower()
+                        .replace("*", "").split())
+        assert "carries no secret" not in flat, path.name
+        assert "credential itself is a path" not in flat, path.name
+
+
+def test_clone_skill_carries_the_inline_secret_rules():
+    low = (ROOT / "skills/snowflake-medallion-clone/SKILL.md").read_text(encoding="utf-8").lower()
+    flat = " ".join(low.split())
+    assert "inline" in flat
+    assert "ask the user before reading" in flat
+    assert "never print" in flat or "never quote" in flat
+    assert "redact" in flat
+    assert "rotate" in flat
+
+
+def test_no_doc_names_the_nonexistent_aidp_test_connection_verb():
+    # `aidp catalog test-connection` was an inferred shape; the wired command
+    # is `snowmig catalog ... --execute --test-connection`.
+    paths = sorted((ROOT / "skills").glob("*/SKILL.md")) + \
+        sorted((ROOT / "commands").glob("*.md")) + \
+        [ROOT / "README.md", ROOT / "ARCHITECTURE.md"]
+    for path in paths:
+        assert "aidp catalog test-connection" not in path.read_text(encoding="utf-8"), path.name
+    medallion = (ROOT / "skills/snowflake-medallion-clone/SKILL.md").read_text(encoding="utf-8")
+    assert "--test-connection" in medallion
 
 
 def test_the_docs_do_not_assume_the_user_is_inside_this_repo():

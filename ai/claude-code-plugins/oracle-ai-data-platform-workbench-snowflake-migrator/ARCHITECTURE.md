@@ -264,8 +264,8 @@ python3 $E catalog --out-dir $OUT --catalog MYCAT \
                    --config ./snowmig-config.yaml \
                    --datalake-ocid ... --workspace ... --cluster-id ...
 #   dry run first — prints the fields, never the secrets
-python3 $E catalog ... --execute
-#   then: aidp catalog test-connection    ← the shape is inferred, not verified
+python3 $E catalog ... --execute --test-connection
+#   --test-connection only runs with --execute (RBAC resolves on an existing catalog)
 
 python3 $E summary --out-dir $OUT
 python3 $E stages  --out-dir $OUT        # where does this run stand?
