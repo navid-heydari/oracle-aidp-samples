@@ -55,6 +55,10 @@ class TranslationRule:
     # Returns (sql, problem) or (sql, problem, warnings).
     translate: Callable[[str], tuple] | None = None
     detail: str = ""
+    # Set when the rewrite is exact only under a stated condition. It travels
+    # with every application of the rule, so the DDL plan cannot call the
+    # result "exact" without the condition next to it.
+    caveat: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -154,6 +158,18 @@ _CANONICAL_INTERVAL = {"hour": "HOUR", "h": "HOUR", "hh": "HOUR",
 _DATEADD = (
     r"\b(?P<kw>DATEADD)\s*\(\s*([A-Za-z]+)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)")
 
+# The only amounts rewritten: an integer literal, or a (qualified) column. An
+# expression such as `a + b` would need parenthesising before `* 7`, and
+# deciding where its boundary lies is exactly what a token rule cannot do.
+_INT_LITERAL = re.compile(r"[+-]?\d+")
+_COLUMN_REF = re.compile(r"[A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*")
+
+# Where the rewrite is exact only for a DATE operand. Spark's date_add and
+# add_months return DATE, so a TIMESTAMP operand loses its time-of-day;
+# Snowflake's DATEADD returns the operand's own type.
+_DATEADD_CAVEAT = ("exact for DATE operands only: Spark date_add/add_months "
+                   "return DATE, so a TIMESTAMP operand is truncated to DATE")
+
 
 def _dateadd(sql: str) -> tuple[str, str | None]:
     problems: list[str] = []
@@ -162,23 +178,47 @@ def _dateadd(sql: str) -> tuple[str, str | None]:
         unit, amount, col = m.group(2).lower(), m.group(3).strip(), m.group(4).strip()
         kind = _DATE_UNITS.get(unit)
         if kind is None:
-            problems.append(unit)
+            problems.append(
+                f"unrecognised DATEADD unit `{unit}`. Units are not guessed -- "
+                "add them to _DATE_UNITS once the intended granularity is confirmed")
             return m.group(0)
+        literal = _INT_LITERAL.fullmatch(amount) is not None
+        if not literal and _COLUMN_REF.fullmatch(amount) is None:
+            problems.append(
+                f"DATEADD({unit}, {amount}, ...): the amount is an expression, "
+                "not an integer literal or a column. Its precedence against the "
+                "unit multiplier would be guessed, so it is not rewritten")
+            return m.group(0)
+        # A column is parenthesised where it meets the multiplier; a literal
+        # keeps its bare form.
+        n = amount if literal else f"({amount})"
         if kind == "days":
             return f"date_add({col}, {amount})"
         if kind == "weeks":
-            return f"date_add({col}, {amount} * 7)"
+            return f"date_add({col}, {n} * 7)"
         if kind == "months":
             if unit.startswith("y"):
-                return f"add_months({col}, {amount} * 12)"
+                return f"add_months({col}, {n} * 12)"
             return f"add_months({col}, {amount})"
+        if not literal:
+            problems.append(
+                f"DATEADD({unit}, {amount}, ...): Spark's INTERVAL literal takes "
+                "a numeric constant only; a column amount needs make_interval() "
+                "or timestampadd(), which is not an implemented rule")
+            return m.group(0)
         return f"({col} + INTERVAL {amount} {_CANONICAL_INTERVAL[unit]})"
 
     out = lexer.sub_code(_DATEADD, repl, sql, anchor_group="kw")[0]
     if problems:
-        return sql, (f"unrecognised DATEADD unit(s): {', '.join(sorted(set(problems)))}. "
-                     "Units are not guessed -- add them to _DATE_UNITS once the "
-                     "intended granularity is confirmed")
+        return sql, "; ".join(dict.fromkeys(problems))
+    # Residue check, as _cast and _listagg do: a form the pattern did not match
+    # -- a quoted unit, a nested call such as CURRENT_DATE() -- must be refused,
+    # not carried over verbatim and reported as portable.
+    if lexer.find_code(r"\bDATEADD\s*\(", out):
+        return sql, ("a DATEADD form beyond DATEADD(unit, n, col) with simple "
+                     "arguments -- a quoted unit or a nested call such as "
+                     "CURRENT_DATE() -- needs argument parsing, which a token "
+                     "rule cannot do safely")
     return out, None
 
 
@@ -226,8 +266,9 @@ RULES: tuple[TranslationRule, ...] = (
         _rename(r"\bOBJECT_CONSTRUCT\s*\(", "named_struct(")),
     TranslationRule(
         "T05_DATEADD", "DATEADD",
-        "DATEADD(unit, n, col) -> date_add / add_months / + INTERVAL, per unit",
-        "implemented", r"\bDATEADD\s*\(", _dateadd),
+        "DATEADD(unit, n, col) -> date_add / add_months / + INTERVAL, per unit; "
+        "n an integer literal or a column, anything else refused",
+        "implemented", r"\bDATEADD\s*\(", _dateadd, caveat=_DATEADD_CAVEAT),
     TranslationRule(
         "T06_LISTAGG", "LISTAGG",
         "LISTAGG(x, sep) -> concat_ws(sep, collect_list(x))", "implemented",
@@ -328,10 +369,22 @@ def translate_sql(sql: str) -> TranslationResult:
                 "rule_id": rule.rule_id, "construct": rule.construct,
                 "detail": problem})
             continue
-        if new_sql != result.sql:
-            result.applied.append({
+        if lexer.find_code(rule.detect, new_sql):
+            # The rule ran and its construct is still there: a form it does
+            # not cover. Left in place it would be carried over verbatim and
+            # the view stamped portable, so it is a refusal.
+            result.unsupported.append({
                 "rule_id": rule.rule_id, "construct": rule.construct,
-                "detail": rule.description})
+                "detail": f"a {rule.construct} form the rule does not cover "
+                          "was left in place; it would otherwise be carried "
+                          "over verbatim and reported as portable"})
+            continue
+        if new_sql != result.sql:
+            entry = {"rule_id": rule.rule_id, "construct": rule.construct,
+                     "detail": rule.description}
+            if rule.caveat:
+                entry["caveat"] = rule.caveat
+            result.applied.append(entry)
             result.sql = new_sql
             result.warnings.extend(rest[0] if rest else [])
     return result

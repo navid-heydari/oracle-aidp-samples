@@ -73,6 +73,13 @@ def test_awkward_identifiers_still_parse():
     "select a::varchar as v from t",
     "select LISTAGG(name, ', ') from t",
     "select DATEADD(day, 1, d) as d2 from t",
+    "select DATEADD(week, n, d) as d2 from t",
+    "select DATEADD(year, n, d) as d3 from t",
+    "select DATEADD(hour, -1, ts) as d4 from t",
+    "select DATEADD(day, -30, CURRENT_DATE()) as cutoff from t",
+    "select DATEADD('day', 1, d) as d2 from t",
+    "select DATEADD(day, abs(n), d) as d2 from t",
+    "select DATEADD(day, 1, d) as d1, DATEADD(day, -30, CURRENT_DATE()) as c from t",
     "select ARRAY_CONSTRUCT(1, 2) as arr",
     "select OBJECT_CONSTRUCT('k', v) as o from t",
 ])

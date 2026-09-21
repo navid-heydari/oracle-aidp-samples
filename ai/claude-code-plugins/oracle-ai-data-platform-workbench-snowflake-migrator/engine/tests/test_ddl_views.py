@@ -309,3 +309,31 @@ def test_view_cast_warnings_reach_the_rewrite_result():
     res = build_create_view(view_record(ddl=ddl), "D.S.V")
     assert res.blocked is False
     assert any("timezone" in w for w in res.warnings), res.warnings
+
+
+# --- DATEADD is exact only for DATE operands, and only in its simple form ---
+
+def test_a_view_with_dateadd_is_not_labelled_exact():
+    ddl = "create view V as select DATEADD(day, 1, created_ts) as due_ts from D.S.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is False
+    r43 = [r for r in res.rules_applied if r.rule_id == "R43_VIEW_DIALECT_TRANSLATED"]
+    assert r43 and "every one is an exact rewrite" not in r43[0].detail, r43
+    assert any("TIMESTAMP" in w for w in res.warnings), res.warnings
+
+
+def test_a_view_with_dateadd_column_hours_is_blocked_with_the_construct_named():
+    ddl = "create view V as select DATEADD(hour, n_hours, ts) as x from D.S.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is True
+    assert "DATEADD" in res.blocked_reason
+
+
+def test_a_view_with_a_nested_dateadd_is_blocked_not_stamped_portable():
+    ddl = ("create view V as select * from D.S.EVENTS "
+           "where ts >= DATEADD(day, -30, CURRENT_DATE())")
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is True
+    assert "DATEADD" in res.blocked_reason
+    assert not any(r.rule_id in ("R42_VIEW_PORTABLE_SQL", "R43_VIEW_DIALECT_TRANSLATED")
+                   for r in res.rules_applied)

@@ -331,14 +331,28 @@ def build_create_view(record: dict, target_fqn: str,
             "bronze mirrors the source 1:1, so object references are unchanged"))
 
     if translated.applied:
-        res.rules_applied.append(RuleApplication(
-            "R43_VIEW_DIALECT_TRANSLATED",
-            f"{len(translated.applied)} dialect rule(s) applied; every one is an "
-            "exact rewrite"))
-        res.warnings.append(
-            f"View SQL was dialect-translated by "
-            f"{len(translated.applied)} exact rule(s). Verify its result against "
-            "the source before relying on it.")
+        n = len(translated.applied)
+        # A rule that is exact only under a condition says so here, next to
+        # the count, rather than letting the plan call the whole view exact.
+        caveats = [f'{a["rule_id"]}: {a["caveat"]}'
+                   for a in translated.applied if a.get("caveat")]
+        if caveats:
+            res.rules_applied.append(RuleApplication(
+                "R43_VIEW_DIALECT_TRANSLATED",
+                f"{n} dialect rule(s) applied; NOT all exact: "
+                + "; ".join(caveats)))
+            res.warnings.append(
+                f"View SQL was dialect-translated by {n} rule(s), not all exact: "
+                + "; ".join(caveats)
+                + ". Confirm the operand types against the source before "
+                "relying on it.")
+        else:
+            res.rules_applied.append(RuleApplication(
+                "R43_VIEW_DIALECT_TRANSLATED",
+                f"{n} dialect rule(s) applied; every one is an exact rewrite"))
+            res.warnings.append(
+                f"View SQL was dialect-translated by {n} exact rule(s). Verify "
+                "its result against the source before relying on it.")
     else:
         res.rules_applied.append(RuleApplication(
             "R42_VIEW_PORTABLE_SQL",

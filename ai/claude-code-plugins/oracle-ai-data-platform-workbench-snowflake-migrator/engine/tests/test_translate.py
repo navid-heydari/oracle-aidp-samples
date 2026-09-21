@@ -339,3 +339,84 @@ def test_cast_shorthand_uses_the_same_mapping_as_table_ddl():
             src, expected = f"a::{name}", map_type(name)
         r = t(f"select {src} from t")
         assert f"CAST(a AS {expected.spark_type})" in r.sql, (name, r.sql)
+
+
+# --------------------------------------------------------------------------
+# DATEADD: only the exact forms are rewritten. The amount used to be
+# interpolated unparenthesised (`a + b * 7`), a column amount was put into an
+# INTERVAL literal (a Spark parse error), and any form the regex could not
+# match -- quoted unit, nested call -- fell through with no report at all, so
+# the view was stamped portable with Snowflake DATEADD still in it.
+# --------------------------------------------------------------------------
+
+def test_dateadd_compound_amount_is_refused_not_misparenthesised():
+    sql = "select DATEADD(week, a + b, d), DATEADD(year, n - 1, d) from t"
+    r = t(sql)
+    assert r.sql == sql, "left untouched rather than `a + b * 7`"
+    assert "T05_DATEADD" in [u["rule_id"] for u in r.unsupported]
+    assert "amount" in r.unsupported[0]["detail"]
+
+
+@pytest.mark.parametrize("sql,expected", [
+    ("select DATEADD(day, n, d) from t", "date_add(d, n)"),
+    ("select DATEADD(week, n, d) from t", "date_add(d, (n) * 7)"),
+    ("select DATEADD(year, n, d) from t", "add_months(d, (n) * 12)"),
+    ("select DATEADD(month, t.n, d) from t", "add_months(d, t.n)"),
+])
+def test_dateadd_column_amount_is_parenthesised_where_it_is_multiplied(sql, expected):
+    r = t(sql)
+    assert expected in r.sql, r.sql
+    assert r.fully_translated is True
+
+
+@pytest.mark.parametrize("sql,expected", [
+    ("select DATEADD(year, 7, d) from t", "add_months(d, 7 * 12)"),
+    ("select DATEADD(day, -3, d) from t", "date_add(d, -3)"),
+    ("select DATEADD(week, -2, d) from t", "date_add(d, -2 * 7)"),
+    ("select DATEADD(hour, -1, ts) from t", "(ts + INTERVAL -1 HOUR)"),
+])
+def test_dateadd_literal_amount_keeps_the_bare_form(sql, expected):
+    r = t(sql)
+    assert expected in r.sql, r.sql
+    assert r.fully_translated is True
+
+
+def test_dateadd_time_unit_with_a_column_amount_is_refused():
+    sql = "select DATEADD(hour, n_hours, ts) from t"
+    r = t(sql)
+    assert r.sql == sql
+    assert "T05_DATEADD" in [u["rule_id"] for u in r.unsupported]
+    assert "INTERVAL" in r.unsupported[0]["detail"]
+
+
+@pytest.mark.parametrize("body", [
+    "select DATEADD(day, -30, CURRENT_DATE()) as cutoff from t",
+    "select DATEADD('day', 1, d) as d2 from t",
+    "select DATEADD(day, abs(n), d) as d2 from t",
+    "select DATEADD(day, 1, d) as d1, DATEADD(day, -30, CURRENT_DATE()) as c from t",
+])
+def test_dateadd_forms_the_rule_cannot_rewrite_are_refused_not_carried_over(body):
+    r = t(body)
+    assert r.sql == body, "refusal is total: no half-translated body"
+    assert r.applied == []
+    assert "T05_DATEADD" in [u["rule_id"] for u in r.unsupported]
+
+
+def test_dateadd_applied_record_carries_the_date_return_caveat():
+    r = t("select DATEADD(day, 1, d) from t")
+    caveat = r.applied[0].get("caveat", "")
+    assert "TIMESTAMP" in caveat and "DATE" in caveat, r.applied
+
+
+def test_a_rule_whose_output_still_matches_its_own_detector_is_reported(monkeypatch):
+    # The generic guard: an implemented rule that leaves its construct in
+    # place is a refusal, never a silent pass-through stamped portable.
+    from snowflake_source.dialect import translate
+
+    fake = translate.TranslationRule(
+        "T99_FAKE", "FAKE", "fake rule", "implemented", r"\bFAKE\s*\(",
+        lambda sql: (sql.replace("x", "y"), None))
+    monkeypatch.setattr(translate, "RULES", (fake,))
+    r = translate.translate_sql("select FAKE(x) from t")
+    assert r.applied == []
+    assert [u["rule_id"] for u in r.unsupported] == ["T99_FAKE"]
