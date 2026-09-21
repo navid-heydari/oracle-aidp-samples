@@ -60,7 +60,7 @@ def test_iff_is_case_insensitive_and_repeated():
 
 def test_cast_shorthand_on_a_simple_operand():
     r = t("select a::string from t")
-    assert "CAST(a AS string)" in r.sql
+    assert "CAST(a AS STRING)" in r.sql, "the type goes through the mapper"
     assert "::" not in r.sql
 
 
@@ -204,7 +204,7 @@ def test_variant_path_rule_still_fires_on_real_variant_access():
 def test_cast_shorthand_still_rewrites_a_literal_operand():
     # The operand is a literal on purpose; only `::` has to be code.
     out = translate_sql("select 'x'::varchar as v")
-    assert out.sql == "select CAST('x' AS varchar) as v"
+    assert out.sql == "select CAST('x' AS STRING) as v"
 
 
 def test_cast_shorthand_inside_a_literal_is_not_rewritten():
@@ -270,3 +270,72 @@ def test_a_rule_that_raises_unterminated_literal_blocks_only_that_construct(monk
     assert r.sql == "select x from t"
     assert [u["rule_id"] for u in r.unsupported] == ["T99_FAKE"]
     assert "boom" in r.unsupported[0]["detail"]
+
+
+# --------------------------------------------------------------------------
+# T02 used to copy the Snowflake type name into CAST verbatim. Spark FLOAT is
+# single precision, bare DECIMAL is DECIMAL(10,0), INT is 32-bit, and NUMBER /
+# TEXT / TIME / VARIANT are not Spark types at all -- so the "exact" rewrite
+# silently narrowed values or failed at first query. The type now goes through
+# the same mapper as table DDL.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("src,expected", [
+    ("a::FLOAT", "DOUBLE"),
+    ("a::REAL", "DOUBLE"),
+    ("a::NUMBER(10,2)", "DECIMAL(10,2)"),
+    ("a::DECIMAL", "DECIMAL(38,0)"),
+    ("a::INT", "DECIMAL(38,0)"),
+    ("a::NUMBER", "DECIMAL(38,0)"),
+    ("a::BIGINT", "DECIMAL(38,0)"),
+    ("a::TEXT", "STRING"),
+    ("a::varchar(20)", "STRING"),
+    ("a::DATE", "DATE"),
+    ("a::BOOLEAN", "BOOLEAN"),
+    ("a::DOUBLE PRECISION", "DOUBLE"),
+])
+def test_cast_shorthand_maps_the_type_through_the_type_mapper(src, expected):
+    r = t(f"select {src} from t")
+    assert f"CAST(a AS {expected}) from t" in r.sql, r.sql
+    assert "::" not in r.sql
+    assert r.fully_translated is True
+
+
+def test_cast_shorthand_never_emits_a_snowflake_type_name():
+    r = t("select a::FLOAT, b::NUMBER(10,2), c::DECIMAL, d::INT, e::TEXT from t")
+    for banned in ("AS FLOAT", "AS NUMBER", "AS TEXT", "AS INT)", "AS DECIMAL)"):
+        assert banned not in r.sql, r.sql
+
+
+@pytest.mark.parametrize("src,reason_word", [
+    ("a::VARIANT", "semi-structured"),
+    ("a::OBJECT", "semi-structured"),
+    ("a::ARRAY", "semi-structured"),
+    ("a::GEOGRAPHY", "no Spark"),
+    ("a::FOOBAR", "unmapped"),
+])
+def test_cast_shorthand_refuses_unmappable_types(src, reason_word):
+    sql = f"select {src} from t"
+    r = t(sql)
+    assert "T02_CAST_SHORTHAND" in [u["rule_id"] for u in r.unsupported]
+    assert reason_word in r.unsupported[0]["detail"], r.unsupported
+    assert r.sql == sql, "the statement is left untouched, not half-cast"
+
+
+def test_cast_shorthand_carries_type_mapper_warnings():
+    r = t("select a::TIMESTAMP, b::TIME from t")
+    assert r.fully_translated is True
+    assert any("timezone semantics differ" in w for w in r.warnings), r.warnings
+    assert any("Spark has no TIME type" in w for w in r.warnings), r.warnings
+
+
+def test_cast_shorthand_uses_the_same_mapping_as_table_ddl():
+    # Guards against the two code paths drifting apart again.
+    from snowflake_source.dialect.types import _DIRECT, map_type
+    for name in list(_DIRECT) + ["NUMBER"]:
+        if name == "NUMBER":
+            src, expected = "a::NUMBER(12,3)", map_type(name, precision=12, scale=3)
+        else:
+            src, expected = f"a::{name}", map_type(name)
+        r = t(f"select {src} from t")
+        assert f"CAST(a AS {expected.spark_type})" in r.sql, (name, r.sql)

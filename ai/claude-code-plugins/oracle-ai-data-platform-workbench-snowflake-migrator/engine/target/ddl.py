@@ -308,6 +308,9 @@ def build_create_view(record: dict, target_fqn: str,
     for applied in translated.applied:
         res.rules_applied.append(RuleApplication(
             applied["rule_id"], f'{applied["construct"]}: {applied["detail"]}'))
+    # The type mapper's notes on a `::TIMESTAMP` or `::TIME` cast travel with
+    # the view, the same way a column's mapping warning travels with a table.
+    res.warnings.extend(translated.warnings)
 
     rewritten, changed = translated.sql, []
     for source_name, target_name in sorted((name_map or {}).items(),

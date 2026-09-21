@@ -103,7 +103,7 @@ def test_a_view_using_only_translatable_sql_migrates():
     res = build_create_view(view_record(ddl=ddl), "D.S.V")
     assert res.blocked is False
     assert "IF(a > 1, 'y', 'n')" in res.sql and "IFF(" not in res.sql
-    assert "CAST(b AS int)" in res.sql
+    assert "CAST(b AS DECIMAL(38,0))" in res.sql, "INT is NUMBER(38,0) in Snowflake"
     assert any(r.rule_id == "R43_VIEW_DIALECT_TRANSLATED" for r in res.rules_applied)
     assert any(r.rule_id == "T01_IFF" for r in res.rules_applied)
 
@@ -293,3 +293,19 @@ def test_translator_value_error_blocks_the_view_not_the_payload(monkeypatch):
     res = build_create_view(view_record(), "D.S.V")
     assert res.blocked is True
     assert "translator could not read this body" in res.blocked_reason
+
+
+# --- `::` casts go through the type mapper ---------------------------------
+
+def test_view_with_variant_cast_is_blocked_with_the_mapper_reason():
+    ddl = "create view V as select p::VARIANT as v from D.S.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is True
+    assert "VARIANT" in res.blocked_reason
+
+
+def test_view_cast_warnings_reach_the_rewrite_result():
+    ddl = "create view V as select d::TIMESTAMP as ts from D.S.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is False
+    assert any("timezone" in w for w in res.warnings), res.warnings

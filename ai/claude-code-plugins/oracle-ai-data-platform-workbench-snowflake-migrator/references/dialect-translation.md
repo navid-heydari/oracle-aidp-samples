@@ -18,7 +18,7 @@ worse than a blocked object.
 | Rule | Snowflake | AIDP / Spark |
 |---|---|---|
 | `T01_IFF` | `IFF(c, a, b)` | `IF(c, a, b)` |
-| `T02_CAST_SHORTHAND` | `x::TYPE` | `CAST(x AS TYPE)` — bare column or literal only; refused when the left operand is an expression, because a token rule cannot find its boundary |
+| `T02_CAST_SHORTHAND` | `x::TYPE` | `CAST(x AS <mapped type>)` — the type goes through the same Snowflake → Spark table as column DDL (`FLOAT` → `DOUBLE`, `TEXT`/`VARCHAR(n)` → `STRING`, `NUMBER(p,s)` → `DECIMAL(p,s)`, bare `NUMBER`/`DECIMAL`/`INT` → `DECIMAL(38,0)`, Snowflake's documented default). `VARIANT`/`OBJECT`/`ARRAY`/`GEOGRAPHY` and unknown spellings are refused with the mapper's reason; `TIMESTAMP`/`TIME` carry the mapper's warning. Bare column or literal operand only; refused when the left operand is an expression, because a token rule cannot find its boundary |
 | `T03_ARRAY_CONSTRUCT` | `ARRAY_CONSTRUCT(…)` | `array(…)` |
 | `T04_OBJECT_CONSTRUCT` | `OBJECT_CONSTRUCT('k', v)` | `named_struct('k', v)` |
 | `T05_DATEADD` | `DATEADD(unit, n, col)` | `date_add` / `add_months` / `+ INTERVAL`, chosen by unit. Argument order differs and the unit decides the function, so a rename would be wrong. An unrecognised unit is refused, never guessed |

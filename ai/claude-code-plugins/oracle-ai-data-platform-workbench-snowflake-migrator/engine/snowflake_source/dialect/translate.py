@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 
 from . import lexer
+from .types import map_type
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -34,6 +35,10 @@ class TranslationResult:
     sql: str
     applied: list[dict] = field(default_factory=list)
     unsupported: list[dict] = field(default_factory=list)
+    # A rewrite that is exact in shape but carries a semantic note -- the type
+    # mapper's "timezone semantics differ" on a `::TIMESTAMP` cast, say. Not a
+    # refusal; the view still migrates and the note travels with it.
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def fully_translated(self) -> bool:
@@ -47,7 +52,8 @@ class TranslationRule:
     description: str
     status: str                      # "implemented" | "declared"
     detect: str                      # regex, case-insensitive
-    translate: Callable[[str], tuple[str, str | None]] | None = None
+    # Returns (sql, problem) or (sql, problem, warnings).
+    translate: Callable[[str], tuple] | None = None
     detail: str = ""
 
 
@@ -71,20 +77,58 @@ _LITERAL = r"'(?:[^'\\]|\\.|'')*'"
 _CAST_SIMPLE = (
     r"(?<![\w).\"'\\])([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*|" + _LITERAL
     + r"|\d+(?:\.\d+)?)"
-    r"\s*(?P<op>::)\s*([A-Za-z_][\w$]*(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)")
+    r"\s*(?P<op>::)\s*((?:DOUBLE\s+PRECISION|[A-Za-z_][\w$]*)"
+    r"(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)")
+
+# The type name as written after `::`: NAME, NAME(p) or NAME(p, s).
+_CAST_TYPE = re.compile(
+    r"^\s*([A-Za-z_][\w$]*(?:\s+[A-Za-z_]+)?)\s*"
+    r"(?:\(\s*(\d+)\s*(?:,\s*(\d+))?\s*\))?\s*$")
+
+# A bare numeric cast is NUMBER(38,0) in Snowflake -- documented, not a
+# guess, unlike INFORMATION_SCHEMA where an absent precision is unknown.
+_NUMERIC_BARE = {"NUMBER", "DECIMAL", "NUMERIC", "INT", "INTEGER", "BIGINT",
+                 "SMALLINT", "TINYINT", "BYTEINT"}
 
 
-def _cast(sql: str) -> tuple[str, str | None]:
+def _cast(sql: str) -> tuple[str, str | None, list[str]]:
+    # The type goes through the SAME mapper as table DDL. Copying the Snowflake
+    # name into CAST was silently wrong: Spark FLOAT is single precision, bare
+    # DECIMAL is DECIMAL(10,0), INT is 32-bit, and NUMBER / TEXT / TIME are not
+    # Spark type names at all.
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    def repl(m: re.Match) -> str:
+        written = m.group(3)
+        parsed = _CAST_TYPE.match(written)
+        if parsed is None:
+            problems.append(f"::{written}: type spelling not understood")
+            return m.group(0)
+        name = " ".join(parsed.group(1).upper().split())
+        precision = int(parsed.group(2)) if parsed.group(2) else None
+        scale = int(parsed.group(3)) if parsed.group(3) else None
+        if name in _NUMERIC_BARE and precision is None:
+            precision, scale = 38, 0
+        mapped = map_type(name, precision=precision, scale=scale)
+        if mapped.blocked:
+            problems.append(f"::{written}: {mapped.reason}")
+            return m.group(0)
+        if mapped.warning:
+            warnings.append(
+                f"{m.group(1)}::{written} -> {mapped.spark_type}: {mapped.warning}")
+        return f"CAST({m.group(1)} AS {mapped.spark_type})"
+
     # The operand may legitimately BE a literal ('x'::int), so the anchor is the
     # `::` operator: that is the token which must be code.
-    out = lexer.sub_code(
-        _CAST_SIMPLE, lambda m: f"CAST({m.group(1)} AS {m.group(3)})", sql,
-        anchor_group="op")[0]
+    out = lexer.sub_code(_CAST_SIMPLE, repl, sql, anchor_group="op")[0]
+    if problems:
+        return sql, "; ".join(problems), []
     if lexer.find_code(r"::", out):
         return sql, ("a `::` cast whose left operand is an expression, not a bare "
                      "column or literal. Rewriting it needs the expression "
-                     "boundary, which a token rule cannot determine safely")
-    return out, None
+                     "boundary, which a token rule cannot determine safely"), []
+    return out, None, list(dict.fromkeys(warnings))
 
 
 def _rename(pattern: str, replacement: str):
@@ -167,8 +211,9 @@ RULES: tuple[TranslationRule, ...] = (
         "T01_IFF", "IFF", "IFF(c, a, b) -> IF(c, a, b)", "implemented",
         r"\bIFF\s*\(", _iff),
     TranslationRule(
-        "T02_CAST_SHORTHAND", "::", "x::TYPE -> CAST(x AS TYPE)", "implemented",
-        r"::\s*[A-Za-z]", _cast),
+        "T02_CAST_SHORTHAND", "::",
+        "x::TYPE -> CAST(x AS <mapped Spark type>) via the type mapper",
+        "implemented", r"::\s*[A-Za-z]", _cast),
     TranslationRule(
         "T03_ARRAY_CONSTRUCT", "ARRAY_CONSTRUCT",
         "ARRAY_CONSTRUCT(...) -> array(...)", "implemented",
@@ -268,7 +313,7 @@ def translate_sql(sql: str) -> TranslationResult:
                 "detail": rule.detail or rule.description})
             continue
         try:
-            new_sql, problem = rule.translate(result.sql)
+            new_sql, problem, *rest = rule.translate(result.sql)
         except lexer.UnterminatedLiteral as exc:
             # A rule that produced SQL the lexer cannot read has a bug. That is
             # a per-view refusal naming the rule, not a stage-wide exit 1 that
@@ -288,4 +333,5 @@ def translate_sql(sql: str) -> TranslationResult:
                 "rule_id": rule.rule_id, "construct": rule.construct,
                 "detail": rule.description})
             result.sql = new_sql
+            result.warnings.extend(rest[0] if rest else [])
     return result

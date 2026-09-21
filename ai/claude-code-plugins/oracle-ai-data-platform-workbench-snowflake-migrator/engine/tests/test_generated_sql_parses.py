@@ -96,3 +96,18 @@ def test_translated_view_bodies_parse_as_spark(body):
     for banned in ("IFF(", "::", "LISTAGG(", "DATEADD(", "ARRAY_CONSTRUCT(",
                    "OBJECT_CONSTRUCT("):
         assert banned not in translated, f"{banned} survived translation"
+
+
+def test_cast_targets_are_spark_types_not_snowflake_names():
+    """The parse gate is lenient: sqlglot accepts CAST(x AS NUMBER(18,2)) and
+    CAST(x AS TEXT) in its spark dialect, so parsing alone cannot catch a type
+    name copied over verbatim. Check the CAST targets themselves."""
+    record = {"source_identifier": "DB.SC.V", "object_type": "VIEW",
+              "view_ddl_get_ddl": ("create view V as select a::NUMBER(18,2) as n, "
+                                   "b::FLOAT as f, c::INT as i from t"),
+              "source_metadata": {}, "columns": []}
+    res = build_create_view(record, "CAT.SC.V", {})
+    assert res.blocked is False, res.blocked_reason
+    tree = _parse(res.sql)
+    targets = sorted(c.to.sql(dialect="spark") for c in tree.find_all(sqlglot.exp.Cast))
+    assert targets == sorted(["DECIMAL(18, 2)", "DOUBLE", "DECIMAL(38, 0)"]), targets
