@@ -136,3 +136,16 @@ def test_external_execute_needs_no_internal_catalog_in_the_config(tmp_path, rec)
                        "--execute"])
     assert rc == 0
     assert [b["displayName"] for b in rec.creates()] == ["my_ext"]
+
+
+def test_dry_run_refuses_to_overwrite_an_executed_record(tmp_path, rec, capsys):
+    cfg = _cfg(tmp_path, AIDP)
+    (tmp_path / "catalog_result.json").write_text(json.dumps(
+        {"dry_run": False, "catalog": "my_ext", "catalog_type": "EXTERNAL",
+         "action": "created", "key": "k", "verified": True}), encoding="utf-8")
+    rc = snowmig.main(["catalog", "--config", cfg, "--out-dir", str(tmp_path)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "EXECUTED" in err and "catalog_result.json" in err
+    assert _result(tmp_path)["action"] == "created"
+    assert _result(tmp_path)["dry_run"] is False

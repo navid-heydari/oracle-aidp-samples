@@ -132,6 +132,39 @@ def _write(out_dir: pathlib.Path, name: str, payload) -> None:
     print(f"  -> {out_dir / name}")
 
 
+def _executed_record_exists(out_dir: pathlib.Path, name: str) -> bool:
+    """Does `name` in `out_dir` record an EXECUTED run (`dry_run: false`)?
+
+    A missing, unreadable or hand-edited file is "no executed record": the
+    guard exists to protect evidence, and a file that is not evidence is
+    not protected by it.
+    """
+    path = out_dir / name
+    if not path.is_file():
+        return False
+    try:
+        prev = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(prev, dict) and prev.get("dry_run") is False
+
+
+def _refuse_dry_run_overwrite(out_dir: pathlib.Path, name: str,
+                              stage: str) -> int:
+    """The write stages default to a dry run, and a dry run writes the same
+    artifact an executed run does. Re-running `deploy` to re-read
+    PREFLIGHT.md, or forgetting --execute, therefore replaced the only local
+    record of what was created, verified and burned with a dry-run record --
+    and the stage board then said nothing had been created. The artifact is
+    the evidence; it is not overwritten by a rehearsal."""
+    print(f"error: {out_dir / name} records an EXECUTED {stage} run "
+          f"(dry_run: false). A dry run would overwrite the only local "
+          f"evidence of what was created and verified, so it was not written. "
+          f"Re-run with --execute to continue that run, or pass a different "
+          f"--out-dir for a rehearsal.", file=sys.stderr)
+    return 1
+
+
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
@@ -676,6 +709,11 @@ def cmd_deploy(args) -> int:
         print(f"  {line}" if line else "")
     print()
 
+    # After the pre-flight, so re-reading PREFLIGHT.md still works; before
+    # the result is built, so nothing below can replace the executed record.
+    if not args.execute and _executed_record_exists(out, "deploy_result.json"):
+        return _refuse_dry_run_overwrite(out, "deploy_result.json", "deploy")
+
     if args.transport == "catalog_api":
         # The working transport. `POST .../sql/execute` returns 404, and a
         # structure-only clone needs no Spark cluster anyway.
@@ -920,6 +958,9 @@ def cmd_catalog(args) -> int:
     name = str(name).strip()
 
     if not args.execute:
+        if _executed_record_exists(out, "catalog_result.json"):
+            return _refuse_dry_run_overwrite(out, "catalog_result.json",
+                                             "catalog")
         result = {"dry_run": True, "catalog": name,
                   "catalog_type": catalog_type,
                   "source_type": args.source_type.upper(),
@@ -1328,6 +1369,9 @@ def cmd_provision(args) -> int:
                 "--execute needs the aiDataPlatform OCID: put it under "
                 "`aidp:` in the config, or pass --datalake-ocid.")
         call = make_provision_call(ocid)
+    elif _executed_record_exists(out, "provision_result.json"):
+        return _refuse_dry_run_overwrite(out, "provision_result.json",
+                                         "provision")
 
     res = provision(
         call=call, workspace_name=args.workspace_name,

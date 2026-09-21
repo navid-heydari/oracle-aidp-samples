@@ -455,3 +455,61 @@ def test_corrupt_artifact_names_the_file(tmp_path, capsys):
     assert main(["plan", "--out-dir", str(tmp_path)]) == 1
     err = capsys.readouterr().err
     assert "error:" in err and "inventory.json" in err
+
+
+# --- a dry run never overwrites an executed record -------------------------
+
+EXECUTED_DEPLOY = {"dry_run": False, "executed": 4, "verified": 2,
+                   "statement_count": 4, "poisoned_names": ["x"],
+                   "failed_targets": ["y"], "failed": ["y"],
+                   "mismatched_targets": []}
+
+
+def test_dry_run_deploy_refuses_to_overwrite_an_executed_record(tmp_path, capsys):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    main(["ddl", "--out-dir", str(tmp_path)])
+    write(tmp_path, "deploy_result.json", EXECUTED_DEPLOY)
+    (tmp_path / "PREFLIGHT.md").unlink(missing_ok=True)
+    assert main(["deploy", "--out-dir", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert "EXECUTED" in err and "deploy_result.json" in err
+    assert "--out-dir" in err
+    kept = json.loads((tmp_path / "deploy_result.json").read_text(encoding="utf-8"))
+    assert kept["dry_run"] is False and kept["poisoned_names"] == ["x"]
+    # Re-reading PREFLIGHT.md is the reason people re-run a dry run; it is
+    # still rendered before the refusal.
+    assert (tmp_path / "PREFLIGHT.md").is_file()
+
+
+def test_the_stage_board_still_shows_the_executed_deploy_after_a_refused_dry_run(
+        tmp_path):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    main(["ddl", "--out-dir", str(tmp_path)])
+    write(tmp_path, "deploy_result.json", EXECUTED_DEPLOY)
+    assert main(["deploy", "--out-dir", str(tmp_path)]) == 1
+    assert main(["stages", "--out-dir", str(tmp_path)]) == 0
+    board = (tmp_path / "STAGES.md").read_text(encoding="utf-8")
+    deploy_row = next(l for l in board.splitlines()
+                      if l.startswith("| `deploy`"))
+    assert "verified 2/4" in deploy_row
+    assert "DRY RUN" not in deploy_row
+
+
+def test_dry_run_provision_refuses_to_overwrite_an_executed_record(
+        tmp_path, capsys):
+    write(tmp_path, "provision_result.json",
+          {"dry_run": False, "workspace": {"name": "w"},
+           "steps": [{"step": "workspace", "action": "created",
+                      "verified": True, "detail": "w"}]})
+    rc = main(["provision", "--out-dir", str(tmp_path), "--workspace-name",
+               "w", "--skip-libraries"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "EXECUTED" in err and "provision_result.json" in err
+    kept = json.loads((tmp_path / "provision_result.json").read_text(encoding="utf-8"))
+    assert kept["dry_run"] is False
+    assert kept["steps"][0]["verified"] is True
