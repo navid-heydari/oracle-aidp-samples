@@ -150,6 +150,7 @@ _CATEGORY_TITLES = {
     "unmapped_type": "Column types with no Delta equivalent",
     "snowflake_only_sql": "View SQL that is Snowflake-only",
     "unsupported_object": "Object kinds with no AIDP equivalent",
+    "dependency_not_migrated": "Depends on an object that is not migrating",
     "no_definition": "Definition could not be read",
     "unparseable_sql": "SQL could not be parsed",
 }

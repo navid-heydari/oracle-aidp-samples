@@ -358,3 +358,14 @@ def test_the_census_report_says_nothing_is_migratable():
 def test_a_task_gets_the_cutover_warning():
     md = render_census(_CENSUS)
     assert "stops being populated" in md or "stops being" in md
+
+
+def test_dependency_not_migrated_has_a_title_not_a_raw_key():
+    plan = dict(PLAN)
+    plan["cannot_migrate"] = PLAN["cannot_migrate"] + [
+        {"source_identifier": "D.PUBLIC.J_VW", "object_type": "VIEW",
+         "category": "dependency_not_migrated",
+         "reason": "depends on D.PUBLIC.J, which is blocked (unmapped_type)"}]
+    md = render_planned_objects(plan)
+    assert "### Depends on an object that is not migrating" in md
+    assert "depends on D.PUBLIC.J, which is blocked" in md

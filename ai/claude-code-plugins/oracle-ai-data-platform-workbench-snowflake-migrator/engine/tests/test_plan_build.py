@@ -184,3 +184,83 @@ def test_unknown_count_under_a_cap_lands_in_cannot_migrate_with_the_reason():
     c = plan["cannot_migrate"][0]
     assert c["category"] == "restriction"
     assert "cannot be evaluated" in c["reason"] and "max_rows" in c["reason"]
+
+
+# --- dependency cascade ---------------------------------------------------
+#
+# A view whose base object is not migrating cannot migrate either. Before,
+# only the planned ids reached compute_waves, so the edge to a blocked or
+# excluded base was dropped, the view had indegree 0, sorted FIRST in wave 1
+# (rows=None -> size 0) and its CREATE VIEW was emitted over a table that
+# will never exist -- while the report said "views follow their base tables".
+
+def _edge(view, base):
+    return {"from": view, "to": base}
+
+
+def test_view_over_a_blocked_table_cannot_migrate_and_is_not_waved_or_emitted():
+    from target.ddl import build_ddl_payload
+    inv = {"inventory": [rec("D.S.T", status="blocked", blocked=["P: VARIANT"]),
+                         rec("D.S.V", kind="VIEW", ddl="create view V as select a from D.S.T")]}
+    plan = build_plan(inv, {"edges": [_edge("D.S.V", "D.S.T")]})
+    cannot = {c["source_identifier"]: c for c in plan["cannot_migrate"]}
+    assert cannot["D.S.V"]["category"] == "dependency_not_migrated"
+    assert "depends on D.S.T, which is blocked" in cannot["D.S.V"]["reason"]
+    assert cannot["D.S.V"]["object_type"] == "VIEW"
+    assert plan["can_migrate"] == [] and plan["waves"] == []
+    assert plan["clone_targets"] == []
+    assert plan["summary"]["can_migrate"] == 0
+    assert plan["summary"]["cannot_migrate"] == 2
+    assert plan["summary"]["cannot_by_category"]["dependency_not_migrated"] == 1
+    assert build_ddl_payload(inv, plan)["statements"] == []
+
+
+def test_view_over_a_restricted_table_cannot_migrate():
+    inv = {"inventory": [rec("D.S.T"), rec("D.S.V", kind="VIEW",
+                                           ddl="create view V as select a from D.S.T")]}
+    plan = build_plan(inv, {"edges": [_edge("D.S.V", "D.S.T")]},
+                      restrictions={"exclude_objects": ["D.S.T"]})
+    cats = {c["source_identifier"]: c["category"] for c in plan["cannot_migrate"]}
+    assert cats == {"D.S.T": "restriction", "D.S.V": "dependency_not_migrated"}
+    v = next(c for c in plan["cannot_migrate"] if c["source_identifier"] == "D.S.V")
+    assert "depends on D.S.T, which is excluded" in v["reason"]
+
+
+def test_dependency_exclusion_cascades_through_a_view_chain():
+    inv = {"inventory": [rec("D.S.T", status="blocked", blocked=["P: VARIANT"]),
+                         rec("D.S.V1", kind="VIEW", ddl="create view V1 as select a from D.S.T"),
+                         rec("D.S.V2", kind="VIEW", ddl="create view V2 as select a from D.S.V1"),
+                         rec("D.S.OK")]}
+    plan = build_plan(inv, {"edges": [_edge("D.S.V1", "D.S.T"),
+                                      _edge("D.S.V2", "D.S.V1")]})
+    cats = {c["source_identifier"]: c["category"] for c in plan["cannot_migrate"]}
+    assert cats["D.S.V1"] == cats["D.S.V2"] == "dependency_not_migrated"
+    v2 = next(c for c in plan["cannot_migrate"] if c["source_identifier"] == "D.S.V2")
+    assert "depends on D.S.V1, which is blocked" in v2["reason"]
+    assert plan["waves"] == [["D.S.OK"]]
+
+
+def test_dependency_exclusion_through_a_diamond_lists_each_view_once():
+    inv = {"inventory": [rec("D.S.T", status="blocked", blocked=["P: VARIANT"]),
+                         rec("D.S.V1", kind="VIEW", ddl="create view V1 as select a from D.S.T"),
+                         rec("D.S.V2", kind="VIEW", ddl="create view V2 as select a from D.S.T"),
+                         rec("D.S.V3", kind="VIEW",
+                             ddl="create view V3 as select a from D.S.V1 join D.S.V2 on 1=1")]}
+    plan = build_plan(inv, {"edges": [_edge("D.S.V1", "D.S.T"), _edge("D.S.V2", "D.S.T"),
+                                      _edge("D.S.V3", "D.S.V1"), _edge("D.S.V3", "D.S.V2")]})
+    ids = ([c["source_identifier"] for c in plan["can_migrate"]]
+           + [c["source_identifier"] for c in plan["cannot_migrate"]])
+    assert sorted(ids) == ["D.S.T", "D.S.V1", "D.S.V2", "D.S.V3"]
+    assert len(ids) == len(set(ids)), "every object in exactly one list, once"
+    cats = {c["source_identifier"]: c["category"] for c in plan["cannot_migrate"]}
+    assert cats == {"D.S.T": "unmapped_type", "D.S.V1": "dependency_not_migrated",
+                    "D.S.V2": "dependency_not_migrated",
+                    "D.S.V3": "dependency_not_migrated"}
+
+
+def test_views_whose_bases_all_migrate_are_unaffected_by_the_cascade():
+    inv = {"inventory": [rec("D.S.T"), rec("D.S.V", kind="VIEW",
+                                           ddl="create view V as select a from D.S.T")]}
+    plan = build_plan(inv, {"edges": [_edge("D.S.V", "D.S.T")]})
+    assert plan["waves"] == [["D.S.T"], ["D.S.V"]]
+    assert plan["cannot_migrate"] == []

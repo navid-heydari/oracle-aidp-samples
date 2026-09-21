@@ -10,6 +10,10 @@ schema, table -> table, view -> view). Silver and Gold are requirement-driven, s
 this module emits disabled job stubs for them rather than inventing
 transformation logic nobody specified.
 
+An object that depends on one that is not migrating cannot migrate either --
+a view over a blocked or excluded table would be created over nothing. The
+cascade follows the dependency edges transitively and names the missing object.
+
 A target-name collision raises: two source objects merging into one target table
 is a data-loss defect, not something to resolve by picking a winner.
 """
@@ -74,6 +78,44 @@ def _view_verdict(rec: dict) -> tuple[bool, str, str]:
     return True, "", ""
 
 
+def _cascade_dependency_exclusions(can: list[dict], cannot: list[dict],
+                                   edges: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Move every dependent of a `cannot` object into `cannot`, transitively.
+
+    Without this only the planned ids reached compute_waves, which drops an
+    edge whose other end is not in the set: the view lost its only edge, sat
+    at indegree 0, sorted first (rows=None -> size 0) and got a CREATE VIEW
+    over a table that will never exist, under a report line promising that
+    views follow their base tables.
+    """
+    can_ids = {c["source_identifier"] for c in can}
+    kinds = {c["source_identifier"]: c["object_type"] for c in can}
+    dependents: dict[str, set[str]] = collections.defaultdict(set)
+    for edge in edges:
+        if edge["from"] != edge["to"]:
+            dependents[edge["to"]].add(edge["from"])
+
+    why = {c["source_identifier"]: c for c in cannot}
+    queue = collections.deque(sorted(why))
+    while queue:
+        missing = queue.popleft()
+        for dependent in sorted(dependents.get(missing, ())):
+            if dependent not in can_ids:
+                continue
+            can_ids.discard(dependent)
+            state = ("excluded" if why[missing]["category"] == "restriction"
+                     else "blocked")
+            entry = {"source_identifier": dependent,
+                     "object_type": kinds[dependent],
+                     "category": "dependency_not_migrated",
+                     "reason": f"depends on {missing}, which is {state} "
+                               f'({why[missing]["category"]})'}
+            cannot.append(entry)
+            why[dependent] = entry
+            queue.append(dependent)
+    return [c for c in can if c["source_identifier"] in can_ids], cannot
+
+
 def build_plan(inventory: dict, dependencies: dict, *,
                restrictions: dict | None = None,
                bronze_catalog_prefix: str | None = None,
@@ -120,6 +162,9 @@ def build_plan(inventory: dict, dependencies: dict, *,
                     "target": targets[ident],
                     "rows": rec.get("row_count_exact"),
                     "columns": len(rec.get("columns") or [])})
+
+    can, cannot = _cascade_dependency_exclusions(
+        can, cannot, dependencies.get("edges", []))
 
     collisions = detect_target_collisions(
         {c["source_identifier"]: targets[c["source_identifier"]] for c in can})
