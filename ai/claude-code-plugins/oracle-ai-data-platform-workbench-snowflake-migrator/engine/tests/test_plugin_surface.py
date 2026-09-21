@@ -476,3 +476,67 @@ def test_manifest_and_marketplace_agree_on_the_data_claim():
     for desc in (plugin["description"], entry["description"]):
         assert "snowmig_02_copy_schema" in desc, desc
         assert "control plane" in desc.lower(), desc
+
+
+# --------------------------------------------------------------------------
+# One order of operations. The overview skill (S1-S12) is the authority and
+# the code enforces it: `catalog --execute` needs the workspace and cluster
+# that `provision` creates. The README once ran them the other way round and
+# bracketed the two coordinates as optional.
+# --------------------------------------------------------------------------
+
+def _runbook(text: str) -> str:
+    start = text.index("## How to run a migration, from zero")
+    end = text.index("\n## ", start + 10)
+    return text[start:end]
+
+
+def test_the_readme_orders_provision_before_catalog_registration():
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    runbook = _runbook(text)
+    assert "Nine steps" not in text
+    assert runbook.index("snowmig provision") < runbook.index("snowmig catalog --catalog")
+    provision = runbook.index("Provision the migration environment")
+    external = runbook.index("EXTERNAL catalog")
+    assert provision < external, "provision (S1/S2) comes before the catalogs (S3/S4)"
+
+
+def test_the_readme_does_not_bracket_workspace_and_cluster_for_catalog_execute():
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    runbook = _runbook(text)
+    catalog_step = runbook[runbook.index("EXTERNAL catalog"):]
+    catalog_step = catalog_step[:catalog_step.index("\n### ", 10)]
+    assert not re.search(r"\[--datalake-ocid <ocid> --workspace <ws> --cluster-id <cl>\]",
+                         catalog_step), "required for --execute; the bracket said optional"
+    # And the hand-off: provision prints the keys, the operator pastes them.
+    assert "aidp.workspace" in runbook and "aidp.cluster_id" in runbook
+    assert "does not write them back" in runbook
+
+
+def test_the_readme_labels_laptop_assess_as_an_optional_preview():
+    runbook = _runbook((ROOT / "README.md").read_text(encoding="utf-8"))
+    step = runbook[runbook.index("Assess the estate"):]
+    step = step[:step.index("\n### ", 10)]
+    low = step.lower()
+    assert "optional" in low and "snowmig_00_discover" in step, \
+        "the laptop assess is a preview; the migration discovers inside AIDP (S6)"
+
+
+def test_the_readme_separates_copy_jobs_from_the_migration_proper():
+    runbook = _runbook((ROOT / "README.md").read_text(encoding="utf-8"))
+    low = " ".join(runbook.lower().split())
+    assert "data migration is not run" in low, \
+        "must share the overview skill's statement: S12 ends with no rows moved"
+    assert runbook.index("snowmig_01_structure") < runbook.index("snowmig_02_copy_schema")
+
+
+def test_the_three_runbooks_agree_on_the_step_order():
+    skill = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text(encoding="utf-8")
+    assert skill.index("| S1 |") < skill.index("| S3 |") < skill.index("| S4 |")
+    arch = (ROOT / "MIGRATION-ARCHITECTURE.md").read_text(encoding="utf-8")
+    table = arch[arch.index("| # | Step | Command | Writes |"):]
+    table = table[:table.index("\n\n", 10)]
+    assert table.index("workspace") < table.index("EXTERNAL") < table.index("INTERNAL")
+    assert "snowmig_01_structure" in table
+    assert "deploy --execute" not in table, \
+        "the control-plane deploy is not the INTERNAL structure step (202 can create nothing)"
