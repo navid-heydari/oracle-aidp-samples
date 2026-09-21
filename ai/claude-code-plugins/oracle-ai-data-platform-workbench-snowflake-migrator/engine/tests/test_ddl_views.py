@@ -426,3 +426,104 @@ def test_no_double_quoted_identifier_survives_into_emitted_spark_sql(body):
     emitted = extract_view_body(res.sql)
     assert not any(kind == "ident" and text.startswith('"')
                    for kind, text in lexer.segments(emitted)), emitted
+
+
+# --------------------------------------------------------------------------
+# R41 object-reference rewrite. It used to be a plain re.sub over the whole
+# body: it mutated string literals (data, not SQL), missed a reference whose
+# parts GET_DDL had quoted, hit a longer sibling name as a substring, and the
+# plan then reported a rewrite that had not happened.
+# --------------------------------------------------------------------------
+
+PREFIX_MAP = {"MY-DATA-DB.SALES.ORDERS": "lake.my-data-db_sales.orders"}
+
+
+def _rules(res):
+    return {r.rule_id: r.detail for r in res.rules_applied}
+
+
+def test_string_literal_containing_a_name_is_not_rewritten():
+    ddl = ("create view V as select CREATED_AT as D, "
+           "'from MY-DATA-DB.SALES.ORDERS' as LBL from \"MY-DATA-DB\".SALES.ORDERS")
+    res = build_create_view(view_record(ddl=ddl, source_database="MY-DATA-DB"),
+                            "lake.my-data-db_analytics.v", name_map=PREFIX_MAP)
+    assert res.blocked is False, res.blocked_reason
+    assert "'from MY-DATA-DB.SALES.ORDERS'" in res.sql, "the literal is data"
+    assert res.sql.count("lake.`my-data-db_sales`.orders") == 1, res.sql
+    assert "R41_VIEW_REFS_REWRITTEN" in _rules(res)
+
+
+def test_double_quoted_reference_is_rewritten_and_backticked():
+    ddl = 'create view V as select o.x from "DB"."S"."ORDERS" o'
+    res = build_create_view(view_record(ddl=ddl), "lake.db_s.v",
+                            name_map={"DB.S.ORDERS": "lake.db_s.orders"})
+    assert res.blocked is False
+    assert '"DB"' not in res.sql and "`DB`" not in res.sql
+    assert "from lake.db_s.orders o" in res.sql, res.sql
+    assert "R41_VIEW_REFS_REWRITTEN" in _rules(res)
+
+
+def test_quoted_part_matches_exact_case_only():
+    # "db" is a different object from DB in Snowflake, so it is not rewritten.
+    ddl = 'create view V as select o.x from "db"."S"."ORDERS" o'
+    res = build_create_view(view_record(ddl=ddl), "lake.db_s.v",
+                            name_map={"DB.S.ORDERS": "lake.db_s.orders"})
+    assert "`db`.`S`.`ORDERS`" in res.sql, res.sql
+    assert "R41_VIEW_REFS_REWRITTEN" not in _rules(res)
+
+
+def test_unquoted_reference_still_matches_case_insensitively():
+    ddl = "create view V as select o.x from db.s.orders o"
+    res = build_create_view(view_record(ddl=ddl), "lake.db_s.v",
+                            name_map={"DB.S.ORDERS": "lake.db_s.orders"})
+    assert "from lake.db_s.orders o" in res.sql, res.sql
+
+
+def test_longer_sibling_is_not_a_substring_hit():
+    ddl = "create view V as select a.x from DB.S.ORDERS_ARCHIVE a"
+    res = build_create_view(
+        view_record(ddl=ddl), "lake.db_s.v",
+        name_map={"DB.S.ORDERS": "lake.db_s.orders",
+                  "DB.S.ORDERS_ARCHIVE": "lake.db_s.orders_archive"})
+    assert "lake.db_s.orders_archive" in res.sql, res.sql
+    assert "orders_ARCHIVE" not in res.sql
+    assert _rules(res)["R41_VIEW_REFS_REWRITTEN"] == (
+        "rewrote object references: DB.S.ORDERS_ARCHIVE -> lake.db_s.orders_archive")
+
+
+def test_sibling_not_in_the_map_is_left_whole_and_no_rewrite_is_reported():
+    ddl = "create view V as select a.x from DB.S.ORDERS_ARCHIVE a"
+    res = build_create_view(view_record(ddl=ddl), "lake.db_s.v",
+                            name_map={"DB.S.ORDERS": "lake.db_s.orders"})
+    assert "from DB.S.ORDERS_ARCHIVE a" in res.sql, res.sql
+    assert "R41_VIEW_REFS_REWRITTEN" not in _rules(res)
+    assert "R40_VIEW_REFS_IDENTITY" in _rules(res)
+
+
+def test_comment_mentioning_a_name_is_untouched():
+    ddl = "create view V as select a.x from DB.S.ORDERS a -- see DB.S.ORDERS\n"
+    res = build_create_view(view_record(ddl=ddl), "lake.db_s.v",
+                            name_map={"DB.S.ORDERS": "lake.db_s.orders"})
+    assert "-- see DB.S.ORDERS" in res.sql, res.sql
+    assert "from lake.db_s.orders a" in res.sql
+
+
+def test_r41_lists_only_the_references_that_were_rewritten():
+    ddl = "create view V as select a.x from DB.S.ORDERS a"
+    res = build_create_view(
+        view_record(ddl=ddl), "lake.db_s.v",
+        name_map={"DB.S.ORDERS": "lake.db_s.orders",
+                  "DB.S.CUSTOMERS": "lake.db_s.customers"})
+    assert _rules(res)["R41_VIEW_REFS_REWRITTEN"] == (
+        "rewrote object references: DB.S.ORDERS -> lake.db_s.orders")
+
+
+def test_rewritten_target_with_a_hyphen_is_backticked_and_parses():
+    sqlglot = pytest.importorskip("sqlglot")
+    ddl = 'create view V as select o.x from "MY-DATA-DB".SALES.ORDERS o'
+    res = build_create_view(view_record(ddl=ddl, source_database="MY-DATA-DB"),
+                            "lake.my-data-db_sales.v", name_map=PREFIX_MAP)
+    tree = sqlglot.parse_one(res.sql, dialect="spark")
+    tables = {t.sql(dialect="spark").split(" AS ")[0]
+              for t in tree.find_all(sqlglot.exp.Table)}
+    assert "lake.`my-data-db_sales`.orders" in tables, tables

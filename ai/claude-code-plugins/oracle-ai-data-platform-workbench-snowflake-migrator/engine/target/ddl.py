@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass, field
 
+from snowflake_source.dialect import lexer
 from snowflake_source.dialect.views import (  # noqa: F401  (re-exported)
     detect_unsupported_constructs, extract_view_body, translate_view_body,
 )
@@ -263,6 +264,60 @@ def build_create_table(record: dict, target_fqn: str) -> RewriteResult:
 
 
 
+_PLAIN_PART = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _ref_part_pattern(part: str) -> str:
+    # One part of a 3-part name as it may appear in a body: unquoted (Snowflake
+    # folds it, so case-insensitive), or quoted -- Spark backticks after the
+    # dialect pass, Snowflake double quotes before it -- which is exact-case,
+    # because "orders" and ORDERS are different objects in Snowflake.
+    backticked = re.escape("`" + part.replace("`", "``") + "`")
+    double_quoted = re.escape('"' + part.replace('"', '""') + '"')
+    return f"(?:(?-i:{backticked}|{double_quoted})|{re.escape(part)})"
+
+
+def _rewrite_view_refs(body: str, name_map: dict[str, str]
+                       ) -> tuple[str, list[str]]:
+    """Rewrite whole 3-part object references in `body` per `name_map`.
+
+    Matches run over code and identifier segments only. A 3-part name inside a
+    string literal is DATA the view returns, and one inside a comment is prose;
+    a plain re.sub over the body rewrote both. Each part must be whole: word
+    boundaries stop `DB.S.ORDERS` from hitting `DB.S.ORDERS_ARCHIVE`, and a hit
+    is blanked before shorter names are tried so nothing matches inside it.
+    Returns the rewritten body and the `src -> tgt` pairs that actually hit.
+    """
+    mask = "".join(
+        "".join("\n" if c == "\n" else " " for c in text)
+        if kind in ("string", "comment") else text
+        for kind, text in lexer.segments(body))
+    edits: list[tuple[int, int, str]] = []
+    changed: list[str] = []
+    for src, tgt in sorted(name_map.items(), key=lambda kv: -len(kv[0])):
+        if src == tgt:
+            continue
+        pattern = (r'(?<![\w`"$.])'
+                   + r"\s*\.\s*".join(_ref_part_pattern(p) for p in src.split("."))
+                   + r'(?![\w`"$])')
+        hits = [m.span() for m in re.finditer(pattern, mask, re.IGNORECASE)]
+        if not hits:
+            continue
+        # A target part the Spark parser would not read as one word (a hyphen
+        # from a prefixed catalog name) is backticked; a plain one is emitted
+        # as-is, so the common case stays byte-identical to the planned name.
+        replacement = ".".join(p if _PLAIN_PART.match(p) else _q(p)
+                               for p in tgt.split("."))
+        for start, end in hits:
+            edits.append((start, end, replacement))
+            mask = mask[:start] + " " * (end - start) + mask[end:]
+        changed.append(f"{src} -> {tgt}")
+    out = body
+    for start, end, replacement in sorted(edits, reverse=True):
+        out = out[:start] + replacement + out[end:]
+    return out, changed
+
+
 def build_create_view(record: dict, target_fqn: str,
                       name_map: dict[str, str] | None = None) -> RewriteResult:
     """Generate CREATE VIEW, or block with the reason it cannot be migrated."""
@@ -312,14 +367,7 @@ def build_create_view(record: dict, target_fqn: str,
     # the view, the same way a column's mapping warning travels with a table.
     res.warnings.extend(translated.warnings)
 
-    rewritten, changed = translated.sql, []
-    for source_name, target_name in sorted((name_map or {}).items(),
-                                           key=lambda kv: -len(kv[0])):
-        if source_name != target_name and re.search(
-                re.escape(source_name), rewritten, re.IGNORECASE):
-            rewritten = re.sub(re.escape(source_name), target_name, rewritten,
-                               flags=re.IGNORECASE)
-            changed.append(f"{source_name} -> {target_name}")
+    rewritten, changed = _rewrite_view_refs(translated.sql, name_map or {})
 
     if changed:
         res.rules_applied.append(RuleApplication(

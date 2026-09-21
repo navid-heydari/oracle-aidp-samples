@@ -41,8 +41,13 @@ rewritten on a guess, because a view that ships a subtly wrong translation
 returns numbers. The authoritative list is `translate.RULES`, documented in
 [dialect-translation.md](dialect-translation.md); the table below summarises it.
 
-Because Bronze mirrors the source 1:1, object references inside a view body need
-no rewriting; the only question is dialect.
+Object references inside a view body are identity in the default Bronze mirror
+(`R40_VIEW_REFS_IDENTITY`) and are rewritten to the planned target names under
+`--bronze-catalog-prefix` or a schema-style option (`R41_VIEW_REFS_REWRITTEN`).
+The rewrite matches whole three-part names on code and identifier segments only
+— never inside a string literal (that is data the view returns) or a comment —
+a quoted part must match exactly, an unquoted one case-insensitively, and the
+plan lists only the references that were actually rewritten.
 
 | Construct | What happens |
 |---|---|
