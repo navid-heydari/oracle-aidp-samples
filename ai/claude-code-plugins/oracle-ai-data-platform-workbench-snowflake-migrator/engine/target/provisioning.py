@@ -41,7 +41,8 @@ from .provision_api import (
 
 __all__ = ["JOB_SPECS", "SCRIPTS_FOLDER", "PLAN_FOLDER", "REPORTS_FOLDER",
            "BACKUP_FOLDER", "ProvisionTransportError",
-           "make_provision_call", "provision", "render_provision"]
+           "make_provision_call", "provision", "render_provision",
+           "async_operation_key", "connection_test_outcome"]
 
 
 class ProvisionTransportError(RuntimeError):
@@ -168,10 +169,108 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
             except RuntimeError as exc:
                 raise ProvisionTransportError(str(exc)) from exc
             return {"items": items}
-        rows, _ = _once(operation, kwargs)
-        return rows[0] if rows else {}
+        rows, headers = _once(operation, kwargs)
+        row = rows[0] if rows else {}
+        # An async action answers 202 with an EMPTY body and its operation
+        # key in a response header. The parser cannot put a header into a
+        # row, so the transport keeps them beside it, under `_headers`, for
+        # async_operation_key to read.
+        if headers and isinstance(row, dict):
+            row = dict(row, _headers=headers)
+        return row
 
     return call
+
+
+# Where the async operation key of a 202 may ride. `aidp-async-operation-key`
+# is the header live-verified on the validated deployment; the documented
+# testConnection contract names `oidl-async-operation-key` and
+# `datalake-async-operation-key`; `opc-work-request-id` is the OCI-wide
+# convention. All four are read, headers first, case-insensitively.
+_ASYNC_KEY_HEADERS = ("aidp-async-operation-key",
+                      "datalake-async-operation-key",
+                      "oidl-async-operation-key", "opc-work-request-id")
+_ASYNC_TERMINAL = ("SUCCEEDED", "SUCCESS", "FAILED", "CANCELED", "CANCELLED")
+
+
+def async_operation_key(payload: dict) -> str | None:
+    """The async operation key a 202 carried, wherever the envelope put it.
+
+    `oci raw-request` prints `{"data": <body>, "headers": {...}, "status"}`.
+    For an empty body the key rides in a HEADER, which make_provision_call
+    keeps under `_headers`; when the parser returned the whole envelope (a
+    null body) the headers sit under `headers`; a body may also carry it as
+    `key`, at the top level or under `data`. Reading it at the top level of
+    the parsed row only -- as the catalog stage once did -- found nothing in
+    any of these shapes, so the poll never ran and every test reported
+    PENDING.
+    """
+    if not isinstance(payload, dict):
+        return None
+    for headers in (payload.get("_headers"), payload.get("headers")):
+        if isinstance(headers, dict):
+            lowered = {str(k).lower(): v for k, v in headers.items()}
+            for name in _ASYNC_KEY_HEADERS:
+                if lowered.get(name):
+                    return str(lowered[name])
+    for name in _ASYNC_KEY_HEADERS:
+        if payload.get(name):
+            return str(payload[name])
+    data = payload.get("data")
+    if isinstance(data, dict) and data.get("key"):
+        return str(data["key"])
+    if payload.get("key"):
+        return str(payload["key"])
+    return None
+
+
+def connection_test_outcome(call: Callable[..., dict], probe: dict, *,
+                            delays: tuple[float, ...] = (5.0, 10.0, 15.0,
+                                                         20.0, 30.0),
+                            sleep: Callable[[float], None] | None = None
+                            ) -> dict:
+    """The verdict of a testConnection POST, read back through
+    `GET /asyncOperations/{key}` with a bounded backoff.
+
+    {requested, status, operation_key, error?, note?}. PENDING means one
+    thing: the key was found and the operation had not ended when the poll
+    budget ran out. A 202 whose envelope carries no key is reported as
+    exactly that -- the verdict cannot be read -- and a poll that fails is
+    UNREADABLE with its error. None of these is a pass.
+    """
+    sleep = sleep or time.sleep
+    key = async_operation_key(probe)
+    outcome: dict = {"requested": True, "status": "PENDING",
+                     "operation_key": key}
+    if not key:
+        outcome["note"] = (
+            "the API accepted the test request but its envelope carried no "
+            "async operation key (in a header or the body), so the verdict "
+            "cannot be read; PENDING is not a pass")
+        return outcome
+    last = "PENDING"
+    for delay in delays:
+        sleep(delay)
+        try:
+            op = call("get_async_operation", key=key)
+        except Exception as exc:
+            outcome["status"] = "UNREADABLE"
+            outcome["error"] = (f"GET asyncOperations/{key}: "
+                                f"{str(exc)[:200]}")
+            return outcome
+        last = str(op.get("status") or op.get("lifecycleState")
+                   or "PENDING").upper()
+        if last in _ASYNC_TERMINAL:
+            outcome["status"] = last
+            if op.get("errorCode") or op.get("errorMessage"):
+                outcome["error"] = (f'{op.get("errorCode")}: '
+                                    f'{op.get("errorMessage")}')
+            return outcome
+    outcome["note"] = (
+        f"the operation still reported {last} after {len(delays)} polls "
+        f"over {sum(delays):g}s, so the verdict was not readable within "
+        f"the budget; PENDING is not a pass -- re-check operation {key}")
+    return outcome
 
 
 def _match(items: list[dict], display_name: str) -> dict | None:

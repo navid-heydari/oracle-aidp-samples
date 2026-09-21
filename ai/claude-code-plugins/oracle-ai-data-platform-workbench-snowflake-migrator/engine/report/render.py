@@ -306,6 +306,28 @@ def render_catalog(res: dict) -> str:
                 "live Snowflake source. It holds no managed tables of its own "
                 "and copies no data, so there is nothing here to keep in "
                 "sync.", ""]
+
+    # `--test-connection` is the one step that catches a wrong role or a
+    # rotated password before the live run, so its verdict belongs here and
+    # not only in the JSON. PENDING is a budget that ran out, not a pass.
+    test = res.get("test_connection")
+    if test:
+        status = str(test.get("status") or "PENDING").upper()
+        out += ["## Connection test", ""]
+        if status in ("SUCCEEDED", "SUCCESS"):
+            out += [f"**{status}** — the API reached Snowflake with the "
+                    f"registered connection details.", ""]
+        elif status in ("FAILED", "CANCELED", "CANCELLED"):
+            out += [f"**{status}**"
+                    + (f" — {test.get('error')}" if test.get("error") else "")
+                    + ". The registered connection does not work as it "
+                      "stands; fix the credential or role before relying on "
+                      "this catalog.", ""]
+        else:
+            out += [f"**{status}** — "
+                    + str(test.get("error") or test.get("note")
+                          or "the verdict was not read")
+                    + ". **PENDING is not a pass.**", ""]
     return "\n".join(out)
 
 

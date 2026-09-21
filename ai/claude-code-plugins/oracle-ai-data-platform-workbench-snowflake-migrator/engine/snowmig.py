@@ -949,8 +949,8 @@ def cmd_catalog(args) -> int:
         result["source_type"] = args.source_type.upper()
 
     # Validation as a COMMAND, not a suggestion: the documented
-    # POST /actions/testConnection, polled through /asyncOperations. Both
-    # contracts live-verified 2026-09-16.
+    # POST /actions/testConnection (live-verified 2026-09-16), then the
+    # async operation it names polled through /asyncOperations to a verdict.
     if args.test_connection and not args.execute:
         print("  test-connection: skipped — it needs an existing catalog "
               "(the API resolves RBAC on the key), so it only runs with "
@@ -967,8 +967,8 @@ def cmd_catalog(args) -> int:
                 "--test-connection needs the aiDataPlatform OCID: put it "
                 "under `aidp:` in the config, or pass --datalake-ocid")
         from target.provision_api import build_test_connection_body
-        from target.provisioning import make_provision_call
-        import time as _time
+        from target.provisioning import (make_provision_call,
+                                         connection_test_outcome)
         pcall = make_provision_call(ocid)
         # The API resolves the catalog KEY (RBAC DESCCATALOG), which is what
         # ensure_catalog reported back -- not necessarily the display name.
@@ -978,25 +978,17 @@ def cmd_catalog(args) -> int:
                           source_type=args.source_type.upper(),
                           connection_properties=connection,
                           display_name=args.catalog))
-        # The response body is empty; the async key rides in a header the
-        # raw-request JSON parser does not surface, so when it is absent the
-        # result is reported PENDING, never assumed. When present, poll.
-        outcome = {"requested": True, "status": "PENDING",
-                   "note": "test requested; result not yet readable"}
-        op_key = probe.get("aidp-async-operation-key") or probe.get("key")
-        if op_key:
-            for delay in (5, 10, 15, 20, 30):
-                _time.sleep(delay)
-                op = pcall("get_async_operation", key=op_key)
-                outcome["status"] = str(op.get("status") or "PENDING")
-                if outcome["status"] in ("SUCCEEDED", "FAILED", "CANCELED"):
-                    outcome["error"] = (f'{op.get("errorCode")}: '
-                                        f'{op.get("errorMessage")}'
-                                        if op.get("errorCode") else None)
-                    break
+        # The response body is empty and the async key rides in a response
+        # HEADER, which the transport keeps under `_headers`;
+        # connection_test_outcome reads it from wherever the envelope put it
+        # and polls /asyncOperations/{key} to a verdict. PENDING means the
+        # budget ran out, never "not looked"; a missing key is said to be
+        # missing.
+        outcome = connection_test_outcome(pcall, probe)
         result["test_connection"] = outcome
         print(f'  test-connection: {outcome["status"]}'
-              + (f' — {outcome.get("error")}' if outcome.get("error") else ""))
+              + (f' — {outcome.get("error")}' if outcome.get("error") else "")
+              + (f' — {outcome.get("note")}' if outcome.get("note") else ""))
 
     _write(out, "catalog_result.json", result)
     _write(out, "CATALOG.md", render_catalog(result))
