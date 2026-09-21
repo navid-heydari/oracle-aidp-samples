@@ -59,3 +59,30 @@ def test_plan_reads_artifacts_written_by_another_locale(tmp_path):
         [sys.executable, str(ENGINE), "summary", "--out-dir", str(out)],
         capture_output=True, check=False, env=env)
     assert second.returncode == 0, second.stderr.decode("utf-8", errors="replace")
+
+
+def test_stages_echo_survives_an_ascii_stdout(tmp_path):
+    """The rendered board is re-printed line by line after it is written.
+
+    Writing the file with an explicit encoding is not enough: `stages`,
+    `deploy` (dry run) and `preflight` echo the same markdown to stdout, and
+    a Windows pipe without UTF-8 mode is cp1252, so the first ⚠️ row raised
+    UnicodeEncodeError -- caught by main() as a ValueError and reported as
+    `error: 'charmap' codec can't encode ...`, exit 1, with STAGES.md
+    already on disk. A passing board must reach the operator, not only the
+    file."""
+    out = tmp_path / "demo"
+    demo = subprocess.run(
+        [sys.executable, str(ENGINE), "demo", "--out-dir", str(out)],
+        capture_output=True, check=False, env=_hostile_env())
+    assert demo.returncode == 0, demo.stderr.decode("utf-8", errors="replace")
+    proc = subprocess.run(
+        [sys.executable, str(ENGINE), "stages", "--out-dir", str(out)],
+        capture_output=True, check=False, env=_hostile_env())
+    stdout = proc.stdout.decode("utf-8", errors="replace")
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    assert proc.returncode == 0, f"rc={proc.returncode}\n{stderr}"
+    assert "charmap" not in stderr and "codec" not in stderr
+    # The echoed board, including its flagged rows, reached stdout.
+    assert "| Stage |" in stdout
+    assert "Needs attention" in stdout
