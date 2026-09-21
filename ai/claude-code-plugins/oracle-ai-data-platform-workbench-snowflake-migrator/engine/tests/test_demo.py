@@ -154,6 +154,20 @@ def test_the_demo_summary_rates_the_clustered_table_medium(demo):
     assert "**MEDIUM**" in rollup
 
 
+def test_the_stage_board_deploy_row_adds_up(demo):
+    # deploy_result.json: 4 statements, 2 verified, 1 failed (poisoned name),
+    # 1 created with derived type drift. The row once read "verified 2/4,
+    # 1 not verified", which does not sum, and the drift was invisible.
+    out, _ = demo
+    board = build_stage_board(out)
+    deploy = next(s for s in board["stages"] if s["stage"] == "deploy")
+    assert "verified 2/4" in deploy["found"]
+    assert "1 failed" in deploy["found"]
+    assert "1 created with derived type drift" in deploy["found"]
+    assert deploy["attention"] is True
+    assert "deploy" in board["needs_attention"]
+
+
 def test_the_emulated_snowflake_refuses_a_question_it_cannot_answer():
     # A fake that improvises is how an emulation starts lying.
     with pytest.raises(ValueError, match="no answer"):
