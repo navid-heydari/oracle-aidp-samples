@@ -172,19 +172,30 @@ cluster-libraries API (`PATCH .../clusters/{key}/libraries`, types `PYPI` /
 
 ## What is proven, and what is not
 
-**Live-verified** (2026-09-16, a real DataLake and a real Snowflake account):
-the connector read and pushdown; discovery of 11 schemas / 1000 tables via two
-queries; structure creation in `ddl-plan` mode, including its refusal of
-tables absent from the approved plan; **the copy, with five tables verified
-row-for-row (87, 88, 89, 90, 91) and exact decimal sums**; the
-upload/job/run/output loop; and the `/Workspace` mount these paths assume.
+Canonical per-stage status: `../GAPS.md` → "What is actually proven". Its
+sentence, repeated here so this file cannot drift from it:
 
-That first copy also failed once, usefully: it died on the sixth table
-because the approved plan covered five and the manifest listed a hundred. Two
-rules came out of it — a table with no target is recorded as
+**What has run live:** the discovery job (`snowmig_00_discover`) ran to
+SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in
+two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
+ran on a cluster from the approved plan, a healthy 23-minute run left alone
+by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
+and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
+authors**.
+
+Also live-verified (2026-09-16, a real DataLake and a real Snowflake
+account): the connector read and pushdown; the structure step's refusal of
+tables absent from the approved plan; the upload/job/run/output loop; and the
+`/Workspace` mount these paths assume.
+
+An earlier version of this file described a five-table copy verified
+row-for-row with exact decimal sums; the 0.25.0 changelog, three days later,
+said the copy had not executed. Until the person who ran the cluster jobs
+confirms which is right, the copy is unproven here. Two rules did come out
+of an early copy attempt — a table with no target is recorded as
 `target_missing` and skipped rather than ending the run, and the copy's
 default scope is **what the structure step created for this target**, not the
-whole manifest.
+whole manifest — and they are pinned by tests regardless.
 
 **Not yet proven at scale**: the largest run was one schema. Before a real
 estate, run `diagnose_environment.ipynb`, then one small schema end to end,

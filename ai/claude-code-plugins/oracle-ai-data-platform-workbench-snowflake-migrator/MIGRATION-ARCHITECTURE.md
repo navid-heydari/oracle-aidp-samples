@@ -153,10 +153,16 @@ before it is called done; a 2xx is never the claim.
   failure modes (async 202s, name poisoning, case folding, derived view
   types); the EXTERNAL registration contract; provisioning end to end
   (workspace, cluster, folders, uploads, jobs); the connector read and
-  pushdown from the cluster; discovery of 11 schemas / 1000 tables in two
-  queries; and structure creation from the approved `ddl_plan`. Still
-  unproven: anything at real scale (the largest run was one schema), the
-  external catalog's crawl, and the cluster-library item shape.
+  pushdown from the cluster. For the data plane the register is `GAPS.md` →
+  "What is actually proven"; its sentence: **What has run live:** the
+  discovery job (`snowmig_00_discover`) ran to SUCCESS on a migration
+  cluster, reading 1065 relations and 9935 columns in two
+  `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
+  ran on a cluster from the approved plan, a healthy 23-minute run left alone
+  by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
+  and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
+  authors**. Still unproven: anything at real scale (the largest run was one
+  schema), the external catalog's crawl, and the cluster-library item shape.
 - **Job startup dominates small work** — ~5–6 minutes per run, measured. The
   operating unit is a schema; per-table runs are the wrong shape.
 - **A failed create can permanently burn its name** in that schema (observed

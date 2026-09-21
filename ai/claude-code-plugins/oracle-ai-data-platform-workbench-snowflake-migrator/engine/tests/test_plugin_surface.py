@@ -540,3 +540,40 @@ def test_the_three_runbooks_agree_on_the_step_order():
     assert "snowmig_01_structure" in table
     assert "deploy --execute" not in table, \
         "the control-plane deploy is not the INTERNAL structure step (202 can create nothing)"
+
+
+# --------------------------------------------------------------------------
+# "Which data-plane stages have run live" has one home and one wording.
+# Five documents once gave four answers; the operator budgets the shake-out
+# from this, so it must not drift.
+# --------------------------------------------------------------------------
+
+_LIVE_STATUS_DOCS = ("README.md", "ASSUMPTIONS.md", "MIGRATION-ARCHITECTURE.md",
+                     "data-migration-scripts/README.md",
+                     "skills/snowflake-migrator-overview/SKILL.md")
+_STALE_LIVE_CLAIM = re.compile(
+    r"never run against a live AIDP|(still|remains?) unexecuted|"
+    r"none implemented", re.I)
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_live_status_register_has_one_home_and_one_wording():
+    gaps = (ROOT / "GAPS.md").read_text(encoding="utf-8")
+    assert "## What is actually proven" in gaps
+    register = gaps.split("## What is actually proven", 1)[1].split("\n## ", 1)[0]
+    for stage in ("00_discover", "01_create_structure", "02_copy", "03_reconcile"):
+        assert stage in register, stage
+    statement = re.search(r"\*\*What has run live:\*\*.*?not yet confirmed by "
+                          r"the authors\*\*\.", _flat(register))
+    assert statement, "GAPS.md must carry the canonical live-status sentence"
+    canonical = statement.group(0)
+    for rel in _LIVE_STATUS_DOCS:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        stale = _STALE_LIVE_CLAIM.search(text)
+        assert not stale, f"{rel} carries a stale live-status claim: {stale.group(0)!r}"
+        flat = _flat(text)
+        assert "What is actually proven" in flat, f"{rel} must point at the GAPS register"
+        assert canonical in flat, f"{rel} must carry the GAPS sentence verbatim"

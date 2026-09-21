@@ -555,27 +555,28 @@ live-verified; the SQL transport is dead (404). The notebook upload-and-run
 path is now live-verified too: the four stage notebooks upload as `NOTEBOOK`
 objects through the `aidp` CLI and the discovery job ran to SUCCESS on a
 migration cluster, reading 1065 relations and 9935 columns from Snowflake in
-two `INFORMATION_SCHEMA` queries. What remains unexecuted is the STRUCTURE
-notebook (`01_create_structure`) and everything downstream of it.
+two `INFORMATION_SCHEMA` queries.
+
+Per-stage live status is kept in one place, `GAPS.md` → "What is actually
+proven", and this is its sentence:
+
+**What has run live:** the discovery job (`snowmig_00_discover`) ran to
+SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in
+two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
+ran on a cluster from the approved plan, a healthy 23-minute run left alone
+by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
+and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
+authors**.
+
+Not yet proven: anything at full-estate scale (the largest run was one
+schema), the EXTERNAL catalog crawler, the cluster-library item shape.
+**Treat the first run on a new estate as a shake-out**: run
+`diagnose_environment.ipynb`, then one small schema end to end, and read
+`MIGRATION_REPORT.md` against the console before anything larger.
 
 **`GAPS.md` is the ranked list of what is left**, including the two questions
-that need Oracle rather than code.
-
-## Known limitation
-
-The `deploy --execute` path has **never run against a live AIDP deployment** —
-no environment has been available. That covers the `aidp`/`oci` command shapes,
-the REST paths, the existence and `DESCRIBE` probes, notebook upload, run-status
-polling, and the destination half of the smoke test. Command construction is
-pure and tested, and every command is printed before it runs, so a wrong flag
-should produce an obvious CLI usage error rather than a silent partial
-migration. **Treat the first live run as a shake-out**, and expect the probe
-response shapes to need adjusting: the code accepts several spellings of the
-name and type columns and reports "unrecognised output" rather than guessing,
-but it cannot know which one AIDP actually returns.
-
-The Snowflake side, by contrast, is live-verified: 10 gated end-to-end tests run
-against a real account.
+that need Oracle rather than code. The Snowflake side is live-verified: 10
+gated end-to-end tests run against a real account.
 
 ## Docs
 

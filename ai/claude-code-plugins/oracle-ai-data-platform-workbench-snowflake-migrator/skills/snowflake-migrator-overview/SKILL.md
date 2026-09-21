@@ -52,6 +52,16 @@ At S12 the migration is **done**: the assets exist, the scripts exist, the
 plans and backups exist. **The data migration is not run.** Moving rows is a
 later decision the customer makes, with the scripts already sitting there.
 
+Budget the shake-out from what has actually run, not from what exists. The
+per-stage register is `GAPS.md` → "What is actually proven"; its sentence:
+**What has run live:** the discovery job (`snowmig_00_discover`) ran to
+SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in
+two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
+ran on a cluster from the approved plan, a healthy 23-minute run left alone
+by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
+and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
+authors**. Say so if the user asks whether the copy is proven.
+
 ---
 
 ### S1 — Create the workspace, named from the Snowflake project
