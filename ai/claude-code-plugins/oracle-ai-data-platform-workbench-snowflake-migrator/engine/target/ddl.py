@@ -354,12 +354,18 @@ def build_create_view(record: dict, target_fqn: str,
                 f"View SQL was dialect-translated by {n} exact rule(s). Verify "
                 "its result against the source before relying on it.")
     else:
+        # This is what was checked, no more: the rule table matched nothing.
+        # A function outside the table (GREATEST/LEAST null handling, SPLIT's
+        # regex separator, ZEROIFNULL) ships as written and is not parsed here.
         res.rules_applied.append(RuleApplication(
             "R42_VIEW_PORTABLE_SQL",
-            "no Snowflake-only construct present; body carried over verbatim"))
+            "no known Snowflake-only construct matched; functions not in the "
+            "rule table are carried verbatim and may fail or differ at Spark "
+            "parse time"))
         res.warnings.append(
-            "View SQL was carried over unchanged. Verify its result against the "
-            "source before relying on it.")
+            "View SQL was carried over unchanged: no known Snowflake-only "
+            "construct matched, and functions not in the rule table were not "
+            "checked. Verify its result against the source before relying on it.")
     res.sql = f"CREATE VIEW IF NOT EXISTS {_qualify(target_fqn)} AS\n{rewritten}"
     res.expected_columns = [
         {"name": c["COLUMN_NAME"], "type": c["target_type"]}

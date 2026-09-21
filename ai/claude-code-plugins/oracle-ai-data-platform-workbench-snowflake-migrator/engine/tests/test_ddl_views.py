@@ -359,3 +359,20 @@ def test_datediff_view_is_blocked_end_to_end():
     ok, category, reason = _view_verdict(view_record(ddl=ddl))
     assert ok is False and category == "snowflake_only_sql"
     assert "DATEDIFF" in reason
+
+
+# --- "portable" means only that no known construct matched -----------------
+
+def test_r42_wording_does_not_claim_a_clean_check():
+    # GREATEST/LEAST parse on Spark with different NULL handling and SPLIT's
+    # separator is a regex there; neither is in the rule table, so the body
+    # ships verbatim. The rule text must say that, not "no construct present".
+    ddl = "create view V as select GREATEST(a, b) as g, SPLIT(p, '.')[0] as r from D.S.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is False
+    r42 = [r for r in res.rules_applied if r.rule_id == "R42_VIEW_PORTABLE_SQL"]
+    assert r42, res.rules_applied
+    assert "no known Snowflake-only construct matched" in r42[0].detail
+    assert "carried verbatim" in r42[0].detail
+    assert "no Snowflake-only construct present" not in r42[0].detail
+    assert any("not in the rule table" in w for w in res.warnings), res.warnings

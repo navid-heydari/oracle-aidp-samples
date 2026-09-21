@@ -47,6 +47,17 @@ worse than a blocked object.
 view touching any **declared** construct is blocked, naming it. A mixed view is
 blocked — partial translation is never emitted.
 
+What "portable" (`R42_VIEW_PORTABLE_SQL`) means, exactly: **no known
+Snowflake-only construct matched**. Detection is the rule table above and nothing
+more — there is no function allowlist and the body is not parsed. A function
+outside the table is carried verbatim and may fail at Spark parse time
+(`ZEROIFNULL`, `DIV0`, `TOP n`, Snowflake `TO_CHAR` format strings) or parse and
+return different values (`GREATEST`/`LEAST` return NULL on any NULL argument in
+Snowflake and skip NULLs in Spark; `SPLIT`'s separator is a literal in Snowflake
+and a Java regex in Spark). The rule text and the view's warning say so, and every
+view is rated HIGH risk for the same reason. Verify each result against the
+source before relying on it.
+
 ## Adding a rule
 
 Append to `RULES` with `status="implemented"` and a `translate` callable that
