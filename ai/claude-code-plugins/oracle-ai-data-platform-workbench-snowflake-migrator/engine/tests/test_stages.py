@@ -154,3 +154,36 @@ def test_an_optional_stage_is_never_proposed_as_next(tmp_path):
     _write(tmp_path, "compute.json", {"proposals": []})
     board = build_stage_board(tmp_path)
     assert board["next_stage"] == "plan"
+
+
+def test_a_smoke_run_that_skipped_the_destination_is_flagged(tmp_path):
+    # Only the source was checked. That is not a pass, and the board must
+    # not show the row as clean.
+    _write(tmp_path, "smoke.json",
+           {"ok": True, "complete": False, "verdict": "PARTIAL",
+            "source": {"reachable": True, "checks": []},
+            "destination": {"skipped": True, "checks": []}})
+    board = build_stage_board(tmp_path)
+    row = next(s for s in board["stages"] if s["stage"] == "smoke")
+    assert "PARTIAL" in row["found"]
+    assert row["attention"] is True
+    assert "smoke" in board["needs_attention"]
+
+
+def test_a_legacy_smoke_result_with_a_skipped_destination_is_not_shown_clean(tmp_path):
+    _write(tmp_path, "smoke.json",
+           {"ok": True, "source": {"reachable": True, "checks": []},
+            "destination": {"skipped": True, "checks": []}})
+    row = next(s for s in build_stage_board(tmp_path)["stages"]
+               if s["stage"] == "smoke")
+    assert row["found"] != "PASS" and row["attention"] is True
+
+
+def test_a_smoke_run_that_checked_both_ends_reads_pass(tmp_path):
+    _write(tmp_path, "smoke.json",
+           {"ok": True, "complete": True, "verdict": "PASS",
+            "source": {"reachable": True, "checks": []},
+            "destination": {"skipped": False, "checks": []}})
+    row = next(s for s in build_stage_board(tmp_path)["stages"]
+               if s["stage"] == "smoke")
+    assert row["found"] == "PASS" and row["attention"] is False

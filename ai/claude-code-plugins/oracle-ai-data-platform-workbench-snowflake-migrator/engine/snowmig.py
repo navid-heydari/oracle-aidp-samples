@@ -48,7 +48,7 @@ from plan.medallion import SCHEMA_STYLES
 from plan.restrictions import InvalidRestriction
 from plan.data_movement import OPTIONS as DATA_OPTIONS
 from plan.data_movement import options_for, record_choice
-from plan.smoke import run_smoke
+from plan.smoke import run_smoke, smoke_verdict
 from target.notebook import build_notebook, notebook_workspace_path
 from report.stages import build_stage_board
 from report.render import (
@@ -1021,8 +1021,13 @@ def cmd_smoke(args) -> int:
                        if getattr(args, "database", None) else None)
     _write(out, "smoke.json", result)
     _write(out, "SMOKE_TEST.md", render_smoke(result))
-    print(f'  verdict: {"PASS" if result["ok"] else "FAIL"}')
-    return 0 if result["ok"] else 1
+    verdict = smoke_verdict(result)
+    if verdict == "PARTIAL":
+        print("  verdict: PARTIAL — Snowflake was checked; the AIDP destination "
+              f'was NOT ({result["destination"].get("reason", "")}). Not a pass.')
+    else:
+        print(f"  verdict: {verdict}")
+    return 0 if verdict == "PASS" else 1
 
 
 def cmd_notebook(args) -> int:

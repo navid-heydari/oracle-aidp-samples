@@ -145,8 +145,13 @@ def test_summary_counts_match_the_lists():
 
 def test_target_collision_still_halts():
     inv = {"inventory": [rec("D.S.T"), rec("D.s.T")]}
-    with pytest.raises(TargetCollision):
+    with pytest.raises(TargetCollision) as exc:
         build_plan(inv, {"edges": []})
+    # The HALT names its one in-tool remedy in the form the JSON file takes:
+    # the twin to defer, spelled exactly, double-quoted.
+    msg = str(exc.value)
+    assert "exclude_objects" in msg
+    assert '\\"D\\".\\"s\\".\\"T\\"' in msg
 
 
 def test_dependency_provenance_carried():
@@ -166,3 +171,206 @@ def test_a_view_with_an_escaped_quote_in_a_cast_does_not_abort_the_plan():
     plan = build_plan(inv, {"edges": []})
     can = {c["source_identifier"] for c in plan["can_migrate"]}
     assert "D.PUBLIC.V_BAD" in can, plan["cannot_migrate"]
+
+
+def test_collision_resolved_by_excluding_the_quoted_twin():
+    # The HALT above has exactly one in-tool remedy: name the twin to defer
+    # with its exact, double-quoted spelling. The other twin is then planned.
+    inv = {"inventory": [rec("D.S.T"), rec("D.S.t")]}
+    plan = build_plan(inv, {"edges": []},
+                      restrictions={"exclude_objects": ['"D"."S"."t"']})
+    assert [c["source_identifier"] for c in plan["can_migrate"]] == ["D.S.T"]
+    assert [(c["source_identifier"], c["category"])
+            for c in plan["cannot_migrate"]] == [("D.S.t", "restriction")]
+
+
+def test_unknown_count_under_a_cap_lands_in_cannot_migrate_with_the_reason():
+    # Views carry no count under the default --row-counts metadata; a cap
+    # that cannot be evaluated excludes rather than silently admitting.
+    uncounted = rec("D.S.T")
+    uncounted["row_count_exact"] = None
+    inv = {"inventory": [uncounted, rec("D.S.SMALL", rows=3)]}
+    plan = build_plan(inv, {"edges": []}, restrictions={"max_rows": 10})
+    assert [c["source_identifier"] for c in plan["can_migrate"]] == ["D.S.SMALL"]
+    c = plan["cannot_migrate"][0]
+    assert c["category"] == "restriction"
+    assert "cannot be evaluated" in c["reason"] and "max_rows" in c["reason"]
+
+
+# --- dependency cascade ---------------------------------------------------
+#
+# A view whose base object is not migrating cannot migrate either. Before,
+# only the planned ids reached compute_waves, so the edge to a blocked or
+# excluded base was dropped, the view had indegree 0, sorted FIRST in wave 1
+# (rows=None -> size 0) and its CREATE VIEW was emitted over a table that
+# will never exist -- while the report said "views follow their base tables".
+
+def _edge(view, base):
+    return {"from": view, "to": base}
+
+
+def test_view_over_a_blocked_table_cannot_migrate_and_is_not_waved_or_emitted():
+    from target.ddl import build_ddl_payload
+    inv = {"inventory": [rec("D.S.T", status="blocked", blocked=["P: VARIANT"]),
+                         rec("D.S.V", kind="VIEW", ddl="create view V as select a from D.S.T")]}
+    plan = build_plan(inv, {"edges": [_edge("D.S.V", "D.S.T")]})
+    cannot = {c["source_identifier"]: c for c in plan["cannot_migrate"]}
+    assert cannot["D.S.V"]["category"] == "dependency_not_migrated"
+    assert "depends on D.S.T, which is blocked" in cannot["D.S.V"]["reason"]
+    assert cannot["D.S.V"]["object_type"] == "VIEW"
+    assert plan["can_migrate"] == [] and plan["waves"] == []
+    assert plan["clone_targets"] == []
+    assert plan["summary"]["can_migrate"] == 0
+    assert plan["summary"]["cannot_migrate"] == 2
+    assert plan["summary"]["cannot_by_category"]["dependency_not_migrated"] == 1
+    assert build_ddl_payload(inv, plan)["statements"] == []
+
+
+def test_view_over_a_restricted_table_cannot_migrate():
+    inv = {"inventory": [rec("D.S.T"), rec("D.S.V", kind="VIEW",
+                                           ddl="create view V as select a from D.S.T")]}
+    plan = build_plan(inv, {"edges": [_edge("D.S.V", "D.S.T")]},
+                      restrictions={"exclude_objects": ["D.S.T"]})
+    cats = {c["source_identifier"]: c["category"] for c in plan["cannot_migrate"]}
+    assert cats == {"D.S.T": "restriction", "D.S.V": "dependency_not_migrated"}
+    v = next(c for c in plan["cannot_migrate"] if c["source_identifier"] == "D.S.V")
+    assert "depends on D.S.T, which is excluded" in v["reason"]
+
+
+def test_dependency_exclusion_cascades_through_a_view_chain():
+    inv = {"inventory": [rec("D.S.T", status="blocked", blocked=["P: VARIANT"]),
+                         rec("D.S.V1", kind="VIEW", ddl="create view V1 as select a from D.S.T"),
+                         rec("D.S.V2", kind="VIEW", ddl="create view V2 as select a from D.S.V1"),
+                         rec("D.S.OK")]}
+    plan = build_plan(inv, {"edges": [_edge("D.S.V1", "D.S.T"),
+                                      _edge("D.S.V2", "D.S.V1")]})
+    cats = {c["source_identifier"]: c["category"] for c in plan["cannot_migrate"]}
+    assert cats["D.S.V1"] == cats["D.S.V2"] == "dependency_not_migrated"
+    v2 = next(c for c in plan["cannot_migrate"] if c["source_identifier"] == "D.S.V2")
+    assert "depends on D.S.V1, which is blocked" in v2["reason"]
+    assert plan["waves"] == [["D.S.OK"]]
+
+
+def test_dependency_exclusion_through_a_diamond_lists_each_view_once():
+    inv = {"inventory": [rec("D.S.T", status="blocked", blocked=["P: VARIANT"]),
+                         rec("D.S.V1", kind="VIEW", ddl="create view V1 as select a from D.S.T"),
+                         rec("D.S.V2", kind="VIEW", ddl="create view V2 as select a from D.S.T"),
+                         rec("D.S.V3", kind="VIEW",
+                             ddl="create view V3 as select a from D.S.V1 join D.S.V2 on 1=1")]}
+    plan = build_plan(inv, {"edges": [_edge("D.S.V1", "D.S.T"), _edge("D.S.V2", "D.S.T"),
+                                      _edge("D.S.V3", "D.S.V1"), _edge("D.S.V3", "D.S.V2")]})
+    ids = ([c["source_identifier"] for c in plan["can_migrate"]]
+           + [c["source_identifier"] for c in plan["cannot_migrate"]])
+    assert sorted(ids) == ["D.S.T", "D.S.V1", "D.S.V2", "D.S.V3"]
+    assert len(ids) == len(set(ids)), "every object in exactly one list, once"
+    cats = {c["source_identifier"]: c["category"] for c in plan["cannot_migrate"]}
+    assert cats == {"D.S.T": "unmapped_type", "D.S.V1": "dependency_not_migrated",
+                    "D.S.V2": "dependency_not_migrated",
+                    "D.S.V3": "dependency_not_migrated"}
+
+
+def test_views_whose_bases_all_migrate_are_unaffected_by_the_cascade():
+    inv = {"inventory": [rec("D.S.T"), rec("D.S.V", kind="VIEW",
+                                           ddl="create view V as select a from D.S.T")]}
+    plan = build_plan(inv, {"edges": [_edge("D.S.V", "D.S.T")]})
+    assert plan["waves"] == [["D.S.T"], ["D.S.V"]]
+    assert plan["cannot_migrate"] == []
+
+
+# --- the plan says whose catalog name its Target column carries -----------
+#
+# The in-AIDP structure job creates <--target-catalog>.<schema>.<table>; the
+# plan's catalog part is the source database mirrored (or a prefix). Reviewers
+# were signing off on names the job never creates, so the plan now states it.
+
+def test_plan_carries_a_target_catalog_note_for_the_default_mirror():
+    plan = build_plan({"inventory": [rec("MYDB.SALES.ORDERS")]}, {"edges": []})
+    note = plan["target_catalog_note"]
+    assert "01_create_structure" in note
+    assert "--target-catalog" in note
+    assert "mydb" in note, "names the mirrored catalog the column carries"
+    assert "source database" in note.lower()
+    assert "external" in note.lower(), "warns that the source-named catalog is the pointer"
+
+
+def test_target_catalog_note_names_the_prefix_when_one_was_given():
+    plan = build_plan({"inventory": [rec("MYDB.SALES.ORDERS")]}, {"edges": []},
+                      bronze_catalog_prefix="lake", bronze_schema_style="db")
+    note = plan["target_catalog_note"]
+    assert "'lake'" in note and "--bronze-catalog-prefix" in note
+    assert "'db'" in note, "names the schema style the column follows"
+    assert "01_create_structure" in note and "--target-catalog" in note
+
+
+def test_target_catalog_note_is_present_even_when_nothing_migrates():
+    inv = {"inventory": [rec("D.S.BAD", status="blocked", blocked=["x: VARIANT"])]}
+    plan = build_plan(inv, {"edges": []})
+    assert plan["target_catalog_note"] and "01_create_structure" in plan["target_catalog_note"]
+
+
+# --- SHOW TABLES kind flags -----------------------------------------------
+#
+# SHOW TABLES lists dynamic, external, Iceberg, event and hybrid tables next
+# to standard ones, and the extractor keeps the is_* flags. build_plan never
+# read them: a dynamic table was planned as a plain Delta copy while
+# CENSUS.md said it never migrates, and the others were flattened silently.
+
+KIND_FLAGS = ("is_dynamic", "is_external", "is_iceberg", "is_event", "is_hybrid")
+
+
+def _flagged(ident, flag, value):
+    r = rec(ident)
+    r["source_metadata"][flag] = value
+    return r
+
+
+@pytest.mark.parametrize("flag", KIND_FLAGS)
+@pytest.mark.parametrize("value", ["Y", "true", "TRUE"])
+def test_a_flagged_table_kind_cannot_migrate_with_a_specific_reason(flag, value):
+    inv = {"inventory": [_flagged("D.S.T", flag, value), rec("D.S.PLAIN")]}
+    plan = build_plan(inv, {"edges": []})
+    cannot = {c["source_identifier"]: c for c in plan["cannot_migrate"]}
+    assert set(cannot) == {"D.S.T"}
+    assert cannot["D.S.T"]["category"] == "unsupported_object"
+    assert cannot["D.S.T"]["object_type"] == "TABLE"
+    assert flag.removeprefix("is_") in cannot["D.S.T"]["reason"].lower()
+    assert [c["source_identifier"] for c in plan["can_migrate"]] == ["D.S.PLAIN"]
+    assert plan["summary"]["can_migrate"] == 1 and plan["summary"]["tables"] == 1
+    assert "D.S.T" not in plan["clone_targets"]
+    assert all("D.S.T" not in wave for wave in plan["waves"])
+
+
+@pytest.mark.parametrize("flag", KIND_FLAGS)
+@pytest.mark.parametrize("value", ["N", "false", "", None])
+def test_an_unset_kind_flag_leaves_the_table_migratable(flag, value):
+    plan = build_plan({"inventory": [_flagged("D.S.T", flag, value)]}, {"edges": []})
+    assert [c["source_identifier"] for c in plan["can_migrate"]] == ["D.S.T"]
+
+
+def test_a_dynamic_table_reason_says_why_a_copy_is_not_the_object():
+    plan = build_plan({"inventory": [_flagged("D.S.DT", "is_dynamic", "Y")]},
+                      {"edges": []})
+    reason = plan["cannot_migrate"][0]["reason"]
+    assert "refreshed by Snowflake" in reason
+    assert "census" in reason.lower()
+    assert "no equivalent is generated" in reason
+
+
+@pytest.mark.parametrize("kind", ["TRANSIENT", "TEMPORARY", "transient"])
+def test_transient_and_temporary_tables_migrate_with_a_warning(kind):
+    r = rec("D.S.T")
+    r["source_metadata"]["kind"] = kind
+    plan = build_plan({"inventory": [r, rec("D.S.PLAIN")]}, {"edges": []})
+    assert {c["source_identifier"] for c in plan["can_migrate"]} == {"D.S.PLAIN", "D.S.T"}
+    warnings = plan["table_kind_warnings"]
+    assert [w["source_identifier"] for w in warnings] == ["D.S.T"]
+    assert warnings[0]["kind"] == kind.upper()
+    assert kind.upper() in warnings[0]["warning"]
+    assert "permanent" in warnings[0]["warning"].lower()
+
+
+def test_a_plain_table_carries_no_kind_warning():
+    r = rec("D.S.T")
+    r["source_metadata"]["kind"] = "TABLE"
+    plan = build_plan({"inventory": [r]}, {"edges": []})
+    assert plan["table_kind_warnings"] == []

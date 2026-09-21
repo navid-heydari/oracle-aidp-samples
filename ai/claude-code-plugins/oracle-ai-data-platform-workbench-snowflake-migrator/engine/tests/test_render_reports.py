@@ -407,3 +407,14 @@ def test_planned_objects_with_an_empty_census_carries_the_visibility_caveat():
     md = render_planned_objects(plan)
     assert "whole estate" not in md.lower()
     assert "visible" in md.lower()
+
+
+def test_dependency_not_migrated_has_a_title_not_a_raw_key():
+    plan = dict(PLAN)
+    plan["cannot_migrate"] = PLAN["cannot_migrate"] + [
+        {"source_identifier": "D.PUBLIC.J_VW", "object_type": "VIEW",
+         "category": "dependency_not_migrated",
+         "reason": "depends on D.PUBLIC.J, which is blocked (unmapped_type)"}]
+    md = render_planned_objects(plan)
+    assert "### Depends on an object that is not migrating" in md
+    assert "depends on D.PUBLIC.J, which is blocked" in md

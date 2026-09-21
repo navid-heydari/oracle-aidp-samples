@@ -390,3 +390,34 @@ def test_deps_warns_when_views_lack_account_usage_lineage(tmp_path, monkeypatch,
     deps = json.loads((tmp_path / "dependencies.json").read_text(encoding="utf-8"))
     assert deps["source_used"] == "account_usage_empty"
     assert deps["edges"][0]["source"] == "parsed_ddl"
+
+
+def test_empty_include_allowlist_exits_1_and_writes_no_plan(tmp_path, capsys):
+    # `{"include_objects": []}` used to plan the whole estate and print the
+    # allowlist under "Restrictions in force".
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    (tmp_path / "r.json").write_text(json.dumps({"include_objects": []}), encoding="utf-8")
+    rc = main(["plan", "--out-dir", str(tmp_path), "--restrictions",
+               str(tmp_path / "r.json")])
+    assert rc == 1
+    assert "include_objects" in capsys.readouterr().err
+    assert not (tmp_path / "plan.json").exists()
+
+
+def test_smoke_without_target_coordinates_is_partial_and_exits_1(tmp_path, monkeypatch, capsys):
+    # The example config ships workspace/cluster_id/catalog commented out, so
+    # this is the default first run: only Snowflake gets checked. That used
+    # to print `verdict: PASS` and exit 0.
+    import snowmig
+    from tests.test_smoke import sf_ok
+    monkeypatch.setattr(snowmig, "_run_sql_from_args", lambda args: sf_ok)
+    monkeypatch.setattr(snowmig, "_aidp_from_config", lambda args: {})
+    rc = main(["smoke", "--out-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "PARTIAL" in out and "verdict: PASS" not in out
+    smoke = json.loads((tmp_path / "smoke.json").read_text(encoding="utf-8"))
+    assert smoke["verdict"] == "PARTIAL"
+    md = (tmp_path / "SMOKE_TEST.md").read_text(encoding="utf-8")
+    assert "Verdict: **PASS**" not in md and "PARTIAL" in md
