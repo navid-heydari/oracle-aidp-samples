@@ -123,3 +123,41 @@ def test_a_path_form_secret_is_refused_by_the_cli_before_anything_is_written(
     assert "key_path" in err and "inline" in err.lower()
     assert fake.ops == []
     assert not (tmp_path / "provision_result.json").exists()
+
+
+# --- --reuse-existing / --refresh-notebooks through the CLI ------------------
+
+def _seeded_workspace():
+    from target.provisioning import JOB_SPECS, SCRIPTS_FOLDER
+    fake = Fake(workspaces=("acme",), clusters=("migration_assets",),
+                jobs=tuple(s["name"] for s in JOB_SPECS))
+    for spec in JOB_SPECS:
+        fake.contents[f'{SCRIPTS_FOLDER}/{spec["notebook"]}'] = {
+            "type": "NOTEBOOK", "body": "console-edited"}
+    return fake
+
+
+def test_reuse_existing_keeps_the_notebooks_and_provision_md_lists_them(
+        tmp_path, monkeypatch):
+    fake = _seeded_workspace()
+    _install(monkeypatch, fake)
+    rc = _provision(tmp_path, "--execute", "--reuse-existing")
+    assert rc == 0
+    assert all(v["body"] == "console-edited" for k, v in fake.contents.items()
+               if k.endswith(".ipynb"))
+    md = (tmp_path / "PROVISION.md").read_text(encoding="utf-8")
+    assert "Stage notebooks kept as found" in md
+    assert "02_copy_schema.ipynb" in md and "--refresh-notebooks" in md
+
+
+def test_refresh_notebooks_is_the_explicit_way_to_overwrite(tmp_path,
+                                                            monkeypatch):
+    fake = _seeded_workspace()
+    _install(monkeypatch, fake)
+    rc = _provision(tmp_path, "--execute", "--reuse-existing",
+                    "--refresh-notebooks")
+    assert rc == 0
+    assert not any(v["body"] == "console-edited"
+                   for k, v in fake.contents.items() if k.endswith(".ipynb"))
+    md = (tmp_path / "PROVISION.md").read_text(encoding="utf-8")
+    assert "kept as found" not in md and "OVERWRITTEN" in md

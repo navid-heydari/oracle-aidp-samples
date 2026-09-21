@@ -150,3 +150,13 @@ def test_a_confirmed_restart_still_renders_the_resubmitted_run():
     assert "**SUCCESS**" in md
     assert "`run-1`" in md and "`run-2`" in md
     assert "CANCELED" in md
+
+
+def test_the_param_refusal_names_the_flag_that_really_rewrites_params(tmp_path):
+    """`--reuse-existing` alone now KEEPS an existing stage notebook, so the
+    text that sends the operator to provision to set PARAMS must name
+    `--refresh-notebooks`, or it sends them to a command that changes
+    nothing."""
+    with pytest.raises(snowmig.MissingTarget) as exc:
+        snowmig.cmd_run(_args(tmp_path, param=["schema=SALES"]))
+    assert "--refresh-notebooks" in str(exc.value)

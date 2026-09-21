@@ -389,7 +389,8 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               execute: bool = False,
               delays: tuple[float, ...] = (3.0, 5.0, 10.0, 15.0),
               subnet_id: str | None = None,
-              reuse_existing: bool = False) -> dict:
+              reuse_existing: bool = False,
+              refresh_notebooks: bool = False) -> dict:
     """Provision this migration's own environment inside AIDP.
 
     `reuse_existing=False` is the default and the rule: a migration creates
@@ -398,6 +399,12 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     COLLISION -- reported, and the run stops so the user can choose another
     name. Adopting a stranger's workspace silently makes the blast radius of
     the migration unknowable.
+
+    With `reuse_existing`, a stage notebook already on the workspace is KEPT
+    as it is unless `refresh_notebooks` is set: operators set schema, mode
+    and verify by editing its PARAMS cell in the console, and this stage
+    has no flags for those, so regenerating it would discard that work
+    without saying so. Kept notebooks are listed in the result.
     """
     ws_name = translate_name(workspace_name, kind="workspace")
     cl_name = translate_name(cluster_name, kind="cluster")
@@ -445,6 +452,9 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         # Workspace objects that hold a credential, so the report can say so
         # in one place and the operator knows what to remove afterwards.
         "credential_objects": [credential_object] if credential_object else [],
+        # Stage notebooks left as found on the workspace (reuse_existing
+        # without refresh_notebooks), so PROVISION.md can list them.
+        "notebooks_kept": [],
         "steps": [],
     }
 
@@ -737,6 +747,23 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         defaults["source-config"] = f"/Workspace/{credential_object}"
     existing = call("list_jobs", workspace=ws_key).get("items") or []
     stages_by_notebook = {st.notebook_name: st for st in STAGES}
+
+    # Which stage notebooks are already on the workspace. Looked up once,
+    # and only when they are to be kept: a fresh run has nothing to keep,
+    # and --refresh-notebooks asks for the overwrite.
+    keep_existing = reuse_existing and not refresh_notebooks
+    present: set[str] = set()
+    listing_error: Exception | None = None
+    if keep_existing:
+        try:
+            listed = call("list_ws_objects", workspace=ws_key,
+                          path=SCRIPTS_FOLDER).get("items") or []
+            for item in listed:
+                present.add(str(item.get("path") or "").rsplit("/", 1)[-1])
+                present.add(str(item.get("displayName") or ""))
+        except Exception as exc:
+            listing_error = exc
+
     for spec in JOB_SPECS:
         stage = stages_by_notebook.get(spec["notebook"])
         if stage is None:
@@ -746,44 +773,70 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                  f'exist.')
             continue
         notebook_path = f'{SCRIPTS_FOLDER}/{spec["notebook"]}'
-        try:
-            # Built here, with this run's coordinates already in PARAMS, so
-            # the notebook on the workspace is ready to run unedited.
-            nb = build_stage_notebook(stage, overrides=defaults)
-            fd, local = tempfile.mkstemp(prefix="snowmig_stage_",
-                                         suffix=".ipynb")
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(nb, fh, indent=1)
-            try:
-                call("upload_ws_file", workspace=ws_key, path=notebook_path,
-                     local_path=local, object_type="NOTEBOOK")
-            finally:
-                os.unlink(local)
-            # Read it back, like every other upload: a 2xx is not the claim.
-            listed = call("list_ws_objects", workspace=ws_key,
-                          path=SCRIPTS_FOLDER).get("items") or []
-            name = notebook_path.rsplit("/", 1)[-1]
-            seen = any(str(i.get("path") or "").endswith("/" + name)
-                       or i.get("displayName") == name for i in listed)
-            step("notebook", "uploaded" if seen else "upload_requested", seen,
-                 notebook_path if seen
-                 else f"{notebook_path}: not visible in the listing")
-            if not seen:
-                continue
-        except Exception as exc:
+        if keep_existing and listing_error is not None:
+            # Could not look. Overwriting on that would be the guess this
+            # flag exists to prevent; creating a job for a notebook that may
+            # not exist would be the other one.
             step("notebook", "failed", False,
-                 f"{notebook_path}: {str(exc)[:200]}")
+                 f"{notebook_path}: could not list {SCRIPTS_FOLDER} to tell "
+                 f"whether it already exists ({str(listing_error)[:160]}); "
+                 f"neither overwritten nor created. Re-run, or pass "
+                 f"--refresh-notebooks to regenerate it regardless")
             continue
+        kept = keep_existing and spec["notebook"] in present
+        if kept:
+            step("notebook", "kept", True,
+                 f"{notebook_path}: already on the workspace and left as it "
+                 f"is -- its PARAMS cell (schema, mode, verify) keeps whatever "
+                 f"was set in the console. Pass --refresh-notebooks to "
+                 f"regenerate it from this run's flags")
+            out["notebooks_kept"].append(spec["notebook"])
+        else:
+            try:
+                # Built here, with this run's coordinates already in PARAMS,
+                # so the notebook on the workspace is ready to run unedited.
+                nb = build_stage_notebook(stage, overrides=defaults)
+                fd, local = tempfile.mkstemp(prefix="snowmig_stage_",
+                                             suffix=".ipynb")
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(nb, fh, indent=1)
+                try:
+                    call("upload_ws_file", workspace=ws_key,
+                         path=notebook_path, local_path=local,
+                         object_type="NOTEBOOK")
+                finally:
+                    os.unlink(local)
+                # Read it back, like every other upload: a 2xx is not the
+                # claim.
+                listed = call("list_ws_objects", workspace=ws_key,
+                              path=SCRIPTS_FOLDER).get("items") or []
+                name = notebook_path.rsplit("/", 1)[-1]
+                seen = any(str(i.get("path") or "").endswith("/" + name)
+                           or i.get("displayName") == name for i in listed)
+                step("notebook", "uploaded" if seen else "upload_requested",
+                     seen, notebook_path if seen
+                     else f"{notebook_path}: not visible in the listing")
+                if not seen:
+                    continue
+            except Exception as exc:
+                step("notebook", "failed", False,
+                     f"{notebook_path}: {str(exc)[:200]}")
+                continue
 
         if _match(existing, spec["name"]) is not None:
+            overwritten = (
+                "OVERWRITTEN from this run's flags; console edits to its "
+                "PARAMS cell are gone")
             if reuse_existing:
                 step("job", "reused", True,
-                     f'{spec["name"]} (stage notebook refreshed)')
+                     f'{spec["name"]} (stage notebook '
+                     f'{"kept" if kept else overwritten})')
             else:
                 step("job", "name_taken", False,
                      f'{spec["name"]} already exists and was NOT adopted; '
-                     f'its stage notebook was refreshed but the job itself '
-                     f'is not this migration\'s. Rename or --reuse-existing.')
+                     f'its stage notebook was {overwritten}, but the job '
+                     f'itself is not this migration\'s. Rename or '
+                     f'--reuse-existing.')
             continue
         body = build_job_body(spec["name"], notebook_path=notebook_path,
                               cluster_key=cluster_key)
@@ -851,6 +904,18 @@ def render_provision(res: dict) -> str:
                   "Remove it from the workspace once the migration is done, "
                   "and rotate the Snowflake credential if anyone who must "
                   "not hold it can read this workspace.", ""]
+
+    if res.get("notebooks_kept"):
+        lines += [
+            "## Stage notebooks kept as found", "",
+            "`--reuse-existing` left these notebooks as they are on the "
+            "workspace, so whatever their PARAMS cells hold (schema, mode, "
+            "verify, counts) still holds. Pass `--refresh-notebooks` to "
+            "regenerate them from this run's flags -- that discards console "
+            "edits:", ""]
+        lines += [f'- `{res["scripts_folder"]}/{n}`'
+                  for n in res["notebooks_kept"]]
+        lines.append("")
 
     lines += [
         "| Step | Action | Verified | Detail |", "|---|---|---|---|"]

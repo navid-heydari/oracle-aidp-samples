@@ -868,3 +868,102 @@ def test_an_inline_secret_config_is_accepted(scripts, tmp_path):
     body = json.loads(
         fake.contents[f"{PLAN_FOLDER}/snowmig-config.json"]["body"])
     assert body["snowflake"]["private_key"] == _FAKE_PEM
+
+
+# --- --reuse-existing keeps the stage notebooks it finds ---------------------
+#
+# Every `provision --execute` used to regenerate all four stage notebooks and
+# upload them with --is-overwrite, before even looking at whether the job
+# existed. Operators set `schema`, `mode`, `verify` and `counts` by editing
+# the PARAMS cell in the console -- provision has no flags for them -- so a
+# later `--reuse-existing` (the documented resume after the workspace/cluster
+# 409) reset them: `schema` back to None, `verify` back to `counts`, the
+# reconcile `counts` back to False, with "reused (stage notebook refreshed)"
+# as the only trace.
+
+def _seeded():
+    fake = Fake(workspaces=("acme",), clusters=("migration_assets",),
+                jobs=tuple(s["name"] for s in JOB_SPECS))
+    for spec in JOB_SPECS:
+        fake.contents[f'{SCRIPTS_FOLDER}/{spec["notebook"]}'] = {
+            "type": "NOTEBOOK", "body": "console-edited"}
+    return fake
+
+
+def test_reuse_existing_keeps_an_existing_stage_notebook(scripts):
+    fake = _seeded()
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(), reuse_existing=True,
+                    target_catalog="mig")
+    uploads = [kw for op, kw in fake.ops
+               if op == "upload_ws_file" and kw.get("object_type") == "NOTEBOOK"]
+    assert uploads == [], "nothing already there is overwritten"
+    assert fake.contents[f"{SCRIPTS_FOLDER}/02_copy_schema.ipynb"]["body"] \
+        == "console-edited"
+    notebooks = [s for s in res["steps"] if s["step"] == "notebook"]
+    assert [s["action"] for s in notebooks] == ["kept"] * len(JOB_SPECS)
+    assert all(s["verified"] is True and "--refresh-notebooks" in s["detail"]
+               for s in notebooks)
+    assert res["notebooks_kept"] == [s["notebook"] for s in JOB_SPECS]
+    jobs = [s for s in res["steps"] if s["step"] == "job"]
+    assert len(jobs) == len(JOB_SPECS)
+    assert all(s["action"] == "reused" and "kept" in s["detail"] for s in jobs)
+    md = render_provision(res)
+    assert "kept" in md and "--refresh-notebooks" in md
+    assert "02_copy_schema.ipynb" in md
+
+
+def test_refresh_notebooks_overwrites_and_says_so(scripts):
+    fake = _seeded()
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(), reuse_existing=True,
+                    refresh_notebooks=True, target_catalog="mig")
+    body = fake.contents[f"{SCRIPTS_FOLDER}/02_copy_schema.ipynb"]["body"]
+    assert body != "console-edited"
+    params = "".join(json.loads(body)["cells"][1]["source"])
+    assert "'target-catalog': 'mig'" in params
+    assert res["notebooks_kept"] == []
+    jobs = [s for s in res["steps"] if s["step"] == "job"]
+    assert all(s["action"] == "reused" and "OVERWRITTEN" in s["detail"]
+               and "console edits" in s["detail"] for s in jobs)
+    assert "kept as found" not in render_provision(res)
+
+
+def test_reuse_existing_still_uploads_a_notebook_that_is_missing(scripts):
+    fake = _seeded()
+    del fake.contents[f"{SCRIPTS_FOLDER}/03_reconcile.ipynb"]
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(), reuse_existing=True)
+    actions = sorted(s["action"] for s in res["steps"]
+                     if s["step"] == "notebook")
+    assert actions == ["kept", "kept", "kept", "uploaded"]
+    assert res["notebooks_kept"] == [s["notebook"] for s in JOB_SPECS[:3]]
+    assert f"{SCRIPTS_FOLDER}/03_reconcile.ipynb" in fake.contents
+
+
+def test_a_fresh_provision_still_uploads_every_notebook(scripts):
+    fake = Fake()
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=())
+    assert [s["action"] for s in res["steps"] if s["step"] == "notebook"] \
+        == ["uploaded"] * len(JOB_SPECS)
+    assert res["notebooks_kept"] == []
+
+
+def test_an_unlistable_scripts_folder_neither_overwrites_nor_creates(scripts):
+    class NoScriptsListing(Fake):
+        def __call__(self, operation, **kw):
+            if operation == "list_ws_objects" and kw["path"] == SCRIPTS_FOLDER:
+                self.ops.append((operation, kw))
+                raise RuntimeError("workspace-object list: 503")
+            return super().__call__(operation, **kw)
+
+    fake = NoScriptsListing(workspaces=("acme",), clusters=("migration_assets",),
+                            jobs=tuple(s["name"] for s in JOB_SPECS))
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(), reuse_existing=True)
+    notebooks = [s for s in res["steps"] if s["step"] == "notebook"]
+    assert [s["action"] for s in notebooks] == ["failed"] * len(JOB_SPECS)
+    assert all("could not list" in s["detail"] for s in notebooks)
+    assert not any(op == "upload_ws_file" and kw.get("object_type") == "NOTEBOOK"
+                   for op, kw in fake.ops), "could not look is not absent"

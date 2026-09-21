@@ -718,9 +718,10 @@ def cmd_run(args) -> int:
             "ignore " + ", ".join(sorted(parameters)) + " and execute "
             "whatever the notebook's PARAMS cell already holds.\n"
             "Set stage parameters where they are actually read:\n"
-            "  * re-run `provision --execute --reuse-existing` with the "
-            "coordinate flags -- it rewrites each stage notebook's PARAMS "
-            "cell and uploads it, or\n"
+            "  * re-run `provision --execute --reuse-existing "
+            "--refresh-notebooks` with the coordinate flags -- it rewrites "
+            "each stage notebook's PARAMS cell and uploads it (console edits "
+            "to that cell are lost), or\n"
             "  * edit the PARAMS cell of "
             "backup-snowflake-migration/scripts/<stage>.ipynb in the "
             "console.\n"
@@ -1336,7 +1337,8 @@ def cmd_provision(args) -> int:
         target_catalog=args.target_catalog, source_mode=args.source_mode,
         source_config=source_config,
         warehouse_clusters=warehouse_clusters, execute=args.execute,
-        subnet_id=args.subnet_id, reuse_existing=args.reuse_existing)
+        subnet_id=args.subnet_id, reuse_existing=args.reuse_existing,
+        refresh_notebooks=args.refresh_notebooks)
     _write(out, "provision_result.json", res)
     _write(out, "PROVISION.md", render_provision(res))
 
@@ -1682,6 +1684,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "default: a migration creates its own environment "
                          "so its blast radius is knowable, and a taken name "
                          "is a collision to resolve, not a shortcut")
+    pv.add_argument("--refresh-notebooks", action="store_true",
+                    help="with --reuse-existing, regenerate the stage "
+                         "notebooks from this run's flags even where they "
+                         "already exist. OFF by default: a notebook already "
+                         "on the workspace is kept, because its PARAMS cell "
+                         "(schema, mode, verify) is edited in the console and "
+                         "an overwrite would discard that silently")
     pv.set_defaults(func=cmd_provision)
 
     rn = sub.add_parser("run", parents=[common],
