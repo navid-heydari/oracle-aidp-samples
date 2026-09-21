@@ -68,14 +68,20 @@ runtime.
   only, never quoted back.
 - **Two paths transmit the Snowflake credential to your AIDP tenancy, both
   only with `--execute`:**
-  1. `provision --execute --source-config <file>` uploads that file
-     **verbatim** to the workspace folder `backup-snowflake-migration/plan/`
-     (`engine/target/provisioning.py`), so the data-plane notebooks can read
-     it from the `/Workspace` mount. It is uploaded only when you pass the
-     flag, and the notebook that `provision` writes beside it echoes the
-     file's key names, never a value. Who can read that folder is governed
-     by AIDP workspace access, which the plugin does not set — treat the
-     file as readable by whoever can open the workspace.
+  1. `provision --execute --source-config <file>` reads that file and
+     uploads a derived copy — the `snowflake:` block only, as JSON — to the
+     workspace folder `backup-snowflake-migration/plan/<config stem>.json`
+     (`source_config_payload` in `engine/target/provisioning.py`), so the
+     data-plane notebooks can read it from the `/Workspace` mount. The
+     `aidp:` block is not copied, and a config whose secret is a `*_path`
+     field (`key_path`, `key_passphrase_path`, `password_path`, `pat_path`)
+     is refused before anything is uploaded — the path names a file on your
+     machine, which the cluster cannot see. It is uploaded only when you
+     pass the flag; the diagnosis notebook `provision` uploads beside the
+     scripts prints the config's shape (key names as set/unset) and the
+     derived Snowflake host, never a secret. Who can read that folder is
+     governed by AIDP workspace access, which the plugin does not set —
+     treat the copy as readable by whoever can open the workspace.
   2. `catalog --execute` registers the EXTERNAL catalog with the credential
      in the request's `connectionDetails` (`SNOWFLAKE_PASSWORD` or
      `SNOWFLAKE_PRIVATE_KEY_CONTENT`, `engine/target/snowflake_catalog_connection.py`);
@@ -85,8 +91,10 @@ runtime.
      under TLS. AIDP then stores the credential as the catalog's connection.
 - What follows from that, plainly: use a **dedicated, read-only Snowflake
   service user** for the migration; **rotate** its password or key when the
-  migration is done; and delete `backup-snowflake-migration/plan/<your
-  config>` from the workspace once the data plane no longer needs it.
+  migration is done; and delete
+  `backup-snowflake-migration/plan/<config stem>.json` (for the default
+  name, `plan/snowmig-config.json`) from the workspace once the data plane
+  no longer needs it.
 - **AIDP target coordinates** (datalake OCID, workspace, cluster, catalog)
   live in the `aidp:` block of the same config and are recorded in
   `PREFLIGHT.md` and the `*_result.json` artifacts, so a run is auditable.
@@ -143,11 +151,14 @@ Dry-run by default for every stage that has one: nothing reaches AIDP without
 | Stage | With | What it creates or changes |
 |---|---|---|
 | `deploy --execute` | coordinates | schemas, empty tables and views in a Standard catalog, `CREATE ... IF NOT EXISTS`; never drops or alters |
-| `provision --execute` | coordinates | the workspace, the `migration-assets` cluster (and, with `--warehouse-clusters`, one per Snowflake warehouse), the folder `backup-snowflake-migration/`, the notebooks, the plan files — and the config, if you pass `--source-config` |
+| `provision --execute` | coordinates | the workspace, the `migration-assets` cluster (and, with `--warehouse-clusters`, one per Snowflake warehouse), the folder `backup-snowflake-migration/`, the notebooks, the plan files — and, with `--source-config`, a derived `plan/<stem>.json` holding the `snowflake:` block |
 | `catalog --execute` | coordinates | one EXTERNAL catalog carrying the Snowflake credential (or an INTERNAL container on request) |
 | `run` | a provisioned job | **starts a job**; there is no dry-run flag, because the dry run happened at `provision`. The job then copies data on your cluster |
-| `smoke --write-probe` | opt-in | a schema `snowmig_permission_probe_<8 hex chars>` to prove write access, then drops that one schema; never `CASCADE`, and a fresh suffix per run because a failed create poisons the name |
-| `notebook --upload` | opt-in | one generated notebook under `Shared/` |
+| `smoke --write-probe --execute` | coordinates and `--execute`; `--write-probe` alone is a dry run | a schema `snowmig_permission_probe_<8 hex chars>` to prove write access, then drops that one schema; never `CASCADE`, and a fresh suffix per run because a failed create poisons the name |
+
+`notebook --upload` is not a writer: without `--execute` it is a dry run, with
+it the upload is refused (GAPS.md 13); the generated notebook stays in
+`--out-dir`.
 
 An object that already exists with a different structure is reported and
 left untouched.
@@ -177,7 +188,7 @@ machine.
 
 It does **not** touch the AIDP side. What a run created there stays until you
 delete it: the workspace folder `backup-snowflake-migration/` — including the
-uploaded config under `plan/`, which holds the credential — the EXTERNAL
+derived `plan/<stem>.json` copy, which holds the credential — the EXTERNAL
 catalog, which stores the credential as its connection, the clusters and the
 jobs. Remove the two credential-bearing objects first, then rotate the
 Snowflake credential they held.

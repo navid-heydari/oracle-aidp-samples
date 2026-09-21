@@ -58,10 +58,10 @@ change the destination.
 | 6 | `data-options` | offline | — | `data_options.json`, `DATA_MOVEMENT_OPTIONS.md` | no |
 | 7 | `plan` | offline | `inventory.json`, `dependencies.json`, *(`data_options.json`)* | `plan.json`, `PLANNED_OBJECTS.md` | no |
 | 8 | `ddl` | offline | `inventory.json`, `plan.json` | `ddl_plan.json`, `DDL_PLAN.md` | no |
-| 9 | `smoke` | Snowflake + AIDP | — | `smoke.json`, `SMOKE_TEST.md` | **only with `--write-probe`** |
+| 9 | `smoke` | Snowflake + AIDP | — | `smoke.json`, `SMOKE_TEST.md` | **only with `--write-probe --execute`** |
 | 10 | `catalog` | AIDP | — | `catalog_result.json`, `CATALOG.md` | **yes, with `--execute`** |
 | 11 | `deploy` | AIDP | `ddl_plan.json`, `plan.json`, `inventory.json` | `PREFLIGHT.md`, `deploy_result.json`, `SOFT_CLONE_SUMMARY.md` | **yes, with `--execute`** |
-| 12 | `notebook` | offline *(AIDP with `--upload`)* | `ddl_plan.json`, `plan.json`, `inventory.json` | `*.ipynb`, `NOTEBOOK.md` | **only with `--upload`** |
+| 12 | `notebook` | offline | `ddl_plan.json`, `plan.json`, `inventory.json` | `*.ipynb`, `NOTEBOOK.md` | no — `--upload` is a dry run, refused with `--execute` **[GAP 13]** |
 | 13 | `summary` | offline | `plan.json`, `inventory.json`, *(`deploy_result.json`)* | `SUMMARY.md` | no |
 | 14 | `provision` | AIDP | the scripts + whatever plan artifacts exist | `provision_result.json`, `PROVISION.md`, and the AIDP-side folder, drivers and jobs | **yes, with `--execute`** |
 | — | `stages` | offline | everything present | `STAGES.md` | no |
@@ -75,7 +75,7 @@ reconcile), and their reports land in the workspace, not in `--out-dir`.
 `stages` is not a pipeline step; it is the read-out of one.
 
 **Three stages write — `provision`, `catalog` and `deploy` — plus, narrowly
-and opt-in, `smoke --write-probe` and `notebook --upload`.** The stage board
+and opt-in, `smoke --write-probe --execute`.** The stage board
 says exactly that, lists `provision` and `catalog` in their dependency
 positions, and reads their artifacts (a `create_requested` that never became
 visible is flagged as pending, not success).
@@ -115,15 +115,15 @@ visible is flagged as pending, not success).
         ┌─────────┴──────────────────────────────┐
         ▼  DEFAULT                               ▼  ON EXPLICIT REQUEST ONLY
   ┌──────────────┐                        ┌──────────────┐
-  │   catalog    │  EXTERNAL/SNOWFLAKE    │   catalog    │  STANDARD → REFUSED here
+  │   catalog    │  EXTERNAL/SNOWFLAKE    │   catalog    │  STANDARD → CONTAINER only
   │  --execute   │  read-only pointer     │  (standard)  │
   └──────┬───────┘  copies nothing        └──────┬───────┘
          │                                       ▼
          │                                ┌──────────────┐
-         │                                │   notebook   │  script → Shared/
+         │                                │   notebook   │  local .ipynb only
          │                                └──────┬───────┘
          │                                       ▼
-         │                                run on AIDP compute
+         │                                run --job snowmig_01_structure
          │                                (Spark reports real errors;
          │                                 the CRUD API returns 202 and
          │                                 can silently create nothing)
@@ -212,9 +212,9 @@ A gate is a point where the run stops and does not proceed on its own.
 | **Unmappable type** | `ddl` | `VARIANT`/`OBJECT`/`ARRAY`/`GEOGRAPHY` block their table unless the operator opts into `string`, which defers rather than solves |
 | **`timestamp_ntz`** | `ddl` | The catalog API silently rejects it. Blocked by default; `--timestamp-ntz timestamp` accepts the timezone-semantics change and records the caveat on the field |
 | **Connectivity** | `smoke` | Both ends reachable with the permissions the next stage needs. The write probe is skipped, with a note, against an EXTERNAL catalog — read-only by design is not a FAIL |
-| **`--execute`** | `catalog`, `deploy` | Dry run otherwise. Nothing reaches AIDP without it |
+| **`--execute`** | `catalog`, `deploy`, `provision`, `smoke --write-probe`, `notebook --upload` | Dry run otherwise. Nothing reaches AIDP without it (and `notebook --upload --execute` is then refused — **[GAP 13]**) |
 | **EXTERNAL target** | `deploy` | The target's `catalogType` is resolved before the first create; EXTERNAL, absent, or unreadable → **refused** |
-| **Managed catalog** | `catalog` | `--catalog-type standard` creates the CONTAINER only (as `INTERNAL`; `STANDARD` is an alias the API rejects) and returns `container_only`. Its **tables** are still refused here, with a pointer to the notebook path |
+| **Managed catalog** | `catalog` | `--catalog-type standard` creates the CONTAINER only (as `INTERNAL`; `STANDARD` is an alias the API rejects) and returns `container_only`. Its **tables** are still refused here, with a pointer to the structure workflow (`run --job snowmig_01_structure`, S10) |
 | **Explicit request** | skill layer | A Standard catalog requires the user to have asked, in words |
 
 ### Failure semantics

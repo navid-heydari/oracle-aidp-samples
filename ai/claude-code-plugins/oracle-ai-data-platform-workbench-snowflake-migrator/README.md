@@ -103,12 +103,17 @@ Any field can still be overridden per run with a flag (`--role`,
 **AIDP authentication.** The plugin drives the `oci` and `aidp` CLIs with
 your normal OCI setup (`~/.oci/config`, from `oci setup config`), and this
 is exactly how: `oci raw-request` runs with that file's `DEFAULT` profile
-(or whatever `OCI_CLI_PROFILE` selects in your shell; the config's
-`aidp.oci_profile` key is accepted but not yet passed through), and every
-`aidp` invocation is given `--auth api_key` plus `--region` derived from the
-DataLake OCID, because the `aidp` CLI's own default is a session token. So
-the API key the plugin uses is the one in that profile. The config only
-names *which* AIDP resources to use — never a credential for them.
+(or whatever `OCI_CLI_PROFILE` selects in your shell) unless the config
+names one — `aidp.oci_profile`, when set, is announced on stdout and passed
+as `--profile <name>` to every `oci` call, which wins over
+`OCI_CLI_PROFILE`; the `aidp` CLI is not given a profile flag, because its
+flag set is unverified. For those `oci` calls a session-token profile
+additionally needs `OCI_CLI_AUTH=security_token` in your shell, which the
+plugin does not add. Every `aidp` invocation is given `--auth api_key` plus
+`--region` derived from the DataLake OCID, because the `aidp` CLI's own
+default is a session token. So the API key the plugin uses is the one in
+that profile. The config only names *which* AIDP resources to use — never a
+credential for them.
 
 #### The rules that go with an inline secret
 
@@ -218,6 +223,10 @@ from `oci`/`aidp` list calls. **Read that printed line before you approve an
 `--execute` later** — it is the last chance to notice a config written for a
 different environment.
 
+Without all four coordinates the run exits 1 with `verdict: PARTIAL`: only
+Snowflake was proven, which is not a pass and not a connectivity failure.
+Exit 0 needs both ends.
+
 ### 6. Provision the migration environment inside AIDP (S1, S2, S5)
 
 **The environment comes first**, because every later AIDP write — including
@@ -253,10 +262,14 @@ and `aidp.cluster_id` of `snowmig-config.yaml` (the commented lines in the
 template) before the next step — `provision` does not write them back, and
 the next step cannot run without them.
 
-`--source-config` is the one file being placed on the workspace mount so the
-in-AIDP scripts can reach Snowflake themselves. **It carries the credential**,
-which is why it is uploaded only when you pass it explicitly. The scripts read
-YAML or JSON; hand them JSON if the cluster image has no PyYAML.
+`--source-config` places the config's `snowflake:` block — and only that
+block, re-serialised as JSON — on the workspace mount as
+`backup-snowflake-migration/plan/<config stem>.json`, so the in-AIDP scripts
+can reach Snowflake themselves. **It carries the credential**, which is why
+it is uploaded only when you pass it explicitly; the `aidp:` block is not
+copied, and a config whose secret is a `*_path` is refused before anything
+is uploaded, because that path does not exist on the cluster. The copy is
+JSON, so the scripts need no PyYAML to read it.
 
 ### 7. Register the source as an EXTERNAL catalog, then create the INTERNAL target (S3, S4)
 
@@ -346,7 +359,7 @@ masking or row-access policy. `CENSUS.md` and `SECURITY.md` list them.
 | Database | **EXTERNAL catalog, source type SNOWFLAKE** (default) — a read-only pointer at the live source. A **Standard catalog** only when you explicitly ask for one |
 | Schema | Schema |
 | Table | Table (managed Delta, empty) — Standard catalogs only |
-| View | View — when its SQL is portable — Standard catalogs only |
+| View | View — when every Snowflake-only construct in its SQL has an exact rewrite (see *Why a view might not migrate*) — Standard catalogs only |
 | Warehouse | Spark compute cluster (see the compute proposal) |
 
 Bronze mirrors the source 1:1, so target names equal source names. Silver and
@@ -437,12 +450,24 @@ an ignored line — a typo would otherwise apply nothing while appearing to work
 
 ## Why a view might not migrate
 
-Because Bronze mirrors the source, object references inside a view need no
-rewriting; only dialect matters. 15 Snowflake-only constructs — `QUALIFY`,
-`LATERAL FLATTEN`, `IFF`, `::`, `LISTAGG`, `DATEADD`, … — **block** the view with
-the construct named, rather than being rewritten on a guess. Secure and
-materialized views are blocked outright. See
-[references/type-mapping.md](references/type-mapping.md).
+Object references inside a view are left as-is in the default Bronze mirror
+(`R40`) and rewritten to the planned names under `--bronze-catalog-prefix`
+or a schema-style option (`R41`): whole three-part names only, never inside
+a string literal or a comment. Dialect is the other half. The translator
+carries 20 rules (`translate.RULES`). 8 have a provably exact rewrite and
+are translated with the rule id recorded in the DDL plan — `IFF`, `x::TYPE`
+on a bare column or literal, `ARRAY_CONSTRUCT`, `OBJECT_CONSTRUCT`,
+`DATEADD(unit, n, col)` (exact for `DATE` operands only, and the plan says
+so), `LISTAGG(x, sep)`, `"quoted identifiers"` → backticks and `''` → `\'`
+— but only in those exact forms; a form the rule cannot prove (an expression
+left of `::`, `LISTAGG … WITHIN GROUP`, a non-literal `DATEADD` amount) is
+refused with the construct named. 12 others — `QUALIFY`, `LATERAL FLATTEN`,
+`DATEDIFF`, `PIVOT`, `DECODE`, `$$…$$`, … — **block** the view with the
+construct named, rather than being rewritten on a guess; a mixed view is
+blocked, never partially translated. Secure and materialized views are
+blocked outright. The authoritative rule table is
+[references/dialect-translation.md](references/dialect-translation.md);
+[references/type-mapping.md](references/type-mapping.md) summarises it.
 
 ## Tests
 
@@ -505,6 +530,13 @@ dynamic tables, stages, pipes, sequences and file formats → `CENSUS.md`.
 plausible-but-wrong procedure translation is worse than an honest gap. The
 scope statement travels into `PLANNED_OBJECTS.md` and `SUMMARY.md`, so the
 migratable count is never mistaken for the size of the estate.
+
+A table that `SHOW TABLES` flags as dynamic, external, Iceberg, event or
+hybrid is not a plain table either: `plan` blocks it with the reason named
+(`unsupported_object`; `_TABLE_KIND_BLOCKS` in `engine/plan/build.py`), under
+"Object kinds with no AIDP equivalent" in `PLANNED_OBJECTS.md`. A view whose
+base table or view is blocked or excluded is blocked too
+(`dependency_not_migrated`), naming what it depends on.
 
 Procedures and UDFs are read from `INFORMATION_SCHEMA` rather than `SHOW`,
 because `SHOW PROCEDURES` returns Snowflake's built-ins (33 on an empty

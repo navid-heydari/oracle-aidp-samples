@@ -12,4 +12,7 @@ Thin wrapper over [`snowflake-smoke-test`](../skills/snowflake-smoke-test/SKILL.
 3. Only pass `--write-probe --execute` after telling them it creates one
    uniquely-named probe schema and removes it again. `--write-probe` alone is a
    dry run: it prints what it would create and reports write access as not attempted.
-4. Present `SMOKE_TEST.md`. If the destination was skipped, say only the source was verified.
+4. Present `SMOKE_TEST.md`. If the destination was skipped, say only the source
+   was verified. A `verdict: PARTIAL` (exit 1) means the destination was
+   skipped for want of the four coordinates; it is not a pass and not a
+   connectivity failure — ask for the coordinates.

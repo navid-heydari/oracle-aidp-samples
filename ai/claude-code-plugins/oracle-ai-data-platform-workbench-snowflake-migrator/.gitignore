@@ -14,13 +14,6 @@ sf_key*
 oci_api_key*.pem
 **/.oci/
 
-# source-specific coordinates — filled at use time, not shipped
-env-coords.md
-env-coords.local.md
-bucket_mapping.json
-bucket_mapping.local.json
-catalog_manifest.json
-
 # THE migration config: ONE file, both ends, live credentials inline.
 # Never committed -- see snowmig-config.example.yaml. The live tests and the
 # corpus validator read this same file; there is no second config.

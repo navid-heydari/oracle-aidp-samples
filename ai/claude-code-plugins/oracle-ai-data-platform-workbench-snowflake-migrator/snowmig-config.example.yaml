@@ -124,5 +124,5 @@ aidp:
   # The name to register the Snowflake source under, as an EXTERNAL catalog.
   # external_catalog: my_snowflake_source
 
-  # Non-default OCI CLI profile, if you use one.
+  # Non-default OCI CLI profile, if you use one (applied to oci calls only, as --profile).
   # oci_profile: DEFAULT

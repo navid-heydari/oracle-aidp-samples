@@ -76,10 +76,10 @@ cluster. So `--source-mode connector` is the default and
 | Database | **Catalog (INTERNAL)** | plan mirrors 1:1; created via structure clone | AIDP lower-cases identifiers; case collisions HALT the plan |
 | Schema | Schema | structure clone | |
 | Table | **Managed Delta table** | from the approved `ddl_plan` (engine-translated types, default), or CTAS `WHERE 1=0` through the source | `NUMBER(p,s)`→`DECIMAL(p,s)` exact; `VARIANT/GEOGRAPHY` **blocked** unless the operator opts into string; `TIMESTAMP_NTZ` needs an explicit downgrade decision |
-| View | View | 6 exact dialect rewrites (`IFF`, `::`, `DATEADD`, `LISTAGG`…); 12 constructs (`QUALIFY`, `LATERAL FLATTEN`, …) **refused and named** for a human | target re-derives column types — drift is reported, narrowing flagged |
+| View | View | 8 dialect rewrites (`IFF`, `::` via the type mapper, `DATEADD` — exact for DATE operands only, caveat recorded on the plan — `LISTAGG`, quoted identifiers, `''` escapes…); 12 constructs (`QUALIFY`, `LATERAL FLATTEN`, …) **refused and named** for a human | target re-derives column types — drift is reported, narrowing flagged |
 | Warehouse | **Compute cluster** | `provision` creates `migration_assets`; per-warehouse clusters proposed by `compute` with sizing left as a decision | same-name clusters, default config, per request |
 | Table data | Delta rows | `02_copy_schema.ipynb` per schema: INSERT-SELECT through the connector (or the external catalog), verified by counts (+ exact decimal sums) | per-table snapshots — see §6 consistency |
-| Task / Stream / Pipe / Dynamic table | **AIDP Job** (to be rewritten) | census inventories them with effort bands; **not auto-translated** | the blast-radius risk: a task that fed a migrated table stops feeding it after cutover |
+| Task / Stream / Pipe / Dynamic table | **AIDP Job** (to be rewritten) | census inventories them with effort bands; **not auto-translated**. A dynamic, external, Iceberg, event or hybrid table that `SHOW TABLES` flags is blocked by `plan` with the reason named (`PLANNED_OBJECTS.md`, "Object kinds with no AIDP equivalent") | the blast-radius risk: a task that fed a migrated table stops feeding it after cutover |
 | Procedure / UDF | Job or Spark UDF (rewrite) | census + language verdict (SQL/JS/Python/Java/Scala) | code is rewritten by humans/AI with review, never mechanically |
 | Masking / row-access policy | — no equivalent API | security stage reports every exposure | data arrives **unprotected**; restricted views + classification is a design task |
 | Secure view | — | blocked, named | guarantees do not survive |
@@ -107,7 +107,7 @@ See `README.md` for the runnable form of this table, and
 | 0 | **Confirm the connection config with the user, field by field**, and test both ends | `preflight` | no |
 | 1 | Preview the estate from the laptop (objects, census, lineage, security, maintenance, warehouses) — optional; the migration's own discovery is step 6 | `assess` `deps` `security` `maintenance` `compute` | no |
 | 2 | Plan + generate DDL, get sign-off (S7–S9) | `plan` `ddl` | no |
-| 3 | Prove both ends | `smoke` | opt-in probe |
+| 3 | Prove both ends | `smoke` | only with `--write-probe --execute`: one probe schema, removed again |
 | 4 | Provision the AIDP environment: workspace (named after the source account), `migration_assets` cluster, **one cluster per Snowflake warehouse**, `backup-snowflake-migration/` (scripts + plan), 4 unscheduled jobs (S1, S2, S5). Copy `workspace.key` and `cluster.key` from `provision_result.json` into the config's `aidp:` block — `PROVISION.md` shows display names, not keys | `provision --execute` | yes |
 | 5 | Register Snowflake as an EXTERNAL catalog (S3), then create the INTERNAL target catalog as a container (S4) | `catalog --execute`, then `catalog --catalog-type standard --execute` | yes |
 | 5b | Confirm the environment from inside AIDP | `diagnose_environment.ipynb` | no |
@@ -128,7 +128,7 @@ before it is called done; a 2xx is never the claim.
 | Work | Who |
 |---|---|
 | Discovery, inventory, census, lineage, sizing inputs | scripts (batched SQL, paginated) |
-| Type mapping, DDL, the 6 exact SQL rewrites | scripts — refuse rather than guess |
+| Type mapping, DDL, the 8 SQL rewrites (7 exact; `DATEADD` exact for DATE operands only, and the plan says so) | scripts — refuse rather than guess |
 | Environment provisioning, uploads, job wiring | scripts, with per-step read-back |
 | Data copy + verification (counts, exact decimal sums) | scripts, resumable per schema |
 | Plan-vs-reality reconciliation | script, consulting the live catalog |

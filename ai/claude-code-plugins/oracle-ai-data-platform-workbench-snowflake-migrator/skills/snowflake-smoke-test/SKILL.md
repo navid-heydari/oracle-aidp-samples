@@ -14,8 +14,14 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig smoke \
 
 Every Snowflake coordinate comes from the migration config (`snowmig-config.yaml`, discovered automatically and printed as `config: <path>`). Pass `--account/--user/--auth/...` only to override a field for one run.
 
-Exit 0 = every check passed. Exit 1 = at least one failed. `SMOKE_TEST.md` shows
-which, so a failure points at one end rather than "it doesn't work".
+The verdict is three-valued and the `verdict:` line on stdout names it — read
+that line, not just the exit code. Exit 0 = both ends were checked and every
+check passed (verdict PASS). Exit 1 = either a check that ran failed (verdict
+FAIL) or only the Snowflake source was checked because the four AIDP
+coordinates were not all supplied (verdict PARTIAL — not a pass, not a
+connectivity failure; supply the coordinates). `SMOKE_TEST.md` and the
+`STAGES.md` smoke row carry the same verdict, so a failure points at one end
+rather than "it doesn't work".
 
 ## What it checks
 
@@ -29,10 +35,11 @@ which, so a failure points at one end rather than "it doesn't work".
 
 ## The write probe writes — say so before you pass the flag
 
-Proving write means actually writing. `--write-probe` creates a schema named
-`snowmig_permission_probe` in the target catalog, confirms it is visible, then
-**drops that one schema again**. Never `CASCADE`, and it skips the drop if the
-schema was already there — a schema it did not create is not its to remove.
+Proving write means actually writing. `--write-probe --execute` creates ONE
+schema named `snowmig_permission_probe_<8 hex chars>` (a fresh suffix per run,
+because a failed create permanently poisons that name) in the target catalog,
+confirms it is visible, then **drops that one schema**. Never `CASCADE`; it
+only ever removes the schema it just created.
 
 The no-`DROP` rule is a **source** guarantee: nothing is ever written to or
 dropped from Snowflake. It does not extend to AIDP, which is where this plugin
@@ -55,4 +62,6 @@ resolved).
 
 Without all four AIDP coordinates the destination section reads *Skipped*. That
 is not a pass. Say plainly that only the source was verified, and ask for the
-coordinates if the user wants the destination checked too.
+coordinates if the user wants the destination checked too. The CLI prints
+`verdict: PARTIAL` and exits 1 in this case (see the exit contract above); do
+not report it as a failed check.

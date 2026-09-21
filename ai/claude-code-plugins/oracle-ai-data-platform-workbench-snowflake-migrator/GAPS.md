@@ -109,6 +109,12 @@ first.
   run, poll to terminal, fetch task output — reachable from no CLI stage. It
   is now the `run` stage, and it reports a spent poll budget as STILL
   RUNNING rather than rounding it to a verdict.
+- **A dependent of an object that is not migrating is not migrating either.**
+  `plan` files a view whose base table or view is blocked or excluded under
+  `dependency_not_migrated`, naming the missing object, instead of waving it
+  into a wave it cannot run in. And a table that `SHOW TABLES` flags as
+  dynamic, external, Iceberg, event or hybrid is `unsupported_object` with
+  the reason named, rather than being planned as a plain Delta copy.
 
 ---
 

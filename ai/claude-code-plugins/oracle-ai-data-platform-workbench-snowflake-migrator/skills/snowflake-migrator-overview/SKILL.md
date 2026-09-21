@@ -354,9 +354,12 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig run \
 **Stage parameters are NOT passed on this command line.** AIDP job parameters
 reach a notebook as neither argv nor environment, so `--param` is refused
 rather than accepted and dropped. Each stage notebook carries its own `PARAMS`
-cell; `provision --execute --reuse-existing` rewrites it and re-uploads. To
-narrow what S10 creates, narrow the **plan** it reads — that is the input —
-and never edit the stage logic to make it cover less.
+cell; `provision --execute --reuse-existing --refresh-notebooks` rewrites it
+and re-uploads (without `--refresh-notebooks`, `--reuse-existing` keeps a
+notebook already on the workspace, because its PARAMS cell may have been
+edited in the console). To narrow what S10 creates, narrow the **plan** it
+reads — that is the input — and never edit the stage logic to make it cover
+less.
 
 Monitor the runs and report progress. Report `verified`, never `executed` — a
 batch can report success while statements inside it failed.

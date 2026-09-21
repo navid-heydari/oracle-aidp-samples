@@ -103,11 +103,21 @@ def test_reference_documents_the_object_and_view_mapping():
 
 
 def test_plan_skill_documents_the_cannot_migrate_categories():
+    """Every category the planner can emit and the report can title must be
+    explained in the skill that reads the reasons out. The list once named
+    four of them by hand and missed `dependency_not_migrated` the day
+    plan/build.py started emitting it."""
+    from report.render import _CATEGORY_TITLES
     text = (ROOT / "skills/snowflake-migration-plan/SKILL.md").read_text(encoding="utf-8")
-    for category in ["restriction", "unmapped_type", "snowflake_only_sql",
-                     "unsupported_object"]:
-        assert category in text, category
+    for category in _CATEGORY_TITLES:
+        assert f"`{category}`" in text, category
     assert "restrictions" in text.lower()
+    # `unsupported_object` is not only the two view kinds: plan/build.py
+    # `_TABLE_KIND_BLOCKS` files five SHOW TABLES flags under it too.
+    row = next(l for l in text.splitlines()
+               if l.startswith("| `unsupported_object` |"))
+    for kind in ("dynamic", "external", "Iceberg", "event", "hybrid"):
+        assert kind in row, f"unsupported_object also covers {kind} tables"
 
 
 def test_clone_skill_documents_one_catalog_per_run_and_cli_backends():
@@ -139,6 +149,21 @@ def test_smoke_skill_documents_the_write_probe_lifecycle():
         "must say a failed cleanup is named, not hidden"
     assert "external" in low, \
         "must say the probe is skipped for a read-only EXTERNAL catalog"
+    # plan/smoke.py `_probe_schema_name()` suffixes PROBE_SCHEMA with 8 hex
+    # chars per run (a failed create poisons the name for good) and drops
+    # only what this run created -- there is no pre-existence check. The
+    # skill and ASSUMPTIONS.md D8 described a constant name and a skipped
+    # drop long after that changed.
+    from plan.smoke import PROBE_SCHEMA
+    flat = " ".join(low.split())
+    assumptions = " ".join((ROOT / "ASSUMPTIONS.md")
+                           .read_text(encoding="utf-8").lower().split())
+    for name, doc in (("smoke skill", flat), ("ASSUMPTIONS.md", assumptions)):
+        assert (PROBE_SCHEMA + "_") in doc, \
+            f"{name}: must name the per-run suffixed probe schema"
+        for stale in ("creates a schema named `snowmig_permission_probe`",
+                      "already there", "pre-existed", "constant schema"):
+            assert stale not in doc, f"{name}: {stale!r}"
 
 
 def test_notebook_skill_says_execution_is_the_users_call():
@@ -540,6 +565,17 @@ def test_privacy_doc_describes_the_current_credential_and_data_flows():
     assert "pyyaml" in flat
     # `run` starts jobs and has no dry-run gate; say so.
     assert "`run`" in text
+    # provisioning.source_config_payload uploads the `snowflake:` block only,
+    # as JSON, to plan/<config stem>.json; the operator's file never travels.
+    assert "snowmig-config.json" in flat, \
+        "name the derived plan/<stem>.json the default config lands as"
+    assert "`aidp:` block is not" in flat, \
+        "say the aidp: block stays on the laptop"
+    # The probe writes only with --execute (snowmig.py cmd_smoke), and
+    # `notebook --upload` writes nothing: dry run, refused with --execute.
+    assert "write-probe --execute" in flat, \
+        "the writers table must show the --execute gate on the probe"
+    assert "notebook --upload` is not a writer" in flat
     # The stale claims must be gone, verbatim.
     for stale in ("never accepted as inline",
                   "written into any artifact",
@@ -547,7 +583,12 @@ def test_privacy_doc_describes_the_current_credential_and_data_flows():
                   "table data is never read",
                   "no stage selects rows",
                   "creates a schema named `snowmig_permission_probe`",
-                  "leaves nothing behind outside"):
+                  "leaves nothing behind outside",
+                  "uploads that file",
+                  "verbatim** to the workspace",
+                  "uploaded config under",
+                  "| `smoke --write-probe` | opt-in",
+                  "| `notebook --upload` | opt-in"):
         assert stale not in flat, f"stale claim still in PRIVACY.md: {stale!r}"
     # And it still says what a reviewer must hear plainly.
     assert "rotate" in flat, "advise rotating the credential after the run"
@@ -787,3 +828,239 @@ def test_the_docs_say_how_the_aidp_clis_authenticate():
         assert "`default`" in flat or "default profile" in flat, \
             f"{rel}: must name the profile `oci` runs with"
         assert "api_key" in text, f"{rel}: must say the aidp CLI is invoked with api_key auth"
+        # snowmig._oci_runner inserts `--profile <aidp.oci_profile>` into
+        # every `oci` argv; the docs once said the key was "not yet passed
+        # through", written against the code before that runner existed.
+        assert "not yet passed through" not in flat, \
+            f"{rel}: aidp.oci_profile IS applied (snowmig._oci_runner)"
+        assert "--profile" in text, \
+            f"{rel}: must say aidp.oci_profile reaches oci as --profile"
+
+
+# --------------------------------------------------------------------------
+# Docs that drifted from the merged engine in the integration pass. Each pin
+# names the code fact it guards, so the next change to that code fails here
+# instead of silently dating the document.
+# --------------------------------------------------------------------------
+
+def test_the_write_carve_outs_name_the_execute_gate():
+    """cmd_smoke: `write_probe = bool(args.write_probe and args.execute)`;
+    cmd_notebook: `--upload` is a dry run without --execute and refused with
+    it (GAPS.md 13). ARCHITECTURE.md and the stage board listed both as bare
+    opt-in writers, which is what the code did before the cli fix."""
+    for rel in ("ARCHITECTURE.md", "MIGRATION-ARCHITECTURE.md",
+                "skills/snowflake-stage-board/SKILL.md"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        for stale in ("only with `--write-probe`**",
+                      "only with `--upload`",
+                      "opt-in, `smoke --write-probe` and `notebook --upload`",
+                      "(`smoke --write-probe`, `notebook --upload`)",
+                      "| opt-in probe |",
+                      "script → Shared/"):
+            assert stale not in text, f"{rel}: {stale!r}"
+        assert "--write-probe --execute" in text, \
+            f"{rel}: the probe writes only with --execute"
+
+
+def test_smoke_docs_state_the_three_valued_exit_contract():
+    """cmd_smoke returns 1 for verdict PARTIAL -- no executed check failed,
+    the four AIDP coordinates were simply not all supplied, which is the
+    default first run with the example config. "Exit 1 = at least one
+    failed" sent the agent hunting a connectivity fault instead of asking
+    for the coordinates."""
+    skill = (ROOT / "skills/snowflake-smoke-test/SKILL.md").read_text(encoding="utf-8")
+    command = (ROOT / "commands/snowflake-smoke.md").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for name, text in (("smoke skill", skill), ("smoke command", command)):
+        assert "partial" in text.lower(), f"{name}: name the PARTIAL verdict"
+    low = " ".join(skill.lower().split())
+    assert "not a pass" in low
+    assert "exit 1 = at least one failed" not in low
+    assert "verdict: PARTIAL" in readme, \
+        "README step 5: without the coordinates the run exits 1 as PARTIAL"
+
+
+def test_view_docs_carry_the_rule_counts_from_translate_rules():
+    """README said "15 Snowflake-only constructs -- QUALIFY, LATERAL FLATTEN,
+    IFF, ::, LISTAGG, DATEADD ... block the view" after four of those had
+    become implemented rewrites and RULES had grown to 20. Every count in
+    prose is bound to coverage() here, and the blocker lists may not name a
+    construct the translator rewrites."""
+    import sys
+    sys.path.insert(0, str(ROOT / "engine"))
+    from snowflake_source.dialect.translate import RULES, coverage
+
+    c = coverage()
+    # Implemented rules with no refusal form and no caveat: naming one of
+    # these as a blocker is simply wrong. (`::`, DATEADD and LISTAGG have
+    # refused forms, so a blocker list may legitimately mention those.)
+    always_rewritten = [r.construct for r in RULES
+                        if r.status == "implemented" and not r.caveat
+                        and r.construct.isidentifier()
+                        and r.construct not in ("LISTAGG",)]
+    assert "IFF" in always_rewritten
+    declared_examples = ("QUALIFY", "LATERAL FLATTEN", "DATEDIFF")
+    for d in declared_examples:
+        assert any(d in r.construct for r in RULES if r.status == "declared"), d
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    para = readme[readme.index("## Why a view might not migrate"):]
+    para = para[:para.index("\n## ", 10)]
+    flat = " ".join(para.split())
+    assert "need no rewriting" not in flat, \
+        "R41 rewrites view references under --bronze-catalog-prefix / schema style"
+    assert not re.search(r"\d+ Snowflake-only constructs", flat)
+    assert f"carries {c['total']} rules" in flat
+    assert f"{c['implemented']} have a provably exact rewrite" in flat
+    assert f"{c['declared']} others" in flat
+    blockers = flat[flat.index(f"{c['declared']} others"):flat.index("**block**")]
+
+    def names(construct: str, text: str) -> bool:
+        # Whole token: `IFF` must not match inside `DATEDIFF`.
+        return re.search(rf"\b{re.escape(construct)}\b", text) is not None
+
+    for construct in always_rewritten:
+        assert not names(construct, blockers), f"README lists {construct} as blocking"
+    for d in declared_examples:
+        assert names(d, blockers), d
+    assert "references/dialect-translation.md" in para
+
+    arch = (ROOT / "MIGRATION-ARCHITECTURE.md").read_text(encoding="utf-8")
+    assert f"{c['implemented']} dialect rewrites" in arch
+    assert f"{c['implemented']} SQL rewrites" in arch
+    assert f"{c['declared']} constructs" in arch
+    assumptions = (ROOT / "ASSUMPTIONS.md").read_text(encoding="utf-8")
+    assert f"of the {c['implemented']} implemented dialect rules" in assumptions
+    for rel, doc in (("README.md", readme), ("MIGRATION-ARCHITECTURE.md", arch),
+                     ("ASSUMPTIONS.md", assumptions)):
+        for stale in ("6 exact", "6 implemented", "15 Snowflake-only"):
+            assert stale not in doc, f"{rel}: {stale!r}"
+
+    # The plan skill's `snowflake_only_sql` row: what blocks comes first,
+    # then what is translated. IFF and :: were listed as blockers.
+    skill = (ROOT / "skills/snowflake-migration-plan/SKILL.md").read_text(encoding="utf-8")
+    row = next(l for l in skill.splitlines()
+               if l.startswith("| `snowflake_only_sql` |"))
+    head, sep, tail = row.partition("The reason names the construct")
+    assert sep, "the row must say the reason names the construct"
+    for construct in always_rewritten:
+        assert not names(construct, head), f"plan skill lists {construct} as blocking"
+    for d in declared_examples:
+        assert names(d, head), d
+    assert "translated, not blocked" in tail
+
+
+def test_no_doc_says_the_standard_catalog_is_never_created_or_routes_to_the_notebook():
+    """`catalog --catalog-type standard --execute` creates the INTERNAL
+    container (S4, live-verified) and the structure is `run --job
+    snowmig_01_structure` (S10); `notebook --upload --execute` is refused.
+    ASSUMPTIONS.md B2 kept the older story after every sibling doc moved."""
+    paths = [ROOT / p for p in ("ASSUMPTIONS.md", "GAPS.md", "README.md",
+                                "ARCHITECTURE.md")]
+    paths += sorted((ROOT / "commands").glob("*.md"))
+    paths += sorted((ROOT / "skills").glob("*/SKILL.md"))
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        for stale in ("never created by this plugin",
+                      "notebook`, run on the cluster",
+                      "run it on the cluster",
+                      # catalog_result.json's note routes to S10 now
+                      "pointer to the notebook path",
+                      # three stages write, not one
+                      "single writing stage"):
+            assert stale not in text, f"{path.relative_to(ROOT)}: {stale!r}"
+
+
+def test_notebook_command_and_skill_do_not_promise_upload_or_execution():
+    """cmd_notebook never places anything on the workspace: `--upload` is a
+    dry run and `--upload --execute` exits 1 with "Upload refused" (GAPS.md
+    13). The command promised "place it in the AIDP workspace, ready for you
+    to execute" and the skill "generate, upload, run"."""
+    text = (ROOT / "commands/snowflake-notebook.md").read_text(encoding="utf-8")
+    low = text.lower()
+    assert "snowmig_01_structure" in text
+    for stale in ("then upload", "ready for you to execute", "ask before executing"):
+        assert stale not in low, stale
+    for line in text.splitlines():
+        if "--upload" in line:
+            assert "refused" in line or "dry run" in line, line
+    assert "/Workspace/Shared/" not in text
+    skill = (ROOT / "skills/snowflake-clone-notebook/SKILL.md").read_text(encoding="utf-8")
+    flat = " ".join(skill.lower().split())
+    for stale in ("three steps: generate, upload, run",
+                  "place it in the workspace shared directory",
+                  "lands at `/workspace/shared/"):
+        assert stale not in flat, stale
+    assert "snowmig_01_structure" in skill
+    assert "refused" in flat and "dry run" in flat
+
+
+def test_bootstrap_skill_describes_the_launcher_as_shipped():
+    """bin/snowmig parses no flags of its own and persists nothing: it runs
+    the first interpreter that imports the deps, else a throwaway venv under
+    $TMPDIR that its EXIT trap removes. The skill told the agent to run
+    `--bootstrap`, described `--python`, and placed the venv under
+    XDG_DATA_HOME -- a design that never shipped."""
+    text = (ROOT / "skills/snowflake-migrator-bootstrap/SKILL.md").read_text(encoding="utf-8")
+    low = text.lower()
+    for stale in ("--bootstrap", "SNOWMIG_VENV", "XDG_DATA_HOME", "`--python`"):
+        assert stale not in text, stale
+    assert "throwaway" in low
+    assert "removed on exit" in low
+    launcher = (ROOT / "bin/snowmig").read_text(encoding="utf-8")
+    for token in ("--bootstrap", "SNOWMIG_VENV"):
+        assert token not in launcher, f"the launcher grew {token}; update the skill"
+
+
+def test_the_runbook_names_refresh_notebooks_for_a_params_rewrite():
+    """provisioning: `keep_existing = reuse_existing and not
+    refresh_notebooks` -- with --reuse-existing alone a stage notebook already
+    on the workspace is KEPT (its PARAMS cell may have been edited in the
+    console). S10 said --reuse-existing rewrites and re-uploads it."""
+    text = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text(encoding="utf-8")
+    flat = " ".join(text.split())
+    assert "--reuse-existing --refresh-notebooks` rewrites it" in flat
+    assert "`provision --execute --reuse-existing` rewrites it" not in flat
+
+
+_ENV_COORDS_TOKENS = re.compile(
+    r"AIDP_REGION|AIDP_DATALAKE_OCID|AIDP_WORKSPACE_ID|AIDP_CLUSTER_ID|"
+    r"AIDP_BASE\b|ANTHROPIC_API_KEY|OCI_TENANCY_OCID|--lake-ocid|--workspace-id\b")
+
+
+def test_no_prose_offers_an_environment_variable_destination():
+    """The destination is the aidp: block of snowmig-config.yaml or the four
+    flags; nothing is read from the environment (ARCHITECTURE.md I5,
+    target/coords.py). references/env-coords.template.md told the operator
+    to export AIDP_* variables and an ANTHROPIC_API_KEY no module reads, and
+    named --lake-ocid/--workspace-id/--cluster flags no subcommand has.
+    Prose only: target/executor.py legitimately passes --workspace-id to the
+    aidp CLI."""
+    assert not (ROOT / "references/env-coords.template.md").exists()
+    paths = sorted((ROOT / "references").glob("*.md"))
+    paths += sorted((ROOT / "skills").glob("*/SKILL.md"))
+    paths += sorted((ROOT / "commands").glob("*.md"))
+    paths += [ROOT / "README.md", ROOT / "ARCHITECTURE.md"]
+    offenders = []
+    for path in paths:
+        hit = _ENV_COORDS_TOKENS.search(path.read_text(encoding="utf-8"))
+        if hit:
+            offenders.append(f"{path.relative_to(ROOT)}: {hit.group(0)}")
+    assert offenders == [], offenders
+
+
+def test_the_docs_describe_the_derived_source_config_copy():
+    """provisioning.source_config_payload uploads the `snowflake:` block only,
+    re-serialised as JSON, to plan/<config stem>.json; the operator's YAML
+    never travels and the aidp: block stays on the laptop. README, the
+    provision skill and the scripts README described the whole-file upload
+    (and a default path, plan/snowmig-config.yaml, that is never created)."""
+    readme = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
+    assert "hand them JSON if the cluster image has no PyYAML" not in readme
+    assert "plan/<config stem>.json" in readme
+    provision = (ROOT / "skills/snowflake-provision-environment/SKILL.md").read_text(encoding="utf-8")
+    flat = " ".join(provision.split())
+    assert "`snowflake:` block" in flat and "`aidp:` block is not copied" in flat
+    scripts = (ROOT / "data-migration-scripts/README.md").read_text(encoding="utf-8")
+    assert "plan/snowmig-config.yaml" not in scripts, "the derived copy is JSON"
+    assert "plan/snowmig-config.json" in scripts

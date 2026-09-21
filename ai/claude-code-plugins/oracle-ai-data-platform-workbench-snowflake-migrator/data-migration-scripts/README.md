@@ -172,7 +172,7 @@ To run one by hand, open it in the console and edit the `PARAMS` cell:
 # ── PARAMETERS ──
 PARAMS = {
     'source-mode': 'connector',
-    'source-config': '/Workspace/backup-snowflake-migration/plan/snowmig-config.yaml',
+    'source-config': '/Workspace/backup-snowflake-migration/plan/snowmig-config.json',
     'target-catalog': 'snowdemo',   # REQUIRED
     'schema': 'SALES',              # REQUIRED for 02_copy_schema
     'verify': 'counts+sums',
