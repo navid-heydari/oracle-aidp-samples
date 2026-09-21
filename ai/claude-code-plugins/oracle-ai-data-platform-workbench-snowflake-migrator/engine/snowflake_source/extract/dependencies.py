@@ -11,6 +11,9 @@ make the whole feature hostage to a privilege.
 authoritative lineage.
 
 Edge direction: {"from": dependent, "to": dependency}. `to` is created first.
+Endpoints are the exact inventory `source_identifier` values, so they match
+the plan's nodes: a quoted identifier keeps its case in Snowflake, and an
+edge spelled any other way is silently dropped by the wave computation.
 """
 from __future__ import annotations
 
@@ -45,7 +48,7 @@ def parse_view_references(ddl: str, *, default_db: str,
 
 
 def _from_account_usage(run_sql: Callable[..., list[dict]],
-                        known: set[str]) -> list[dict]:
+                        by_upper: dict[str, str]) -> list[dict]:
     rows = run_sql(
         "select referencing_database || '.' || referencing_schema || '.' || "
         "       referencing_object_name as REFERENCING, "
@@ -56,8 +59,10 @@ def _from_account_usage(run_sql: Callable[..., list[dict]],
         "from snowflake.account_usage.object_dependencies")
     edges = []
     for r in rows:
-        dependent, dependency = r["REFERENCING"], r["REFERENCED"]
-        if dependent in known and dependency in known and dependent != dependency:
+        # Matched case-insensitively, emitted in the inventory's spelling.
+        dependent = by_upper.get(str(r.get("REFERENCING") or "").upper())
+        dependency = by_upper.get(str(r.get("REFERENCED") or "").upper())
+        if dependent and dependency and dependent != dependency:
             edges.append({
                 "from": dependent, "to": dependency,
                 "kind": f'{r.get("REFERENCING_TYPE")}->{r.get("REFERENCED_TYPE")}',
@@ -69,10 +74,15 @@ def _from_account_usage(run_sql: Callable[..., list[dict]],
 def extract_dependencies(run_sql: Callable[..., list[dict]],
                          inventory: dict) -> dict:
     records = inventory.get("inventory", [])
-    known = {r["source_identifier"].upper() for r in records}
+    # Upper-cased name -> the inventory's exact spelling. Unambiguous because
+    # the inventory HALTs on identifier-case collisions before this stage
+    # runs (snowmig.py); were that gate ever bypassed, this map would be
+    # last-wins and could attach an edge to the wrong twin.
+    by_upper = {r["source_identifier"].upper(): r["source_identifier"]
+                for r in records}
 
     try:
-        edges = _from_account_usage(run_sql, known)
+        edges = _from_account_usage(run_sql, by_upper)
         return {"edges": edges, "source_used": "account_usage",
                 "coverage_note": "ACCOUNT_USAGE.OBJECT_DEPENDENCIES: authoritative "
                                  "lineage for all object types",
@@ -86,17 +96,16 @@ def extract_dependencies(run_sql: Callable[..., list[dict]],
     for rec in records:
         if rec.get("object_type") != "VIEW":
             continue
-        dependent = rec["source_identifier"].upper()
-        for dependency in parse_view_references(
+        dependent = rec["source_identifier"]
+        for ref in parse_view_references(
                 rec.get("view_ddl_get_ddl") or rec.get("view_text_show") or "",
                 default_db=rec["source_database"],
                 default_schema=rec["source_schema"]):
-            if dependency == dependent:
-                continue
-            if dependency in known:
+            dependency = by_upper.get(ref)
+            if dependency is None:
+                unresolved.add(ref)
+            elif dependency != dependent:
                 edges.append({"from": dependent, "to": dependency,
                               "kind": "VIEW->OBJECT", "source": "parsed_ddl"})
-            else:
-                unresolved.add(dependency)
     return {"edges": edges, "source_used": "parsed_ddl", "coverage_note": note,
             "unresolved_references": sorted(unresolved)}

@@ -114,3 +114,65 @@ def test_tables_produce_no_edges_in_fallback_mode():
             raise RuntimeError("not authorized")
 
     assert extract_dependencies(Denied({}), inv)["edges"] == []
+
+
+# --- quoted, case-sensitive identifiers ------------------------------------
+#
+# Snowflake keeps a quoted identifier's case and treats it as case-SENSITIVE,
+# so a view created as "SalesView" over "Orders" is inventoried as
+# DB.S.SalesView / DB.S.Orders, and that exact spelling is the plan's node.
+# An edge whose endpoints are spelled any other way is silently dropped by
+# the wave computation, and the view is then created before its base table.
+
+def _mixed_case_inventory():
+    return {"inventory": [
+        {"source_identifier": "DB.S.Orders", "object_type": "TABLE",
+         "source_database": "DB", "source_schema": "S",
+         "row_count_exact": 1000},
+        {"source_identifier": "DB.S.SalesView", "object_type": "VIEW",
+         "source_database": "DB", "source_schema": "S",
+         "view_ddl_get_ddl": 'create view "SalesView" as '
+                             'select * from "DB"."S"."Orders"'},
+        {"source_identifier": "DB.S.PLAIN", "object_type": "TABLE",
+         "source_database": "DB", "source_schema": "S",
+         "row_count_exact": 10},
+        {"source_identifier": "DB.S.PLAIN_V", "object_type": "VIEW",
+         "source_database": "DB", "source_schema": "S",
+         "view_ddl_get_ddl": "create view PLAIN_V as select * from DB.S.PLAIN"}]}
+
+
+def test_account_usage_keeps_edges_for_quoted_mixed_case_objects():
+    run = FakeSql({"object_dependencies": [
+        {"REFERENCING": "DB.S.SalesView", "REFERENCED": "DB.S.Orders",
+         "REFERENCING_TYPE": "VIEW", "REFERENCED_TYPE": "TABLE"},
+        {"REFERENCING": "DB.S.PLAIN_V", "REFERENCED": "DB.S.PLAIN",
+         "REFERENCING_TYPE": "VIEW", "REFERENCED_TYPE": "TABLE"}]})
+    out = extract_dependencies(run, _mixed_case_inventory())
+    assert out["source_used"] == "account_usage"
+    assert sorted((e["from"], e["to"]) for e in out["edges"]) == [
+        ("DB.S.PLAIN_V", "DB.S.PLAIN"), ("DB.S.SalesView", "DB.S.Orders")]
+
+
+def test_parsed_ddl_fallback_emits_exact_inventory_identifiers():
+    class Denied(FakeSql):
+        def __call__(self, sql, params=None):
+            raise RuntimeError("not authorized")
+
+    out = extract_dependencies(Denied({}), _mixed_case_inventory())
+    assert out["source_used"] == "parsed_ddl"
+    assert sorted((e["from"], e["to"]) for e in out["edges"]) == [
+        ("DB.S.PLAIN_V", "DB.S.PLAIN"), ("DB.S.SalesView", "DB.S.Orders")], \
+        "endpoints are the inventory's exact spelling, not an upper-cased copy"
+    assert out["unresolved_references"] == []
+
+
+def test_a_mixed_case_view_lands_in_a_later_wave_than_its_base_table():
+    # End to end through the planner: the edge has to survive into the waves.
+    from plan.build import build_plan
+    inv = _mixed_case_inventory()
+    run = FakeSql({"object_dependencies": [
+        {"REFERENCING": "DB.S.SalesView", "REFERENCED": "DB.S.Orders",
+         "REFERENCING_TYPE": "VIEW", "REFERENCED_TYPE": "TABLE"}]})
+    plan = build_plan(inv, extract_dependencies(run, inv))
+    wave_of = {n: i for i, wave in enumerate(plan["waves"]) for n in wave}
+    assert wave_of["DB.S.Orders"] < wave_of["DB.S.SalesView"], plan["waves"]
