@@ -97,7 +97,9 @@ def test_timestamp_ntz_maps_to_ntz(out):
 def test_deps_and_plan(out):
     assert main(["deps", "--out-dir", str(out)] + auth_args()) == 0
     deps = json.loads((out / "dependencies.json").read_text(encoding="utf-8"))
-    assert deps["source_used"] in ("account_usage", "parsed_ddl")
+    assert deps["source_used"] in ("account_usage", "parsed_ddl",
+                                   "account_usage_empty",
+                                   "account_usage+parsed_ddl")
     assert main(["plan", "--out-dir", str(out)]) == 0
     plan = json.loads((out / "plan.json").read_text(encoding="utf-8"))
     assert plan["waves"], "at least one wave expected"

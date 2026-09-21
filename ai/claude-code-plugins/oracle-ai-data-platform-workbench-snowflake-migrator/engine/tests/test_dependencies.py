@@ -176,3 +176,101 @@ def test_a_mixed_case_view_lands_in_a_later_wave_than_its_base_table():
     plan = build_plan(inv, extract_dependencies(run, inv))
     wave_of = {n: i for i, wave in enumerate(plan["waves"]) for n in wave}
     assert wave_of["DB.S.Orders"] < wave_of["DB.S.SalesView"], plan["waves"]
+
+
+# --- readable but not (yet) populated ---------------------------------------
+#
+# OBJECT_DEPENDENCIES lags DDL by up to ~3 hours. A view created or altered
+# shortly before the run -- the normal state of a freshly prepared estate --
+# has no row there yet, and the query succeeds with nothing in it. That must
+# not be presented as authoritative lineage: the DDL already captured for
+# the view is parsed instead, and the provenance says what happened.
+
+def _chain_inventory():
+    return {"inventory": [
+        {"source_identifier": "DB.S.T_BASE", "object_type": "TABLE",
+         "source_database": "DB", "source_schema": "S"},
+        {"source_identifier": "DB.S.V_LEVEL1", "object_type": "VIEW",
+         "source_database": "DB", "source_schema": "S",
+         "view_ddl_get_ddl": "create view V_LEVEL1 as select * from DB.S.T_BASE"},
+        {"source_identifier": "DB.S.A_TOP", "object_type": "VIEW",
+         "source_database": "DB", "source_schema": "S",
+         "view_ddl_get_ddl": "create view A_TOP as select * from DB.S.V_LEVEL1"}]}
+
+
+def test_readable_but_empty_account_usage_parses_view_ddl():
+    inv = {"inventory": [
+        {"source_identifier": "D.S.V", "object_type": "VIEW",
+         "source_database": "D", "source_schema": "S",
+         "view_ddl_get_ddl": "create view V as select * from D.S.T"},
+        {"source_identifier": "D.S.T", "object_type": "TABLE",
+         "source_database": "D", "source_schema": "S"}]}
+    out = extract_dependencies(FakeSql({"object_dependencies": []}), inv)
+    assert out["source_used"] == "account_usage_empty"
+    assert out["edges"] == [{"from": "D.S.V", "to": "D.S.T",
+                             "kind": "VIEW->OBJECT", "source": "parsed_ddl"}]
+    assert out["views_without_account_usage_edge"] == ["D.S.V"]
+    note = out["coverage_note"].lower()
+    assert "lag" in note and "not authoritative" in note
+    assert out["warning"] and "no account_usage lineage edge" in out["warning"].lower()
+
+
+def test_partial_account_usage_merges_only_uncovered_views():
+    from plan.waves import compute_waves
+    inv = _chain_inventory()
+    run = FakeSql({"object_dependencies": [
+        {"REFERENCING": "DB.S.V_LEVEL1", "REFERENCED": "DB.S.T_BASE",
+         "REFERENCING_TYPE": "VIEW", "REFERENCED_TYPE": "TABLE"}]})
+    out = extract_dependencies(run, inv)
+    assert out["source_used"] == "account_usage+parsed_ddl"
+    by_from = {e["from"]: e for e in out["edges"]}
+    assert len(out["edges"]) == 2
+    assert by_from["DB.S.V_LEVEL1"]["source"] == "account_usage"
+    assert by_from["DB.S.A_TOP"]["source"] == "parsed_ddl"
+    assert by_from["DB.S.A_TOP"]["to"] == "DB.S.V_LEVEL1"
+    assert out["views_without_account_usage_edge"] == ["DB.S.A_TOP"]
+    nodes = [r["source_identifier"] for r in inv["inventory"]]
+    assert compute_waves(nodes, out["edges"])["waves"] == [
+        ["DB.S.T_BASE"], ["DB.S.V_LEVEL1"], ["DB.S.A_TOP"]]
+
+
+def test_fully_covered_account_usage_is_unchanged():
+    inv = _chain_inventory()
+    run = FakeSql({"object_dependencies": [
+        {"REFERENCING": "DB.S.V_LEVEL1", "REFERENCED": "DB.S.T_BASE",
+         "REFERENCING_TYPE": "VIEW", "REFERENCED_TYPE": "TABLE"},
+        {"REFERENCING": "DB.S.A_TOP", "REFERENCED": "DB.S.V_LEVEL1",
+         "REFERENCING_TYPE": "VIEW", "REFERENCED_TYPE": "VIEW"}]})
+    out = extract_dependencies(run, inv)
+    assert out["source_used"] == "account_usage"
+    assert "authoritative" in out["coverage_note"]
+    assert all(e["source"] == "account_usage" for e in out["edges"])
+    assert not out.get("views_without_account_usage_edge")
+    assert out["warning"] is None
+
+
+def test_readable_empty_with_tables_only_stays_account_usage():
+    # No views, so there is nothing to lag and nothing to parse.
+    inv = {"inventory": [{"source_identifier": "D.S.T", "object_type": "TABLE",
+                          "source_database": "D", "source_schema": "S"}]}
+    out = extract_dependencies(FakeSql({"object_dependencies": []}), inv)
+    assert out["source_used"] == "account_usage"
+    assert out["edges"] == []
+    assert out["warning"] is None
+
+
+def test_a_view_with_no_edge_from_either_source_is_named_in_the_warning():
+    # The manifest path carries no view SQL, so there is nothing to parse:
+    # the view is ordered by size only, and the warning has to say so rather
+    # than let the plan imply it was ordered.
+    inv = {"inventory": [
+        {"source_identifier": "D.S.V", "object_type": "VIEW",
+         "source_database": "D", "source_schema": "S",
+         "view_ddl_get_ddl": None, "view_text_show": None},
+        {"source_identifier": "D.S.T", "object_type": "TABLE",
+         "source_database": "D", "source_schema": "S"}]}
+    out = extract_dependencies(FakeSql({"object_dependencies": []}), inv)
+    assert out["source_used"] == "account_usage_empty"
+    assert out["edges"] == []
+    assert "D.S.V" in out["warning"]
+    assert "size only" in out["warning"]

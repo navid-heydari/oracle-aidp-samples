@@ -387,7 +387,9 @@ def cmd_deps(args) -> int:
     out = pathlib.Path(args.out_dir)
     deps = extract_dependencies(_run_sql_from_args(args), _read(out, "inventory.json"))
     _write(out, "dependencies.json", deps)
-    print(f'  lineage source: {deps["source_used"]}')
+    print(f'  lineage source: {deps["source_used"]}, {len(deps["edges"])} edge(s)')
+    if deps.get("warning"):
+        print(f'  {deps["warning"]}', file=sys.stderr)
     return 0
 
 

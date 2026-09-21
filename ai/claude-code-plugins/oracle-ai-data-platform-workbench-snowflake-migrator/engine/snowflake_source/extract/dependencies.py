@@ -7,6 +7,14 @@ make the whole feature hostage to a privilege.
   1. preferred -- SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES
   2. fallback  -- parse the view DDL already captured during inventory
 
+The two are also MERGED. OBJECT_DEPENDENCIES lags DDL by up to ~3 hours, so
+a view created or altered shortly before the run has no row there yet while
+the query itself succeeds. A view with no ACCOUNT_USAGE edge is parsed from
+its DDL instead, and `source_used` says so: `account_usage_empty` when the
+view returned nothing within the inventory, `account_usage+parsed_ddl` when
+it covered some views but not others. A readable-but-empty result is never
+presented as authoritative lineage.
+
 `source` is recorded per edge so a plan built on parsed DDL is never presented as
 authoritative lineage.
 
@@ -71,28 +79,15 @@ def _from_account_usage(run_sql: Callable[..., list[dict]],
     return edges
 
 
-def extract_dependencies(run_sql: Callable[..., list[dict]],
-                         inventory: dict) -> dict:
-    records = inventory.get("inventory", [])
-    # Upper-cased name -> the inventory's exact spelling. Unambiguous because
-    # the inventory HALTs on identifier-case collisions before this stage
-    # runs (snowmig.py); were that gate ever bypassed, this map would be
-    # last-wins and could attach an edge to the wrong twin.
-    by_upper = {r["source_identifier"].upper(): r["source_identifier"]
-                for r in records}
+_AUTHORITATIVE_NOTE = ("ACCOUNT_USAGE.OBJECT_DEPENDENCIES: authoritative "
+                       "lineage for all object types")
 
-    try:
-        edges = _from_account_usage(run_sql, by_upper)
-        return {"edges": edges, "source_used": "account_usage",
-                "coverage_note": "ACCOUNT_USAGE.OBJECT_DEPENDENCIES: authoritative "
-                                 "lineage for all object types",
-                "unresolved_references": []}
-    except Exception as exc:
-        note = (f"ACCOUNT_USAGE.OBJECT_DEPENDENCIES unavailable ({exc}); fell back to "
-                "parsing view DDL. Covers view->object edges ONLY -- not "
-                "authoritative lineage.")
 
-    edges, unresolved = [], set()
+def _from_parsed_ddl(records: list[dict],
+                     by_upper: dict[str, str]) -> tuple[list[dict], set[str]]:
+    """view->object edges parsed from the DDL captured at inventory time."""
+    edges: list[dict] = []
+    unresolved: set[str] = set()
     for rec in records:
         if rec.get("object_type") != "VIEW":
             continue
@@ -107,5 +102,61 @@ def extract_dependencies(run_sql: Callable[..., list[dict]],
             elif dependency != dependent:
                 edges.append({"from": dependent, "to": dependency,
                               "kind": "VIEW->OBJECT", "source": "parsed_ddl"})
-    return {"edges": edges, "source_used": "parsed_ddl", "coverage_note": note,
-            "unresolved_references": sorted(unresolved)}
+    return edges, unresolved
+
+
+def extract_dependencies(run_sql: Callable[..., list[dict]],
+                         inventory: dict) -> dict:
+    records = inventory.get("inventory", [])
+    # Upper-cased name -> the inventory's exact spelling. Unambiguous because
+    # the inventory HALTs on identifier-case collisions before this stage
+    # runs (snowmig.py); were that gate ever bypassed, this map would be
+    # last-wins and could attach an edge to the wrong twin.
+    by_upper = {r["source_identifier"].upper(): r["source_identifier"]
+                for r in records}
+    views = [r for r in records if r.get("object_type") == "VIEW"]
+
+    try:
+        au_edges = _from_account_usage(run_sql, by_upper)
+    except Exception as exc:
+        note = (f"ACCOUNT_USAGE.OBJECT_DEPENDENCIES unavailable ({exc}); fell back to "
+                "parsing view DDL. Covers view->object edges ONLY -- not "
+                "authoritative lineage.")
+        edges, unresolved = _from_parsed_ddl(views, by_upper)
+        return {"edges": edges, "source_used": "parsed_ddl", "coverage_note": note,
+                "unresolved_references": sorted(unresolved), "warning": None}
+
+    covered = {e["from"] for e in au_edges}
+    uncovered = [r for r in views if r["source_identifier"] not in covered]
+    if not uncovered:
+        return {"edges": au_edges, "source_used": "account_usage",
+                "coverage_note": _AUTHORITATIVE_NOTE,
+                "unresolved_references": [],
+                "views_without_account_usage_edge": [], "warning": None}
+
+    # Readable, but not populated for these views. The query succeeding is
+    # not evidence that the lineage is complete: a freshly prepared estate
+    # lands here, and so does a view whose only references lie outside the
+    # inventory. Parse what DDL we hold and say plainly what is still
+    # unordered, so the plan cannot imply an order it does not have.
+    parsed, unresolved = _from_parsed_ddl(uncovered, by_upper)
+    missing = sorted(r["source_identifier"] for r in uncovered)
+    ordered_by_parse = {e["from"] for e in parsed}
+    unordered = [i for i in missing if i not in ordered_by_parse]
+    source_used = ("account_usage_empty" if not au_edges
+                   else "account_usage+parsed_ddl")
+    note = (f"ACCOUNT_USAGE.OBJECT_DEPENDENCIES was readable but returned no "
+            f"edge within the inventory for {len(missing)} of {len(views)} "
+            f"view(s). The view lags DDL by up to ~3 hours, so a view created "
+            f"or altered shortly before this run is not in it yet. Their DDL "
+            f"was parsed instead (view->object edges only) -- NOT "
+            f"authoritative lineage for those views.")
+    warning = (f"{len(missing)} view(s) have no ACCOUNT_USAGE lineage edge "
+               f"(the view lags DDL by up to ~3 h); their DDL was parsed instead")
+    if unordered:
+        warning += (f". {len(unordered)} still have no edge from either source "
+                    f"and are ordered by size only: {', '.join(unordered)}")
+    warning += ". Re-run `deps` after the lag before relying on the wave order."
+    return {"edges": au_edges + parsed, "source_used": source_used,
+            "coverage_note": note, "unresolved_references": sorted(unresolved),
+            "views_without_account_usage_edge": missing, "warning": warning}
