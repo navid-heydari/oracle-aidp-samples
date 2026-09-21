@@ -4,17 +4,21 @@ The transport is injected, so every decision — look-first, name translation,
 poll-the-read-back, record-don't-swallow — is tested with no environment.
 """
 import json
+import os
 import pathlib
+import types
 
 import pytest
 
 from target.provision_api import (
     ProvisionBackendUnsupported, build_driver_notebook, build_job_body,
-    build_library_items, build_provision_command, content_path,
+    build_library_items, build_provision_command, build_test_connection_body,
+    content_path,
 )
 from target.stage_notebooks import STAGES, build_stage_notebook
 from target.provisioning import (
-    BACKUP_FOLDER, JOB_SPECS, REPORTS_FOLDER, SCRIPTS_FOLDER, provision,
+    BACKUP_FOLDER, JOB_SPECS, REPORTS_FOLDER, SCRIPTS_FOLDER,
+    ProvisionTransportError, make_provision_call, provision,
     render_provision,
 )
 
@@ -517,3 +521,134 @@ def test_provisioning_creates_the_backup_folder_the_runbook_writes_into(scripts)
               delays=())
     folders = [kw["path"] for op, kw in fake.ops if op == "create_ws_folder"]
     assert BACKUP_FOLDER in folders, folders
+
+
+# --- testConnection carries the Snowflake credential ------------------------
+# `create_catalog` spools its credential-bearing body to a temp file so `ps`
+# (and process-creation auditing) never see it. The testConnection body carries
+# the SAME credential -- password, or the whole private key PEM -- and went
+# inline on the `oci` argv.
+
+_SECRET = "ZqTrickyPW_93-hunter2"
+_PEM = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----"
+_PASSPHRASE = "pass-phrase-Q7"
+
+
+def _ok(cmd):
+    return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+
+def _test_connection_body(**props):
+    return build_test_connection_body(
+        "cat-key", connection_properties={"SNOWFLAKE_USERNAME": "U", **props},
+        display_name="src")
+
+
+@pytest.mark.parametrize("props,secrets", [
+    ({"SNOWFLAKE_PASSWORD": _SECRET}, [_SECRET]),
+    ({"SNOWFLAKE_PRIVATE_KEY_CONTENT": _PEM,
+      "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE": _PASSPHRASE},
+     ["BEGIN PRIVATE KEY", "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", _PASSPHRASE]),
+], ids=["password", "keypair"])
+def test_the_test_connection_body_travels_by_file_not_argv(props, secrets,
+                                                           capsys):
+    seen = {}
+
+    def fake(cmd):
+        seen["cmd"] = list(cmd)
+        path = next((a for a in cmd if a.startswith("file://")), None)
+        seen["file"] = path
+        if path:
+            with open(path[len("file://"):], encoding="utf-8") as fh:
+                seen["spooled"] = fh.read()
+        return _ok(cmd)
+
+    call = make_provision_call(OCID, run_process=fake)
+    call("test_connection", body=_test_connection_body(**props))
+    blob = " ".join(seen["cmd"])
+    for secret in secrets:
+        assert secret not in blob, "the credential must not be an argv element"
+    assert seen["file"], "the body must travel by file"
+    assert seen["cmd"][seen["cmd"].index("--request-body") + 1] == seen["file"]
+    for secret in secrets:
+        assert secret in seen["spooled"], "the CLI reads the real body"
+        assert secret not in capsys.readouterr().out
+
+
+def test_the_test_connection_spool_is_removed_after_the_call():
+    seen = {}
+
+    def fake(cmd):
+        seen["path"] = next(a[len("file://"):] for a in cmd
+                            if a.startswith("file://"))
+        assert os.path.exists(seen["path"]), \
+            "the file must exist while the CLI runs"
+        return _ok(cmd)
+
+    call = make_provision_call(OCID, run_process=fake)
+    call("test_connection",
+         body=_test_connection_body(SNOWFLAKE_PASSWORD=_SECRET))
+    assert not os.path.exists(seen["path"]), \
+        "the spool must not outlive the call"
+
+
+def test_the_test_connection_spool_is_removed_even_when_the_call_fails():
+    seen = {}
+
+    def fake(cmd):
+        seen["path"] = next(a[len("file://"):] for a in cmd
+                            if a.startswith("file://"))
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="denied")
+
+    call = make_provision_call(OCID, run_process=fake)
+    with pytest.raises(ProvisionTransportError):
+        call("test_connection",
+             body=_test_connection_body(SNOWFLAKE_PASSWORD=_SECRET))
+    assert not os.path.exists(seen["path"])
+
+
+def test_build_provision_command_prefers_a_body_file_for_test_connection():
+    body = _test_connection_body(SNOWFLAKE_PASSWORD=_SECRET)
+    cmd = build_provision_command("oci_raw", "test_connection", OCID,
+                                  body=body, body_file="/tmp/x.json")
+    assert cmd[cmd.index("--request-body") + 1] == "file:///tmp/x.json"
+    assert json.dumps(body) not in cmd
+    # The body-only form keeps working, so the builder stays usable alone.
+    plain = build_provision_command("oci_raw", "test_connection", OCID,
+                                    body=body)
+    assert cmd[cmd.index("--target-uri") + 1].endswith(
+        "/actions/testConnection")
+    assert json.dumps(body) in plain
+
+
+def _catalog_transport(fake):
+    from target.coords import resolve_target
+    from target.runner import make_call
+    target = resolve_target(datalake_ocid=OCID, workspace="w",
+                            cluster_id="c", catalog="MYDB")
+    return make_call(target, backend="oci_raw", run_process=fake)
+
+
+@pytest.mark.parametrize("transport,operation,body", [
+    (_catalog_transport, "create_catalog",
+     {"displayName": "src", "catalogType": "EXTERNAL",
+      "connectionDetails": {"connectionProperties": {
+          "SNOWFLAKE_PASSWORD": _SECRET}}}),
+    (lambda fake: make_provision_call(OCID, run_process=fake),
+     "test_connection", _test_connection_body(SNOWFLAKE_PASSWORD=_SECRET)),
+], ids=["runner.create_catalog", "provisioning.test_connection"])
+def test_no_transport_puts_connection_details_on_argv(transport, operation,
+                                                      body):
+    """The guard that would have caught the drift: two transports, one rule.
+    Whatever carries `connectionDetails` never appears as an argv element."""
+    seen = {}
+
+    def fake(cmd):
+        seen["cmd"] = list(cmd)
+        return types.SimpleNamespace(
+            returncode=0, stdout=json.dumps({"data": {"key": "k"}}),
+            stderr="")
+
+    transport(fake)(operation, body=body)
+    assert not any("connectionDetails" in a for a in seen["cmd"]), seen["cmd"]
+    assert _SECRET not in " ".join(seen["cmd"])

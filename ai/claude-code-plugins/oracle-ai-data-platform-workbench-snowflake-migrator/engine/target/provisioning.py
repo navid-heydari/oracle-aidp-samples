@@ -100,7 +100,7 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
     """A `call(operation, **kwargs) -> dict` over the documented API."""
     import subprocess
 
-    from .runner import _printable
+    from .runner import _printable, spool_body
     from .executor import parse_cli_json
 
     def _run(cmd):
@@ -120,6 +120,13 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
                 "this transport does not carry file content; upload through "
                 "the workspace-object operations (upload_ws_file), which take "
                 "a local path")
+        # `connectionDetails` is the Snowflake credential -- the testConnection
+        # body carries the same password or PEM the catalog registration did.
+        # It travels by file, exactly like create_catalog's body, so it is
+        # never an argv element for `ps` or process auditing to record.
+        if isinstance(body, dict) and "connectionDetails" in body:
+            spooled = spool_body(body, prefix="snowmig_testconn_")
+            kwargs = {**kwargs, "body_file": spooled}
         try:
             cmd = build_provision_command(backend, operation, platform_ocid,
                                           **kwargs)

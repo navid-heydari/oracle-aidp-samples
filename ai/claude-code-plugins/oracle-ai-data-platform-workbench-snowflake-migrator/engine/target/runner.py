@@ -18,9 +18,25 @@ from typing import Callable
 
 from .executor import build_command, parse_cli_json
 
-__all__ = ["BackendError", "make_run_sql"]
+__all__ = ["BackendError", "make_run_sql", "spool_body"]
 
 _MAX_STDERR = 500
+
+
+def spool_body(body: dict, *, prefix: str) -> str:
+    """Write a credential-bearing request body to a private temp file.
+
+    In argv a body is visible to every user on the host via `ps`, and
+    process-creation auditing records it permanently. So a body that carries
+    `connectionDetails` travels by file -- created 0600 where the OS has mode
+    bits -- and the command references the path. The caller unlinks it after
+    the call, success or failure. One helper for every transport, so the
+    `create_catalog` and `testConnection` paths cannot drift apart again.
+    """
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(body, fh)
+    return path
 
 
 class BackendError(RuntimeError):
@@ -97,10 +113,7 @@ def make_call(target, *, backend: str, run_process=None):
         # removed after the call) and the command references the path.
         if operation == "create_catalog" and isinstance(body, dict) \
                 and "connectionDetails" in body:
-            fd, spooled = tempfile.mkstemp(prefix="snowmig_catalog_",
-                                           suffix=".json")
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(body, fh)
+            spooled = spool_body(body, prefix="snowmig_catalog_")
             kwargs = {**kwargs, "body_file": spooled}
         try:
             cmd = build_command(backend, operation, target, **kwargs)
