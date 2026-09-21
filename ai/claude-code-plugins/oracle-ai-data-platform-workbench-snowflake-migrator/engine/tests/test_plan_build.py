@@ -295,3 +295,71 @@ def test_target_catalog_note_is_present_even_when_nothing_migrates():
     inv = {"inventory": [rec("D.S.BAD", status="blocked", blocked=["x: VARIANT"])]}
     plan = build_plan(inv, {"edges": []})
     assert plan["target_catalog_note"] and "01_create_structure" in plan["target_catalog_note"]
+
+
+# --- SHOW TABLES kind flags -----------------------------------------------
+#
+# SHOW TABLES lists dynamic, external, Iceberg, event and hybrid tables next
+# to standard ones, and the extractor keeps the is_* flags. build_plan never
+# read them: a dynamic table was planned as a plain Delta copy while
+# CENSUS.md said it never migrates, and the others were flattened silently.
+
+KIND_FLAGS = ("is_dynamic", "is_external", "is_iceberg", "is_event", "is_hybrid")
+
+
+def _flagged(ident, flag, value):
+    r = rec(ident)
+    r["source_metadata"][flag] = value
+    return r
+
+
+@pytest.mark.parametrize("flag", KIND_FLAGS)
+@pytest.mark.parametrize("value", ["Y", "true", "TRUE"])
+def test_a_flagged_table_kind_cannot_migrate_with_a_specific_reason(flag, value):
+    inv = {"inventory": [_flagged("D.S.T", flag, value), rec("D.S.PLAIN")]}
+    plan = build_plan(inv, {"edges": []})
+    cannot = {c["source_identifier"]: c for c in plan["cannot_migrate"]}
+    assert set(cannot) == {"D.S.T"}
+    assert cannot["D.S.T"]["category"] == "unsupported_object"
+    assert cannot["D.S.T"]["object_type"] == "TABLE"
+    assert flag.removeprefix("is_") in cannot["D.S.T"]["reason"].lower()
+    assert [c["source_identifier"] for c in plan["can_migrate"]] == ["D.S.PLAIN"]
+    assert plan["summary"]["can_migrate"] == 1 and plan["summary"]["tables"] == 1
+    assert "D.S.T" not in plan["clone_targets"]
+    assert all("D.S.T" not in wave for wave in plan["waves"])
+
+
+@pytest.mark.parametrize("flag", KIND_FLAGS)
+@pytest.mark.parametrize("value", ["N", "false", "", None])
+def test_an_unset_kind_flag_leaves_the_table_migratable(flag, value):
+    plan = build_plan({"inventory": [_flagged("D.S.T", flag, value)]}, {"edges": []})
+    assert [c["source_identifier"] for c in plan["can_migrate"]] == ["D.S.T"]
+
+
+def test_a_dynamic_table_reason_says_why_a_copy_is_not_the_object():
+    plan = build_plan({"inventory": [_flagged("D.S.DT", "is_dynamic", "Y")]},
+                      {"edges": []})
+    reason = plan["cannot_migrate"][0]["reason"]
+    assert "refreshed by Snowflake" in reason
+    assert "census" in reason.lower()
+    assert "no equivalent is generated" in reason
+
+
+@pytest.mark.parametrize("kind", ["TRANSIENT", "TEMPORARY", "transient"])
+def test_transient_and_temporary_tables_migrate_with_a_warning(kind):
+    r = rec("D.S.T")
+    r["source_metadata"]["kind"] = kind
+    plan = build_plan({"inventory": [r, rec("D.S.PLAIN")]}, {"edges": []})
+    assert {c["source_identifier"] for c in plan["can_migrate"]} == {"D.S.PLAIN", "D.S.T"}
+    warnings = plan["table_kind_warnings"]
+    assert [w["source_identifier"] for w in warnings] == ["D.S.T"]
+    assert warnings[0]["kind"] == kind.upper()
+    assert kind.upper() in warnings[0]["warning"]
+    assert "permanent" in warnings[0]["warning"].lower()
+
+
+def test_a_plain_table_carries_no_kind_warning():
+    r = rec("D.S.T")
+    r["source_metadata"]["kind"] = "TABLE"
+    plan = build_plan({"inventory": [r]}, {"edges": []})
+    assert plan["table_kind_warnings"] == []

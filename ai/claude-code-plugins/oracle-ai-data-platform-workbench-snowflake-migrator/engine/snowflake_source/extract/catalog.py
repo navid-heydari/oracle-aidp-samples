@@ -50,7 +50,7 @@ _META_KEYS = ("rows", "bytes", "created_on", "comment", "owner",
               "retention_time", "search_optimization",
               "search_optimization_bytes", "search_optimization_progress",
               # table kind, which changes what maintenance even applies
-              "is_dynamic", "is_iceberg", "is_secure", "is_materialized",
+              "kind", "is_dynamic", "is_iceberg", "is_secure", "is_materialized",
               "is_external", "is_hybrid", "is_event", "is_immutable",
               "enable_schema_evolution")
 

@@ -10,6 +10,13 @@ schema, table -> table, view -> view). Silver and Gold are requirement-driven, s
 this module emits disabled job stubs for them rather than inventing
 transformation logic nobody specified.
 
+SHOW TABLES lists dynamic, external, Iceberg, event and hybrid tables next to
+standard ones, and the extractor keeps the is_* flags. None of those is a table
+this plugin can copy: each lands in `cannot_migrate` with a reason specific to
+its kind, so the plan agrees with CENSUS.md instead of contradicting it.
+TRANSIENT and TEMPORARY tables do migrate, as permanent Delta tables, and the
+plan carries a warning per object saying so.
+
 An object that depends on one that is not migrating cannot migrate either --
 a view over a blocked or excluded table would be created over nothing. The
 cascade follows the dependency edges transitively and names the missing object.
@@ -52,14 +59,65 @@ class TargetCollision(RuntimeError):
         super().__init__(f"target name collision, refusing to guess: {detail}{remedy}")
 
 
+def _is_set(value) -> bool:
+    return str(value if value is not None else "").strip().lower() in (
+        "true", "y", "yes", "1")
+
+
+# SHOW TABLES flag -> why a plain Delta copy is not that object. First match
+# wins; a table carrying several flags is still one refusal.
+_TABLE_KIND_BLOCKS = (
+    ("is_dynamic", "Snowflake dynamic table: refreshed by Snowflake from its "
+                   "defining query; the census lists them; no equivalent is "
+                   "generated -- a copy would be a snapshot that never refreshes"),
+    ("is_external", "Snowflake external table: its data lives in the stage's "
+                    "object storage, not in Snowflake; point AIDP at that "
+                    "location rather than copying a materialisation of it"),
+    ("is_iceberg", "Snowflake Iceberg table: already open-format in object "
+                   "storage; register that Iceberg location in AIDP rather "
+                   "than copying it into Delta"),
+    ("is_event", "Snowflake event table: a log and trace sink written by "
+                 "Snowflake itself; AIDP has no equivalent object"),
+    ("is_hybrid", "Snowflake hybrid (Unistore) table: row-store OLTP "
+                  "semantics do not carry to Delta"),
+)
+
+# SHOW TABLES `kind` values that migrate, as permanent tables, with a warning.
+_TABLE_KIND_WARNINGS = {
+    "TRANSIENT": "TRANSIENT table in Snowflake (no Fail-safe, short Time "
+                 "Travel); it is planned as a permanent Delta table, so confirm "
+                 "it is meant to persist",
+    "TEMPORARY": "TEMPORARY table in Snowflake (session-scoped, dropped when "
+                 "the session ends); it is planned as a permanent Delta table, "
+                 "so confirm it is meant to persist at all",
+}
+
+
+def _table_verdict(rec: dict) -> tuple[bool, str, str]:
+    """(can_migrate, category, reason) for one table, from its SHOW flags."""
+    meta = rec.get("source_metadata") or {}
+    for flag, reason in _TABLE_KIND_BLOCKS:
+        if _is_set(meta.get(flag)):
+            return False, "unsupported_object", reason
+    return True, "", ""
+
+
+def _table_kind_warning(rec: dict) -> dict | None:
+    kind = str((rec.get("source_metadata") or {}).get("kind") or "").upper()
+    if kind in _TABLE_KIND_WARNINGS:
+        return {"source_identifier": rec["source_identifier"], "kind": kind,
+                "warning": _TABLE_KIND_WARNINGS[kind]}
+    return None
+
+
 def _view_verdict(rec: dict) -> tuple[bool, str, str]:
     """(can_migrate, category, reason) for one view."""
     meta = rec.get("source_metadata") or {}
-    if str(meta.get("is_secure", "")).lower() in ("true", "y", "yes"):
+    if _is_set(meta.get("is_secure")):
         return False, "unsupported_object", (
             "Snowflake secure view: its definition and row-visibility rules have "
             "no Delta equivalent")
-    if str(meta.get("is_materialized", "")).lower() in ("true", "y", "yes"):
+    if _is_set(meta.get("is_materialized")):
         return False, "unsupported_object", (
             "Snowflake materialized view: no AIDP equivalent; rebuild as a table "
             "plus a refresh job")
@@ -163,6 +221,7 @@ def build_plan(inventory: dict, dependencies: dict, *,
         for e in restricted]
 
     targets: dict[str, str] = {}
+    kind_warnings: list[dict] = []
     for rec in kept:
         ident = rec["source_identifier"]
         db, schema, name = ident.split(".", 2)
@@ -178,13 +237,16 @@ def build_plan(inventory: dict, dependencies: dict, *,
                           + "; ".join(rec.get("blocked_reasons") or ["unspecified"])})
             continue
 
-        if rec.get("object_type") == "VIEW":
-            ok, category, reason = _view_verdict(rec)
-            if not ok:
-                cannot.append({
-                    "source_identifier": ident, "object_type": "VIEW",
-                    "category": category, "reason": reason})
-                continue
+        verdict = _view_verdict if rec.get("object_type") == "VIEW" else _table_verdict
+        ok, category, reason = verdict(rec)
+        if not ok:
+            cannot.append({
+                "source_identifier": ident, "object_type": rec.get("object_type"),
+                "category": category, "reason": reason})
+            continue
+        warning = _table_kind_warning(rec)
+        if warning:
+            kind_warnings.append(warning)
 
         can.append({"source_identifier": ident,
                     "object_type": rec.get("object_type"),
@@ -226,6 +288,12 @@ def build_plan(inventory: dict, dependencies: dict, *,
         "clone_targets": sorted(can_ids),
         "can_migrate": sorted(can, key=lambda c: c["source_identifier"]),
         "cannot_migrate": sorted(cannot, key=lambda c: c["source_identifier"]),
+        # Planned, but not as what they were: TRANSIENT/TEMPORARY tables
+        # become permanent Delta tables. One entry per affected object.
+        "table_kind_warnings": sorted(
+            (w for w in kind_warnings
+             if w["source_identifier"] in {c["source_identifier"] for c in can}),
+            key=lambda w: w["source_identifier"]),
         "restrictions_applied": restrictions or {},
         "catalogs_to_create": catalogs,
         "schemas_to_create": [list(s) for s in schemas],

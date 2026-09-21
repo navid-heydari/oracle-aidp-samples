@@ -323,3 +323,21 @@ def test_maintenance_columns_are_captured_from_show_output():
                 "search_optimization", "search_optimization_bytes",
                 "retention_time"):
         assert key in meta, f"{key} not captured from SHOW"
+
+
+def test_show_tables_kind_and_flags_reach_the_plan():
+    # SHOW TABLES says which rows are dynamic, and whether a table is
+    # TRANSIENT/TEMPORARY. Both must survive extraction so the plan can act:
+    # a dynamic table cannot migrate; a transient one migrates with a warning.
+    from plan.build import build_plan
+    fake = FakeSql(_base_responses(
+        tables=[{"name": "DT", "rows": 1, "is_dynamic": "Y", "kind": "TABLE"},
+                {"name": "TT", "rows": 1, "is_dynamic": "N", "kind": "TRANSIENT"}],
+        columns=[_col("DT"), _col("TT")]))
+    inv = build_inventory(fake, row_counts="none")
+    meta = {r["source_identifier"]: r["source_metadata"] for r in inv["inventory"]}
+    assert meta["DB.PUBLIC.TT"]["kind"] == "TRANSIENT"
+    plan = build_plan(inv, {"edges": []})
+    assert [c["source_identifier"] for c in plan["cannot_migrate"]] == ["DB.PUBLIC.DT"]
+    assert plan["cannot_migrate"][0]["category"] == "unsupported_object"
+    assert [w["source_identifier"] for w in plan["table_kind_warnings"]] == ["DB.PUBLIC.TT"]
