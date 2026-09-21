@@ -283,7 +283,7 @@ def build_stage_notebook(stage: StageSpec,
     fail the whole run.
     """
     root = dataplane or dataplane_dir()
-    body = (root / stage.source).read_text()
+    body = (root / stage.source).read_text(encoding="utf-8")
     body, needs_helpers = _strip_shared_import(body, stage.source)
     body = _strip_main_guard(body, stage.source)
 
@@ -300,7 +300,7 @@ def build_stage_notebook(stage: StageSpec,
             _md("## Shared source helpers\n\nInlined from "
                 "`engine/dataplane/snowmig_source.py` so this notebook runs "
                 "with nothing else uploaded beside it."),
-            _code((root / SHARED_SOURCE_NAME).read_text()),
+            _code((root / SHARED_SOURCE_NAME).read_text(encoding="utf-8")),
         ]
     cells += [_md("## Stage logic"), _code(body), _code(_RUN_CELL)]
     return {"cells": cells,
@@ -325,6 +325,6 @@ def write_stage_notebooks(out_dir: str | pathlib.Path,
     for stage in STAGES:
         nb = build_stage_notebook(stage, dataplane, overrides)
         path = out / stage.notebook_name
-        path.write_text(json.dumps(nb, indent=1) + "\n")
+        path.write_text(json.dumps(nb, indent=1) + "\n", encoding="utf-8")
         written.append(path)
     return written

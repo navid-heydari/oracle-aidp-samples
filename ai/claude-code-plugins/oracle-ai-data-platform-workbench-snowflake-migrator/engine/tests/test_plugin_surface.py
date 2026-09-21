@@ -19,7 +19,7 @@ COMMANDS = ["snowflake-assess", "snowflake-plan", "snowflake-soft-clone",
 
 
 def frontmatter(path: pathlib.Path) -> dict:
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     assert text.startswith("---\n"), f"{path} needs YAML frontmatter"
     block = text.split("---", 2)[1]
     out = {}
@@ -31,7 +31,7 @@ def frontmatter(path: pathlib.Path) -> dict:
 
 
 def test_manifest_is_valid_and_keeps_the_name():
-    m = json.loads((ROOT / ".claude-plugin/plugin.json").read_text())
+    m = json.loads((ROOT / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
     assert m["name"] == "oracle-ai-data-platform-workbench-snowflake-migrator"
     assert "SCAFFOLD" not in m["description"]
     assert m["version"] and m["license"]
@@ -69,13 +69,13 @@ def test_skills_invoke_the_engine_by_plugin_root():
     accepted = ("${CLAUDE_PLUGIN_ROOT}/bin/snowmig",
                 "${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py")
     for name in SKILLS:
-        text = (ROOT / "skills" / name / "SKILL.md").read_text()
+        text = (ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
         if "snowmig" in text:
             assert any(a in text for a in accepted), name
 
 
 def test_clone_skill_states_the_runtime_coordinate_rule():
-    text = (ROOT / "skills/snowflake-medallion-clone/SKILL.md").read_text()
+    text = (ROOT / "skills/snowflake-medallion-clone/SKILL.md").read_text(encoding="utf-8")
     low = text.lower()
     assert "ask the user" in low
     assert "--execute" in text
@@ -83,13 +83,13 @@ def test_clone_skill_states_the_runtime_coordinate_rule():
 
 
 def test_type_mapping_reference_covers_the_blocked_types():
-    text = (ROOT / "references/type-mapping.md").read_text()
+    text = (ROOT / "references/type-mapping.md").read_text(encoding="utf-8")
     for t in ["NUMBER", "TIMESTAMP_NTZ", "VARIANT", "GEOGRAPHY"]:
         assert t in text
 
 
 def test_reference_documents_the_object_and_view_mapping():
-    text = (ROOT / "references/type-mapping.md").read_text()
+    text = (ROOT / "references/type-mapping.md").read_text(encoding="utf-8")
     # A Snowflake database maps to a catalog, and which KIND of catalog is the
     # part a reader has to get right: EXTERNAL by default, Standard on request.
     assert "EXTERNAL catalog" in text
@@ -100,7 +100,7 @@ def test_reference_documents_the_object_and_view_mapping():
 
 
 def test_plan_skill_documents_the_cannot_migrate_categories():
-    text = (ROOT / "skills/snowflake-migration-plan/SKILL.md").read_text()
+    text = (ROOT / "skills/snowflake-migration-plan/SKILL.md").read_text(encoding="utf-8")
     for category in ["restriction", "unmapped_type", "snowflake_only_sql",
                      "unsupported_object"]:
         assert category in text, category
@@ -108,7 +108,7 @@ def test_plan_skill_documents_the_cannot_migrate_categories():
 
 
 def test_clone_skill_documents_one_catalog_per_run_and_cli_backends():
-    text = (ROOT / "skills/snowflake-medallion-clone/SKILL.md").read_text()
+    text = (ROOT / "skills/snowflake-medallion-clone/SKILL.md").read_text(encoding="utf-8")
     low = text.lower()
     assert "one catalog per run" in low
     assert "aidp" in low and "oci" in low
@@ -119,7 +119,7 @@ def test_clone_skill_documents_one_catalog_per_run_and_cli_backends():
 def test_no_skill_still_promises_tables_only():
     # Views came into scope; a stale "tables only" line would mislead.
     for name in SKILLS:
-        text = (ROOT / "skills" / name / "SKILL.md").read_text().lower()
+        text = (ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8").lower()
         assert "tables only" not in text, name
 
 
@@ -128,7 +128,7 @@ def test_smoke_skill_documents_the_write_probe_lifecycle():
     failed cleanup left behind. An earlier test (and the CLI help) still
     described the pre-cleanup behaviour -- "it is NOT dropped afterwards" --
     long after the code was corrected; this one pins the corrected claim."""
-    text = (ROOT / "skills/snowflake-smoke-test/SKILL.md").read_text()
+    text = (ROOT / "skills/snowflake-smoke-test/SKILL.md").read_text(encoding="utf-8")
     low = text.lower()
     assert "write-probe" in low
     assert "drop" in low or "remove" in low, "must say it cleans up after itself"
@@ -139,7 +139,7 @@ def test_smoke_skill_documents_the_write_probe_lifecycle():
 
 
 def test_notebook_skill_says_execution_is_the_users_call():
-    text = (ROOT / "skills/snowflake-clone-notebook/SKILL.md").read_text()
+    text = (ROOT / "skills/snowflake-clone-notebook/SKILL.md").read_text(encoding="utf-8")
     low = text.lower()
     assert "do not run it for them" in low
     assert "empty" in low, "must say the tables arrive with no rows"
@@ -148,7 +148,7 @@ def test_notebook_skill_says_execution_is_the_users_call():
 
 def test_every_skill_that_can_write_states_the_no_data_guarantee():
     for name in ("snowflake-medallion-clone", "snowflake-clone-notebook"):
-        low = (ROOT / "skills" / name / "SKILL.md").read_text().lower()
+        low = (ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8").lower()
         assert "no data" in low or "moves no data" in low or "copies no data" in low, name
 
 
@@ -157,7 +157,7 @@ def test_dialect_translation_reference_reports_honest_coverage():
     sys.path.insert(0, str(ROOT / "engine"))
     from snowflake_source.dialect.translate import coverage
 
-    text = (ROOT / "references/dialect-translation.md").read_text()
+    text = (ROOT / "references/dialect-translation.md").read_text(encoding="utf-8")
     c = coverage()
     assert f"Implemented ({c['implemented']})" in text
     assert f"({c['declared']})" in text
@@ -167,7 +167,7 @@ def test_dialect_translation_reference_reports_honest_coverage():
 
 
 def test_overview_states_the_source_read_only_guarantee_as_enforced():
-    text = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text()
+    text = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text(encoding="utf-8")
     low = text.lower()
     assert "enforced" in low
     assert "ever written to or dropped from the source" in low
@@ -180,7 +180,7 @@ def test_cleanup_checklist_covers_the_confidential_docs_and_the_history():
     A working-tree cleanup cannot close that, so the checklist has to keep
     saying so -- without naming the customer, since this is a public sample.
     """
-    text = (ROOT / "CLEANUP-BEFORE-PUBLISH.md").read_text()
+    text = (ROOT / "CLEANUP-BEFORE-PUBLISH.md").read_text(encoding="utf-8")
     assert "engagement docs" in text.lower()
     assert "history" in text.lower(), "must say the remote history still has it"
     assert "snowmig-config" in text, \
@@ -189,7 +189,7 @@ def test_cleanup_checklist_covers_the_confidential_docs_and_the_history():
 
 
 def test_readme_warns_before_publishing():
-    text = (ROOT / "README.md").read_text()
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "CLEANUP-BEFORE-PUBLISH.md" in text
     assert text.index("CLEANUP-BEFORE-PUBLISH.md") < 800, "must be near the top"
 
@@ -202,7 +202,7 @@ def test_assumptions_register_states_the_live_verified_split():
     then ENFORCED the stale claim, and correcting the document broke the
     suite. What is invariant is the split itself: the register must name the
     live-verified surfaces and the never-executed ones, in both directions."""
-    text = (ROOT / "ASSUMPTIONS.md").read_text()
+    text = (ROOT / "ASSUMPTIONS.md").read_text(encoding="utf-8")
     assert "Never contacted" not in text, \
         "AIDP has been contacted; the register must say so"
     low = text.lower()
@@ -219,7 +219,7 @@ def test_data_movement_reference_offers_at_least_three_options():
     sys.path.insert(0, str(ROOT / "engine"))
     from plan.data_movement import OPTIONS
 
-    text = (ROOT / "references/data-movement-options.md").read_text()
+    text = (ROOT / "references/data-movement-options.md").read_text(encoding="utf-8")
     assert len(OPTIONS) >= 3
     for o in OPTIONS:
         assert o["id"] in text, o["id"]
@@ -227,7 +227,7 @@ def test_data_movement_reference_offers_at_least_three_options():
 
 
 def test_overview_requires_the_options_to_be_presented_always():
-    text = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text()
+    text = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text(encoding="utf-8")
     flat = " ".join(text.lower().split())
     assert "always present the data-movement architecture options" in flat
     assert "undecided" in flat
@@ -235,7 +235,7 @@ def test_overview_requires_the_options_to_be_presented_always():
 
 
 def test_plan_skill_lists_every_option_with_a_stated_recommendation():
-    text = (ROOT / "skills/snowflake-migration-plan/SKILL.md").read_text()
+    text = (ROOT / "skills/snowflake-migration-plan/SKILL.md").read_text(encoding="utf-8")
     for opt in ("`A1`", "`A2`", "`A3`", "`A4`", "`A5`", "`A6`"):
         assert opt in text, opt
     # Collapse whitespace: markdown line wacmeng must not break a prose check.
@@ -246,7 +246,7 @@ def test_plan_skill_lists_every_option_with_a_stated_recommendation():
 
 
 def test_reference_carries_the_capability_matrix_and_build_notes():
-    text = (ROOT / "references/data-movement-options.md").read_text()
+    text = (ROOT / "references/data-movement-options.md").read_text(encoding="utf-8")
     assert "Capability matrix" in text
     assert "What each option would take to build" in text
     for cap in ("historic_bulk", "ongoing_incremental", "read_without_copy"):
@@ -256,14 +256,14 @@ def test_reference_carries_the_capability_matrix_and_build_notes():
 def test_skills_present_the_open_slot_as_a_valid_answer():
     for name in ("snowflake-migrator-overview", "snowflake-migration-plan"):
         flat = " ".join((ROOT / "skills" / name / "SKILL.md")
-                        .read_text().lower().split())
+                        .read_text(encoding="utf-8").lower().split())
         assert "a6" in flat, name
         assert "never paraphrase" in flat or "never mapped" in flat, name
 
 
 def test_no_skill_pushes_the_user_to_pick_from_the_listed_options():
     flat = " ".join((ROOT / "skills/snowflake-migration-plan/SKILL.md")
-                    .read_text().lower().split())
+                    .read_text(encoding="utf-8").lower().split())
     assert "real answer, not a fallback" in flat
 
 
@@ -293,7 +293,7 @@ def test_no_shipped_file_mentions_the_forked_source_platform():
         parts = set(rel.parts)
         if "tests" in parts or "__pycache__" in parts or ".pytest_cache" in parts:
             continue
-        low = path.read_text(errors="ignore").lower()
+        low = path.read_text(errors="ignore", encoding="utf-8").lower()
         for literal in allowed_literals:
             low = low.replace(literal, "")
         hits = [b for b in banned if b in low]
@@ -311,14 +311,14 @@ def test_every_cli_stage_is_invoked_by_at_least_one_skill():
     for `maintenance` the day it was added.
     """
     root = pathlib.Path(__file__).resolve().parents[2]
-    cli = (root / "engine" / "snowmig.py").read_text()
+    cli = (root / "engine" / "snowmig.py").read_text(encoding="utf-8")
     stages = set(re.findall(r'sub\.add_parser\(\s*"([a-z-]+)"', cli))
     assert stages, "no stages parsed -- the regex needs updating"
 
     invoked: set[str] = set()
     for path in list((root / "skills").rglob("SKILL.md")) + \
             list((root / "commands").glob("*.md")):
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         # Both invocation forms count: `snowmig.py <stage>` and the
         # launcher, `bin/snowmig <stage>`, which is what the docs now use.
         # `snowmig-test` cannot match -- the pattern needs whitespace
@@ -337,7 +337,7 @@ def test_the_readme_carries_a_runnable_from_zero_runbook():
     A fresh conversation has no memory of how the last migration was driven,
     so the sequence has to live in the repo, name the config file, and cover
     every stage that writes."""
-    text = (ROOT / "README.md").read_text()
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "How to run a migration, from zero" in text
     # The config file is the single place coordinates and secrets live.
     assert "snowmig-config.example.yaml" in text
@@ -357,7 +357,7 @@ def test_the_readme_carries_a_runnable_from_zero_runbook():
 
 
 def test_the_runbook_states_the_two_things_it_must_not_let_slide():
-    text = (ROOT / "README.md").read_text()
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
     low = text.lower()
     # A target catalog that exists as a CONTAINER only, and a cutover the
     # plugin cannot make consistent on its own.
@@ -376,7 +376,7 @@ def test_the_runbook_states_the_two_things_it_must_not_let_slide():
 
 
 def test_the_router_points_at_the_runbook():
-    text = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text()
+    text = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text(encoding="utf-8")
     assert "README.md" in text
     assert "from zero" in text.lower()
     # And names the config file as the first thing to establish.
@@ -394,7 +394,7 @@ def test_the_docs_say_where_each_credential_lives():
     for path in ("README.md",
                  "skills/snowflake-migrator-bootstrap/SKILL.md",
                  "snowmig-config.example.yaml"):
-        text = (ROOT / path).read_text()
+        text = (ROOT / path).read_text(encoding="utf-8")
         low = text.lower()
         # AIDP authentication is NOT this plugin's business.
         assert "~/.oci/config" in text, f"{path}: AIDP auth is the OCI config"
@@ -408,7 +408,7 @@ def test_the_docs_say_where_each_credential_lives():
 def test_the_docs_do_not_assume_the_user_is_inside_this_repo():
     """An installed plugin has no repo and no open folder: paths come from
     CLAUDE_PLUGIN_ROOT, and the config belongs in the working directory."""
-    text = (ROOT / "skills/snowflake-migrator-bootstrap/SKILL.md").read_text()
+    text = (ROOT / "skills/snowflake-migrator-bootstrap/SKILL.md").read_text(encoding="utf-8")
     assert "${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py" in text
     assert "init-config" in text, "must say how to create a config from nothing"
     low = text.lower()
@@ -424,7 +424,7 @@ def test_the_router_forbids_doing_the_engine_s_work_by_hand():
     must not fall back to hand-written SQL and ad-hoc API calls: that leaves
     an estate half-migrated with no artifact saying what happened.
     """
-    text = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text()
+    text = (ROOT / "skills/snowflake-migrator-overview/SKILL.md").read_text(encoding="utf-8")
     low = " ".join(text.lower().split())
     assert "never do by hand what a stage does" in low
     assert "do not re-implement a stage" in low

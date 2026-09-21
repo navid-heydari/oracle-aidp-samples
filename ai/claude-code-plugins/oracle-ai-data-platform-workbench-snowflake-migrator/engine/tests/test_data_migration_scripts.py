@@ -236,7 +236,7 @@ def test_a_report_from_a_different_target_is_not_reused(structure, tmp_path):
     # live, against an empty target schema.
     path = tmp_path / "structure_report_sales.json"
     path.write_text(json.dumps({"schema": "SALES", "target": "lake.old",
-                                "objects": {"T": {"status": "created"}}}))
+                                "objects": {"T": {"status": "created"}}}), encoding="utf-8")
     fresh = structure._load_report(path, "SALES", "lake.new")
     assert fresh["objects"] == {}
     assert fresh["target"] == "lake.new"
@@ -247,7 +247,7 @@ def test_a_report_from_a_different_target_is_not_reused(structure, tmp_path):
 def test_a_report_for_the_same_target_is_resumed(structure, tmp_path):
     path = tmp_path / "structure_report_sales.json"
     path.write_text(json.dumps({"schema": "SALES", "target": "lake.new",
-                                "objects": {"T": {"status": "created"}}}))
+                                "objects": {"T": {"status": "created"}}}), encoding="utf-8")
     prior = structure._load_report(path, "SALES", "lake.new")
     assert prior["objects"]["T"]["status"] == "created"
 
@@ -332,7 +332,7 @@ def test_a_table_a_report_claims_but_the_catalog_lacks_is_flagged(reconcile,
                                                                   tmp_path):
     (tmp_path / "copy_report_sales.json").write_text(json.dumps(
         {"schema": "SALES", "target": "lake.sales",
-         "tables": {"ORDERS": {"status": "verified"}}}))
+         "tables": {"ORDERS": {"status": "verified"}}}), encoding="utf-8")
     manifest = {"schemas": [{"name": "SALES",
                              "tables": [{"name": "ORDERS", "columns": []}],
                              "views": [], "errors": []}]}
@@ -411,7 +411,7 @@ def test_the_one_migration_config_is_read_as_uploaded(source_helpers, tmp_path):
         "snowflake": {"account": "ACC", "warehouse": "WH", "database": "DB",
                       "user": "u", "auth": "password", "password": "p"},
         "aidp": {"datalake_ocid": "ocid1.aidataplatform.oc1..x"},
-    }))
+    }), encoding="utf-8")
     loaded = source_helpers.load_source_config(cfg)
     assert loaded["account"] == "ACC"
     assert loaded["auth"] == "password"
@@ -424,7 +424,7 @@ def test_a_flat_source_config_still_loads(source_helpers, tmp_path):
     cfg = tmp_path / "source.json"
     cfg.write_text(json.dumps({"account": "ACC", "warehouse": "WH",
                                "database": "DB", "user": "u",
-                               "auth": "password"}))
+                               "auth": "password"}), encoding="utf-8")
     assert source_helpers.load_source_config(cfg)["account"] == "ACC"
 
 

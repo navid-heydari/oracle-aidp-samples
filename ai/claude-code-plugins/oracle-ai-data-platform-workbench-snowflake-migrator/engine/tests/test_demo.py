@@ -42,9 +42,9 @@ def test_the_demo_writes_every_production_artifact(demo):
 
 def test_the_demo_is_unmistakably_marked_as_emulated(demo):
     out, _ = demo
-    marker = json.loads((out / "emulation.json").read_text())
+    marker = json.loads((out / "emulation.json").read_text(encoding="utf-8"))
     assert marker["emulated"] is True
-    text = (out / "DEMO.md").read_text()
+    text = (out / "DEMO.md").read_text(encoding="utf-8")
     assert "EMULATED" in text.splitlines()[0], \
         "the banner must be the first thing a reader sees"
     assert "No Snowflake account and no AIDP DataLake were contacted" in text
@@ -52,7 +52,7 @@ def test_the_demo_is_unmistakably_marked_as_emulated(demo):
 
 def test_the_demo_estate_teaches_the_blocking_lessons(demo):
     out, _ = demo
-    plan = json.loads((out / "plan.json").read_text())
+    plan = json.loads((out / "plan.json").read_text(encoding="utf-8"))
     cannot = {r["source_identifier"]: r["category"]
               for r in plan["cannot_migrate"]}
     assert cannot["SNOWDEMO.SALES.EVENTS_RAW"] == "unmapped_type"
@@ -63,7 +63,7 @@ def test_the_demo_estate_teaches_the_blocking_lessons(demo):
 
 def test_the_demo_deploy_demonstrates_the_live_learned_behaviours(demo):
     out, result = demo
-    deployed = json.loads((out / "deploy_result.json").read_text())
+    deployed = json.loads((out / "deploy_result.json").read_text(encoding="utf-8"))
     assert deployed["catalog_type"] == "INTERNAL"
     assert sorted(deployed["verified_targets"]) == [
         "SNOWDEMO.SALES.CUSTOMERS", "SNOWDEMO.SALES.ORDERS"]
@@ -79,18 +79,18 @@ def test_the_demo_deploy_demonstrates_the_live_learned_behaviours(demo):
 
 def test_the_demo_security_and_census_lessons_fire(demo):
     out, _ = demo
-    sec = json.loads((out / "security.json").read_text())
+    sec = json.loads((out / "security.json").read_text(encoding="utf-8"))
     assert sec["exposure_count"] == 1
     assert sec["exposures"][0]["object"] == "SNOWDEMO.SALES.CUSTOMERS"
     assert len(sec["secure_views"]) == 1
-    inv = json.loads((out / "inventory.json").read_text())
+    inv = json.loads((out / "inventory.json").read_text(encoding="utf-8"))
     kinds = inv["census"]["by_kind"]
     assert kinds.get("TASK") == 1 and kinds.get("STREAM") == 1
 
 
 def test_the_demo_smoke_passes_and_the_probe_cleans_up(demo):
     out, _ = demo
-    smoke = json.loads((out / "smoke.json").read_text())
+    smoke = json.loads((out / "smoke.json").read_text(encoding="utf-8"))
     assert smoke["ok"] is True
     assert smoke["destination"]["write_verified"] is True
     assert smoke["destination"]["left_behind"] == []
@@ -99,7 +99,7 @@ def test_the_demo_smoke_passes_and_the_probe_cleans_up(demo):
 
 def test_the_demo_registers_and_verifies_the_external_catalog(demo):
     out, _ = demo
-    cat = json.loads((out / "catalog_result.json").read_text())
+    cat = json.loads((out / "catalog_result.json").read_text(encoding="utf-8"))
     assert cat["catalog"] == DEMO_EXTERNAL_CATALOG
     assert cat["action"] == "created"
     assert cat["verified"] is True

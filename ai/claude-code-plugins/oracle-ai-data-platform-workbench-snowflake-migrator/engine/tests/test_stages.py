@@ -10,7 +10,7 @@ from report.render import render_stages
 
 
 def _write(tmp, name, payload):
-    (tmp / name).write_text(json.dumps(payload))
+    (tmp / name).write_text(json.dumps(payload), encoding="utf-8")
 
 
 def test_every_stage_is_listed_even_on_an_empty_directory(tmp_path):

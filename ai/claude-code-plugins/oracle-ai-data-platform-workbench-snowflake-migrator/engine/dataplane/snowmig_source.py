@@ -66,7 +66,7 @@ def load_source_config(path: str | pathlib.Path) -> dict:
     """Read the Snowflake connection config (JSON) from the workspace."""
     p = pathlib.Path(path).expanduser()
     try:
-        text = p.read_text()
+        text = p.read_text(encoding="utf-8")
     except OSError as exc:
         raise SourceConfigError(
             f"source config not readable at {p}: {exc.strerror}") from exc
@@ -160,7 +160,7 @@ class SnowflakeSource:
                 return str(cfg[inline])
             if cfg.get(path_field):
                 return pathlib.Path(
-                    str(cfg[path_field])).expanduser().read_text().strip()
+                    str(cfg[path_field])).expanduser().read_text(encoding="utf-8").strip()
             return None
 
         auth = str(cfg["auth"]).strip().lower()

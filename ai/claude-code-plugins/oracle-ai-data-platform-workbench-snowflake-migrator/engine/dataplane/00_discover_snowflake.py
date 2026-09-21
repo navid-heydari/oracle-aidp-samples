@@ -295,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = {"schemas": []}
     if manifest_path.exists() and not args.force:
-        existing = json.loads(manifest_path.read_text())
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         if existing.get("source_identity") not in (None, identity):
             return fail(f"error: {manifest_path} describes "
                   f"{existing.get('source_identity')!r}, not {identity!r}. "
@@ -343,12 +343,12 @@ def main(argv: list[str] | None = None) -> int:
                 [s for s in manifest["schemas"] if s["name"] != schema]
                 + [record], key=lambda s: s["name"])
             # Flush after EVERY schema: a large estate resumes, not restarts.
-            manifest_path.write_text(json.dumps(manifest, indent=2))
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             log(f"{schema}: {len(record['tables'])} table(s), "
                 f"{len(record['views'])} view(s)")
 
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    (reports / "DISCOVERY.md").write_text(render_summary(manifest))
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (reports / "DISCOVERY.md").write_text(render_summary(manifest), encoding="utf-8")
     total = sum(len(s["tables"]) for s in manifest["schemas"])
     log(f"{len(manifest['schemas'])} schema(s), {total} table(s) "
         f"-> {manifest_path}")

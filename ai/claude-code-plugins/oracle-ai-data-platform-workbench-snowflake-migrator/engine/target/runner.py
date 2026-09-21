@@ -28,7 +28,7 @@ class BackendError(RuntimeError):
 
 
 def _default_run_process(cmd: list[str]):
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+    return subprocess.run(cmd, capture_output=True, text=True, check=False, encoding="utf-8", errors="replace")
 
 
 def make_run_sql(target, *, backend: str,
@@ -99,7 +99,7 @@ def make_call(target, *, backend: str, run_process=None):
                 and "connectionDetails" in body:
             fd, spooled = tempfile.mkstemp(prefix="snowmig_catalog_",
                                            suffix=".json")
-            with os.fdopen(fd, "w") as fh:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(body, fh)
             kwargs = {**kwargs, "body_file": spooled}
         try:

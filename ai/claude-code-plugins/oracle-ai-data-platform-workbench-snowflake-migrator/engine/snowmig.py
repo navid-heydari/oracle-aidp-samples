@@ -113,15 +113,15 @@ def _read(out_dir: pathlib.Path, name: str) -> dict:
     if not path.is_file():
         raise FileNotFoundError(
             f"{name} not found in {out_dir}. Run the earlier stage first.")
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _write(out_dir: pathlib.Path, name: str, payload) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     if isinstance(payload, str):
-        (out_dir / name).write_text(payload)
+        (out_dir / name).write_text(payload, encoding="utf-8")
     else:
-        (out_dir / name).write_text(json.dumps(payload, indent=2, default=str))
+        (out_dir / name).write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     print(f"  -> {out_dir / name}")
 
 
@@ -235,7 +235,7 @@ def _run_sql_from_args(args):
         if existing or not value:
             return existing
         fd, path = tempfile.mkstemp(prefix="snowmig_secret_")
-        with os.fdopen(fd, "w") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(value)
         spooled.append(path)
         return path
@@ -331,7 +331,7 @@ def cmd_ingest(args) -> int:
             f"workspace by the discovery workflow (runbook S6); download it "
             f"from backup-snowflake-migration/reports/ first.")
 
-    manifest = json.loads(manifest_path.read_text())
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     inv = inventory_from_manifest(
         manifest, database=args.database_name,
         semi_structured=args.semi_structured, geospatial=args.geospatial,
@@ -561,7 +561,7 @@ def cmd_plan(args) -> int:
     out = pathlib.Path(args.out_dir)
     inv = _read(out, "inventory.json")
     deps = _read(out, "dependencies.json")
-    restrictions = (json.loads(pathlib.Path(args.restrictions).read_text())
+    restrictions = (json.loads(pathlib.Path(args.restrictions).read_text(encoding="utf-8"))
                     if args.restrictions else None)
     # A recorded architecture choice, if the data-options stage has been run.
     choice = None
@@ -1084,7 +1084,7 @@ def cmd_notebook(args) -> int:
         return 0
 
     import subprocess
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False, encoding="utf-8", errors="replace")
     if proc.returncode != 0:
         print(f"error: upload failed: {(proc.stderr or '')[:400]}", file=sys.stderr)
         return 1
@@ -1129,7 +1129,7 @@ def cmd_data_options(args) -> int:
             custom = {
                 "name": args.custom_name,
                 "description": pathlib.Path(
-                    args.custom_description_file).read_text().strip()}
+                    args.custom_description_file).read_text(encoding="utf-8").strip()}
         payload["choice"] = record_choice(
             args.choose, chosen_by=args.chosen_by, rationale=args.rationale,
             custom_architecture=custom)
@@ -1820,7 +1820,7 @@ def prepare_out_dir(path: str | pathlib.Path) -> pathlib.Path:
     if out.resolve() == default_out_dir().resolve():
         readme = out / "README.md"
         if not readme.exists():
-            readme.write_text(_ARTIFACTS_README)
+            readme.write_text(_ARTIFACTS_README, encoding="utf-8")
         ignore = out / ".gitignore"
         if not ignore.exists():
             # Ignore everything here, including this rule: the contents name
@@ -1828,11 +1828,26 @@ def prepare_out_dir(path: str | pathlib.Path) -> pathlib.Path:
             ignore.write_text(
                 "# Generated migrator output: never committed.\n"
                 "# Contents name a real Snowflake estate.\n"
-                "*\n")
+                "*\n", encoding="utf-8")
     return out
 
 
+def _utf8_streams() -> None:
+    """Reports use → — · and friends. On Windows a piped stdout is cp1252 and
+    print() would raise UnicodeEncodeError half-way through a stage; artifacts
+    are written with an explicit encoding, so the streams get the same."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _utf8_streams()
     args = build_parser().parse_args(argv)
     if getattr(args, "out_dir", None) is None:
         args.out_dir = str(default_out_dir())

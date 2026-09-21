@@ -132,8 +132,8 @@ def write_template(destination: pathlib.Path, *,
     # Create it closed, THEN fill it: a chmod after the write leaves a window
     # where the secret-bearing file is readable by everyone.
     fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(pathlib.Path(template).read_text())
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(pathlib.Path(template).read_text(encoding="utf-8"))
     os.chmod(destination, 0o600)
     return destination
 
@@ -142,7 +142,7 @@ def load_config(path: str | pathlib.Path) -> dict:
     """Parse the migration config. Never guesses a location."""
     p = pathlib.Path(path).expanduser()
     try:
-        text = p.read_text()
+        text = p.read_text(encoding="utf-8")
     except OSError as exc:
         raise ConfigError(
             f"config not readable at {p}: {exc.strerror}") from exc
@@ -209,7 +209,7 @@ def resolve_secret(block: dict, inline: str, path_field: str) -> str | None:
         return None
     p = pathlib.Path(str(path)).expanduser()
     try:
-        return p.read_text().strip()
+        return p.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise ConfigError(
             f"`{path_field}` points at {p}, which is not readable: "

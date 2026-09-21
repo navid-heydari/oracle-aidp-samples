@@ -166,7 +166,7 @@ def test_the_spooled_body_file_is_removed_after_the_call():
         path = next(a[len("file://"):] for a in cmd if a.startswith("file://"))
         seen["path"] = path
         assert os.path.exists(path), "the file must exist while the CLI runs"
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             assert _SECRET in fh.read(), "the CLI reads the real body"
         return types.SimpleNamespace(
             returncode=0, stdout=json.dumps({"data": {"key": "k"}}), stderr="")

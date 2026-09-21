@@ -68,7 +68,7 @@ class Fake:
             # notebook to a temp file and unlinks it immediately after, so a
             # double that only remembers the path has nothing to read later.
             try:
-                body = pathlib.Path(kw["local_path"]).read_text()
+                body = pathlib.Path(kw["local_path"]).read_text(encoding="utf-8")
             except OSError:
                 body = None
             self.contents[kw["path"]] = {"type": "FILE",
@@ -95,7 +95,7 @@ def scripts(tmp_path):
     for name in ("00_discover_snowflake.py", "01_create_structure.py",
                  "02_copy_schema.py", "03_reconcile.py"):
         path = tmp_path / name
-        path.write_text("# script body\n")
+        path.write_text("# script body\n", encoding="utf-8")
         out.append(path)
     return out
 
@@ -270,7 +270,7 @@ def test_an_existing_job_is_reused(scripts):
 
 def test_libraries_come_from_the_requirements_file(scripts, tmp_path):
     req = tmp_path / "requirements-aidp.txt"
-    req.write_text("# comment\nsnowflake-connector-python>=4.7.0\n")
+    req.write_text("# comment\nsnowflake-connector-python>=4.7.0\n", encoding="utf-8")
     fake = Fake()
     provision(call=fake, workspace_name="acme", scripts=scripts,
               requirements=req, execute=True, delays=())
@@ -284,7 +284,7 @@ def test_libraries_come_from_the_requirements_file(scripts, tmp_path):
 
 def test_an_all_comments_requirements_file_installs_nothing(scripts, tmp_path):
     req = tmp_path / "requirements-aidp.txt"
-    req.write_text("# nothing enabled\n")
+    req.write_text("# nothing enabled\n", encoding="utf-8")
     fake = Fake()
     provision(call=fake, workspace_name="acme", scripts=scripts,
               requirements=req, execute=True, delays=())

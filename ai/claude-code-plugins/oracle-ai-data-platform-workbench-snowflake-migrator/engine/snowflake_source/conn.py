@@ -89,7 +89,7 @@ def assert_read_only(sql: str) -> None:
 def _read_secret_file(path: str, label: str) -> str:
     p = pathlib.Path(path).expanduser()
     try:
-        return p.read_text().strip()
+        return p.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise AuthError(f"{label} not readable at {path}: {exc.strerror}") from exc
 

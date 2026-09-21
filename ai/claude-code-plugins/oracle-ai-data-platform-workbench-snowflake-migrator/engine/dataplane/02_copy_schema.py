@@ -240,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
         return fail("error: source and target catalog are the same.")
 
     reports = pathlib.Path(args.reports_dir)
-    manifest = json.loads((reports / MANIFEST_NAME).read_text())
+    manifest = json.loads((reports / MANIFEST_NAME).read_text(encoding="utf-8"))
     record = next((s for s in manifest["schemas"] if s["name"] == args.schema),
                   None)
     if record is None:
@@ -251,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
     target = f"{args.target_catalog}.{target_schema}"
     report = {"schema": args.schema, "tables": {}, "target": target}
     if path.exists():
-        prior = json.loads(path.read_text())
+        prior = json.loads(path.read_text(encoding="utf-8"))
         # Resumability is keyed by SOURCE schema, so a report written against
         # a DIFFERENT target must not let this run skip copies as already
         # verified (the same trap the structure script hit live).
@@ -260,7 +260,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"{target} — starting a fresh record for this target")
             path.with_suffix(
                 f".{prior['target'].replace('.', '_')}.json").write_text(
-                    json.dumps(prior, indent=2))
+                    json.dumps(prior, indent=2), encoding="utf-8")
         else:
             report = prior
             report["target"] = target
@@ -286,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
         structure_path = reports / f"structure_report_{args.schema.lower()}.json"
         created = []
         if structure_path.is_file():
-            prior = json.loads(structure_path.read_text())
+            prior = json.loads(structure_path.read_text(encoding="utf-8"))
             if prior.get("target") in (None, target):
                 created = [n for n, rec in (prior.get("objects") or {}).items()
                            if rec.get("status") == "created"]
@@ -338,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
         report["tables"][name] = result
         report["updated_at"] = datetime.datetime.now(
             datetime.timezone.utc).isoformat()
-        path.write_text(json.dumps(report, indent=2))
+        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         log(f"{args.schema}.{name}: {result['status']} "
             f"({result.get('target_count', '?')} row(s))")
 

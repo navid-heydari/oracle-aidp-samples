@@ -93,7 +93,7 @@ def _load(out_dir: pathlib.Path, name: str):
     if path.suffix != ".json":
         return {"_exists": True}
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {"_unreadable": True}
 

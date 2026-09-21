@@ -104,7 +104,7 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
     from .executor import parse_cli_json
 
     def _run(cmd):
-        return subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return subprocess.run(cmd, capture_output=True, text=True, check=False, encoding="utf-8", errors="replace")
 
     runner = run_process or _run
 
@@ -178,7 +178,7 @@ def _pypi_from_requirements(path: pathlib.Path | None) -> list[str]:
     if path is None or not path.is_file():
         return []
     out = []
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             out.append(line)
@@ -462,7 +462,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
             nb = build_stage_notebook(stage, overrides=defaults)
             fd, local = tempfile.mkstemp(prefix="snowmig_stage_",
                                          suffix=".ipynb")
-            with os.fdopen(fd, "w") as fh:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(nb, fh, indent=1)
             try:
                 call("upload_ws_file", workspace=ws_key, path=notebook_path,

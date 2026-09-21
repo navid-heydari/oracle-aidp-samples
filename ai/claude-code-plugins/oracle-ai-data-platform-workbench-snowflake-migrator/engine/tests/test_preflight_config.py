@@ -18,7 +18,7 @@ from plan.preflight import (
 
 def _config(tmp_path, **overrides):
     key = tmp_path / "rsa.p8"
-    key.write_text("-----BEGIN PRIVATE KEY-----\nSUPERSECRET\n")
+    key.write_text("-----BEGIN PRIVATE KEY-----\nSUPERSECRET\n", encoding="utf-8")
     base = {"account": "ORG-ACC", "user": "SVC", "warehouse": "WH",
             "database": "SALES_DB", "role": "READER", "auth": "keypair",
             "key_path": str(key)}
@@ -159,7 +159,7 @@ def test_a_new_config_is_created_unreadable_to_others(tmp_path):
     import stat
     from migration_config import write_template
     template = tmp_path / "template.yaml"
-    template.write_text("snowflake:\n  account: X\n")
+    template.write_text("snowflake:\n  account: X\n", encoding="utf-8")
     written = write_template(tmp_path / "snowmig-config.yaml",
                              template=template)
     mode = stat.S_IMODE(written.stat().st_mode)
@@ -169,26 +169,26 @@ def test_a_new_config_is_created_unreadable_to_others(tmp_path):
 def test_it_refuses_to_overwrite_a_config_that_holds_credentials(tmp_path):
     from migration_config import ConfigError, write_template
     template = tmp_path / "template.yaml"
-    template.write_text("snowflake: {}\n")
+    template.write_text("snowflake: {}\n", encoding="utf-8")
     target = tmp_path / "snowmig-config.yaml"
-    target.write_text("snowflake:\n  password: real-one\n")
+    target.write_text("snowflake:\n  password: real-one\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="refusing to overwrite"):
         write_template(target, template=template)
-    assert "real-one" in target.read_text(), "the existing file is untouched"
+    assert "real-one" in target.read_text(encoding="utf-8"), "the existing file is untouched"
     # --force is the explicit way through.
     write_template(target, template=template, overwrite=True)
-    assert "real-one" not in target.read_text()
+    assert "real-one" not in target.read_text(encoding="utf-8")
 
 
 def test_discovery_prefers_the_working_directory_over_the_plugin(tmp_path):
     from migration_config import discover_config
     cwd, plugin = tmp_path / "work", tmp_path / "plugin"
     cwd.mkdir(), plugin.mkdir()
-    (plugin / "snowmig-config.yaml").write_text("snowflake: {}\n")
+    (plugin / "snowmig-config.yaml").write_text("snowflake: {}\n", encoding="utf-8")
     # With only the plugin's copy, that is what is found.
     assert discover_config(cwd=cwd, plugin_root=plugin).parent == plugin
     # The operator's own file wins as soon as it exists.
-    (cwd / "snowmig-config.yaml").write_text("snowflake: {}\n")
+    (cwd / "snowmig-config.yaml").write_text("snowflake: {}\n", encoding="utf-8")
     assert discover_config(cwd=cwd, plugin_root=plugin).parent == cwd
 
 
@@ -219,7 +219,7 @@ def test_a_secret_is_never_rendered(tmp_path):
 def test_inline_and_path_together_are_refused_not_ranked(tmp_path):
     from migration_config import ConfigError, resolve_secret
     secret = tmp_path / "pw"
-    secret.write_text("from-file")
+    secret.write_text("from-file", encoding="utf-8")
     with pytest.raises(ConfigError, match="keep one"):
         resolve_secret({"password": "inline", "password_path": str(secret)},
                        "password", "password_path")

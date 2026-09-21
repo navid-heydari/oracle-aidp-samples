@@ -73,9 +73,9 @@ def _write(out: pathlib.Path, name: str, payload) -> pathlib.Path:
     out.mkdir(parents=True, exist_ok=True)
     path = out / name
     if isinstance(payload, str):
-        path.write_text(payload)
+        path.write_text(payload, encoding="utf-8")
     else:
-        path.write_text(json.dumps(payload, indent=2, default=str))
+        path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     return path
 
 

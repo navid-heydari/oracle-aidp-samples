@@ -40,7 +40,7 @@ def test_externalbrowser_sets_the_authenticator():
 
 def test_pat_reads_the_token_from_a_file(tmp_path):
     f = tmp_path / "pat"
-    f.write_text("  tok-abc123  \n")
+    f.write_text("  tok-abc123  \n", encoding="utf-8")
     kw = build_connect_kwargs("pat", account=ACC, user="u", pat_path=str(f))
     assert kw["authenticator"] == "PROGRAMMATIC_ACCESS_TOKEN"
     assert kw["password"] == "tok-abc123", "token must be stripped"
@@ -48,7 +48,7 @@ def test_pat_reads_the_token_from_a_file(tmp_path):
 
 def test_password_read_from_file_not_taken_inline(tmp_path):
     f = tmp_path / "pw"
-    f.write_text("s3cret\n")
+    f.write_text("s3cret\n", encoding="utf-8")
     kw = build_connect_kwargs("password", account=ACC, user="u", password_path=str(f))
     assert kw["password"] == "s3cret"
 

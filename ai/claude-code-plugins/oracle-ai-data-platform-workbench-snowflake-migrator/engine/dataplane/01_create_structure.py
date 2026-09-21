@@ -83,14 +83,14 @@ def _load_report(path: pathlib.Path, schema: str, target: str) -> dict:
     """
     if not path.exists():
         return {"schema": schema, "objects": {}, "target": target}
-    prior = json.loads(path.read_text())
+    prior = json.loads(path.read_text(encoding="utf-8"))
     if prior.get("target") and prior["target"] != target:
         log(f"{schema}: the previous report targeted {prior['target']}, not "
             f"{target} — starting a fresh record for this target (the old "
             f"one is kept at {path.name}.{prior['target'].replace('.', '_')})")
         path.with_suffix(
             f".{prior['target'].replace('.', '_')}.json").write_text(
-                json.dumps(prior, indent=2))
+                json.dumps(prior, indent=2), encoding="utf-8")
         return {"schema": schema, "objects": {}, "target": target}
     return prior
 
@@ -197,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         return fail("error: --target-schema needs exactly one --schema")
 
     reports = pathlib.Path(args.reports_dir)
-    manifest = json.loads((reports / MANIFEST_NAME).read_text())
+    manifest = json.loads((reports / MANIFEST_NAME).read_text(encoding="utf-8"))
     by_name = {s["name"]: s for s in manifest["schemas"]}
     schemas = args.schema or sorted(by_name)
 
@@ -213,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
                         f"not there. Run the migrator's `ddl` stage and let "
                         f"`provision` upload it, or pass --ddl-plan")
         planned_columns = columns_from_ddl_plan(
-            json.loads(ddl_path.read_text()))
+            json.loads(ddl_path.read_text(encoding="utf-8")))
         log(f"ddl plan: {len(planned_columns)} table(s) with engine-"
             f"translated types, from {ddl_path}")
 
@@ -273,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
                                       "columns for this table -- the engine "
                                       "either blocked it or it was outside "
                                       "the plan's scope. NOT created."}
-                        path.write_text(json.dumps(report, indent=2))
+                        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
                         log(f"{schema}.{name}: not in the approved plan")
                         continue
                     create_table_from_columns(spark, columns,
@@ -301,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
                 log(f"{schema}.{name}: FAILED — {str(exc)[:200]}")
             report["updated_at"] = datetime.datetime.now(
                 datetime.timezone.utc).isoformat()
-            path.write_text(json.dumps(report, indent=2))
+            path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
         counts = {}
         for obj in report["objects"].values():

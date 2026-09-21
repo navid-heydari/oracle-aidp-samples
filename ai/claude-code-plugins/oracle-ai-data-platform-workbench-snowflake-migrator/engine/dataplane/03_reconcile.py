@@ -61,7 +61,7 @@ def fail(msg: str) -> int:
 
 def _load(reports: pathlib.Path, name: str) -> dict | None:
     path = reports / name
-    return json.loads(path.read_text()) if path.exists() else None
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
 
 def _live_tables(spark, catalog: str, schema: str) -> set[str] | None:
@@ -208,8 +208,8 @@ def main(argv: list[str] | None = None) -> int:
     rec = reconcile(spark, manifest=manifest,
                     target_catalog=args.target_catalog, reports=reports,
                     counts=args.counts)
-    (reports / "reconciliation.json").write_text(json.dumps(rec, indent=2))
-    (reports / "MIGRATION_REPORT.md").write_text(render(rec))
+    (reports / "reconciliation.json").write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    (reports / "MIGRATION_REPORT.md").write_text(render(rec), encoding="utf-8")
     log(f"totals: {rec['totals']}")
     log(f"-> {reports / 'MIGRATION_REPORT.md'}")
 

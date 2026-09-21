@@ -60,7 +60,7 @@ def auth_args():
 def test_assess_finds_tables_and_views(out):
     rc = main(["assess", "--out-dir", str(out), "--database", DB] + auth_args())
     assert rc == 0, "exit 3 would mean an identifier-case collision"
-    inv = json.loads((out / "inventory.json").read_text())
+    inv = json.loads((out / "inventory.json").read_text(encoding="utf-8"))
     assert inv["counts_by_type"].get("TABLE", 0) >= 1
     assert inv["counts_by_type"].get("VIEW", 0) >= 1
     assert inv["extraction_notes"] == []
@@ -77,7 +77,7 @@ def test_assess_finds_tables_and_views(out):
 
 
 def test_decimal_columns_map_with_precision(out):
-    inv = json.loads((out / "inventory.json").read_text())
+    inv = json.loads((out / "inventory.json").read_text(encoding="utf-8"))
     decimals = [c for r in inv["inventory"] for c in r["columns"]
                 if (c.get("DATA_TYPE") or "").upper() == "NUMBER"]
     assert decimals, "the estate should contain NUMBER columns"
@@ -87,7 +87,7 @@ def test_decimal_columns_map_with_precision(out):
 
 
 def test_timestamp_ntz_maps_to_ntz(out):
-    inv = json.loads((out / "inventory.json").read_text())
+    inv = json.loads((out / "inventory.json").read_text(encoding="utf-8"))
     ntz = [c for r in inv["inventory"] for c in r["columns"]
            if (c.get("DATA_TYPE") or "").upper() == "TIMESTAMP_NTZ"]
     assert ntz, "the estate should contain TIMESTAMP_NTZ columns"
@@ -96,10 +96,10 @@ def test_timestamp_ntz_maps_to_ntz(out):
 
 def test_deps_and_plan(out):
     assert main(["deps", "--out-dir", str(out)] + auth_args()) == 0
-    deps = json.loads((out / "dependencies.json").read_text())
+    deps = json.loads((out / "dependencies.json").read_text(encoding="utf-8"))
     assert deps["source_used"] in ("account_usage", "parsed_ddl")
     assert main(["plan", "--out-dir", str(out)]) == 0
-    plan = json.loads((out / "plan.json").read_text())
+    plan = json.loads((out / "plan.json").read_text(encoding="utf-8"))
     assert plan["waves"], "at least one wave expected"
     assert plan["clone_targets"], "objects should be clone targets"
     # Bronze mirrors the source, so the target name equals the source name --
@@ -117,8 +117,8 @@ def test_deps_and_plan(out):
 
 
 def test_view_lands_after_its_base_tables(out):
-    plan = json.loads((out / "plan.json").read_text())
-    deps = json.loads((out / "dependencies.json").read_text())
+    plan = json.loads((out / "plan.json").read_text(encoding="utf-8"))
+    deps = json.loads((out / "dependencies.json").read_text(encoding="utf-8"))
     if not deps["edges"]:
         pytest.skip("no edges resolved; ordering assertion not meaningful")
     wave_of = {n: i for i, w in enumerate(plan["waves"]) for n in w}
@@ -129,7 +129,7 @@ def test_view_lands_after_its_base_tables(out):
 
 def test_ddl_generates_delta_tables_and_views_and_no_replace(out):
     assert main(["ddl", "--out-dir", str(out)]) == 0
-    ddl = json.loads((out / "ddl_plan.json").read_text())
+    ddl = json.loads((out / "ddl_plan.json").read_text(encoding="utf-8"))
     assert ddl["statements"]
     kinds = {s["object_type"] for s in ddl["statements"]}
     assert "TABLE" in kinds
@@ -143,7 +143,7 @@ def test_ddl_generates_delta_tables_and_views_and_no_replace(out):
 
 
 def test_the_view_is_emitted_after_its_base_tables(out):
-    ddl = json.loads((out / "ddl_plan.json").read_text())
+    ddl = json.loads((out / "ddl_plan.json").read_text(encoding="utf-8"))
     kinds = [s["object_type"] for s in ddl["statements"]]
     if "VIEW" not in kinds:
         pytest.skip("estate has no migratable view")
@@ -152,7 +152,7 @@ def test_the_view_is_emitted_after_its_base_tables(out):
 
 
 def test_silver_and_gold_jobs_are_planned_but_disabled(out):
-    plan = json.loads((out / "plan.json").read_text())
+    plan = json.loads((out / "plan.json").read_text(encoding="utf-8"))
     jobs = plan["silver_gold_jobs"]
     assert jobs, "one silver + one gold job per migratable schema"
     assert all(j["enabled"] is False for j in jobs)
@@ -161,7 +161,7 @@ def test_silver_and_gold_jobs_are_planned_but_disabled(out):
 
 def test_compute_proposal_maps_warehouses_to_clusters(out):
     assert main(["compute", "--out-dir", str(out)] + auth_args()) == 0
-    sizing = json.loads((out / "compute.json").read_text())
+    sizing = json.loads((out / "compute.json").read_text(encoding="utf-8"))
     assert sizing["warehouse_count"] >= 1
     assert sizing["proposals"], "at least one cluster proposal"
     for p in sizing["proposals"]:
@@ -173,7 +173,7 @@ def test_compute_proposal_maps_warehouses_to_clusters(out):
 
 def test_deploy_dry_run_creates_nothing(out):
     assert main(["deploy", "--out-dir", str(out)]) == 0
-    res = json.loads((out / "deploy_result.json").read_text())
+    res = json.loads((out / "deploy_result.json").read_text(encoding="utf-8"))
     assert res["dry_run"] is True and res["executed"] == 0
 
 
@@ -289,7 +289,7 @@ def test_census_and_security_stages_run_live(tmp_path):
     assert main(["assess", "--out-dir", str(out), "--database", DB]
                 + auth_args()) == 0
 
-    inv = json.loads((out / "inventory.json").read_text())
+    inv = json.loads((out / "inventory.json").read_text(encoding="utf-8"))
     census = inv.get("census")
     assert census is not None, "the census must run inside assess by default"
     # Every declared kind is accounted for, readable or explicitly not.
@@ -303,7 +303,7 @@ def test_census_and_security_stages_run_live(tmp_path):
         assert obj["migratable"] is False
 
     assert main(["security", "--out-dir", str(out)] + auth_args()) == 0
-    sec = json.loads((out / "security.json").read_text())
+    sec = json.loads((out / "security.json").read_text(encoding="utf-8"))
     assert (out / "SECURITY.md").exists()
     if sec["exposure_count"] is None:
         assert "could not" in sec["statement"].lower()
@@ -320,7 +320,7 @@ def test_maintenance_stage_runs_live(tmp_path):
     assert main(["assess", "--out-dir", str(out), "--database", DB]
                 + auth_args()) == 0
     assert main(["maintenance", "--out-dir", str(out)] + auth_args()) == 0
-    maint = json.loads((out / "maintenance.json").read_text())
+    maint = json.loads((out / "maintenance.json").read_text(encoding="utf-8"))
     assert (out / "MAINTENANCE.md").exists()
     # Reports, never proposes.
     assert "RETAIN" not in json.dumps(maint).upper()

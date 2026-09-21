@@ -20,7 +20,7 @@ DEPS = {"edges": [], "source_used": "parsed_ddl", "coverage_note": "views only"}
 
 def write(tmp, name, payload):
     p = tmp / name
-    p.write_text(json.dumps(payload))
+    p.write_text(json.dumps(payload), encoding="utf-8")
     return p
 
 
@@ -29,16 +29,16 @@ def test_plan_subcommand_writes_both_artifacts(tmp_path):
     write(tmp_path, "dependencies.json", DEPS)
     rc = main(["plan", "--out-dir", str(tmp_path)])
     assert rc == 0
-    plan = json.loads((tmp_path / "plan.json").read_text())
+    plan = json.loads((tmp_path / "plan.json").read_text(encoding="utf-8"))
     assert plan["clone_targets"] == ["D.PUBLIC.ORDERS"]
-    assert "planned to move" in (tmp_path / "PLANNED_OBJECTS.md").read_text().lower()
+    assert "planned to move" in (tmp_path / "PLANNED_OBJECTS.md").read_text(encoding="utf-8").lower()
 
 
 def test_plan_bronze_mirrors_the_source_by_default(tmp_path):
     write(tmp_path, "inventory.json", INV)
     write(tmp_path, "dependencies.json", DEPS)
     main(["plan", "--out-dir", str(tmp_path)])
-    plan = json.loads((tmp_path / "plan.json").read_text())
+    plan = json.loads((tmp_path / "plan.json").read_text(encoding="utf-8"))
     assert plan["target_names"]["D.PUBLIC.ORDERS"] == "d.public.orders"
     assert plan["catalogs_to_create"] == ["d"]
 
@@ -47,17 +47,17 @@ def test_plan_honours_the_bronze_catalog_prefix(tmp_path):
     write(tmp_path, "inventory.json", INV)
     write(tmp_path, "dependencies.json", DEPS)
     main(["plan", "--out-dir", str(tmp_path), "--bronze-catalog-prefix", "bronze"])
-    plan = json.loads((tmp_path / "plan.json").read_text())
+    plan = json.loads((tmp_path / "plan.json").read_text(encoding="utf-8"))
     assert plan["target_names"]["D.PUBLIC.ORDERS"] == "bronze.d_public.orders"
 
 
 def test_plan_applies_a_restrictions_file(tmp_path):
     write(tmp_path, "inventory.json", INV)
     write(tmp_path, "dependencies.json", DEPS)
-    (tmp_path / "r.json").write_text(json.dumps({"exclude_databases": ["D"]}))
+    (tmp_path / "r.json").write_text(json.dumps({"exclude_databases": ["D"]}), encoding="utf-8")
     main(["plan", "--out-dir", str(tmp_path), "--restrictions",
           str(tmp_path / "r.json")])
-    plan = json.loads((tmp_path / "plan.json").read_text())
+    plan = json.loads((tmp_path / "plan.json").read_text(encoding="utf-8"))
     assert plan["can_migrate"] == []
     assert plan["cannot_migrate"][0]["category"] == "restriction"
 
@@ -65,7 +65,7 @@ def test_plan_applies_a_restrictions_file(tmp_path):
 def test_bad_restriction_key_exits_1(tmp_path, capsys):
     write(tmp_path, "inventory.json", INV)
     write(tmp_path, "dependencies.json", DEPS)
-    (tmp_path / "r.json").write_text(json.dumps({"exclude_datbases": ["D"]}))
+    (tmp_path / "r.json").write_text(json.dumps({"exclude_datbases": ["D"]}), encoding="utf-8")
     rc = main(["plan", "--out-dir", str(tmp_path), "--restrictions",
                str(tmp_path / "r.json")])
     assert rc == 1
@@ -83,7 +83,7 @@ def test_separate_databases_no_longer_collide_under_the_bronze_mirror(tmp_path):
     write(tmp_path, "inventory.json", inv)
     write(tmp_path, "dependencies.json", DEPS)
     assert main(["plan", "--out-dir", str(tmp_path)]) == 0
-    plan = json.loads((tmp_path / "plan.json").read_text())
+    plan = json.loads((tmp_path / "plan.json").read_text(encoding="utf-8"))
     assert sorted(plan["catalogs_to_create"]) == ["d", "d2"]
 
 
@@ -113,7 +113,7 @@ def test_ddl_subcommand_generates_sql_offline(tmp_path):
     main(["plan", "--out-dir", str(tmp_path)])
     rc = main(["ddl", "--out-dir", str(tmp_path)])
     assert rc == 0
-    ddl = json.loads((tmp_path / "ddl_plan.json").read_text())
+    ddl = json.loads((tmp_path / "ddl_plan.json").read_text(encoding="utf-8"))
     assert len(ddl["statements"]) == 1
     assert "CREATE TABLE IF NOT EXISTS" in ddl["statements"][0]["sql"]
     assert "USING DELTA" in ddl["statements"][0]["sql"]
@@ -131,7 +131,7 @@ def test_ddl_emits_views_too_after_their_tables(tmp_path):
            "source_used": "parsed_ddl", "coverage_note": "views only"})
     main(["plan", "--out-dir", str(tmp_path)])
     main(["ddl", "--out-dir", str(tmp_path)])
-    ddl = json.loads((tmp_path / "ddl_plan.json").read_text())
+    ddl = json.loads((tmp_path / "ddl_plan.json").read_text(encoding="utf-8"))
     idents = [s["source_identifier"] for s in ddl["statements"]]
     assert idents == ["D.PUBLIC.ORDERS", "D.PUBLIC.V"], "view emitted last"
     assert "CREATE VIEW IF NOT EXISTS" in ddl["statements"][1]["sql"]
@@ -147,7 +147,7 @@ def test_ddl_blocks_a_snowflake_only_view_with_a_reason(tmp_path):
     write(tmp_path, "inventory.json", inv)
     write(tmp_path, "dependencies.json", DEPS)
     main(["plan", "--out-dir", str(tmp_path)])
-    plan = json.loads((tmp_path / "plan.json").read_text())
+    plan = json.loads((tmp_path / "plan.json").read_text(encoding="utf-8"))
     assert any("QUALIFY" in c["reason"] for c in plan["cannot_migrate"])
 
 
@@ -157,9 +157,9 @@ def test_deploy_defaults_to_dry_run(tmp_path):
     main(["plan", "--out-dir", str(tmp_path)])
     main(["ddl", "--out-dir", str(tmp_path)])
     assert main(["deploy", "--out-dir", str(tmp_path)]) == 0
-    res = json.loads((tmp_path / "deploy_result.json").read_text())
+    res = json.loads((tmp_path / "deploy_result.json").read_text(encoding="utf-8"))
     assert res["dry_run"] is True and res["executed"] == 0
-    assert "DRY RUN" in (tmp_path / "SOFT_CLONE_SUMMARY.md").read_text().upper()
+    assert "DRY RUN" in (tmp_path / "SOFT_CLONE_SUMMARY.md").read_text(encoding="utf-8").upper()
 
 
 def test_deploy_execute_without_coordinates_exits_1(tmp_path, capsys):
@@ -244,10 +244,10 @@ def test_notebook_needs_no_catalog_flag_when_there_is_only_one(tmp_path):
 
 def test_data_options_stage_presents_options_and_implements_nothing(tmp_path):
     assert main(["data-options", "--out-dir", str(tmp_path)]) == 0
-    payload = json.loads((tmp_path / "data_options.json").read_text())
+    payload = json.loads((tmp_path / "data_options.json").read_text(encoding="utf-8"))
     assert payload["implemented"] is False
     assert len(payload["options"]) >= 3
-    md = (tmp_path / "DATA_MOVEMENT_OPTIONS.md").read_text()
+    md = (tmp_path / "DATA_MOVEMENT_OPTIONS.md").read_text(encoding="utf-8")
     assert "moves no bytes" in md.lower()
 
 
@@ -256,7 +256,7 @@ def test_data_options_records_a_choice_without_executing(tmp_path):
                "--choose", "A2_FEDERATE_EXTERNAL_CATALOG",
                "--chosen-by", "navid", "--rationale", "no bulk transfer yet"])
     assert rc == 0
-    payload = json.loads((tmp_path / "data_options.json").read_text())
+    payload = json.loads((tmp_path / "data_options.json").read_text(encoding="utf-8"))
     assert payload["choice"]["executed"] is False
     assert payload["choice"]["unknowns_outstanding"]
 
@@ -273,7 +273,7 @@ def test_plan_always_reports_the_architecture_state(tmp_path, capsys):
     write(tmp_path, "dependencies.json", DEPS)
     main(["plan", "--out-dir", str(tmp_path)])
     assert "architecture: UNDECIDED" in capsys.readouterr().out
-    md = (tmp_path / "PLANNED_OBJECTS.md").read_text()
+    md = (tmp_path / "PLANNED_OBJECTS.md").read_text(encoding="utf-8")
     assert "Data-movement architecture" in md
     assert "A1_UNLOAD_OBJECT_STORAGE" in md and "A5_HYBRID_WAVES" in md
 
@@ -286,9 +286,9 @@ def test_plan_picks_up_a_recorded_architecture_choice(tmp_path, capsys):
           "--chosen-by", "navid", "--rationale", "federate first"])
     main(["plan", "--out-dir", str(tmp_path)])
     assert "architecture: A2_FEDERATE_EXTERNAL_CATALOG" in capsys.readouterr().out
-    plan = json.loads((tmp_path / "plan.json").read_text())
+    plan = json.loads((tmp_path / "plan.json").read_text(encoding="utf-8"))
     assert plan["architecture_choice"]["option_id"] == "A2_FEDERATE_EXTERNAL_CATALOG"
-    md = (tmp_path / "PLANNED_OBJECTS.md").read_text()
+    md = (tmp_path / "PLANNED_OBJECTS.md").read_text(encoding="utf-8")
     assert "federate first" in md
     assert "✅" in md, "the chosen option is marked in the table"
 
@@ -299,20 +299,20 @@ def test_data_options_records_a_deferral(tmp_path, capsys):
                "--rationale", "platform team decides next month"])
     assert rc == 0
     assert "DEFERRED" in capsys.readouterr().out
-    choice = json.loads((tmp_path / "data_options.json").read_text())["choice"]
+    choice = json.loads((tmp_path / "data_options.json").read_text(encoding="utf-8"))["choice"]
     assert choice["deferred"] is True and choice["custom_architecture"] is None
 
 
 def test_data_options_records_a_customer_architecture_verbatim(tmp_path):
     desc = tmp_path / "arch.md"
-    desc.write_text("Debezium off Snowflake into OCI Streaming, then Iceberg.\n")
+    desc.write_text("Debezium off Snowflake into OCI Streaming, then Iceberg.\n", encoding="utf-8")
     rc = main(["data-options", "--out-dir", str(tmp_path),
                "--choose", "A6_CUSTOMER_DEFINED", "--chosen-by", "navid",
                "--rationale", "their team already runs this",
                "--custom-name", "Kafka CDC into Iceberg",
                "--custom-description-file", str(desc)])
     assert rc == 0
-    choice = json.loads((tmp_path / "data_options.json").read_text())["choice"]
+    choice = json.loads((tmp_path / "data_options.json").read_text(encoding="utf-8"))["choice"]
     assert choice["custom_architecture"]["name"] == "Kafka CDC into Iceberg"
     assert "Debezium" in choice["custom_architecture"]["description"]
     assert choice["deferred"] is False
@@ -333,7 +333,7 @@ def test_a_deferral_flows_into_the_plan_reports(tmp_path):
           "--choose", "A6_CUSTOMER_DEFINED", "--chosen-by", "navid",
           "--rationale", "decide later"])
     main(["plan", "--out-dir", str(tmp_path)])
-    md = (tmp_path / "PLANNED_OBJECTS.md").read_text()
+    md = (tmp_path / "PLANNED_OBJECTS.md").read_text(encoding="utf-8")
     assert "deliberately deferred" in md.lower()
     assert "A6_CUSTOMER_DEFINED" in md
     assert "does not have to be one of the others" in md
@@ -357,7 +357,7 @@ def test_plan_stdout_distinguishes_deferred_from_undecided(tmp_path, capsys):
 def test_plan_stdout_names_a_custom_architecture(tmp_path, capsys):
     write(tmp_path, "inventory.json", INV)
     write(tmp_path, "dependencies.json", DEPS)
-    (tmp_path / "a.md").write_text("their design")
+    (tmp_path / "a.md").write_text("their design", encoding="utf-8")
     main(["data-options", "--out-dir", str(tmp_path),
           "--choose", "A6_CUSTOMER_DEFINED", "--chosen-by", "n",
           "--rationale", "r", "--custom-name", "Their Pattern",
