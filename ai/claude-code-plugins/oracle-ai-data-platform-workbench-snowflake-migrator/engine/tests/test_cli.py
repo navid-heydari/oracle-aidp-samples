@@ -413,3 +413,45 @@ def test_clean_removes_only_the_default_directory(tmp_path, monkeypatch):
     assert main(["clean"]) == 0
     assert not default.exists()
     assert (chosen / "x").is_file()
+
+
+# --- bad inputs are one `error:` line, never a traceback -------------------
+
+def test_out_dir_that_is_a_file_exits_1_with_an_error_line(tmp_path, capsys):
+    f = tmp_path / "afile.txt"
+    f.write_text("not a directory", encoding="utf-8")
+    assert main(["stages", "--out-dir", str(f)]) == 1
+    err = capsys.readouterr().err
+    assert "error:" in err and "afile.txt" in err
+    assert "Traceback" not in err
+
+
+def test_list_shaped_restrictions_file_exits_1(tmp_path, capsys):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    (tmp_path / "r.json").write_text("[1, 2]", encoding="utf-8")
+    rc = main(["plan", "--out-dir", str(tmp_path), "--restrictions",
+               str(tmp_path / "r.json")])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "error:" in err and "JSON object" in err
+    assert "Traceback" not in err
+
+
+def test_unparseable_restrictions_file_names_the_file(tmp_path, capsys):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    (tmp_path / "r.json").write_text("{not json", encoding="utf-8")
+    rc = main(["plan", "--out-dir", str(tmp_path), "--restrictions",
+               str(tmp_path / "r.json")])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "error:" in err and "r.json" in err
+
+
+def test_corrupt_artifact_names_the_file(tmp_path, capsys):
+    (tmp_path / "inventory.json").write_text("{not json", encoding="utf-8")
+    write(tmp_path, "dependencies.json", DEPS)
+    assert main(["plan", "--out-dir", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert "error:" in err and "inventory.json" in err

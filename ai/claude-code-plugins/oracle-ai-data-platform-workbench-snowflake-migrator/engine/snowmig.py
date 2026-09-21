@@ -113,7 +113,14 @@ def _read(out_dir: pathlib.Path, name: str) -> dict:
     if not path.is_file():
         raise FileNotFoundError(
             f"{name} not found in {out_dir}. Run the earlier stage first.")
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        # Name the file: the decoder's own message says where in the text
+        # the problem is, not which artifact holds it.
+        raise ValueError(
+            f"{path} is not valid JSON ({exc}); delete it and re-run the "
+            f"stage that produces it") from exc
 
 
 def _write(out_dir: pathlib.Path, name: str, payload) -> None:
@@ -561,8 +568,21 @@ def cmd_plan(args) -> int:
     out = pathlib.Path(args.out_dir)
     inv = _read(out, "inventory.json")
     deps = _read(out, "dependencies.json")
-    restrictions = (json.loads(pathlib.Path(args.restrictions).read_text(encoding="utf-8"))
-                    if args.restrictions else None)
+    restrictions = None
+    if args.restrictions:
+        rpath = pathlib.Path(args.restrictions)
+        try:
+            restrictions = json.loads(rpath.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise InvalidRestriction(
+                f"{rpath}: not valid JSON: {exc}") from exc
+        # The validator iterates a mapping; anything else is a shape error to
+        # report by name, not an AttributeError from inside it.
+        if not isinstance(restrictions, dict):
+            raise InvalidRestriction(
+                f"{rpath}: a restrictions file must be a JSON object mapping "
+                f"restriction names to values, got "
+                f"{type(restrictions).__name__}")
     # A recorded architecture choice, if the data-options stage has been run.
     choice = None
     if (out / "data_options.json").is_file():
@@ -1829,6 +1849,9 @@ def prepare_out_dir(path: str | pathlib.Path) -> pathlib.Path:
     committed even if it is copied out of this repo.
     """
     out = pathlib.Path(path)
+    if out.exists() and not out.is_dir():
+        raise ValueError(
+            f"--out-dir {out} is an existing file, not a directory")
     out.mkdir(parents=True, exist_ok=True)
     if out.resolve() == default_out_dir().resolve():
         readme = out / "README.md"
@@ -1870,12 +1893,16 @@ def main(argv: list[str] | None = None) -> int:
     # be absurd.
     if args.func is not cmd_clean:
         print(f"  artifacts: {args.out_dir}")
-        prepare_out_dir(args.out_dir)
     try:
+        if args.func is not cmd_clean:
+            # Inside the try: an --out-dir that cannot be created (an
+            # existing file, a permission) is the operator's input, and it
+            # gets the same one-line `error:` as every other bad input.
+            prepare_out_dir(args.out_dir)
         return args.func(args)
     except (AuthError, MissingTarget, RefusedToExecute, CatalogRefused,
             DeployRefused, ProvisionTransportError, JobRunCollision,
-            ConnectionConfigError, ConfigError, FileNotFoundError,
+            ConnectionConfigError, ConfigError, FileNotFoundError, OSError,
             InvalidRestriction, NoBackendAvailable, BackendError,
             ExecutorBackendError,
             SourceWriteRefused, ValueError) as exc:
