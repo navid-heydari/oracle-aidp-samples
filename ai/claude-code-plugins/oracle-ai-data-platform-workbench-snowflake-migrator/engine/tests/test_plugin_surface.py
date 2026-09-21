@@ -1,6 +1,8 @@
 """Plugin manifest and skill/command structure."""
 import json
 import pathlib
+
+import yaml
 import re
 
 import pytest
@@ -22,11 +24,12 @@ def frontmatter(path: pathlib.Path) -> dict:
     text = path.read_text(encoding="utf-8")
     assert text.startswith("---\n"), f"{path} needs YAML frontmatter"
     block = text.split("---", 2)[1]
-    out = {}
-    for line in block.splitlines():
-        if ":" in line and not line.startswith(" "):
-            k, v = line.split(":", 1)
-            out[k.strip()] = v.strip()
+    # A real YAML parser, not a line splitter. Claude Code parses this block
+    # as YAML; an unquoted description containing ': ' is a mapping error
+    # there, and the skill then loads with EMPTY metadata. The old
+    # split-on-colon reader accepted exactly that file.
+    out = yaml.safe_load(block)
+    assert isinstance(out, dict), f"{path}: frontmatter is not a YAML mapping"
     return out
 
 

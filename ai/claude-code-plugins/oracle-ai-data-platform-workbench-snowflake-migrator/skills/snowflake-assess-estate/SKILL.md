@@ -1,6 +1,6 @@
 ---
 name: snowflake-assess-estate
-description: Read-only PREVIEW of a Snowflake environment from the operator's machine - inventory of tables and views with row counts, byte sizes and column types, plus the census of objects that are not tables or views, table-maintenance state and security posture. Use ONLY when the user wants to look at an account without migrating it - answering what is in there, how big the tables are, what the security posture looks like. This is NOT the discovery step of a migration: a migration discovers inside AIDP as a workflow (runbook S6), because a laptop-side read leaves no log and no evidence on the platform. If the user asked to migrate, route to snowflake-migrator-overview and follow S1 through S12.
+description: "Read-only PREVIEW of a Snowflake environment from the operator's machine - inventory of tables and views with row counts, byte sizes and column types, plus the census of objects that are not tables or views, table-maintenance state and security posture. Use ONLY when the user wants to look at an account without migrating it - answering what is in there, how big the tables are, what the security posture looks like. This is NOT the discovery step of a migration: a migration discovers inside AIDP as a workflow (runbook S6), because a laptop-side read leaves no log and no evidence on the platform. If the user asked to migrate, route to snowflake-migrator-overview and follow S1 through S12."
 ---
 
 # Preview the estate — from the operator's machine
