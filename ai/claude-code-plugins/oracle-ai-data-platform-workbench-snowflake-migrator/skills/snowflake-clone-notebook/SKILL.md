@@ -36,12 +36,18 @@ has several.
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig notebook \
-  --upload --datalake-ocid <ocid> --workspace <ws> --cluster-id <cl> --catalog <cat> \
-  [--dry-run]
+  --upload --datalake-ocid <ocid> --workspace <ws> --cluster-id <cl> --catalog <cat>
 ```
 
-`--dry-run` prints the exact upload command without running it. Ask the user for
-the four coordinates in this turn; nothing is stored.
+`--upload` is a **dry run** without `--execute`: it prints where the notebook
+would land and sends nothing. With `--execute` the upload is **refused**, and
+the command says so: its only transport is the Jupyter contents API, which
+the validated build answers with a 200 and then cannot read the file back
+(GAPS.md 13), so an upload could not be reported honestly. The verified way to
+create the structure is `snowmig provision --execute` (which places the stage
+notebooks in the workspace) followed by `snowmig run --job
+snowmig_01_structure`. Ask the user for the four coordinates in this turn;
+nothing is stored.
 
 Lands at `/Workspace/Shared/snowmig_shallow_clone_<catalog>.ipynb` — the
 **shared** directory on purpose, so it can be re-run, read and debugged
@@ -51,8 +57,8 @@ hold tables and views. Say that if the user expects to find it under a catalog.
 
 ## 3. Execution is the user's call
 
-**Do not run it for them.** Ask, then either let them run it in AIDP or invoke
-`aidp notebook run` after they agree.
+**Do not run it for them.** Ask, then let them run it in the AIDP workspace
+after they agree.
 
 The notebook is built to be watched: each object prints
 `[3/7] D.S.ORDERS ... ok (0.4s)`. If a run is slow, that output is where the

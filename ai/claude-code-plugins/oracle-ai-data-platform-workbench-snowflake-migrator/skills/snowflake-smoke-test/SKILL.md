@@ -9,7 +9,7 @@ description: Check connectivity and permissions on both ends before any migratio
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig smoke \
   [--database <db>] \
   [--datalake-ocid <ocid> --workspace <ws> --cluster-id <cl> --catalog <cat>] \
-  [--write-probe]
+  [--write-probe --execute]
 ```
 
 Every Snowflake coordinate comes from the migration config (`snowmig-config.yaml`, discovered automatically and printed as `config: <path>`). Pass `--account/--user/--auth/...` only to override a field for one run.
@@ -25,7 +25,7 @@ which, so a failure points at one end rather than "it doesn't work".
 | Snowflake | list databases | `USAGE` on at least one database |
 | Snowflake | read `INFORMATION_SCHEMA` | read on a real database — the probe is **qualified**, because a fresh session has no current database and an unqualified reference fails with `090105` even for `ACCOUNTADMIN` |
 | AIDP | read the target catalog (`SHOW SCHEMAS`) | the four coordinates |
-| AIDP | **write** — creates a probe schema | `--write-probe` |
+| AIDP | **write** — creates a probe schema | `--write-probe --execute` |
 
 ## The write probe writes — say so before you pass the flag
 
@@ -38,8 +38,10 @@ The no-`DROP` rule is a **source** guarantee: nothing is ever written to or
 dropped from Snowflake. It does not extend to AIDP, which is where this plugin
 legitimately creates objects.
 
-It is still off by default, because it writes. Tell the user what it will create
-before you pass the flag. If cleanup fails, the report names what was left under
+It is still off by default, because it writes, and like every write it needs
+`--execute`: `--write-probe` alone is a dry run that prints what it would create
+and reports write access as *not attempted*. Tell the user what it will create
+before you pass both flags. If cleanup fails, the report names what was left under
 "left behind" — pass that on.
 
 **If the target catalog is EXTERNAL, the probe is skipped with a note** — an

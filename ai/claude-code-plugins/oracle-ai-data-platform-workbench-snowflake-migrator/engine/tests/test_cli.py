@@ -513,3 +513,150 @@ def test_dry_run_provision_refuses_to_overwrite_an_executed_record(
     kept = json.loads((tmp_path / "provision_result.json").read_text(encoding="utf-8"))
     assert kept["dry_run"] is False
     assert kept["steps"][0]["verified"] is True
+
+
+# --- the two opt-in writes are gated by --execute like every other write ---
+
+OCID = "ocid1.aidataplatform.oc1.iad.fakefakefakefake"
+TARGET_FLAGS = ["--datalake-ocid", OCID, "--workspace", "ws-fake",
+                "--cluster-id", "cl-fake"]
+
+
+def _sf_ok(sql, params=None):
+    low = sql.lower()
+    if "current_user" in low:
+        return [{"U": "SVC", "A": "ORGACCT", "R": "AWS_US_EAST_2",
+                 "ROLE": "READER"}]
+    if "show databases" in low:
+        return [{"name": "SALES_DB"}]
+    if "information_schema" in low:
+        return [{"N": 7}]
+    return []
+
+
+class _DestRecorder:
+    """Catalog-API double for `smoke`: one INTERNAL catalog, creates visible."""
+
+    def __init__(self):
+        self.ops: list[str] = []
+        self.schemas: list[str] = []
+
+    def __call__(self, operation, **kw):
+        self.ops.append(operation)
+        if operation == "list_catalogs":
+            return {"items": [{"displayName": "lake", "key": "lake",
+                               "catalogType": "INTERNAL"}]}
+        if operation == "list_schemas":
+            return {"items": [{"key": f"lake.{s}"} for s in self.schemas]}
+        if operation == "create_schema":
+            self.schemas.append(kw["schema"])
+            return {}
+        if operation == "delete_schema":
+            self.schemas.remove(kw["schema"])
+            return {}
+        raise AssertionError(operation)
+
+
+def _smoke_env(monkeypatch):
+    import snowmig
+    rec = _DestRecorder()
+    monkeypatch.setattr(snowmig, "_run_sql_from_args", lambda args: _sf_ok)
+    monkeypatch.setattr(snowmig, "detect_backend", lambda: "oci_raw")
+    monkeypatch.setattr(snowmig, "make_call",
+                        lambda target, *, backend, **kw: rec)
+    return rec
+
+
+def test_smoke_write_probe_without_execute_issues_no_writes(
+        tmp_path, monkeypatch, capsys):
+    rec = _smoke_env(monkeypatch)
+    rc = main(["smoke", "--write-probe", "--out-dir", str(tmp_path),
+               "--account", "a", "--user", "u", "--auth", "password",
+               "--password-path", "/p", *TARGET_FLAGS, "--catalog", "lake"])
+    assert rc == 0
+    assert "create_schema" not in rec.ops and "delete_schema" not in rec.ops
+    out = capsys.readouterr().out
+    assert "dry run" in out and "--execute" in out
+    smoke = json.loads((tmp_path / "smoke.json").read_text(encoding="utf-8"))
+    assert smoke["destination"]["write_verified"] is False
+    assert "--execute" in smoke["destination"]["write_note"]
+
+
+def test_smoke_write_probe_with_execute_creates_then_deletes(
+        tmp_path, monkeypatch):
+    rec = _smoke_env(monkeypatch)
+    rc = main(["smoke", "--write-probe", "--execute", "--out-dir",
+               str(tmp_path), "--account", "a", "--user", "u", "--auth",
+               "password", "--password-path", "/p", *TARGET_FLAGS,
+               "--catalog", "lake"])
+    assert rc == 0
+    assert rec.ops.index("create_schema") < rec.ops.index("delete_schema")
+    smoke = json.loads((tmp_path / "smoke.json").read_text(encoding="utf-8"))
+    assert smoke["destination"]["write_verified"] is True
+
+
+def _no_subprocess(monkeypatch):
+    import subprocess
+
+    def refuse(*a, **k):
+        raise AssertionError("no CLI may be invoked from this test")
+    monkeypatch.setattr(subprocess, "run", refuse)
+
+
+def test_notebook_upload_without_execute_is_a_dry_run(
+        tmp_path, monkeypatch, capsys):
+    _no_subprocess(monkeypatch)
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    main(["ddl", "--out-dir", str(tmp_path)])
+    rc = main(["notebook", "--upload", "--out-dir", str(tmp_path),
+               *TARGET_FLAGS, "--catalog", "d"])
+    assert rc == 0
+    assert (tmp_path / "snowmig_shallow_clone_d.ipynb").is_file()
+    md = (tmp_path / "NOTEBOOK.md").read_text(encoding="utf-8")
+    assert "dry run" in md.lower()
+    assert "Uploaded to" not in md
+    out = capsys.readouterr().out
+    assert "dry run" in out and "--execute" in out
+
+
+def test_notebook_upload_with_execute_is_refused_and_points_at_provision(
+        tmp_path, monkeypatch, capsys):
+    # The Jupyter-contents transport 200s and cannot read the file back
+    # (GAPS.md 13). Refusing is honest; "uploaded" was not.
+    _no_subprocess(monkeypatch)
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    main(["ddl", "--out-dir", str(tmp_path)])
+    rc = main(["notebook", "--upload", "--execute", "--out-dir",
+               str(tmp_path), *TARGET_FLAGS, "--catalog", "d"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "provision" in err and "run" in err
+    assert "aidp notebook run" not in err
+    md = (tmp_path / "NOTEBOOK.md").read_text(encoding="utf-8")
+    assert "Uploaded to" not in md and "aidp notebook run" not in md
+
+
+def test_notebook_still_generates_offline_without_upload(tmp_path):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    main(["ddl", "--out-dir", str(tmp_path)])
+    assert main(["notebook", "--out-dir", str(tmp_path)]) == 0
+    md = (tmp_path / "NOTEBOOK.md").read_text(encoding="utf-8")
+    assert "aidp notebook run" not in md
+
+
+def test_every_writing_subcommand_accepts_execute():
+    import snowmig
+    parser = snowmig.build_parser()
+    for argv in (["deploy", "--execute"],
+                 ["provision", "--workspace-name", "w", "--execute"],
+                 ["catalog", "--execute"],
+                 ["smoke", "--write-probe", "--execute"],
+                 ["notebook", "--upload", "--execute"]):
+        assert parser.parse_args(argv).execute is True, argv

@@ -15,7 +15,8 @@ can be re-run alone. The main ones:
                                                              --execute needs AIDP)
   compute -> compute.json        + COMPUTE_PROPOSAL.md      (needs Snowflake)
   smoke   -> smoke.json          + SMOKE_TEST.md            (source; dest if given)
-  notebook-> <nb>.ipynb          + NOTEBOOK.md              (offline; --upload writes)
+  notebook-> <nb>.ipynb          + NOTEBOOK.md              (offline; --upload is
+                                                             refused, see GAPS 13)
   summary -> SUMMARY.md                                     (offline)
   data-options -> data_options.json + DATA_MOVEMENT_OPTIONS.md  (offline; PROPOSAL
                   ONLY -- this plugin moves no bytes and implements no transfer)
@@ -93,7 +94,7 @@ from target.deploy import RefusedToExecute, deploy
 from target.jobs import JobRunCollision
 from target.provisioning import ProvisionTransportError
 from target.executor import (
-    NoBackendAvailable, build_command, detect_backend,
+    NoBackendAvailable, detect_backend,
 )
 # Aliased: snowflake_source.conn also exports make_run_sql, and the
 # unqualified import shadowed it.
@@ -1091,10 +1092,30 @@ def cmd_smoke(args) -> int:
         # The catalog API, not SQL: `POST .../sql/execute` returns 404, so a
         # SQL-based check reported FAIL against a working destination.
         dest_call = make_call(target, backend=backend)
+    # The probe WRITES (one schema, created and removed), so it is gated
+    # like every other write: `--write-probe` alone is a dry run that says
+    # what it would create; `--write-probe --execute` creates it.
+    write_probe = bool(args.write_probe and args.execute)
+    if args.write_probe and not args.execute:
+        if target is not None:
+            print(f"  dry run: --write-probe would create and remove one "
+                  f"schema named snowmig_permission_probe_<hex> in "
+                  f"{target.catalog} on {target.datalake_ocid} "
+                  f"(workspace {target.workspace}); add --execute to run it. "
+                  f"Nothing was created.")
+        else:
+            print("  dry run: --write-probe needs the four AIDP coordinates "
+                  "and --execute; nothing was created.")
     result = run_smoke(source_run_sql=_run_sql_from_args(args), target=target,
-                       dest_call=dest_call, write_probe=args.write_probe,
+                       dest_call=dest_call, write_probe=write_probe,
                        database=(args.database or [None])[0]
                        if getattr(args, "database", None) else None)
+    if args.write_probe and not args.execute \
+            and not result["destination"].get("skipped"):
+        result["destination"]["write_note"] = (
+            "not attempted: --write-probe was given without --execute, so "
+            "this was a dry run. Re-run with --write-probe --execute to "
+            "create one probe schema and remove it again.")
     _write(out, "smoke.json", result)
     _write(out, "SMOKE_TEST.md", render_smoke(result))
     print(f'  verdict: {"PASS" if result["ok"] else "FAIL"}')
@@ -1140,10 +1161,12 @@ def cmd_notebook(args) -> int:
              "verifies each object individually at the end.", ""]
 
     if not args.upload:
-        lines += ["Not uploaded. Re-run with `--upload` plus the AIDP target "
-                  "coordinates to place it in the workspace.", ""]
+        lines += ["Not uploaded. The structure it describes is created on AIDP "
+                  "compute by the `provision` + `run` workflow (runbook S10); "
+                  "`--upload` is a dry run without `--execute`, and is refused "
+                  "with it (see below).", ""]
         _write(out, "NOTEBOOK.md", "\n".join(lines))
-        print("  generated only; pass --upload to place it in AIDP")
+        print("  generated only; the structure workflow is `provision` + `run`")
         return 0
 
     target = _optional_target(args)
@@ -1151,28 +1174,41 @@ def cmd_notebook(args) -> int:
         raise MissingTarget(
             "--upload needs all four AIDP coordinates: --datalake-ocid, "
             "--workspace, --cluster-id, --catalog. Ask the user for them.")
-    backend = args.backend or detect_backend()
-    cmd = build_command(backend, "upload_notebook", target,
-                        workspace_path=ws_path, local_path=str(local))
-    print(f"  backend: {backend}")
-    print(f'  command: {" ".join(cmd)}')
-    if args.dry_run:
-        lines += ["Upload was a **dry run**. The command above was not executed.",
-                  ""]
+
+    # An upload is a write, so it is a dry run without --execute like every
+    # other write. And WITH --execute it is refused: the only transport this
+    # command has is the Jupyter contents API, which the validated build
+    # answers with a 200 and then cannot read the file back (GAPS.md 13).
+    # Reporting "uploaded" on that 200 was a false success; the verified
+    # upload surface is the one `provision` drives for the stage notebooks.
+    remedy = (f"The notebook is at {local}. Upload it from the workspace UI, "
+              f"or create the structure through the verified path: `snowmig "
+              f"provision --execute` places the stage notebooks in the "
+              f"workspace and `snowmig run --job snowmig_01_structure` "
+              f"executes the structure stage from ddl_plan.json.")
+    if not args.execute:
+        print(f"  dry run: --upload would place {local.name} at {ws_path} in "
+              f"workspace {target.workspace} on {target.datalake_ocid}; "
+              f"nothing was sent. Add --execute to attempt it -- which is "
+              f"currently refused: the upload transport is known-bad "
+              f"(GAPS.md 13). {remedy}")
+        lines += [f"Upload was a **dry run**: nothing was sent to `{ws_path}`. "
+                  f"With `--execute` the upload is refused because its "
+                  f"transport is known-bad (GAPS.md 13). {remedy}", ""]
         _write(out, "NOTEBOOK.md", "\n".join(lines))
         return 0
 
-    import subprocess
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False, encoding="utf-8", errors="replace")
-    if proc.returncode != 0:
-        print(f"error: upload failed: {(proc.stderr or '')[:400]}", file=sys.stderr)
-        return 1
-    lines += [f"Uploaded to `{ws_path}`.", "",
-              "**Ask the user before executing it.** Then run it from the AIDP "
-              "workspace, or via `aidp notebook run`.", ""]
+    lines += [f"**Upload refused.** Nothing was sent to `{ws_path}`: the "
+              f"transport this command has (the Jupyter contents API) returns "
+              f"200 and the file cannot be read back on the validated build "
+              f"(GAPS.md 13), so a success here would be a false one. "
+              f"{remedy}", ""]
     _write(out, "NOTEBOOK.md", "\n".join(lines))
-    print(f"  uploaded to {ws_path}")
-    return 0
+    print(f"error: notebook --upload is refused: its transport is known-bad "
+          f"(GAPS.md 13 -- the PUT returns 200 and the file cannot be read "
+          f"back), so an upload could not be reported honestly. {remedy}",
+          file=sys.stderr)
+    return 1
 
 
 def cmd_summary(args) -> int:
@@ -1807,16 +1843,29 @@ def build_parser() -> argparse.ArgumentParser:
                          "probe schema and removing it again; if cleanup fails, "
                          "the report names what was left. Skipped with a note "
                          "when the target catalog is EXTERNAL, which is "
-                         "read-only by design")
+                         "read-only by design. A dry run without --execute")
+    sm.add_argument("--execute", action="store_true",
+                    help="actually run --write-probe; without it the probe is "
+                         "a dry run that prints what it would create")
     sm.set_defaults(func=cmd_smoke)
 
     nb = sub.add_parser("notebook", parents=[common],
-                        help="generate the shallow-clone notebook; --upload places "
-                             "it in the AIDP workspace")
+                        help="generate the shallow-clone notebook (offline). "
+                             "--upload is a dry run without --execute, and "
+                             "refused with it: its transport is known-bad "
+                             "(GAPS.md 13); the structure workflow is "
+                             "`provision` + `run`")
     _add_target_args(nb)
-    nb.add_argument("--upload", action="store_true")
+    nb.add_argument("--upload", action="store_true",
+                    help="say where the notebook would be placed in the AIDP "
+                         "workspace (dry run). With --execute the upload is "
+                         "refused -- see GAPS.md 13")
+    nb.add_argument("--execute", action="store_true",
+                    help="with --upload, attempt the upload instead of the "
+                         "dry run; currently refused (GAPS.md 13)")
     nb.add_argument("--dry-run", action="store_true",
-                    help="with --upload, print the command without running it")
+                    help="accepted for compatibility: the upload is a dry run "
+                         "unless --execute is given")
     nb.set_defaults(func=cmd_notebook)
 
     su = sub.add_parser("summary", parents=[common],
