@@ -1405,6 +1405,57 @@ def test_a_flat_source_config_still_loads(source_helpers, tmp_path):
     assert source_helpers.load_source_config(cfg)["account"] == "ACC"
 
 
+def test_every_spark_statement_the_stages_emit_parses_as_spark_sql(
+        copy_schema, reconcile, monkeypatch, tmp_path):
+    """The stages run on a cluster nobody can reach from the suite, so the
+    strongest offline check on the SQL they build is a Spark-dialect parser.
+    A statement that does not parse is wrong for certain."""
+    sqlglot = pytest.importorskip("sqlglot", reason="dev-only SQL parse check")
+    # structure: CREATE SCHEMA, DESCRIBE, CREATE TABLE ... USING DELTA
+    spark = _CatalogSpark()
+    _structure_run(monkeypatch, tmp_path, spark)
+    statements = list(spark.statements)
+    # copy: DESCRIBE both sides, COUNT(*), INSERT, the decimal SUMs
+    typed = _typed([("ORDER_ID", "decimal(38,0)"), ("AMOUNT", "decimal(18,2)"),
+                    ("NOTE", "string")])
+    _copy_typed(copy_schema, typed)
+    typed.counts = {_SRC: 3, _TGT: 3}
+    _copy_typed(copy_schema, typed, mode="overwrite")
+    statements += typed.statements
+    # reconcile: SHOW TABLES, COUNT(*)
+    _verified_orders(tmp_path)
+    live = _orders_spark(5)
+    reconcile.reconcile(live, manifest=_manifest("ORDERS"),
+                        target_catalog="lake", reports=tmp_path, counts=True)
+    statements += live.statements
+    kinds = {s.split()[0].upper() for s in statements}
+    assert {"CREATE", "DESCRIBE", "SELECT", "INSERT", "SHOW"} <= kinds, kinds
+    for statement in statements:
+        assert sqlglot.parse_one(statement, read="spark") is not None, statement
+
+
+def test_the_committed_notebooks_match_their_sources():
+    """The `.ipynb` under data-migration-scripts/ are generated from
+    engine/dataplane and committed; the AIDP job runs the notebook, so a fix
+    that lands only in the `.py` never reaches the live run. Regenerate with
+    `snowmig.py build-notebooks`."""
+    sys.path.insert(0, str(SCRIPTS.parent))
+    from target.stage_notebooks import STAGES, build_stage_notebook
+
+    shipped = SCRIPTS.parents[1] / "data-migration-scripts"
+
+    def code_cells(nb):
+        return ["".join(c["source"]).replace("\r\n", "\n")
+                for c in nb["cells"] if c["cell_type"] == "code"]
+
+    for stage in STAGES:
+        committed = json.loads((shipped / stage.notebook_name)
+                               .read_text(encoding="utf-8"))
+        assert code_cells(committed) == code_cells(build_stage_notebook(stage)), (
+            f"{stage.notebook_name} is stale against engine/dataplane/"
+            f"{stage.source}; run `snowmig.py build-notebooks`")
+
+
 def test_the_structure_stage_does_not_ship_a_default_that_cannot_work():
     """`manifest` mode reads types from the discovery manifest, but a manifest
     built in `connector` mode carries SNOWFLAKE types and Delta rejects them
