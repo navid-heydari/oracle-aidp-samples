@@ -122,8 +122,13 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
         # fire. What dependencies.json does say is WHERE the graph came from:
         # account_usage is the full graph; parsed_ddl is partial (view DDL
         # only); not_extracted is "did not look" and must not read as clean.
-        source = data.get("source_used", _UNKNOWN)
+        source = data.get("source_used")
         edges = len(data.get("edges") or [])
+        if not source:
+            # Both producers write the key. Without it, how the graph was got
+            # is unknown, and "view DDL only" would be a guess about it.
+            return (f'lineage source not recorded; {edges} edge(s) -- '
+                    '**completeness unknown**', True)
         text = f'lineage from {source}; {edges} edge(s)'
         if source == "not_extracted":
             return (text + " -- **NOT extracted; view order unchecked**", True)

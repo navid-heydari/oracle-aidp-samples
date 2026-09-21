@@ -189,6 +189,17 @@ def test_not_extracted_lineage_is_flagged(tmp_path):
     assert "not extracted" in row["found"].lower()
 
 
+def test_a_lineage_artifact_without_a_source_is_flagged_not_guessed(tmp_path):
+    # No `source_used` means the board cannot tell how the graph was got.
+    # Refuse rather than guess: flag it, and do not label it "view DDL only",
+    # which is a statement about parsed_ddl.
+    _write(tmp_path, "dependencies.json", {"edges": []})
+    row = _row(tmp_path, "deps")
+    assert row["attention"] is True
+    assert "view ddl only" not in row["found"].lower(), row["found"]
+    assert "not recorded" in row["found"].lower(), row["found"]
+
+
 def test_account_usage_lineage_is_clean(tmp_path):
     _write(tmp_path, "dependencies.json",
            {"edges": [{"from": "A", "to": "B"}], "source_used": "account_usage",
