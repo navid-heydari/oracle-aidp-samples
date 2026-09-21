@@ -755,6 +755,83 @@ def test_reconcile_reads_the_counts_a_skipped_record_carries(
     assert rec["schemas"][0]["tables"][0]["verdict"] == verdict
 
 
+# --- copy: a per-table failure is recorded and the run continues -----------
+#
+# Only the INSERT was guarded. A source read (a Snowflake login in connector
+# mode), a COUNT(*) or a SUM that raised propagated out of the per-table loop:
+# the job died with a traceback, the failing table had no record, and every
+# table after it was never attempted -- and reconcile then showed those as
+# "not attempted yet", not as the failure that happened.
+
+def _three_tables(tmp_path):
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["T1", "T2", "T3"]})
+    catalog = {}
+    for t in ("T1", "T2", "T3"):
+        catalog.update(_both_sides(t))
+    spark = _CatalogSpark(catalog)
+    spark.counts = {f"`ext`.`SALES`.`{t}`": 5 for t in ("T1", "T2", "T3")}
+    return reports, spark
+
+
+def test_a_source_read_failure_is_recorded_and_the_run_continues(
+        copy_schema, monkeypatch, tmp_path):
+    reports, spark = _three_tables(tmp_path)
+
+    class Flaky(_MainSource):
+        fail_on = ("T2",)
+
+    rc, report = _copy_run(monkeypatch, reports, spark,
+                           argv=["--mode", "append"], source_cls=Flaky)
+    assert rc == 1
+    assert report["tables"]["T2"]["status"] == "failed"
+    assert "DATA_ACCESS_LAYER_0007" in report["tables"]["T2"]["reason"]
+    assert report["tables"]["T1"]["status"] == "verified"
+    assert report["tables"]["T3"]["status"] == "verified", \
+        "the table after the failure is still attempted"
+    assert any("INSERT INTO `lake`.`SALES`.`T3`" in s for s in spark.statements)
+
+
+def test_a_target_count_failure_is_recorded_and_the_run_continues(
+        copy_schema, monkeypatch, tmp_path):
+    reports, spark = _three_tables(tmp_path)
+
+    class NoCount(_CatalogSpark):
+        def sql(self, statement):
+            if "count(*)" in statement.lower() and "`lake`.`SALES`.`T2`" in statement:
+                self.statements.append(" ".join(statement.split()))
+                raise RuntimeError("[INSUFFICIENT_PERMISSIONS] on lake.SALES.T2")
+            return super().sql(statement)
+
+    denied = NoCount(spark.catalog)
+    denied.counts = spark.counts
+    rc, report = _copy_run(monkeypatch, reports, denied, argv=["--mode", "append"])
+    assert rc == 1
+    assert report["tables"]["T2"]["status"] == "failed"
+    assert "INSUFFICIENT_PERMISSIONS" in report["tables"]["T2"]["reason"]
+    assert report["tables"]["T3"]["status"] == "verified"
+
+
+def test_a_failure_after_the_insert_landed_says_so(copy_schema):
+    """A `failed` record after a completed INSERT must not look like a failed
+    INSERT: an `append` re-run would duplicate every row."""
+    class CountDiesAfterInsert(_CatalogSpark):
+        def sql(self, statement):
+            out = super().sql(statement)
+            if "count(*)" in statement.lower() and _TGT in statement \
+                    and any(s.startswith("INSERT") for s in self.statements):
+                raise RuntimeError("executor lost")
+            return out
+
+    spark = CountDiesAfterInsert({_SRC: [("A", "string")], _TGT: [("A", "string")]})
+    spark.counts = {_SRC: 3, _TGT: 0}
+    out = _copy_typed(copy_schema, spark, verify="counts")
+    assert out["status"] == "failed"
+    assert out["insert_completed"] is True
+    assert "executor lost" in out["reason"]
+    assert "--mode overwrite" in out["reason"]
+    assert any(s.startswith("INSERT") for s in spark.statements)
+
+
 # --- copy: the DECIMAL check is keyed off the SOURCE, not the target -------
 #
 # `--verify counts+sums` derived both the DECIMAL column set and the cast

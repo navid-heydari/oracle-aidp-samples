@@ -244,7 +244,22 @@ def _copy(spark, src: str, tgt: str, *, mode: str, verify: str,
            "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
            "mode": mode}
 
-    # The verification IS the claim.
+    # The verification IS the claim. The rows have landed by now, so a
+    # failure from here on must say so: a `failed` record that looked like a
+    # failed INSERT would invite an `append` re-run that duplicates every row.
+    try:
+        return _verify(spark, src, tgt, out, verify=verify,
+                       source_count=source_count, src_types=src_types)
+    except Exception as exc:
+        out.update(status="failed", insert_completed=True,
+                   reason=f"the INSERT completed but the verification raised: "
+                          f"{str(exc)[:300]}. NOT verified; re-copy with "
+                          f"--mode overwrite, not append")
+        return out
+
+
+def _verify(spark, src: str, tgt: str, out: dict, *, verify: str,
+            source_count: int, src_types: dict[str, str]) -> dict:
     src_after = _count(spark, src)
     tgt_after = _count(spark, tgt)
     out.update(source_count=src_after, target_count=tgt_after)
@@ -260,8 +275,9 @@ def _copy(spark, src: str, tgt: str, *, mode: str, verify: str,
 
     if verify == "counts+sums":
         # The SOURCE's decimal columns, cast to the SOURCE's scale on both
-        # sides: the target is at least as wide (checked above), so the
-        # comparison is exact rather than rounded to whatever the target is.
+        # sides: the target is at least as wide (the pre-flight in _copy
+        # refused it otherwise), so the comparison is exact rather than
+        # rounded to whatever the target happens to be.
         columns = [(c, s) for c, _p, s in _decimal_columns(src_types)]
         src_sums = _decimal_sums(spark, src, columns)
         tgt_sums = _decimal_sums(spark, tgt, columns)
@@ -431,9 +447,18 @@ def main(argv: list[str] | None = None) -> int:
                 f"source={args.source_mode})")
             continue
         log(f"{args.schema}.{name}: copying ({args.mode})")
-        result = copy_table(source, args.schema, name, tgt, mode=args.mode,
-                            verify=args.verify,
-                            source_count=source_counts.get(name))
+        started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        try:
+            result = copy_table(source, args.schema, name, tgt, mode=args.mode,
+                                verify=args.verify,
+                                source_count=source_counts.get(name))
+        except Exception as exc:
+            # A failure is a finding, not the end of the run: live, one
+            # connector login timeout would otherwise end the schema with
+            # the failing table unrecorded and the rest never attempted.
+            result = {"status": "failed", "started_at": started,
+                      "reason": str(exc)[:400]}
+            log(f"{args.schema}.{name}: FAILED — {str(exc)[:200]}")
         if result["status"] == "skipped_nonempty" and \
                 prior.get("status") in _COPY_FAILURES:
             # Nothing was copied, so nothing was re-verified: a recorded
