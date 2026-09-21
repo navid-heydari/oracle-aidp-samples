@@ -1456,6 +1456,24 @@ def test_the_committed_notebooks_match_their_sources():
             f"{stage.source}; run `snowmig.py build-notebooks`")
 
 
+def test_the_committed_notebooks_use_lf_line_endings():
+    """The committed `.ipynb` are LF like the rest of the tree (the repo sets
+    no autocrlf). `write_stage_notebooks` writes in text mode, so a
+    `build-notebooks` on Windows rewrites every line as CRLF: a whole-file
+    diff that buries the real change, and a tree that is no longer LF. The
+    content test above cannot see it -- it compares parsed cells -- so the
+    bytes are pinned here."""
+    sys.path.insert(0, str(SCRIPTS.parent))
+    from target.stage_notebooks import STAGES
+
+    shipped = SCRIPTS.parents[1] / "data-migration-scripts"
+    for stage in STAGES:
+        data = (shipped / stage.notebook_name).read_bytes()
+        crlf = data.count(b"\r\n")
+        assert crlf == 0, (
+            f"{stage.notebook_name} has {crlf} CRLF line ending(s); the tree "
+            f"is LF. Rewrite it with LF endings after `build-notebooks`")
+
 def test_the_structure_stage_does_not_ship_a_default_that_cannot_work():
     """`manifest` mode reads types from the discovery manifest, but a manifest
     built in `connector` mode carries SNOWFLAKE types and Delta rejects them
