@@ -5,7 +5,11 @@ Runs on AIDP compute. Per table:
 
   1. read the source count;
   2. move the rows —
-       skip-existing (default): only into a table with 0 rows;
+       skip-existing (default): only into a table with 0 rows; a table that
+                                already holds rows is `skipped_nonempty`
+                                when its count equals the source's and
+                                `count_mismatch` when it does not -- a
+                                re-run never softens a recorded failure;
        append:                  INSERT INTO ... SELECT *;
        overwrite:               INSERT OVERWRITE ... SELECT * (rewrites ROWS,
                                 never drops the table);
@@ -48,6 +52,10 @@ DEFAULT_REPORTS_DIR = "/Workspace/backup-snowflake-migration/reports"
 MANIFEST_NAME = "discovery_manifest.json"
 
 _DECIMAL = re.compile(r"^decimal\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
+
+# Copy statuses that mean the table is NOT verified. A later run that copies
+# nothing (skip-existing over a table with rows) never softens one of these.
+_COPY_FAILURES = ("count_mismatch", "sum_mismatch", "failed")
 
 
 def q(identifier: str) -> str:
@@ -147,6 +155,15 @@ def _copy(spark, src: str, tgt: str, *, mode: str, verify: str,
 
     target_rows = _count(spark, tgt)
     if mode == "skip-existing" and target_rows > 0:
+        # A verification, not a bypass: a target that holds rows but not the
+        # source's count is a mismatch whether or not this run wrote it.
+        if target_rows != source_count:
+            return {"status": "count_mismatch", "source_count": source_count,
+                    "target_count": target_rows, "started_at": started,
+                    "reason": f"target already holds {target_rows} row(s) "
+                              f"but the source has {source_count}; nothing "
+                              f"was copied. Use --mode overwrite to rewrite "
+                              f"it. NOT verified."}
         return {"status": "skipped_nonempty", "source_count": source_count,
                 "target_count": target_rows, "started_at": started,
                 "reason": f"target already holds {target_rows} row(s); use "
@@ -232,12 +249,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--reports-dir", default=DEFAULT_REPORTS_DIR)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true",
-                    help="re-copy tables already recorded as verified")
+                    help="re-copy tables already recorded as verified; needs "
+                         "--mode overwrite or append, since skip-existing "
+                         "cannot re-copy a table that holds rows")
     args = ap.parse_args(argv)
 
     if args.source_catalog and \
             args.source_catalog.lower() == args.target_catalog.lower():
         return fail("error: source and target catalog are the same.")
+    if args.force and args.mode == "skip-existing":
+        # Under the default mode --force copied nothing (skip-existing never
+        # writes into a table with rows) and overwrote a `verified` record
+        # with `skipped_nonempty`. Refuse rather than guess at overwrite.
+        return fail("error: --force re-copies tables already recorded as "
+                    "verified, which --mode skip-existing cannot do; pass "
+                    "--mode overwrite (rewrites rows) or --mode append")
 
     reports = pathlib.Path(args.reports_dir)
     manifest = json.loads((reports / MANIFEST_NAME).read_text(encoding="utf-8"))
@@ -350,6 +376,14 @@ def main(argv: list[str] | None = None) -> int:
         result = copy_table(source, args.schema, name, tgt, mode=args.mode,
                             verify=args.verify,
                             source_count=source_counts.get(name))
+        if result["status"] == "skipped_nonempty" and \
+                prior.get("status") in _COPY_FAILURES:
+            # Nothing was copied, so nothing was re-verified: a recorded
+            # failure stands until a real re-copy verifies the table.
+            result = dict(prior, reason=(
+                f"{prior.get('reason') or prior['status']} (a re-run in "
+                f"skip-existing mode left the target untouched; use --mode "
+                f"overwrite to re-copy and re-verify it)"))
         if result["status"] not in ("verified", "skipped_nonempty",
                                     "target_missing"):
             failures += 1

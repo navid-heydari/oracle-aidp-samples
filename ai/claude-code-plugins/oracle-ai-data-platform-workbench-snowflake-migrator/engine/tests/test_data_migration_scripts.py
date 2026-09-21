@@ -648,6 +648,101 @@ def test_skip_existing_leaves_a_nonempty_target_alone(copy_schema):
     assert not any("INSERT" in s.upper() for s in spark.statements)
 
 
+# --- copy: a re-run must never soften a recorded failure -------------------
+#
+# A table whose copy ended `count_mismatch` is still in `todo` on the next
+# run. In the default skip-existing mode `_copy` saw target_rows > 0 and
+# returned `skipped_nonempty`, which OVERWROTE the mismatch record; reconcile
+# maps that to PRESENT_NOT_REVERIFIED, not a problem, exit 0. Re-running the
+# failed job unchanged -- the most natural reaction -- erased the failure
+# without moving a row.
+
+def test_skip_existing_on_a_short_target_is_a_count_mismatch_not_a_skip(
+        copy_schema):
+    spark = _FakeSpark()
+    spark.counts = {"`src`": 91, "`lake`.`s`.`t`": 90}
+    out = copy_schema._copy(spark, "`src`", "`lake`.`s`.`t`",
+                            mode="skip-existing", verify="counts",
+                            retries=0, retry_wait=0, started="now")
+    assert out["status"] == "count_mismatch"
+    assert out["target_count"] == 90 and out["source_count"] == 91
+    assert "NOT verified" in out["reason"]
+    assert not any("INSERT" in s.upper() for s in spark.statements), \
+        "skip-existing still never writes"
+
+
+def _seeded_copy_report(reports, table, record):
+    (reports / "copy_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "tables": {table: record}}), encoding="utf-8")
+
+
+def test_a_rerun_does_not_downgrade_a_prior_count_mismatch(
+        copy_schema, monkeypatch, tmp_path):
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["T"]})
+    _seeded_copy_report(reports, "T", {"status": "count_mismatch",
+                                       "source_count": 91, "target_count": 90,
+                                       "reason": "target has 90 row(s), source has 91. NOT verified."})
+    spark = _CatalogSpark({"`lake`.`SALES`.`T`": [("A", "string")]})
+    spark.counts = {"`ext`.`SALES`.`T`": 91, "`lake`.`SALES`.`T`": 90}
+    rc, report = _copy_run(monkeypatch, reports, spark)
+    assert rc == 1
+    assert report["tables"]["T"]["status"] == "count_mismatch"
+    assert not any("INSERT" in s for s in spark.statements)
+
+
+def test_a_rerun_keeps_a_prior_sum_mismatch_when_only_counts_now_agree(
+        copy_schema, monkeypatch, tmp_path):
+    """Counts alone cannot clear a sum mismatch: the resident rows were never
+    re-verified, so the record stays until a real re-copy verifies them."""
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["T"]})
+    _seeded_copy_report(reports, "T", {"status": "sum_mismatch",
+                                       "source_count": 91, "target_count": 91,
+                                       "reason": "1 decimal column(s) do not sum equal. NOT verified."})
+    spark = _CatalogSpark({"`lake`.`SALES`.`T`": [("A", "string")]})
+    spark.counts = {"`ext`.`SALES`.`T`": 91, "`lake`.`SALES`.`T`": 91}
+    rc, report = _copy_run(monkeypatch, reports, spark)
+    assert rc == 1
+    rec = report["tables"]["T"]
+    assert rec["status"] == "sum_mismatch"
+    assert "left the target untouched" in rec["reason"]
+    assert not any("INSERT" in s for s in spark.statements)
+
+
+def test_force_under_the_default_mode_is_refused_not_a_silent_downgrade(
+        copy_schema, monkeypatch, tmp_path, capsys):
+    """--force puts verified tables back in scope, but skip-existing cannot
+    re-copy a non-empty table: the flag copied nothing and overwrote a
+    `verified` record with `skipped_nonempty`. Refuse the pair instead of
+    guessing that the operator meant overwrite."""
+    reports = _write_estate(tmp_path / "reports", {"SALES": ["T"]})
+    _seeded_copy_report(reports, "T", {"status": "verified",
+                                       "source_count": 91, "target_count": 91})
+    spark = _CatalogSpark({"`lake`.`SALES`.`T`": [("A", "string")]})
+    spark.counts = {"`ext`.`SALES`.`T`": 91, "`lake`.`SALES`.`T`": 91}
+    rc, report = _copy_run(monkeypatch, reports, spark, argv=["--force"])
+    assert rc == 1
+    assert "--mode overwrite" in capsys.readouterr().out
+    assert report["tables"]["T"]["status"] == "verified"
+    assert not any("INSERT" in s for s in spark.statements)
+
+
+@pytest.mark.parametrize("target_count,verdict", [
+    (90, "STRUCTURE_ONLY_COPY_FAILED"), (91, "PRESENT_NOT_REVERIFIED")])
+def test_reconcile_reads_the_counts_a_skipped_record_carries(
+        reconcile, tmp_path, target_count, verdict):
+    # Belt and braces: an older or hand-edited copy report that says
+    # `skipped_nonempty` over unequal counts cannot render as fine.
+    _seeded_copy_report(tmp_path, "T", {"status": "skipped_nonempty",
+                                        "source_count": 91,
+                                        "target_count": target_count})
+    spark = _CatalogSpark({"`lake`.`SALES`.`T`": [("A", "string")]})
+    rec = reconcile.reconcile(spark, manifest=_manifest("T"),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=False)
+    assert rec["schemas"][0]["tables"][0]["verdict"] == verdict
+
+
 def test_a_count_mismatch_is_not_verified(copy_schema):
     class Mismatch(_FakeSpark):
         def sql(self, statement):

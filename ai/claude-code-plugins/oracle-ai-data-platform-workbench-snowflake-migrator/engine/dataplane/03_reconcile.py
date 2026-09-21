@@ -122,6 +122,12 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                 verdict = "MIGRATED_VERIFIED"
             elif c_status in ("count_mismatch", "sum_mismatch", "failed"):
                 verdict = "STRUCTURE_ONLY_COPY_FAILED"
+            elif c_status == "skipped_nonempty" and \
+                    c_rec.get("source_count") is not None and \
+                    c_rec.get("target_count") != c_rec.get("source_count"):
+                # The record carries both counts and they disagree: the
+                # status alone cannot make that a pass.
+                verdict = "STRUCTURE_ONLY_COPY_FAILED"
             elif c_status == "skipped_nonempty":
                 verdict = "PRESENT_NOT_REVERIFIED"
             else:
