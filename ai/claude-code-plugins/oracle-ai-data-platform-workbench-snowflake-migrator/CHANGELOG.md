@@ -8,6 +8,44 @@ scaffold's behaviour survives — the engine, skills, commands and docs are all
 specific to Snowflake — so the history below starts with this plugin's own
 first release.
 
+## [Unreleased]
+
+### Fixed — the CLI could not run on a Windows machine
+
+Every `read_text()`/`write_text()`/`open()` in the engine, the data-plane
+scripts and the tests used the platform default encoding. On Windows that is
+cp1252, which cannot encode the arrows and dashes every report carries, so
+`snowmig.py demo` — and every stage that renders a report — died with
+`UnicodeEncodeError`, and 34 tests failed or errored while the same tree
+passed under `PYTHONUTF8=1`.
+
+- Every text-mode file operation and CLI-output decode now says
+  `encoding="utf-8"`; `main()` reconfigures stdout/stderr the same way, so a
+  piped report line cannot raise either.
+- `tests/test_locale_independence.py` runs the demo in a subprocess under an
+  ASCII locale on every platform and fails on the previous tree.
+
+### Fixed — one skill loaded with empty metadata
+
+`skills/snowflake-assess-estate/SKILL.md` had an unquoted description
+containing `: `, which YAML rejects; Claude Code then loaded the skill with no
+description to route on. The description is quoted, and the plugin-surface
+test parses frontmatter with `yaml.safe_load` instead of splitting each line
+on its first colon, which is how the file passed before.
+
+### Fixed — housekeeping
+
+- `.claude-plugin/marketplace.json` now carries the same version as
+  `plugin.json` (0.25.0); it said 0.23.1.
+- README no longer links `docs/plans/2026-09-09-snowflake-migrator-mvp1.md`,
+  which is not in the repository.
+- The `0600` promise for the config file is stated as POSIX-only, and the test
+  pinning it skips on Windows instead of failing.
+- `bin/snowmig` and `bin/snowmig-test` find the interpreter of a venv built on
+  Windows (`Scripts/python.exe`) and accept `python` as a last-resort name.
+- `--help` no longer opens with "Five subcommands" (there are 24); pyflakes
+  is clean apart from one deliberate re-export.
+
 ## [0.25.0] — 2026-09-19
 
 ### Fixed — the data plane could not read the one config file it is given
