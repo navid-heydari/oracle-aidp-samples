@@ -51,7 +51,8 @@ def _closing_quote(sql: str, start: int, quote: str) -> int:
     """Index just past the closing `quote`, honouring doubling and backslash.
 
     Snowflake accepts both `''` and `\\'` inside a single-quoted literal, and
-    `""` inside a quoted identifier.
+    `""` inside a quoted identifier. Spark doubles a backtick inside a
+    backtick-quoted identifier the same way.
     """
     i = start + 1
     n = len(sql)
@@ -67,7 +68,7 @@ def _closing_quote(sql: str, start: int, quote: str) -> int:
             return i + 1
         i += 1
     raise UnterminatedLiteral(
-        f"unterminated {'identifier' if quote == chr(34) else 'string'} "
+        f"unterminated {'string' if quote == chr(39) else 'identifier'} "
         f"starting at offset {start}")
 
 
@@ -121,6 +122,15 @@ def segments(sql: str) -> list[tuple[str, str]]:
             i = end
         elif ch == '"':
             end = _closing_quote(sql, i, '"')
+            flush()
+            out.append(("ident", sql[i:end]))
+            i = end
+        elif ch == "`":
+            # Spark's quoted identifier. Not Snowflake syntax, so on source SQL
+            # this changes nothing; on the Spark SQL this plugin EMITS -- which
+            # the DDL generator re-lexes to hand the catalog API a view body --
+            # a `"` inside a backticked name must not open a phantom identifier.
+            end = _closing_quote(sql, i, "`")
             flush()
             out.append(("ident", sql[i:end]))
             i = end

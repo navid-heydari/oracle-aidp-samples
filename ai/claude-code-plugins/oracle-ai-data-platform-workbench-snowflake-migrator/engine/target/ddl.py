@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass, field
 
+from snowflake_source.dialect import lexer
 from snowflake_source.dialect.views import (  # noqa: F401  (re-exported)
     detect_unsupported_constructs, extract_view_body, translate_view_body,
 )
@@ -56,18 +57,31 @@ TARGET_REJECTED_COLUMN_TYPES: dict[str, str] = {
 def unsupported_target_types(statements: list[dict]) -> list[dict]:
     """Column types in `statements` that the target will refuse.
 
-    Reads the EMITTED sql, not the source inventory: the question is what this
-    plan would actually declare, after every mapping flag has been applied.
+    Reads what this plan would actually DECLARE, after every mapping flag has
+    been applied: the statement's expected_columns, which build_ddl_plan fills
+    from the same target_type the SQL was written from, or -- for a caller that
+    hands over raw SQL -- the emitted text itself.
     """
     found: list[dict] = []
     for stmt in statements:
         sql = stmt.get("sql") or ""
+        # Views carry their SOURCE column types in expected_columns and declare
+        # none in their SQL, so they are out regardless of the path taken.
         if "CREATE TABLE" not in sql.upper():
             continue
+        columns = stmt.get("expected_columns") or []
         for type_name, remedy in TARGET_REJECTED_COLUMN_TYPES.items():
-            # Anchored on the backtick-quoted column the emitter writes, so a
-            # type NAMED in a comment or a rule note is not a false positive.
-            hits = re.findall(r"`(\w+)`\s+" + type_name + r"\b", sql)
+            if columns:
+                hits = [c["name"] for c in columns
+                        if str(c.get("type") or "").upper() == type_name]
+            else:
+                # Anchored on the backtick-quoted column the emitter writes, so
+                # a type NAMED in a comment or a rule note is not a false
+                # positive. Any character may appear inside the backticks --
+                # `(\w+)` missed every name with a space, hyphen or dot, and
+                # truncated one with an embedded (doubled) backtick.
+                hits = [h.replace("``", "`") for h in re.findall(
+                    r"`((?:[^`]|``)+)`\s+" + re.escape(type_name) + r"\b", sql)]
             if hits:
                 found.append({"target_fqn": stmt.get("target_fqn"),
                               "source_identifier": stmt.get(
@@ -263,6 +277,60 @@ def build_create_table(record: dict, target_fqn: str) -> RewriteResult:
 
 
 
+_PLAIN_PART = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _ref_part_pattern(part: str) -> str:
+    # One part of a 3-part name as it may appear in a body: unquoted (Snowflake
+    # folds it, so case-insensitive), or quoted -- Spark backticks after the
+    # dialect pass, Snowflake double quotes before it -- which is exact-case,
+    # because "orders" and ORDERS are different objects in Snowflake.
+    backticked = re.escape("`" + part.replace("`", "``") + "`")
+    double_quoted = re.escape('"' + part.replace('"', '""') + '"')
+    return f"(?:(?-i:{backticked}|{double_quoted})|{re.escape(part)})"
+
+
+def _rewrite_view_refs(body: str, name_map: dict[str, str]
+                       ) -> tuple[str, list[str]]:
+    """Rewrite whole 3-part object references in `body` per `name_map`.
+
+    Matches run over code and identifier segments only. A 3-part name inside a
+    string literal is DATA the view returns, and one inside a comment is prose;
+    a plain re.sub over the body rewrote both. Each part must be whole: word
+    boundaries stop `DB.S.ORDERS` from hitting `DB.S.ORDERS_ARCHIVE`, and a hit
+    is blanked before shorter names are tried so nothing matches inside it.
+    Returns the rewritten body and the `src -> tgt` pairs that actually hit.
+    """
+    mask = "".join(
+        "".join("\n" if c == "\n" else " " for c in text)
+        if kind in ("string", "comment") else text
+        for kind, text in lexer.segments(body))
+    edits: list[tuple[int, int, str]] = []
+    changed: list[str] = []
+    for src, tgt in sorted(name_map.items(), key=lambda kv: -len(kv[0])):
+        if src == tgt:
+            continue
+        pattern = (r'(?<![\w`"$.])'
+                   + r"\s*\.\s*".join(_ref_part_pattern(p) for p in src.split("."))
+                   + r'(?![\w`"$])')
+        hits = [m.span() for m in re.finditer(pattern, mask, re.IGNORECASE)]
+        if not hits:
+            continue
+        # A target part the Spark parser would not read as one word (a hyphen
+        # from a prefixed catalog name) is backticked; a plain one is emitted
+        # as-is, so the common case stays byte-identical to the planned name.
+        replacement = ".".join(p if _PLAIN_PART.match(p) else _q(p)
+                               for p in tgt.split("."))
+        for start, end in hits:
+            edits.append((start, end, replacement))
+            mask = mask[:start] + " " * (end - start) + mask[end:]
+        changed.append(f"{src} -> {tgt}")
+    out = body
+    for start, end, replacement in sorted(edits, reverse=True):
+        out = out[:start] + replacement + out[end:]
+    return out, changed
+
+
 def build_create_view(record: dict, target_fqn: str,
                       name_map: dict[str, str] | None = None) -> RewriteResult:
     """Generate CREATE VIEW, or block with the reason it cannot be migrated."""
@@ -291,12 +359,14 @@ def build_create_view(record: dict, target_fqn: str,
 
     try:
         body = extract_view_body(ddl)
+        # Inside the guard on purpose: a translator that cannot read one view
+        # blocks THAT view with the reason, it does not abort the stage.
+        translated = translate_view_body(body)
     except ValueError as exc:
         res.blocked = True
         res.blocked_reason = str(exc)
         return res
 
-    translated = translate_view_body(body)
     if translated.unsupported:
         res.blocked = True
         res.blocked_reason = "Snowflake-only SQL: " + "; ".join(
@@ -306,15 +376,11 @@ def build_create_view(record: dict, target_fqn: str,
     for applied in translated.applied:
         res.rules_applied.append(RuleApplication(
             applied["rule_id"], f'{applied["construct"]}: {applied["detail"]}'))
+    # The type mapper's notes on a `::TIMESTAMP` or `::TIME` cast travel with
+    # the view, the same way a column's mapping warning travels with a table.
+    res.warnings.extend(translated.warnings)
 
-    rewritten, changed = translated.sql, []
-    for source_name, target_name in sorted((name_map or {}).items(),
-                                           key=lambda kv: -len(kv[0])):
-        if source_name != target_name and re.search(
-                re.escape(source_name), rewritten, re.IGNORECASE):
-            rewritten = re.sub(re.escape(source_name), target_name, rewritten,
-                               flags=re.IGNORECASE)
-            changed.append(f"{source_name} -> {target_name}")
+    rewritten, changed = _rewrite_view_refs(translated.sql, name_map or {})
 
     if changed:
         res.rules_applied.append(RuleApplication(
@@ -326,21 +392,41 @@ def build_create_view(record: dict, target_fqn: str,
             "bronze mirrors the source 1:1, so object references are unchanged"))
 
     if translated.applied:
-        res.rules_applied.append(RuleApplication(
-            "R43_VIEW_DIALECT_TRANSLATED",
-            f"{len(translated.applied)} dialect rule(s) applied; every one is an "
-            "exact rewrite"))
-        res.warnings.append(
-            f"View SQL was dialect-translated by "
-            f"{len(translated.applied)} exact rule(s). Verify its result against "
-            "the source before relying on it.")
+        n = len(translated.applied)
+        # A rule that is exact only under a condition says so here, next to
+        # the count, rather than letting the plan call the whole view exact.
+        caveats = [f'{a["rule_id"]}: {a["caveat"]}'
+                   for a in translated.applied if a.get("caveat")]
+        if caveats:
+            res.rules_applied.append(RuleApplication(
+                "R43_VIEW_DIALECT_TRANSLATED",
+                f"{n} dialect rule(s) applied; NOT all exact: "
+                + "; ".join(caveats)))
+            res.warnings.append(
+                f"View SQL was dialect-translated by {n} rule(s), not all exact: "
+                + "; ".join(caveats)
+                + ". Confirm the operand types against the source before "
+                "relying on it.")
+        else:
+            res.rules_applied.append(RuleApplication(
+                "R43_VIEW_DIALECT_TRANSLATED",
+                f"{n} dialect rule(s) applied; every one is an exact rewrite"))
+            res.warnings.append(
+                f"View SQL was dialect-translated by {n} exact rule(s). Verify "
+                "its result against the source before relying on it.")
     else:
+        # This is what was checked, no more: the rule table matched nothing.
+        # A function outside the table (GREATEST/LEAST null handling, SPLIT's
+        # regex separator, ZEROIFNULL) ships as written and is not parsed here.
         res.rules_applied.append(RuleApplication(
             "R42_VIEW_PORTABLE_SQL",
-            "no Snowflake-only construct present; body carried over verbatim"))
+            "no known Snowflake-only construct matched; functions not in the "
+            "rule table are carried verbatim and may fail or differ at Spark "
+            "parse time"))
         res.warnings.append(
-            "View SQL was carried over unchanged. Verify its result against the "
-            "source before relying on it.")
+            "View SQL was carried over unchanged: no known Snowflake-only "
+            "construct matched, and functions not in the rule table were not "
+            "checked. Verify its result against the source before relying on it.")
     res.sql = f"CREATE VIEW IF NOT EXISTS {_qualify(target_fqn)} AS\n{rewritten}"
     res.expected_columns = [
         {"name": c["COLUMN_NAME"], "type": c["target_type"]}
@@ -364,13 +450,33 @@ def build_ddl_payload(inventory: dict, plan: dict) -> dict:
     Emits in wave order, so a view always follows the tables it reads. Shared
     by the CLI stage and the emulated (demo) pipeline, so the two cannot
     drift apart.
+
+    A member of a dependency cycle is NOT emitted. PLANNED_OBJECTS.md lists
+    those objects as excluded from the ordering pending a human decision, and
+    the ddl stage used to re-add every un-waved clone target -- exactly the
+    cycle members -- so the two artifacts contradicted each other and deploy
+    attempted views whose dependency did not exist.
     """
     by_id = {r["source_identifier"]: r for r in inventory["inventory"]}
     name_map = plan.get("target_names", {})
+    cycles = [list(c) for c in plan.get("cycles", [])]
+    in_cycle = {n for c in cycles for n in c}
     ordered = [i for wave in plan.get("waves", []) for i in wave]
-    ordered += [i for i in plan.get("clone_targets", []) if i not in ordered]
+    ordered += [i for i in plan.get("clone_targets", [])
+                if i not in ordered and i not in in_cycle]
 
     statements, blocked = [], []
+    for ident in sorted(i for i in plan.get("clone_targets", []) if i in in_cycle):
+        rec = by_id.get(ident) or {}
+        others = sorted(n for c in cycles if ident in c for n in c if n != ident)
+        blocked.append({
+            "source_identifier": ident,
+            "object_type": rec.get("object_type"),
+            "reason": ("not emitted: dependency cycle with "
+                       + (", ".join(others) or "itself")
+                       + "; PLANNED_OBJECTS.md lists it under Dependency "
+                       "cycles for a human decision, and no edge was broken "
+                       "to force an order")})
     for ident in ordered:
         rec = by_id.get(ident)
         if rec is None:

@@ -308,3 +308,24 @@ def test_sub_code_anchor_group_accepts_a_literal_at_the_span_start():
                             sql, anchor_group="op")
     assert out == "select CAST('x' AS int)"
     assert n == 1
+
+
+# ------------------------------------------------------- backtick identifiers
+
+def test_backtick_quoted_identifier_is_its_own_segment():
+    # The translator emits Spark backtick identifiers and the DDL generator
+    # re-lexes the emitted statement to hand the catalog API its body. While a
+    # backtick was code, a `"` inside it opened a phantom identifier and the
+    # re-lex raised -- and the catalog API would have received an empty body.
+    assert lexer.segments('select `a"b` from t') == [
+        ("code", "select "), ("ident", '`a"b`'), ("code", " from t")]
+
+
+def test_doubled_backtick_inside_identifier_does_not_end_it():
+    assert lexer.segments("select `we``ird`") == [
+        ("code", "select "), ("ident", "`we``ird`")]
+
+
+def test_unterminated_backtick_identifier_is_reported():
+    with pytest.raises(lexer.UnterminatedLiteral, match="identifier"):
+        lexer.segments("select `oops from t")

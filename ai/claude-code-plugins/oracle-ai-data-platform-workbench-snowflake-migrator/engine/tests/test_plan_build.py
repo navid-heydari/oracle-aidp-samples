@@ -155,3 +155,14 @@ def test_dependency_provenance_carried():
                        "coverage_note": "view edges ONLY"})
     assert plan["dependency_source"] == "parsed_ddl"
     assert "ONLY" in plan["dependency_coverage_note"]
+
+
+# --- one bad view must not abort the plan -----------------------------------
+
+def test_a_view_with_an_escaped_quote_in_a_cast_does_not_abort_the_plan():
+    bad = "create view V_BAD as select 'don\\'t'::string as w, a from D.PUBLIC.T"
+    inv = {"inventory": [rec("D.PUBLIC.T"),
+                         rec("D.PUBLIC.V_BAD", kind="VIEW", ddl=bad)]}
+    plan = build_plan(inv, {"edges": []})
+    can = {c["source_identifier"] for c in plan["can_migrate"]}
+    assert "D.PUBLIC.V_BAD" in can, plan["cannot_migrate"]
