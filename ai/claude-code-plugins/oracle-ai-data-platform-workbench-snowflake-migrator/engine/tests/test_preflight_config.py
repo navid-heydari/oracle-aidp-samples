@@ -9,6 +9,7 @@ credential's CONTENT never appears, and a check that was not run reads as
 skipped rather than as a pass.
 """
 import json
+import os
 
 import pytest
 
@@ -153,6 +154,8 @@ def test_the_report_tells_the_reader_to_confirm_with_the_user(tmp_path):
 
 # --- the config file itself ------------------------------------------------
 
+@pytest.mark.skipif(os.name == "nt",
+                    reason="POSIX mode bits; Windows files inherit the profile ACL")
 def test_a_new_config_is_created_unreadable_to_others(tmp_path):
     """It is about to hold a password in plain text; 0644 from the default
     umask would make that world-readable on a shared host."""

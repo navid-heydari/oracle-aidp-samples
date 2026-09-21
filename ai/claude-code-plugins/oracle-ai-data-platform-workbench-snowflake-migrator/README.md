@@ -58,7 +58,8 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig init-config
 ```
 
 That writes `./snowmig-config.yaml` from `snowmig-config.example.yaml` with
-mode `0600`, and refuses to overwrite one that already exists (it would be
+mode `0600` (on POSIX; Windows has no mode bits, so the file inherits your
+profile's ACL), and refuses to overwrite one that already exists (it would be
 holding credentials). Copying the template by hand works just as well —
 `chmod 600` it yourself if you do. Fill it in:
 **the Snowflake connection and the AIDP destination both live in that one
@@ -537,7 +538,6 @@ against a real account.
 ## Docs
 
 - [docs/specs/2026-09-09-mvp1-design.md](docs/specs/2026-09-09-mvp1-design.md) — design
-- [docs/plans/2026-09-09-snowflake-migrator-mvp1.md](docs/plans/2026-09-09-snowflake-migrator-mvp1.md) — implementation plan
 - [references/type-mapping.md](references/type-mapping.md) — the type table
 - [ASSUMPTIONS.md](ASSUMPTIONS.md) — everything this rests on, and what breaks if each is wrong
 - [references/data-movement-options.md](references/data-movement-options.md) — the five ways bytes could move later; **none implemented**

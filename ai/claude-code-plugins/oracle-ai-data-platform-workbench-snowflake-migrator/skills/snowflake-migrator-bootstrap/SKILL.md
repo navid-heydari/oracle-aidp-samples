@@ -67,7 +67,8 @@ If there is no config, create one where the user is working:
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig init-config
 ```
 
-That writes `./snowmig-config.yaml` from the template, mode `0600`, and refuses
+That writes `./snowmig-config.yaml` from the template, mode `0600` on POSIX
+(Windows has no mode bits), and refuses
 to overwrite an existing one (that file holds live credentials). An installed
 plugin's own directory may be read-only, which is exactly why the config
 belongs in the working directory.

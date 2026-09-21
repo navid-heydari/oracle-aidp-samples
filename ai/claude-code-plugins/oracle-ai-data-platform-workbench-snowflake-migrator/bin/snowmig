@@ -37,7 +37,7 @@ has_deps() { "$1" -c 'import yaml, snowflake.connector' >/dev/null 2>&1; }
 
 # A usable interpreter that ALREADY has what the engine needs.
 find_ready_python() {
-  for candidate in "${SNOWMIG_PYTHON:-}" python3 python3.13 python3.12 python3.11; do
+  for candidate in "${SNOWMIG_PYTHON:-}" python3 python3.13 python3.12 python3.11 python; do
     [ -n "${candidate}" ] || continue
     command -v "${candidate}" >/dev/null 2>&1 || continue
     if has_deps "${candidate}"; then printf '%s' "${candidate}"; return 0; fi
@@ -49,7 +49,7 @@ find_ready_python() {
 # 3.10+ syntax, so an older one is refused here rather than failing later
 # with a confusing SyntaxError.
 find_base_python() {
-  for candidate in python3.13 python3.12 python3.11 python3; do
+  for candidate in python3.13 python3.12 python3.11 python3 python; do
     command -v "${candidate}" >/dev/null 2>&1 || continue
     if "${candidate}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
       printf '%s' "${candidate}"; return 0
@@ -72,6 +72,8 @@ if [ -z "${PY}" ]; then
   "${base}" -m venv "${SCRATCH}/venv" >/dev/null 2>&1 \
     || die "could not create a temporary venv in ${SCRATCH}"
   PY="${SCRATCH}/venv/bin/python"
+  # A venv on Windows (Git Bash) puts the interpreter under Scripts/.
+  [ -x "${PY}" ] || PY="${SCRATCH}/venv/Scripts/python.exe"
   "${PY}" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
   if [ -f "${REQUIREMENTS}" ]; then
     "${PY}" -m pip install --quiet -r "${REQUIREMENTS}" \

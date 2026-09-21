@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """snowmig -- Snowflake -> AIDP migrator CLI.
 
-Five subcommands, one per pipeline stage. Each reads the previous stage's JSON
-and writes its own plus a markdown report, so any stage can be re-run alone.
+One subcommand per pipeline stage (`--help` lists them all). Each reads the
+previous stage's JSON and writes its own plus a markdown report, so any stage
+can be re-run alone. The main ones:
 
   assess  -> inventory.json      + INVENTORY.md            (needs Snowflake)
   deps    -> dependencies.json                              (needs Snowflake)
@@ -83,11 +84,10 @@ from target.catalog_provision import ensure_catalog
 from target.catalog_provision import RefusedToExecute as CatalogRefused
 from target.snowflake_catalog_connection import (
     ConnectionConfigError, build_snowflake_connection_details,
-    load_connection_config,
 )
 from migration_config import (
     CONFIG_NAMES, TEMPLATE_NAME, ConfigError, aidp_block, discover_config,
-    load_config, redact, resolve_secret, snowflake_block, write_template,
+    load_config, resolve_secret, snowflake_block, write_template,
 )
 from target.deploy import RefusedToExecute, deploy
 from target.jobs import JobRunCollision

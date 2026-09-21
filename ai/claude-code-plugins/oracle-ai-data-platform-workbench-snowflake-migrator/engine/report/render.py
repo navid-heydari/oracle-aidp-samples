@@ -231,7 +231,7 @@ def render_planned_objects(plan: dict) -> str:
     out += architecture_section(plan)
 
     if plan.get("dependency_source"):
-        out += [f'---', "",
+        out += ['---', "",
                 f'Lineage source: **{plan["dependency_source"]}** — '
                 f'{plan.get("dependency_coverage_note") or ""}']
     return "\n".join(out) + "\n"
@@ -250,9 +250,9 @@ def render_catalog(res: dict) -> str:
         headline = (f'Would register an **EXTERNAL** catalog of source type '
                     f'**{res.get("source_type")}**'
                     if is_external else
-                    f'Would create the **STANDARD** catalog **container**, and '
-                    f'nothing inside it — its schemas and tables are created '
-                    f'on AIDP compute by the structure workflow (runbook S10)')
+                    'Would create the **STANDARD** catalog **container**, and '
+                    'nothing inside it — its schemas and tables are created '
+                    'on AIDP compute by the structure workflow (runbook S10)')
         out = [f"# Target catalog `{name}` — DRY RUN", "",
                f'{headline}; **nothing was created**.', ""]
         if not is_external:
@@ -413,7 +413,7 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
 
     jobs = plan.get("silver_gold_jobs") or []
     if jobs and not res.get("dry_run"):
-        out += [f"## Silver/Gold jobs", "",
+        out += ["## Silver/Gold jobs", "",
                 f"{len(jobs)} job(s) defined in the plan, disabled and never "
                 "triggered. Creating them on AIDP is a separate step.", ""]
     return "\n".join(out).rstrip() + "\n"
@@ -1091,7 +1091,6 @@ def render_security(sec: dict) -> str:
 
 def render_preflight(plan: dict, *, source: dict | None = None,
                      target: dict | None = None) -> str:
-    s = plan.get("summary") or {}
     can = plan.get("can_migrate") or []
     cannot = plan.get("cannot_migrate") or []
     schemas = plan.get("schemas_to_create") or []
