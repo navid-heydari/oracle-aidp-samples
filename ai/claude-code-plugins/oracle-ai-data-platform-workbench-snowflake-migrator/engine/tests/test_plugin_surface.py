@@ -436,3 +436,79 @@ def test_the_router_forbids_doing_the_engine_s_work_by_hand():
     assert "cannot be found, stop" in low
     assert "${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py" in text
     assert "never a reason to improvise" in low
+
+
+# --- the key files the docs tell the operator to create -----------------------
+# `snowmig-config.example.yaml` and the bootstrap skill both generate an
+# UNENCRYPTED PKCS#8 key into the working directory (`./migrator_rsa_key.p8`,
+# `./sf_key.p8`), and the plugin folder is the documented "convenient spot"
+# to work from inside a checkout. `.gitignore` covered `*.pem` and `*.key`
+# but not `*.p8`, so a `git add -A` for a doc fix would have staged the key.
+
+KEY_FILES_THE_DOCS_CREATE = ["migrator_rsa_key.p8", "sf_key.p8", "rsa_key.p8",
+                             "engine/anything.pk8", "x.pem", "x.key"]
+
+
+def test_gitignore_names_every_private_key_spelling():
+    rules = [line.strip() for line in
+             (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()]
+    for pattern in ("*.pem", "*.key", "*.p8", "*.pk8", "rsa_key*",
+                    "*_rsa_key*", "sf_key*"):
+        assert pattern in rules, f".gitignore must carry {pattern!r}"
+
+
+@pytest.mark.parametrize("name", KEY_FILES_THE_DOCS_CREATE)
+def test_gitignore_covers_every_key_file_the_docs_tell_you_to_create(name):
+    import shutil
+    import subprocess
+    if shutil.which("git") is None:
+        pytest.skip("git is not on PATH")
+    proc = subprocess.run(["git", "check-ignore", "-q", "--", name],
+                          cwd=ROOT, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    if proc.returncode == 128:
+        pytest.skip("the plugin is not inside a git work tree")
+    assert proc.returncode == 0, f"{name} would be committed by `git add -A`"
+
+
+def test_privacy_doc_describes_the_current_credential_and_data_flows():
+    """PRIVACY.md is what a security reviewer reads before the live run. It
+    described the structure-only era: path-only secrets, no credential in any
+    artifact, coordinates not persisted, table data never read, only `deploy`
+    writes. The code does the opposite on each point -- the one config file
+    holds the credential inline, `provision --source-config` uploads it to
+    the workspace, `catalog --execute` sends it to AIDP in connectionDetails,
+    the copy stage reads every row -- and an approval obtained on the old text
+    would be obtained on false premises."""
+    from plan.smoke import PROBE_SCHEMA
+    from snowmig import ARTIFACTS_DIRNAME
+    text = (ROOT / "PRIVACY.md").read_text(encoding="utf-8")
+    flat = " ".join(text.lower().split())
+    # What leaves the machine, and how.
+    assert "backup-snowflake-migration/plan" in flat, \
+        "name the workspace folder the config is uploaded to"
+    assert "provision --execute" in flat and "catalog --execute" in flat
+    assert "connectiondetails" in flat or "snowflake_password" in flat, \
+        "say the credential travels in the catalog registration body"
+    assert "raw-request" in flat or "aidp catalog" in flat
+    assert "tls" in flat
+    # What the data plane does with rows.
+    assert "select * from" in flat or "every row" in flat
+    # Where things land locally, and what the probe is called.
+    assert ARTIFACTS_DIRNAME.lower() in flat
+    assert (PROBE_SCHEMA + "_").lower() in flat, \
+        "the probe schema carries a per-run suffix"
+    assert "pyyaml" in flat
+    # `run` starts jobs and has no dry-run gate; say so.
+    assert "`run`" in text
+    # The stale claims must be gone, verbatim.
+    for stale in ("never accepted as inline",
+                  "written into any artifact",
+                  "not persisted by the plugin",
+                  "table data is never read",
+                  "no stage selects rows",
+                  "creates a schema named `snowmig_permission_probe`",
+                  "leaves nothing behind outside"):
+        assert stale not in flat, f"stale claim still in PRIVACY.md: {stale!r}"
+    # And it still says what a reviewer must hear plainly.
+    assert "rotate" in flat, "advise rotating the credential after the run"

@@ -36,7 +36,9 @@ from migration_config import ConfigError, load_config, snowflake_block
 from plan.preflight import SECRET_PATH_FIELDS
 
 from .naming import translate_name
-from .stage_notebooks import STAGES, build_stage_notebook
+from .stage_notebooks import (
+    DIAGNOSE_NOTEBOOK_NAME, STAGES, build_diagnose_notebook,
+    build_stage_notebook)
 from .provision_api import (
     build_cluster_body, build_job_body,
     build_library_items, build_provision_command, build_workspace_body,
@@ -105,7 +107,7 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
     """A `call(operation, **kwargs) -> dict` over the documented API."""
     import subprocess
 
-    from .runner import _printable
+    from .runner import _printable, spool_body
     from .executor import collect_pages, parse_cli_envelope
 
     def _run(cmd):
@@ -126,6 +128,13 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
                 "this transport does not carry file content; upload through "
                 "the workspace-object operations (upload_ws_file), which take "
                 "a local path")
+        # `connectionDetails` is the Snowflake credential -- the testConnection
+        # body carries the same password or PEM the catalog registration did.
+        # It travels by file, exactly like create_catalog's body, so it is
+        # never an argv element for `ps` or process auditing to record.
+        if isinstance(body, dict) and "connectionDetails" in body:
+            spooled = spool_body(body, prefix="snowmig_testconn_")
+            kwargs = {**kwargs, "body_file": spooled}
         try:
             cmd = build_provision_command(backend, operation, platform_ocid,
                                           **kwargs)
@@ -485,6 +494,9 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
             step("upload", "would upload", None,
                  f'{spec["notebook"]} (generated) -> '
                  f'{SCRIPTS_FOLDER}/{spec["notebook"]}')
+        step("upload", "would upload", None,
+             f"{DIAGNOSE_NOTEBOOK_NAME} (generated, no job) -> "
+             f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}")
         for path in plan_files:
             step("upload", "would upload", None,
                  f"{path.name} -> {PLAN_FOLDER}/{path.name}")
@@ -848,6 +860,50 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                  found is not None, spec["name"])
         except Exception as exc:
             step("job", "failed", False, f'{spec["name"]}: {str(exc)[:200]}')
+
+    # 6 · the environment diagnosis, beside the stages, with NO job --------
+    # README step 8 has the operator open it from scripts/ before the jobs;
+    # only the four job notebooks were uploaded, so it was never there. Built
+    # with this run's config path so it runs unedited, and recorded under its
+    # own step name: it is not one of the job notebooks.
+    diagnose_path = f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}"
+    if keep_existing and listing_error is not None:
+        # Same rule as the stage notebooks: could not look is not absent.
+        step("diagnose", "failed", False,
+             f"{diagnose_path}: could not list {SCRIPTS_FOLDER} to tell "
+             f"whether it already exists ({str(listing_error)[:160]}); "
+             f"neither overwritten nor created. Re-run, or pass "
+             f"--refresh-notebooks to regenerate it regardless")
+        return out
+    if keep_existing and DIAGNOSE_NOTEBOOK_NAME in present:
+        step("diagnose", "kept", True,
+             f"{diagnose_path}: already on the workspace and left as it is. "
+             f"Pass --refresh-notebooks to regenerate it from this run's "
+             f"config path")
+        out["notebooks_kept"].append(DIAGNOSE_NOTEBOOK_NAME)
+        return out
+    try:
+        nb = build_diagnose_notebook(overrides=defaults)
+        fd, local = tempfile.mkstemp(prefix="snowmig_diagnose_",
+                                     suffix=".ipynb")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(nb, fh, indent=1)
+        try:
+            call("upload_ws_file", workspace=ws_key, path=diagnose_path,
+                 local_path=local, object_type="NOTEBOOK")
+        finally:
+            os.unlink(local)
+        listed = call("list_ws_objects", workspace=ws_key,
+                      path=SCRIPTS_FOLDER).get("items") or []
+        seen = any(str(i.get("path") or "").endswith("/" + DIAGNOSE_NOTEBOOK_NAME)
+                   or i.get("displayName") == DIAGNOSE_NOTEBOOK_NAME
+                   for i in listed)
+        step("diagnose", "uploaded" if seen else "upload_requested", seen,
+             diagnose_path if seen
+             else f"{diagnose_path}: not visible in the listing")
+    except Exception as exc:
+        step("diagnose", "failed", False,
+             f"{diagnose_path}: {str(exc)[:200]}")
 
     return out
 

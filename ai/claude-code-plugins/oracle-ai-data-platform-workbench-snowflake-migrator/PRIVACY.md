@@ -4,101 +4,180 @@
 
 ## Summary
 
-This plugin **collects, stores and transmits no data to its authors or to
-Oracle**. There is no telemetry, no analytics, no usage reporting and no
-licence check. It is self-contained: the full engine ships under `engine/` as
-plain Python and runs locally, against **your** Snowflake account and **your**
-Oracle AI Data Platform (AIDP) tenancy.
+This plugin **collects, stores and transmits no data to its authors**. There
+is no telemetry, no analytics, no usage reporting and no licence check. It is
+self-contained: the full engine ships under `engine/` as plain Python and
+runs locally, against **your** Snowflake account and **your** Oracle AI Data
+Platform (AIDP) tenancy — and, past `provision`, as notebooks on **your**
+AIDP compute.
+
+Two things do leave your machine, and only when you pass `--execute`: the
+**Snowflake credential**, which travels to your AIDP tenancy so the data
+plane can reach Snowflake from there, and the **migration plan**. This
+document says exactly how. Table rows never pass through the operator's
+machine.
 
 ## What runs
 
 | Component | What it is |
 |---|---|
-| `engine/` | Python modules invoked as `python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py <stage>` |
+| `engine/` | Python modules invoked as `python3 ${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py <stage>` — the control plane, on your machine |
+| `data-migration-scripts/` | Generated `.ipynb` notebooks that `provision` uploads and that run **inside AIDP**, on your cluster — the data plane |
 | `skills/`, `commands/` | Markdown instructions for Claude Code. No code, no network access |
 | `references/` | Markdown documentation |
 
-Runtime dependencies are `snowflake-connector-python` and `cryptography`
-(`engine/requirements.txt`). `pytest` is used for development only.
+Runtime dependencies are `snowflake-connector-python`, `cryptography` and
+`pyyaml` (`engine/requirements.txt`). `pytest` is used for development only.
+The notebooks need nothing installed on the cluster: the AIDP Snowflake
+connector is built in.
 
 ## Where it connects
 
 Two destinations, both yours:
 
-1. **Your Snowflake account** — over the official
-   `snowflake-connector-python`. `engine/snowflake_source/conn.py` is the only
-   module that opens a socket.
-2. **Your OCI tenancy / AIDP instance** — never directly. The plugin shells out
-   to the `aidp` CLI, or to the `oci` CLI, using the OCI configuration and keys
-   **already on your machine**. It does not read, copy or transmit your OCI
-   credentials.
+1. **Your Snowflake account** — from your machine over the official
+   `snowflake-connector-python` (`engine/snowflake_source/conn.py` is the
+   only module that opens a socket), and from your AIDP cluster over the
+   AIDP Snowflake connector when the data-plane notebooks run.
+2. **Your OCI tenancy / AIDP instance** — never directly. The plugin shells
+   out to the `aidp` CLI, or to the `oci` CLI (`oci raw-request` against the
+   documented AIDP REST API), using the OCI configuration and keys **already
+   on your machine**. Both speak HTTPS (TLS) to the OCI endpoint. It does not
+   read, copy or transmit your OCI credentials.
 
 Nothing else. No third-party service, no update check, no package download at
 runtime.
 
 ## Credentials
 
-- Snowflake secrets are read **from files you name by path** (`--key-path`,
-  `--pat-path`, `--password-path`). They are never accepted as inline
-  arguments, so they do not reach your shell history or a process listing.
-- No credential is logged, printed, or written into any artifact.
-- AIDP target coordinates (datalake OCID, workspace, cluster, catalog) are
-  **not persisted by the plugin**. They are supplied per invocation and are
-  held only for the life of the process. `engine/target/coords.py` contains no
-  filesystem or environment access at all, and a test enforces that.
+- **The configuration is one file, and it holds the Snowflake credential in
+  plain text.** `snowmig-config.yaml` carries the connection (`password:` or
+  `private_key: |` inline) beside the AIDP destination. `key_path:` /
+  `password_path:` remain as the way to keep the secret out of that file.
+  Secrets are never taken as command-line flags, so they do not reach your
+  shell history. The file is gitignored; `init-config` creates it readable
+  by you alone where the OS has mode bits (Windows files inherit your
+  profile's ACL instead).
+- **An inline secret is spooled to a temp file for the life of one
+  connection** (`tempfile.mkstemp(prefix="snowmig_secret_")` in
+  `engine/snowmig.py`), restricted to the current user where the OS supports
+  it, and removed in a `finally`.
+- **Nothing local renders a secret.** `preflight` and every report pass the
+  config through a redactor: an inline secret reads as *inline*, a `*_path`
+  as the path. A config the YAML parser rejects is refused by position
+  only, never quoted back.
+- **Two paths transmit the Snowflake credential to your AIDP tenancy, both
+  only with `--execute`:**
+  1. `provision --execute --source-config <file>` uploads that file
+     **verbatim** to the workspace folder `backup-snowflake-migration/plan/`
+     (`engine/target/provisioning.py`), so the data-plane notebooks can read
+     it from the `/Workspace` mount. It is uploaded only when you pass the
+     flag, and the notebook that `provision` writes beside it echoes the
+     file's key names, never a value. Who can read that folder is governed
+     by AIDP workspace access, which the plugin does not set — treat the
+     file as readable by whoever can open the workspace.
+  2. `catalog --execute` registers the EXTERNAL catalog with the credential
+     in the request's `connectionDetails` (`SNOWFLAKE_PASSWORD` or
+     `SNOWFLAKE_PRIVATE_KEY_CONTENT`, `engine/target/snowflake_catalog_connection.py`);
+     `--test-connection` sends the same body to `testConnection`. Both bodies
+     are spooled to a temp file the CLI reads by path — never an argv
+     element — and travel over `aidp catalog create` / `oci raw-request`
+     under TLS. AIDP then stores the credential as the catalog's connection.
+- What follows from that, plainly: use a **dedicated, read-only Snowflake
+  service user** for the migration; **rotate** its password or key when the
+  migration is done; and delete `backup-snowflake-migration/plan/<your
+  config>` from the workspace once the data plane no longer needs it.
+- **AIDP target coordinates** (datalake OCID, workspace, cluster, catalog)
+  live in the `aidp:` block of the same config and are recorded in
+  `PREFLIGHT.md` and the `*_result.json` artifacts, so a run is auditable.
+  `engine/target/coords.py` itself contains no filesystem or environment
+  access at all — it can only be handed a destination — and a test enforces
+  that. A coordinate read from the file is printed before anything acts on it.
 
 ## What it does to your Snowflake account
 
-**Reads only.** The transport refuses any statement that is not a read, so
-nothing is written to or dropped from the source whatever your credential
-permits (`engine/snowflake_source/conn.py`). It issues `SHOW`, `DESCRIBE`,
-`SELECT` against `INFORMATION_SCHEMA`, `GET_DDL()`, and — only with
-`--row-counts exact` — `SELECT COUNT(*)`, which returns an aggregate and no row
-content.
+**The control plane reads only.** The transport refuses any statement that is
+not a read, so nothing is written to or dropped from the source whatever your
+credential permits (`engine/snowflake_source/conn.py`). It issues `SHOW`,
+`DESCRIBE`, `SELECT` against `INFORMATION_SCHEMA`, `GET_DDL()`, and — only
+with `--row-counts exact` — `SELECT COUNT(*)`, which returns an aggregate and
+no row content. No stage running on your machine selects rows from a user
+table.
 
-**Your table data is never read.** No stage selects rows from a user table.
+**The data plane reads every row of every in-scope table.**
+`02_copy_schema`, running as an AIDP job on your cluster, copies a schema with
+`INSERT INTO <target> SELECT * FROM <source>` and, with
+`--verify counts+sums`, aggregates the rows again. Row data flows
+Snowflake → your AIDP cluster → your AIDP catalog storage, never through the
+operator's machine and never to the plugin's authors. The connector is
+read-only against Snowflake, so the source is unchanged. Two consequences
+worth stating: a **masked column arrives unmasked** and a row-access policy is
+simply absent on the copy (see `SECURITY.md` from the `security` stage), and
+each table is copied at its own moment, so a live source yields a target
+that is consistent per table but not across tables.
 
 ## What it writes to disk
 
-Artifacts go to the `--out-dir` you choose, locally. They contain **metadata
-about your estate, not its contents**:
+Artifacts go to `--out-dir`; when you do not pass one, the default is
+`<plugin root>/migration-artifacts/`, inside the plugin directory and
+gitignored. They contain **metadata about your estate, not its contents**:
 
 - database, schema, table and view names; column names, types, precision and
   nullability; row counts; warehouse names and sizes
 - **view SQL, verbatim** — a view definition can embed literal values, so
   treat these artifacts as sensitive as your schema
-- generated Spark SQL DDL and an `.ipynb` notebook
+- generated Spark SQL DDL and `.ipynb` notebooks
+- the AIDP coordinates the run used (`PREFLIGHT.md`, `*_result.json`)
 
-No table rows appear in any artifact.
+Also on your machine: `./snowmig-config.yaml`, created by `init-config` and
+holding the credential, and the short-lived temp files named above. No table
+rows appear in any local artifact. The reports the data plane writes
+(`copy_report_<schema>.json`, `MIGRATION_REPORT.md`) land in the workspace
+folder `backup-snowflake-migration/reports/` and hold counts and sums only.
 
 ## What it does to your AIDP tenancy
 
-Dry-run by default: `deploy` prints the statements and executes nothing unless
-you pass `--execute` **and** supply the target coordinates. When it does
-execute, it creates schemas, empty tables and views, and optionally uploads a
-notebook. It never drops or alters an existing object — the DDL is
-`CREATE ... IF NOT EXISTS`, and an object that already exists with a different
-structure is reported and left untouched.
+Dry-run by default for every stage that has one: nothing reaches AIDP without
+`--execute` **and** the target coordinates. The writers are:
 
-The one exception is `smoke --write-probe`, which creates a schema named
-`snowmig_permission_probe` to prove write access and then drops that one
-schema again. It is opt-in, never uses `CASCADE`, and skips the drop if the
-schema was already there.
+| Stage | With | What it creates or changes |
+|---|---|---|
+| `deploy --execute` | coordinates | schemas, empty tables and views in a Standard catalog, `CREATE ... IF NOT EXISTS`; never drops or alters |
+| `provision --execute` | coordinates | the workspace, the `migration-assets` cluster (and, with `--warehouse-clusters`, one per Snowflake warehouse), the folder `backup-snowflake-migration/`, the notebooks, the plan files — and the config, if you pass `--source-config` |
+| `catalog --execute` | coordinates | one EXTERNAL catalog carrying the Snowflake credential (or an INTERNAL container on request) |
+| `run` | a provisioned job | **starts a job**; there is no dry-run flag, because the dry run happened at `provision`. The job then copies data on your cluster |
+| `smoke --write-probe` | opt-in | a schema `snowmig_permission_probe_<8 hex chars>` to prove write access, then drops that one schema; never `CASCADE`, and a fresh suffix per run because a failed create poisons the name |
+| `notebook --upload` | opt-in | one generated notebook under `Shared/` |
+
+An object that already exists with a different structure is reported and
+left untouched.
 
 ## Two things worth knowing
 
 - **SQL is passed to the `aidp`/`oci` CLI as a command-line argument**, so
   while a statement runs it is visible to other users on the same machine via
-  `ps`. That is DDL and object names, never row data. On a shared host, keep
-  that in mind.
+  `ps`. That is DDL and object names, never row data. The two request bodies
+  that carry the credential (catalog registration and `testConnection`) are
+  the exception: they travel by temp file, not argv. On a shared host, keep
+  both in mind.
 - **This is a Claude Code plugin.** The skills instruct Claude, and the reports
   it generates are read back into the conversation so Claude can summarise
   them. Your conversation — including estate metadata and view SQL that Claude
   reads — is handled under the terms of whichever Claude product you are using.
   That is a property of using an AI assistant, not something this plugin adds,
-  but it is the honest answer to "where does this information go".
+  but it is the honest answer to "where does this information go". The
+  plugin never asks you to paste a secret into that conversation; if one
+  lands there anyway, rotate it.
 
 ## Removal
 
-Delete the plugin directory. It leaves nothing behind outside the `--out-dir`
-you chose.
+Delete the plugin directory, the `migration-artifacts/` folder inside it (or
+your `--out-dir`) and `./snowmig-config.yaml`. That removes everything on your
+machine.
+
+It does **not** touch the AIDP side. What a run created there stays until you
+delete it: the workspace folder `backup-snowflake-migration/` — including the
+uploaded config under `plan/`, which holds the credential — the EXTERNAL
+catalog, which stores the credential as its connection, the clusters and the
+jobs. Remove the two credential-bearing objects first, then rotate the
+Snowflake credential they held.

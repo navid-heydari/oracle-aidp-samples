@@ -350,6 +350,9 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
                    {})
 
     if operation == "test_connection":
-        return raw("POST", f"{base}/actions/testConnection", kwargs["body"])
+        # The body carries the Snowflake credential; the transport spools it
+        # and passes `body_file`, which `raw()` prefers over the inline body.
+        return raw("POST", f"{base}/actions/testConnection",
+                   kwargs.get("body"), body_file=kwargs.get("body_file"))
 
     raise ValueError(f"unknown provisioning operation {operation!r}")

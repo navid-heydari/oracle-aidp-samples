@@ -4,18 +4,24 @@ The transport is injected, so every decision — look-first, name translation,
 poll-the-read-back, record-don't-swallow — is tested with no environment.
 """
 import json
+import os
 import pathlib
+import tempfile
+import types
 
 import pytest
 
 from target.provision_api import (
     ProvisionBackendUnsupported, build_driver_notebook, build_job_body,
-    build_library_items, build_provision_command, content_path,
+    build_library_items, build_provision_command, build_test_connection_body,
+    content_path,
 )
-from target.stage_notebooks import STAGES, build_stage_notebook
+from target.stage_notebooks import (
+    DIAGNOSE_NOTEBOOK_NAME, STAGES, build_stage_notebook)
 from target.provisioning import (
     BACKUP_FOLDER, JOB_SPECS, PLAN_FOLDER, REPORTS_FOLDER, SCRIPTS_FOLDER,
-    provision, render_provision,
+    ProvisionTransportError, make_provision_call, provision,
+    render_provision,
 )
 
 OCID = "ocid1.aidataplatform.oc1.iad.a"
@@ -227,7 +233,74 @@ def test_jobs_point_straight_at_the_stage_notebook(scripts):
     uploaded = [kw for op, kw in fake.ops
                 if op == "upload_ws_file"
                 and kw.get("object_type") == "NOTEBOOK"]
-    assert len(uploaded) == len(JOB_SPECS)
+    # One NOTEBOOK per job, plus the environment diagnosis, which has none.
+    assert {kw["path"].rsplit("/", 1)[-1] for kw in uploaded} == \
+        {s["notebook"] for s in JOB_SPECS} | {DIAGNOSE_NOTEBOOK_NAME}
+
+
+# --- the environment diagnosis rides along, without a job -------------------
+# README step 8 says to open `scripts/diagnose_environment.ipynb` on the
+# cluster. provision uploaded only the four job notebooks, so it was never
+# there; hand-placed, it imported a module that is inlined elsewhere and read a
+# file nothing creates.
+
+def _provisioned_with_config(scripts, fake=None):
+    fake = fake or Fake()
+    # provision reads the config to derive the snowflake-block copy it
+    # uploads, so the file has to exist; an inline (fake) password keeps it
+    # off the laptop-only *_path refusal.
+    cfg = pathlib.Path(tempfile.mkdtemp(prefix="snowmig_cfg_")) / "snowmig-config.yaml"
+    cfg.write_text("snowflake:\n  account: ACC\n  user: u\n  warehouse: WH\n"
+                   "  database: DB\n  auth: password\n  password: not-a-real-one\n",
+                   encoding="utf-8")
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(), external_catalog="ext",
+                    source_config=cfg)
+    return fake, res
+
+
+def test_the_diagnose_notebook_is_uploaded_beside_the_stages_without_a_job(
+        scripts):
+    fake, res = _provisioned_with_config(scripts)
+    path = f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}"
+    assert path in fake.contents
+    upload = next(kw for op, kw in fake.ops
+                  if op == "upload_ws_file" and kw["path"] == path)
+    assert upload["object_type"] == "NOTEBOOK"
+    bodies = [kw["body"] for op, kw in fake.ops if op == "create_job"]
+    assert {b["name"] for b in bodies} == {s["name"] for s in JOB_SPECS}, \
+        "no job runs the diagnosis; it is opened by a human"
+    diagnose = [s for s in res["steps"] if s["step"] == "diagnose"]
+    assert len(diagnose) == 1 and diagnose[0]["verified"] is True
+    # The stage-notebook accounting is untouched by the fifth upload.
+    assert len([s for s in res["steps"] if s["step"] == "notebook"]) \
+        == len(JOB_SPECS)
+
+
+def test_the_diagnose_notebook_carries_this_run_s_config_path_and_no_mount_import(
+        scripts):
+    fake, _ = _provisioned_with_config(scripts)
+    body = fake.contents[f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}"]["body"]
+    assert "/Workspace/backup-snowflake-migration/plan/snowmig-config.json" \
+        in body, "the same mount path the stage notebooks receive"
+    assert "from snowmig_source import" not in body
+    assert "sys.path.insert" not in body
+    assert "def load_source_config" in body, "helpers inlined, like the stages"
+    assert "EXTERNAL_CATALOG = 'ext'" in body
+
+
+def test_a_failed_diagnose_upload_is_recorded_not_swallowed(scripts):
+    fake, res = _provisioned_with_config(scripts, Fake(fail={"upload_ws_file"}))
+    diagnose = [s for s in res["steps"] if s["step"] == "diagnose"]
+    assert len(diagnose) == 1 and diagnose[0]["verified"] is False
+
+
+def test_the_dry_run_previews_the_diagnose_notebook():
+    out = provision(call=None, workspace_name="ws",
+                    scripts=[pathlib.Path("00_discover_snowflake.py")],
+                    execute=False)
+    uploads = [s["detail"] for s in out["steps"] if s["step"] == "upload"]
+    assert any(DIAGNOSE_NOTEBOOK_NAME in d for d in uploads), uploads
 
 
 def test_this_run_s_coordinates_are_written_into_the_params_cell(scripts):
@@ -897,7 +970,8 @@ def test_reuse_existing_keeps_an_existing_stage_notebook(scripts):
                     target_catalog="mig")
     uploads = [kw for op, kw in fake.ops
                if op == "upload_ws_file" and kw.get("object_type") == "NOTEBOOK"]
-    assert uploads == [], "nothing already there is overwritten"
+    assert {kw["path"] for kw in uploads} <= {f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}"}, \
+        "nothing already there is overwritten; only the missing diagnosis is added"
     assert fake.contents[f"{SCRIPTS_FOLDER}/02_copy_schema.ipynb"]["body"] \
         == "console-edited"
     notebooks = [s for s in res["steps"] if s["step"] == "notebook"]
@@ -967,3 +1041,134 @@ def test_an_unlistable_scripts_folder_neither_overwrites_nor_creates(scripts):
     assert all("could not list" in s["detail"] for s in notebooks)
     assert not any(op == "upload_ws_file" and kw.get("object_type") == "NOTEBOOK"
                    for op, kw in fake.ops), "could not look is not absent"
+
+
+# --- testConnection carries the Snowflake credential ------------------------
+# `create_catalog` spools its credential-bearing body to a temp file so `ps`
+# (and process-creation auditing) never see it. The testConnection body carries
+# the SAME credential -- password, or the whole private key PEM -- and went
+# inline on the `oci` argv.
+
+_SECRET = "ZqTrickyPW_93-hunter2"
+_PEM = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----"
+_PASSPHRASE = "pass-phrase-Q7"
+
+
+def _ok(cmd):
+    return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+
+def _test_connection_body(**props):
+    return build_test_connection_body(
+        "cat-key", connection_properties={"SNOWFLAKE_USERNAME": "U", **props},
+        display_name="src")
+
+
+@pytest.mark.parametrize("props,secrets", [
+    ({"SNOWFLAKE_PASSWORD": _SECRET}, [_SECRET]),
+    ({"SNOWFLAKE_PRIVATE_KEY_CONTENT": _PEM,
+      "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE": _PASSPHRASE},
+     ["BEGIN PRIVATE KEY", "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", _PASSPHRASE]),
+], ids=["password", "keypair"])
+def test_the_test_connection_body_travels_by_file_not_argv(props, secrets,
+                                                           capsys):
+    seen = {}
+
+    def fake(cmd):
+        seen["cmd"] = list(cmd)
+        path = next((a for a in cmd if a.startswith("file://")), None)
+        seen["file"] = path
+        if path:
+            with open(path[len("file://"):], encoding="utf-8") as fh:
+                seen["spooled"] = fh.read()
+        return _ok(cmd)
+
+    call = make_provision_call(OCID, run_process=fake)
+    call("test_connection", body=_test_connection_body(**props))
+    blob = " ".join(seen["cmd"])
+    for secret in secrets:
+        assert secret not in blob, "the credential must not be an argv element"
+    assert seen["file"], "the body must travel by file"
+    assert seen["cmd"][seen["cmd"].index("--request-body") + 1] == seen["file"]
+    for secret in secrets:
+        assert secret in seen["spooled"], "the CLI reads the real body"
+        assert secret not in capsys.readouterr().out
+
+
+def test_the_test_connection_spool_is_removed_after_the_call():
+    seen = {}
+
+    def fake(cmd):
+        seen["path"] = next(a[len("file://"):] for a in cmd
+                            if a.startswith("file://"))
+        assert os.path.exists(seen["path"]), \
+            "the file must exist while the CLI runs"
+        return _ok(cmd)
+
+    call = make_provision_call(OCID, run_process=fake)
+    call("test_connection",
+         body=_test_connection_body(SNOWFLAKE_PASSWORD=_SECRET))
+    assert not os.path.exists(seen["path"]), \
+        "the spool must not outlive the call"
+
+
+def test_the_test_connection_spool_is_removed_even_when_the_call_fails():
+    seen = {}
+
+    def fake(cmd):
+        seen["path"] = next(a[len("file://"):] for a in cmd
+                            if a.startswith("file://"))
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="denied")
+
+    call = make_provision_call(OCID, run_process=fake)
+    with pytest.raises(ProvisionTransportError):
+        call("test_connection",
+             body=_test_connection_body(SNOWFLAKE_PASSWORD=_SECRET))
+    assert not os.path.exists(seen["path"])
+
+
+def test_build_provision_command_prefers_a_body_file_for_test_connection():
+    body = _test_connection_body(SNOWFLAKE_PASSWORD=_SECRET)
+    cmd = build_provision_command("oci_raw", "test_connection", OCID,
+                                  body=body, body_file="/tmp/x.json")
+    assert cmd[cmd.index("--request-body") + 1] == "file:///tmp/x.json"
+    assert json.dumps(body) not in cmd
+    # The body-only form keeps working, so the builder stays usable alone.
+    plain = build_provision_command("oci_raw", "test_connection", OCID,
+                                    body=body)
+    assert cmd[cmd.index("--target-uri") + 1].endswith(
+        "/actions/testConnection")
+    assert json.dumps(body) in plain
+
+
+def _catalog_transport(fake):
+    from target.coords import resolve_target
+    from target.runner import make_call
+    target = resolve_target(datalake_ocid=OCID, workspace="w",
+                            cluster_id="c", catalog="MYDB")
+    return make_call(target, backend="oci_raw", run_process=fake)
+
+
+@pytest.mark.parametrize("transport,operation,body", [
+    (_catalog_transport, "create_catalog",
+     {"displayName": "src", "catalogType": "EXTERNAL",
+      "connectionDetails": {"connectionProperties": {
+          "SNOWFLAKE_PASSWORD": _SECRET}}}),
+    (lambda fake: make_provision_call(OCID, run_process=fake),
+     "test_connection", _test_connection_body(SNOWFLAKE_PASSWORD=_SECRET)),
+], ids=["runner.create_catalog", "provisioning.test_connection"])
+def test_no_transport_puts_connection_details_on_argv(transport, operation,
+                                                      body):
+    """The guard that would have caught the drift: two transports, one rule.
+    Whatever carries `connectionDetails` never appears as an argv element."""
+    seen = {}
+
+    def fake(cmd):
+        seen["cmd"] = list(cmd)
+        return types.SimpleNamespace(
+            returncode=0, stdout=json.dumps({"data": {"key": "k"}}),
+            stderr="")
+
+    transport(fake)(operation, body=body)
+    assert not any("connectionDetails" in a for a in seen["cmd"]), seen["cmd"]
+    assert _SECRET not in " ".join(seen["cmd"])

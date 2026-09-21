@@ -3,6 +3,14 @@
 .env.*
 *.pem
 *.key
+# The key-pair recipe in snowmig-config.example.yaml and the bootstrap skill
+# writes an UNENCRYPTED PKCS#8 key into the working directory, which is often
+# this checkout. Every spelling those recipes produce, by extension and by name.
+*.p8
+*.pk8
+rsa_key*
+*_rsa_key*
+sf_key*
 oci_api_key*.pem
 **/.oci/
 

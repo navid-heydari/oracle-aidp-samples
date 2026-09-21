@@ -238,6 +238,81 @@ def test_an_unknown_aidp_key_is_reported_not_ignored():
         aidp_block({"aidp": {"datalake_ocd": "typo"}})
 
 
+# --- a config the parser rejects must not be quoted back ---------------------
+
+_BROKEN_SECRET = "SECRET-XYZ-123"
+
+# Each line is what a real password looks like once a YAML-special character
+# lands in it unquoted, and each drives PyYAML into a different error class.
+# A parser error quotes the offending source line; on the password line that
+# IS the password.
+_BROKEN_PASSWORD_LINES = [
+    pytest.param("password: {" + _BROKEN_SECRET, id="brace-parser-error"),
+    pytest.param("password: Pa: " + _BROKEN_SECRET, id="colon-scanner-error"),
+    pytest.param("password: [" + _BROKEN_SECRET, id="bracket-parser-error"),
+    pytest.param("password: *" + _BROKEN_SECRET, id="star-composer-error"),
+    pytest.param('password: "' + _BROKEN_SECRET, id="quote-unterminated"),
+]
+
+
+def _broken_config(tmp_path, line):
+    cfg = tmp_path / "snowmig-config.yaml"
+    cfg.write_text("snowflake:\n  account: acme\n  auth: password\n"
+                   f"  {line}\naidp:\n  workspace: ws\n", encoding="utf-8")
+    return cfg
+
+
+@pytest.mark.parametrize("line", _BROKEN_PASSWORD_LINES)
+def test_a_malformed_yaml_config_is_refused_without_echoing_the_secret(
+        tmp_path, line):
+    """`yaml.safe_load` was unguarded, and a YAMLError is not a ValueError, so
+    a password containing `{`, `: `, `[`, `*` or a leading quote escaped
+    `main()` as a traceback -- with PyYAML's snippet of the offending line,
+    i.e. the password, in it."""
+    import traceback
+    from migration_config import ConfigError, load_config
+    with pytest.raises(ConfigError) as caught:
+        load_config(_broken_config(tmp_path, line))
+    message = str(caught.value)
+    assert "not valid YAML" in message
+    assert "line 4" in message, "the operator needs to know WHERE, not what"
+    assert _BROKEN_SECRET not in message
+    # Nor may the chained cause carry it: a traceback printer walks the chain.
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert _BROKEN_SECRET not in rendered
+
+
+@pytest.mark.parametrize("line", _BROKEN_PASSWORD_LINES)
+def test_preflight_on_a_malformed_config_exits_1_with_a_redacted_message(
+        tmp_path, line, capsys):
+    """`preflight` is the documented first command, and it is where a strong
+    password first meets the YAML parser."""
+    from snowmig import main
+    cfg = _broken_config(tmp_path, line)
+    rc = main(["preflight", "--config", str(cfg),
+               "--out-dir", str(tmp_path / "out")])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "error:" in captured.err
+    assert "Traceback" not in captured.err
+    assert _BROKEN_SECRET not in captured.out
+    assert _BROKEN_SECRET not in captured.err
+
+
+def test_a_malformed_json_config_is_refused_without_echoing_the_secret(
+        tmp_path):
+    import traceback
+    from migration_config import ConfigError, load_config
+    cfg = tmp_path / "snowmig-config.json"
+    cfg.write_text('{"snowflake": {"account": "acme", "password": '
+                   + _BROKEN_SECRET + '}}', encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_config(cfg)
+    assert "not valid JSON" in str(caught.value)
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert _BROKEN_SECRET not in rendered
+
+
 # --- the first-run failure everyone hits -----------------------------------
 
 def test_a_bad_account_is_explained_not_tracebacked(monkeypatch):

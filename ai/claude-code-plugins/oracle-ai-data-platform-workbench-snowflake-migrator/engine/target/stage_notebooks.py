@@ -25,15 +25,34 @@ they are regenerated, never edited by hand.
 """
 from __future__ import annotations
 
+import ast
 import json
 import pathlib
 import re
 
-__all__ = ["STAGES", "StageSpec", "build_stage_notebook", "dataplane_dir",
-           "write_stage_notebooks"]
+__all__ = ["DIAGNOSE_NOTEBOOK_NAME", "DIAGNOSE_SOURCE_NAME", "STAGES",
+           "StageSpec", "build_diagnose_notebook", "build_stage_notebook",
+           "dataplane_dir", "write_stage_notebooks"]
 
 # The shared helper module every stage needs, inlined into each notebook.
 SHARED_SOURCE_NAME = "snowmig_source.py"
+
+# The environment diagnosis is generated like the stages but is NOT a stage:
+# no job runs it, it has no argparse `main()`, and a human reads its verdicts
+# cell by cell. Its source is split on `# %%` markers -- one cell per check,
+# `# %% [markdown]` for prose -- its module docstring is the notebook header,
+# and its parameters are edited in place with this run's coordinates. It used
+# to be a hand-maintained `.ipynb` that imported `snowmig_source` off the
+# mount (never uploaded there any more) and echoed the config with a
+# top-level-only redaction, which printed a nested `snowflake:` block whole.
+DIAGNOSE_SOURCE_NAME = "diagnose_environment.py"
+DIAGNOSE_NOTEBOOK_NAME = "diagnose_environment.ipynb"
+# provision's override keys -> the parameter each one sets. The rest of what
+# provision knows (target catalog, reports dir) is not a diagnosis input.
+DIAGNOSE_PARAMS = {"source-config": "CONFIG_PATH",
+                   "source-catalog": "EXTERNAL_CATALOG",
+                   "session-schema": "SESSION_SCHEMA"}
+_CELL_MARK = re.compile(r"^# %% ?(.*)$", re.MULTILINE)
 
 # `from snowmig_source import (...)` plus the sys.path line that made it
 # resolvable off the mount. Both are meaningless once the helpers are inlined
@@ -314,17 +333,121 @@ def build_stage_notebook(stage: StageSpec,
             "nbformat": 4, "nbformat_minor": 5}
 
 
+def _split_cells(body: str) -> list[tuple[str, str]]:
+    """`(title, source)` per `# %%` marker; index 0 is the untitled preamble."""
+    cells = []
+    pos, title = 0, ""
+    for match in _CELL_MARK.finditer(body):
+        cells.append((title, body[pos:match.start()]))
+        title, pos = match.group(1).strip(), match.end() + 1
+    cells.append((title, body[pos:]))
+    return cells
+
+
+def _set_parameter(source: str, name: str, value: str) -> str:
+    """Rewrite `NAME = ...` in the parameters cell, keeping its comment."""
+    pattern = re.compile(rf"^{re.escape(name)} = [^#\n]*?(\s*#[^\n]*)?$",
+                         re.MULTILINE)
+    new, count = pattern.subn(
+        lambda m: f"{name} = {value!r}{m.group(1) or ''}", source, count=1)
+    if count != 1:
+        raise ValueError(
+            f"{DIAGNOSE_SOURCE_NAME}: no `{name} = ...` line in the "
+            f"parameters cell to fill in")
+    return new
+
+
+def build_diagnose_notebook(dataplane: pathlib.Path | None = None,
+                            overrides: dict[str, object] | None = None
+                            ) -> dict:
+    """The environment diagnosis: header, parameters, inlined helpers, one
+    cell per check, reading guide. Same inlining as the stages; no job.
+
+    `overrides` is the same dict provision builds for the stages, so
+    `CONFIG_PATH` becomes exactly the mount path the config was uploaded to.
+    """
+    root = dataplane or dataplane_dir()
+    body = (root / DIAGNOSE_SOURCE_NAME).read_text(encoding="utf-8")
+    body, needs_helpers = _strip_shared_import(body, DIAGNOSE_SOURCE_NAME)
+    if not needs_helpers:
+        raise ValueError(
+            f"{DIAGNOSE_SOURCE_NAME}: expected an import of snowmig_source; "
+            f"the connector check is meaningless without the helpers")
+    module = ast.parse(body)
+    header = ast.get_docstring(module) or ""
+    if header and isinstance(module.body[0], ast.Expr):
+        # The docstring is the notebook's markdown header, not a code cell.
+        body = "".join(body.splitlines(keepends=True)[module.body[0].end_lineno:])
+    sections = _split_cells(body)
+    params = next((src for title, src in sections if title == "parameters"),
+                  None)
+    if params is None:
+        raise ValueError(f"{DIAGNOSE_SOURCE_NAME}: no `# %% parameters` cell")
+    for key, value in (overrides or {}).items():
+        name = DIAGNOSE_PARAMS.get(key)
+        if name and value is not None:
+            params = _set_parameter(params, name, str(value))
+
+    header += (f"\n\n---\n\n"
+               f"*Generated from `engine/dataplane/{DIAGNOSE_SOURCE_NAME}` by "
+               f"`engine/target/stage_notebooks.py`. Regenerate with "
+               f"`snowmig.py build-notebooks`; do not hand-edit — an edit here "
+               f"is overwritten on the next build. Change the source instead.*")
+    cells = [
+        _md(header), _code(params.strip("\n")),
+        _md("## Shared source helpers\n\nInlined from "
+            "`engine/dataplane/snowmig_source.py` so this notebook runs "
+            "with nothing else uploaded beside it."),
+        _code((root / SHARED_SOURCE_NAME).read_text(encoding="utf-8")),
+    ]
+    lead = sections[0][1].strip("\n")  # the imports, ahead of the first check
+    for title, src in sections[1:]:
+        if title == "parameters":
+            continue
+        if title.startswith("[markdown]"):
+            heading = title[len("[markdown]"):].strip()
+            text = "\n".join(line[2:] if line.startswith("# ") else line.lstrip("#")
+                             for line in src.strip("\n").splitlines())
+            cells.append(_md((f"## {heading}\n\n" if heading else "") + text))
+            continue
+        rule = "-" * max(3, 74 - len(title))
+        code = f"# --- {title} {rule}\n{src.strip(chr(10))}"
+        if lead:
+            code, lead = f"{lead}\n\n{code}", ""
+        cells.append(_code(code))
+    return {"cells": cells,
+            "metadata": {"snowmig": {"generated": True, "stage": "diagnose",
+                                     "source": DIAGNOSE_SOURCE_NAME,
+                                     "job": None},
+                         "kernelspec": {"display_name": "Python 3",
+                                        "language": "python",
+                                        "name": "python3"},
+                         "language_info": {"name": "python"}},
+            "nbformat": 4, "nbformat_minor": 5}
+
+
+def _write_notebook(path: pathlib.Path, nb: dict) -> pathlib.Path:
+    # LF on every platform. `write_text` translates to CRLF on Windows, and
+    # the committed notebooks are LF, so a rebuild there showed every line
+    # changed.
+    with path.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(nb, indent=1) + "\n")
+    return path
+
+
 def write_stage_notebooks(out_dir: str | pathlib.Path,
                           dataplane: pathlib.Path | None = None,
                           overrides: dict[str, object] | None = None
                           ) -> list[pathlib.Path]:
-    """Write every stage notebook into `out_dir`. Returns the paths written."""
+    """Write every stage notebook, plus the environment diagnosis, into
+    `out_dir`. Returns the paths written."""
     out = pathlib.Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     written = []
     for stage in STAGES:
         nb = build_stage_notebook(stage, dataplane, overrides)
-        path = out / stage.notebook_name
-        path.write_text(json.dumps(nb, indent=1) + "\n", encoding="utf-8")
-        written.append(path)
+        written.append(_write_notebook(out / stage.notebook_name, nb))
+    written.append(_write_notebook(
+        out / DIAGNOSE_NOTEBOOK_NAME,
+        build_diagnose_notebook(dataplane, overrides)))
     return written

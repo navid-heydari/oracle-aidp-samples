@@ -144,7 +144,8 @@ def test_reuse_existing_keeps_the_notebooks_and_provision_md_lists_them(
     rc = _provision(tmp_path, "--execute", "--reuse-existing")
     assert rc == 0
     assert all(v["body"] == "console-edited" for k, v in fake.contents.items()
-               if k.endswith(".ipynb"))
+               if k.endswith(".ipynb")
+               and not k.endswith("diagnose_environment.ipynb"))
     md = (tmp_path / "PROVISION.md").read_text(encoding="utf-8")
     assert "Stage notebooks kept as found" in md
     assert "02_copy_schema.ipynb" in md and "--refresh-notebooks" in md
