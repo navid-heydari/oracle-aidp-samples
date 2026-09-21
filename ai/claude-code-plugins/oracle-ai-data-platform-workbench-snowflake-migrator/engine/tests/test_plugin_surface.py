@@ -641,3 +641,17 @@ def test_soft_clone_command_routes_standard_structure_to_s10():
     assert "snowmig_01_structure" in text
     assert "/Workspace/Shared/" not in text and "--upload" not in text, \
         "structure does not go through the notebook upload path"
+
+
+def test_the_docs_scope_the_gitignore_claim_to_the_plugin_folder():
+    """The only ignore rule for snowmig-config.* lives in the plugin's own
+    .gitignore, while the documented home of the file is the operator's
+    working directory. "It is gitignored" was therefore a promise the
+    documented location does not keep; `git add .` from another repo stages
+    the password."""
+    for rel in ("README.md", "skills/snowflake-migrator-bootstrap/SKILL.md"):
+        flat = " ".join((ROOT / rel).read_text(encoding="utf-8").lower().split())
+        assert "gitignored only inside" in flat, rel
+        assert "your own `.gitignore`" in flat or "that repo's `.gitignore`" in flat, rel
+        assert "it is **gitignored**, and" not in flat, f"{rel}: unscoped claim"
+        assert "gitignored, `0600`" not in flat, f"{rel}: unscoped claim"

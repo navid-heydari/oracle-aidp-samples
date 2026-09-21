@@ -109,7 +109,11 @@ config only names *which* AIDP resources to use — never how to authenticate.
 The file holds live credentials in plain text, which is the trade made for
 having one file. So:
 
-- it is **gitignored**, and must stay out of commits, tickets and chat;
+- it is **gitignored only inside this plugin's own folder** (the rule lives
+  in the plugin's `.gitignore`), and the file belongs in *your* working
+  directory — so add `snowmig-config.yaml` (and `.yml`, `.json`) to your own
+  `.gitignore` before filling it in; `git add .` from another repo stages
+  it otherwise. It must stay out of commits, tickets and chat;
 - **secrets are never echoed** — `preflight` and every report render the
   config through a redactor, so a password cannot reach a log or a summary;
 - **an agent asks before reading it**, and never asks you to paste a secret

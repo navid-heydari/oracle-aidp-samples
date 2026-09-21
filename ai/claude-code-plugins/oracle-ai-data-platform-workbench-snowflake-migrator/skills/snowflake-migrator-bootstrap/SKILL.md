@@ -82,7 +82,7 @@ one file to fill in, and the secret goes *in that file*, not into the chat:
 
 | What | Where | Note |
 |---|---|---|
-| Snowflake account/host, user, warehouse, database, role, schema | `snowmig-config.yaml`, under `snowflake:` | created from the template; gitignored, `0600` |
+| Snowflake account/host, user, warehouse, database, role, schema | `snowmig-config.yaml`, under `snowflake:` | created from the template; `0600` on POSIX; gitignored only inside the plugin folder — tell the user to add it to their own `.gitignore` when it lives elsewhere |
 | The Snowflake **password or private key** | the same file — `password:` or `private_key: |` inline | inline is the default; `*_path` variants exist but are not what you propose first |
 | Which AIDP resources to use (DataLake OCID, workspace, cluster, catalog) | the same file, under `aidp:` | any of them can also be passed as a flag, and a flag wins |
 | AIDP **authentication** | `~/.oci/config` (`oci setup config`) | **not configured in this plugin at all** — it drives the `oci`/`aidp` CLIs with the user's normal OCI setup |
@@ -97,7 +97,9 @@ Rules that come with an inline secret, and they are not optional:
   conversation.** They put it in the file, on their own machine. If one does end
   up in the chat or in a committed file, say so plainly and tell them to rotate
   it.
-- The file is gitignored. Keep it out of tickets and commits too — an inline
+- The file is gitignored only inside the plugin folder; in the user's working
+  directory nothing ignores it until they add it to that repo's `.gitignore`
+  — say so when you create it. Keep it out of tickets and commits too — an inline
   secret is a secret that leaks the moment the file travels.
 
 Key-pair setup, if the user wants one instead of a password:

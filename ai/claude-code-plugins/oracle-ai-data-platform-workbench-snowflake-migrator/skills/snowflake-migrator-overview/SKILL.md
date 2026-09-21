@@ -11,7 +11,8 @@ sequence. Steps are skipped only when the user explicitly says to skip one, and
 you say out loud which step you skipped and what that costs.
 
 Before S1, two things must exist: the one connection config (copied from
-`snowmig-config.example.yaml`, gitignored, `0600`) and the user's answer to
+`snowmig-config.example.yaml`; `0600` on POSIX; gitignored only inside the
+plugin folder, so the user adds it to their own repo's `.gitignore`) and the user's answer to
 *which database*. `README.md` -> "How to run a migration, from zero" carries
 the prerequisites and the flags; this file is the sequence and the rules.
 
