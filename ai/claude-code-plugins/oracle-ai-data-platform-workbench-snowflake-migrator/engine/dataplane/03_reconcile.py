@@ -41,8 +41,9 @@ MANIFEST_NAME = "discovery_manifest.json"
 # normal state of most of the estate for most of the project -- exiting
 # non-zero on it would make every partial run look broken, which is how a
 # real signal gets ignored.
-PROBLEM_VERDICTS = ("MISSING_DESPITE_REPORT", "STRUCTURE_TYPE_DRIFT",
-                    "STRUCTURE_ONLY_COPY_FAILED", "TARGET_UNREADABLE")
+PROBLEM_VERDICTS = ("MISSING_DESPITE_REPORT", "STRUCTURE_FAILED",
+                    "STRUCTURE_TYPE_DRIFT", "STRUCTURE_ONLY_COPY_FAILED",
+                    "TARGET_UNREADABLE")
 
 
 def q(identifier: str) -> str:
@@ -137,11 +138,17 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
 
             if live is None:
                 verdict = "TARGET_UNREADABLE"
+            elif not exists and (s_status in ("created", "already_existed")
+                                 or c_status == "verified"):
+                verdict = "MISSING_DESPITE_REPORT"
+            elif s_status == "failed":
+                # The CREATE raised. Whether or not something by that name
+                # is there now, nobody has checked it: the operator has to
+                # act, so this is not "never attempted". `not_in_plan` and
+                # `dry_run` stay NOT_MIGRATED -- those are intentional.
+                verdict = "STRUCTURE_FAILED"
             elif not exists:
-                verdict = ("MISSING_DESPITE_REPORT"
-                           if s_status in ("created", "already_existed")
-                           or c_status == "verified"
-                           else "NOT_MIGRATED")
+                verdict = "NOT_MIGRATED"
             elif s_status == "type_drift":
                 # The table is there with a layout the plan did not produce.
                 # A copy into it can verify counts and still have landed rows

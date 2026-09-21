@@ -1214,9 +1214,56 @@ def test_not_migrated_is_pending_not_a_problem(reconcile):
     ignored."""
     assert "NOT_MIGRATED" not in reconcile.PROBLEM_VERDICTS
     assert "STRUCTURE_ONLY" not in reconcile.PROBLEM_VERDICTS
-    for verdict in ("MISSING_DESPITE_REPORT", "STRUCTURE_ONLY_COPY_FAILED",
+    for verdict in ("MISSING_DESPITE_REPORT", "STRUCTURE_FAILED",
+                    "STRUCTURE_TYPE_DRIFT", "STRUCTURE_ONLY_COPY_FAILED",
                     "TARGET_UNREADABLE"):
         assert verdict in reconcile.PROBLEM_VERDICTS
+
+
+def test_a_structure_create_that_raised_is_a_problem_not_pending(reconcile,
+                                                                 tmp_path):
+    """01_create_structure records `failed` when CREATE raised on the cluster.
+    That table is absent from the target, but it is not "never attempted" --
+    the operator has to act on it -- yet it rendered NOT_MIGRATED, the same
+    verdict as an untouched table, under "No table is in a problem state"."""
+    (tmp_path / "structure_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "objects": {"GOOD": {"status": "created"},
+                     "BAD": {"status": "failed",
+                             "reason": "DataType decimal(45,2) is not supported"},
+                     "SKIPPED": {"status": "not_in_plan",
+                                 "reason": "the approved ddl_plan carries no "
+                                           "columns for this table"}}}),
+        encoding="utf-8")
+    spark = _CatalogSpark({"`lake`.`SALES`.`GOOD`": [("A", "string")]})
+    rec = reconcile.reconcile(
+        spark, manifest=_manifest("GOOD", "BAD", "SKIPPED", "UNTOUCHED"),
+        target_catalog="lake", reports=tmp_path, counts=False)
+    by_name = {t["table"]: t for t in rec["schemas"][0]["tables"]}
+    assert by_name["BAD"]["verdict"] == "STRUCTURE_FAILED"
+    assert by_name["BAD"]["reason"].startswith("DataType decimal(45,2)")
+    assert by_name["UNTOUCHED"]["verdict"] == "NOT_MIGRATED"
+    assert by_name["SKIPPED"]["verdict"] == "NOT_MIGRATED", \
+        "an intentional engine block is not done yet, not broken"
+    assert by_name["GOOD"]["verdict"] == "STRUCTURE_ONLY"
+    md = reconcile.render(rec)
+    assert "1 table(s) need attention" in md
+    assert "No table is in a problem state" not in md
+
+
+def test_a_failed_create_whose_table_exists_anyway_is_still_a_problem(
+        reconcile, tmp_path):
+    # The CREATE raised, yet something by that name is there: nobody has
+    # checked its layout. Re-running 01 settles it (it re-checks `failed`).
+    (tmp_path / "structure_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "objects": {"BAD": {"status": "failed", "reason": "boom"}}}),
+        encoding="utf-8")
+    spark = _CatalogSpark({"`lake`.`SALES`.`BAD`": [("A", "string")]})
+    rec = reconcile.reconcile(spark, manifest=_manifest("BAD"),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=False)
+    assert rec["schemas"][0]["tables"][0]["verdict"] == "STRUCTURE_FAILED"
 
 
 def test_the_report_says_plainly_when_nothing_is_wrong(reconcile):
