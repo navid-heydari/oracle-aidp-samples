@@ -655,9 +655,13 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
             "",
             "Status vocabulary: `NOT_YET_DONE` → `IN_PROGRESS` → `SHALLOW_CLONE` → "
             "`DATA_CLONE` → `DONE`, or `BLOCKED`.", "",
-            "**`DATA_CLONE` and `DONE` are unreachable in this version: the plugin "
-            "copies structure only and moves no data.** Every object that reports "
-            "`SHALLOW_CLONE` exists in AIDP with its columns and zero rows.", ""]
+            "**`DATA_CLONE` and `DONE` are not reported by this summary.** It "
+            "reads only the control-plane deploy result -- structure, not rows; "
+            "whether rows were copied by the in-AIDP job "
+            "`snowmig_02_copy_schema` is reported by `snowmig_03_reconcile` in "
+            "`MIGRATION_REPORT.md` / `reconciliation.json`. `SHALLOW_CLONE` "
+            "means the object exists in AIDP with its columns; it says nothing "
+            "about rows.", ""]
 
     out += _row_count_provenance(inventory)
 
@@ -713,11 +717,13 @@ def render_smoke(result: dict) -> str:
 
 def render_data_options(options: list[dict]) -> str:
     out = ["# Data-movement options — for you to choose", "",
-           "**This plugin moves no bytes, and nothing below is implemented.** "
-           "These are the realistic ways data could move in a later phase, with "
-           "the trade-offs and the open unknowns attached, so the choice is made "
-           "deliberately rather than defaulting to whichever path got built "
-           "first.", "",
+           "**The control-plane CLI moves no bytes.** One path is implemented "
+           "by the data plane: in-AIDP INSERT-SELECT from the EXTERNAL catalog, "
+           "run schema by schema by the `snowmig_02_copy_schema` job. The other "
+           "options below are not implemented. They are the realistic ways data "
+           "could move, with the trade-offs and the open unknowns attached, so "
+           "the choice is made deliberately rather than defaulting to whichever "
+           "path got built first.", "",
            "| Option | Catalog | Moves bytes | Phase |", "|---|---|---|---|"]
     for o in options:
         out.append(f'| **{o["id"]}** — {o["name"]} | {o["catalog_type"]} '
@@ -757,8 +763,9 @@ def architecture_section(plan: dict) -> list[str]:
     """
     decision = architecture_decision(plan.get("architecture_choice"))
     out = ["## Data-movement architecture", "",
-           "**This plugin moves no bytes.** None of the paths below is "
-           "implemented; they are the ways data could move in a later phase.", "",
+           "**The control-plane CLI moves no bytes.** Rows move only through "
+           "the in-AIDP job `snowmig_02_copy_schema`, when the operator runs "
+           "it; none of the other paths below is implemented.", "",
            decision["statement"], ""]
 
     if decision["decided"]:

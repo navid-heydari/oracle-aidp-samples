@@ -1,6 +1,6 @@
 ---
 name: snowflake-clone-notebook
-description: Generate the table-creation script for a Standard AIDP catalog as an executable notebook, place it in the workspace Shared directory, and run it on AIDP compute. The script creates schemas, then tables, then views in dependency order, prints per-object progress with elapsed time so a long run stays visible, and verifies each object individually at the end. Creates structure only and copies no data - every table arrives with zero rows. Use when the user has explicitly asked for a Standard catalog, or wants the migration delivered as a runnable script rather than executed straight from the CLI.
+description: Generate the table-creation script for a Standard AIDP catalog as an executable notebook, place it in the workspace Shared directory, and run it on AIDP compute. The script creates schemas, then tables, then views in dependency order, prints per-object progress with elapsed time so a long run stays visible, and verifies each object individually at the end. This script creates structure only and copies no data - every table arrives with zero rows; rows are copied only by the snowmig_02_copy_schema job, when the operator runs it. Use when the user has explicitly asked for a Standard catalog, or wants the migration delivered as a runnable script rather than executed straight from the CLI.
 ---
 
 # Standard-catalog table-creation script

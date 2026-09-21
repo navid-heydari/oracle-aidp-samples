@@ -370,7 +370,14 @@ conversation until the phase that needs them arrives.
 
 ## Known limits, stated rather than hidden
 
-- **No data is moved.** By design; `DATA_CLONE` and `DONE` are unreachable.
+- **Data moves by one path only.** The control plane copies no data; rows
+  move solely through the in-AIDP job `snowmig_02_copy_schema`
+  (INSERT-SELECT over the EXTERNAL catalog, one schema per run, verified by
+  row count and decimal sums), and only when the operator runs it. The CLI
+  summary still tops out at `SHALLOW_CLONE`: `summary` reads the
+  control-plane deploy result and never `reconciliation.json`, so copy
+  status is reported by `snowmig_03_reconcile` in `MIGRATION_REPORT.md`,
+  not by `SUMMARY.md`.
 - **Scale is untested.** Validated on 7 objects. Pagination, per-schema column
   reads and metadata row counts are all in place, but nothing has run against
   a large estate.

@@ -13,10 +13,12 @@ schema by schema**, via the parametrised PySpark **notebooks** in
 [data-migration-scripts/](data-migration-scripts/) that run INSIDE AIDP and
 verify every copy (row counts, exact decimal sums).
 
-**The control plane copies no data itself.** The data plane is the scripts on
-AIDP compute, and the jobs that run them carry **no schedule** — running one
-is always the operator's call. Stored procedures, tasks, streams and pipes are
-inventoried with effort bands, never auto-translated.
+**The control plane copies no data itself.** Rows move only when the operator
+runs the in-AIDP job `snowmig_02_copy_schema`, one schema per run. The data
+plane is the scripts on AIDP compute, and the jobs that run them carry **no
+schedule** — running one is always the operator's call. Stored procedures,
+tasks, streams and pipes are inventoried with effort bands, never
+auto-translated.
 
 Two modes: **dev** (`snowmig.py demo` — the whole pipeline against a built-in
 emulation, zero credentials, every artifact narrated in `DEMO.md`) and
@@ -540,5 +542,5 @@ against a real account.
 - [docs/specs/2026-09-09-mvp1-design.md](docs/specs/2026-09-09-mvp1-design.md) — design
 - [references/type-mapping.md](references/type-mapping.md) — the type table
 - [ASSUMPTIONS.md](ASSUMPTIONS.md) — everything this rests on, and what breaks if each is wrong
-- [references/data-movement-options.md](references/data-movement-options.md) — the five ways bytes could move later; **none implemented**
+- [references/data-movement-options.md](references/data-movement-options.md) — the ways bytes could move; one is implemented by the data plane (`snowmig_02_copy_schema`, in-AIDP INSERT-SELECT), the rest are options
 - [CLEANUP-BEFORE-PUBLISH.md](CLEANUP-BEFORE-PUBLISH.md) — **do this before sharing**

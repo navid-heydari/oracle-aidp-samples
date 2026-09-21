@@ -73,7 +73,7 @@ says what happens if it is wrong. Reviewed 2026-09-16.
 |---|---|---|
 | D1 | Dependency depth then size is a sensible wave order | Usage-frequency ranking is the better input and is a documented extension point |
 | D2 | Risk levels are meaningful | Derived from observable facts (view, dropped properties, timezone warnings, row count), not judgement. Adjust the thresholds if they mislead |
-| D3 | `DATA_CLONE` and `DONE` stay unreachable | They are, by construction. No code path can report that data moved |
+| D3 | The CLI status model tops out at `SHALLOW_CLONE` | By construction: `summary` reads the control-plane deploy result and never `reconciliation.json`, so it cannot report `DATA_CLONE`/`DONE`. Copy status is reported only by `snowmig_03_reconcile` (`MIGRATION_REPORT.md`) after `snowmig_02_copy_schema` has run. Breaks if: someone reads `SUMMARY.md` as the data verdict |
 | D4 | One catalog per deploy is safer than fanning out | A multi-database estate spans catalogs; one approval must not authorise all of them |
 | D5 | ~~`DESCRIBE` shapes~~ **SUPERSEDED.** Structure is verified through the catalog API, not SQL | **Live-verified.** `GET /tables/<key>` returns `tableFields` with `fieldName`/`fieldType`/`fieldPrecision`/`fieldScale`. The LIST response carries no fields at all, which is why structure needs a GET |
 | D6 | ~~`SHOW` name columns~~ **SUPERSEDED.** Existence comes from `GET /tables?catalogKey=&schemaKey=` | **Live-verified.** Objects are keyed `<catalog>.<schema>.<name>`, and `schemaKey` must be fully qualified or the call returns 400 |

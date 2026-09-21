@@ -1,9 +1,12 @@
 """Per-object migration status and migration risk. Pure, zero I/O.
 
 The status vocabulary is deliberately closed, and two of its values --
-DATA_CLONE and DONE -- are UNREACHABLE in this version. The plugin moves no data,
-so no code path may report that it did. They exist so the vocabulary does not
-have to change when a data phase is added.
+DATA_CLONE and DONE -- are never produced here. This module sees only the
+control-plane deploy result, which copies no data; whether rows were copied
+by the in-AIDP job snowmig_02_copy_schema is known to snowmig_03_reconcile
+(MIGRATION_REPORT.md), not to this module, so claiming either value would be
+a report of something it cannot see. They exist so the vocabulary does not
+have to change if that result is ever ingested.
 """
 from __future__ import annotations
 
@@ -37,8 +40,9 @@ def migration_status(identifier: str, *, deployed: dict | None,
         # BLOCKED, not cloned: something else owns that name.
         return "BLOCKED"
     if identifier in set(deployed.get("verified_targets") or []):
-        # Structure only. DATA_CLONE/DONE are never returned here: this plugin
-        # copies no rows, and claiming otherwise would be a false report.
+        # Structure only. DATA_CLONE/DONE are never returned here: the deploy
+        # result says nothing about rows (the copy job's outcome lives in
+        # 03_reconcile), and claiming otherwise would be a false report.
         return "SHALLOW_CLONE"
     if identifier in set(deployed.get("derived_type_drift_targets") or []):
         # The view exists and is ours; the target derived some column types

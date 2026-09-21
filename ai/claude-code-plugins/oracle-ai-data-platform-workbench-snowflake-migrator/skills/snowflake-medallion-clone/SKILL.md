@@ -1,6 +1,6 @@
 ---
 name: snowflake-medallion-clone
-description: Create the medallion architecture on Oracle AI Data Platform - registering an EXTERNAL catalog of source type SNOWFLAKE by default, and generating Spark SQL for schemas, tables and views from an approved Snowflake plan only when the user has explicitly asked for a Standard catalog. Structure only; copies no data. Use when the user asks to create the medallion structure, soft clone, shallow clone, create the target catalog, or deploy the target schema.
+description: Create the medallion architecture on Oracle AI Data Platform - registering an EXTERNAL catalog of source type SNOWFLAKE by default, and generating Spark SQL for schemas, tables and views from an approved Snowflake plan only when the user has explicitly asked for a Standard catalog. This stage copies no data - rows are copied only by the snowmig_02_copy_schema job, when the operator runs it. Use when the user asks to create the medallion structure, soft clone, shallow clone, create the target catalog, or deploy the target schema.
 ---
 
 # Catalogs — runbook S3 and S4

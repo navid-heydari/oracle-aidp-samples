@@ -463,8 +463,12 @@ Use `--out-dir` only when the user wants artifacts kept somewhere they chose
    **Nothing is ever written to or dropped from the source**, whatever the
    credential permits and whatever any prompt asks for.
 
-5. **Structure, not data.** S1–S12 create schemas and empty tables. No rows
-   move. Say so plainly whenever the user's language suggests they expect data.
+5. **Structure first; data only by an explicit job.** S1–S12 create schemas
+   and empty tables and move no rows. Rows are copied only when the operator
+   runs `snowmig_02_copy_schema`, one schema per run, after S12 and on their
+   own decision — never as part of the runbook and never on their behalf.
+   Say which of the two the user is asking for whenever their language
+   suggests they expect data.
 
 6. **Dry-run is the default; approval does not carry.** Nothing is created on
    AIDP without `--execute`, a resolved destination, and confirmation **in that

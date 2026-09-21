@@ -436,3 +436,43 @@ def test_the_router_forbids_doing_the_engine_s_work_by_hand():
     assert "cannot be found, stop" in low
     assert "${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py" in text
     assert "never a reason to improvise" in low
+
+
+# --------------------------------------------------------------------------
+# "Copies no data" is true of the control plane and false of the plugin: the
+# in-AIDP job snowmig_02_copy_schema INSERT-SELECTs every row when the
+# operator runs it. Every surface that makes the claim has to scope it.
+# --------------------------------------------------------------------------
+
+_NO_DATA_CLAIM = re.compile(
+    r"copies no data|moves no bytes|no data is moved|no rows\s+move|"
+    r"none implemented|nothing below is implemented|"
+    r"no code path can report that data moved", re.I)
+_DATA_SURFACES = (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json",
+                  "NOTICE", "GAPS.md", "ASSUMPTIONS.md", "README.md",
+                  "references/data-movement-options.md")
+
+
+def test_no_surface_claims_the_plugin_copies_no_data_unscoped():
+    paths = [ROOT / p for p in _DATA_SURFACES]
+    paths += sorted((ROOT / "skills").glob("*/SKILL.md"))
+    offenders = []
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        for para in re.split(r"\n\s*\n", text):
+            hit = _NO_DATA_CLAIM.search(para)
+            if hit and "02_copy_schema" not in para:
+                offenders.append(f"{path.relative_to(ROOT)}: {hit.group(0)!r}")
+    assert not offenders, (
+        "unscoped 'no data' claims (name snowmig_02_copy_schema in the same "
+        "paragraph):\n" + "\n".join(offenders))
+
+
+def test_manifest_and_marketplace_agree_on_the_data_claim():
+    plugin = json.loads((ROOT / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
+    market = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
+    entry = market["plugins"][0]
+    assert entry["version"] == plugin["version"]
+    for desc in (plugin["description"], entry["description"]):
+        assert "snowmig_02_copy_schema" in desc, desc
+        assert "control plane" in desc.lower(), desc

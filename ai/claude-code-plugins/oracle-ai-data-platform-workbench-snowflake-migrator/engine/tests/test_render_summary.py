@@ -147,11 +147,18 @@ def test_job_risk_notes_it_is_a_placeholder():
 
 # --- the no-data guarantee ------------------------------------------------
 
-def test_summary_states_no_data_was_moved():
+def test_summary_does_not_claim_data_status_and_points_to_reconcile():
+    # The summary reads only the control-plane deploy result. Whether rows
+    # were copied is the in-AIDP reconcile job's report; the summary once
+    # said "the plugin ... moves no data" while snowmig_02_copy_schema
+    # INSERT-SELECTs every row.
     md = render_summary(PLAN, INV, DEPLOYED, None)
     low = md.lower()
-    assert "no data" in low
+    assert "moves no data" not in low and "copies no data" not in low
+    assert "reconcil" in low and "MIGRATION_REPORT.md" in md
+    assert "snowmig_02_copy_schema" in md
     assert "DATA_CLONE" in md, "the vocabulary is shown so the gap is visible"
+    assert "says nothing about rows" in low
 
 
 def test_status_counts_rolled_up():
