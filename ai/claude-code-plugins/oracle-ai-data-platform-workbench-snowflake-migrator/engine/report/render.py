@@ -30,6 +30,62 @@ def _bytes(n) -> str:
     return f"{n:.1f} EB"
 
 
+# How the row counts in an inventory were obtained, keyed by `row_count_mode`.
+# One table for INVENTORY.md and SUMMARY.md, so the two cannot disagree about
+# what a number is. The label is the Rows column header.
+_ROW_COUNT_MODE_TEXT = {
+    "metadata": {
+        "label": "Rows (metadata)",
+        "described": ("Snowflake's maintained row count, read from `SHOW` at "
+                      "no cost. It agrees with `COUNT(*)` for a settled "
+                      "standard table, but it can lag very recent DML and is "
+                      "not maintained for external tables, so it is not a "
+                      "verified number."),
+        "inventory": ("Row counts are Snowflake's maintained `SHOW` count, "
+                      "**not** a verified `COUNT(*)`; views carry none. "
+                      "Re-run with `--row-counts exact` for a counted number."),
+    },
+    "exact": {
+        "label": "Rows (exact)",
+        "described": ("a `COUNT(*)` per object -- verified, and it executes "
+                      "every view to get there."),
+        "inventory": ("Row counts are **exact** (in-session `count(*)`), not "
+                      "`SHOW` estimates."),
+    },
+    "none": {
+        "label": "Rows",
+        "described": "not collected; `--row-counts` was `none`.",
+        "inventory": "Row counts were not requested (`--row-counts none`).",
+    },
+}
+
+
+def _row_count_mode(inventory: dict | None) -> tuple[str, dict]:
+    mode = (inventory or {}).get("row_count_mode", "metadata")
+    text = _ROW_COUNT_MODE_TEXT.get(mode) or {
+        "label": "Rows", "described": mode,
+        "inventory": f"Row-count mode: {mode}."}
+    return mode, text
+
+
+def _row_cell(record: dict) -> str:
+    """The Rows cell for one object. A blank always says what it is.
+
+    `None` used to render as ERROR whatever the reason, so in the default
+    metadata mode every view -- deliberately not counted -- read as an
+    extraction failure to chase.
+    """
+    rows = record.get("row_count_exact")
+    if rows is not None:
+        return str(rows)
+    source = record.get("row_count_source")
+    if source == "error":
+        return "ERROR"
+    if source == "not_counted":
+        return "not counted"
+    return "-"
+
+
 def render_inventory(inv: dict) -> str:
     s = inv.get("session", {})
     out = ["# Snowflake estate inventory", "",
@@ -50,19 +106,36 @@ def render_inventory(inv: dict) -> str:
         out += [f"- `{k}` ← {', '.join('`' + x + '`' for x in v)}"
                 for k, v in collisions.items()] + [""]
 
+    _, mode_text = _row_count_mode(inv)
+    records = inv.get("inventory", [])
     out += ["## Objects", "",
-            "Row counts are **exact** (in-session `count(*)`), not `SHOW` estimates. "
-            "Sizes are Snowflake-reported compressed bytes.", "",
-            "| Object | Type | Rows (exact) | Size | Cols | Case form | Compatibility |",
+            f'{mode_text["inventory"]} Sizes are Snowflake-reported '
+            "compressed bytes.", "",
+            f'| Object | Type | {mode_text["label"]} | Size | Cols | Case form '
+            "| Compatibility |",
             "|---|---|---:|---:|---:|---|---|"]
-    for r in inv.get("inventory", []):
-        rows = r.get("row_count_exact")
+    for r in records:
         out.append(
             f'| `{r["source_identifier"]}` | {r["object_type"]} '
-            f'| {rows if rows is not None else "ERROR"} '
+            f'| {_row_cell(r)} '
             f'| {_bytes((r.get("source_metadata") or {}).get("bytes"))} '
             f'| {len(r.get("columns") or [])} | {r.get("identifier_case_form")} '
             f'| {r.get("compatibility_status")} |')
+
+    # Every blank in the Rows column carries its reason. "not counted" and
+    # ERROR are different facts, and neither is a zero.
+    not_counted = [r for r in records if r.get("row_count_source") == "not_counted"]
+    errored = [r for r in records if r.get("row_count_source") == "error"]
+    if not_counted or errored:
+        out.append("")
+    for note in sorted({r.get("row_count_note") for r in not_counted
+                        if r.get("row_count_note")}):
+        out.append(f"`not counted` -- {note}")
+    if errored:
+        out += ["", f"**{len(errored)} row count(s) FAILED** -- `ERROR` is an "
+                    "error, not a zero:", ""]
+        out += [f'- `{r["source_identifier"]}` -- '
+                f'{r.get("row_count_note") or "no detail"}' for r in errored]
 
     notes = inv.get("extraction_notes") or []
     if notes:
@@ -480,28 +553,18 @@ def _row_count_provenance(inventory: dict | None) -> list[str]:
     records = (inventory or {}).get("inventory") or []
     if not records:
         return []
-    mode = (inventory or {}).get("row_count_mode", "metadata")
-    described = {
-        "metadata": "Snowflake's maintained row count, read from `SHOW` at no "
-                    "cost. It agrees with `COUNT(*)` for a settled standard "
-                    "table, but it can lag very recent DML and is not "
-                    "maintained for external tables, so it is not a verified "
-                    "number.",
-        "exact": "a `COUNT(*)` per object — verified, and it executes every "
-                 "view to get there.",
-        "none": "not collected; `--row-counts` was `none`.",
-    }.get(mode, mode)
+    mode, mode_text = _row_count_mode(inventory)
 
     out = ["## Row counts", "",
-           f"Mode: **{mode}** — {described}", ""]
+           f'Mode: **{mode}** — {mode_text["described"]}', ""]
 
     not_counted = [r for r in records if r.get("row_count_source") == "not_counted"]
     errored = [r for r in records if r.get("row_count_source") == "error"]
 
     if not_counted:
         notes = {r.get("row_count_note") for r in not_counted if r.get("row_count_note")}
-        out.append(f"**{len(not_counted)} object(s) show `-` because they were "
-                   f"not counted**, not because they are empty:")
+        out.append(f"**{len(not_counted)} object(s) have no row count because "
+                   f"they were not counted**, not because they are empty:")
         out.append("")
         out += [f'- `{r["source_identifier"]}`' for r in not_counted[:20]]
         if len(not_counted) > 20:
