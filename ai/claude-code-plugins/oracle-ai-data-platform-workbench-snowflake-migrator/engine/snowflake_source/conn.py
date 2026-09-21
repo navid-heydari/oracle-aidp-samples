@@ -24,7 +24,9 @@ __all__ = ["AuthError", "SourceWriteRefused", "READ_ONLY_VERBS",
            "make_run_sql"]
 
 # The ONLY statements this plugin may send to Snowflake. Default deny: an
-# unrecognised verb is refused rather than assumed safe.
+# unrecognised verb is refused rather than assumed safe. WITH is on the list
+# for the CTE-SELECT and only for it: assert_read_only looks past the CTE
+# list, because `WITH x AS (...) INSERT ...` leads with WITH too.
 #
 # This is enforced at the transport, not by convention, so it holds even when the
 # credential has write privileges and even if a future skill, agent or prompt
@@ -55,6 +57,10 @@ def assert_read_only(sql: str) -> None:
       * a statement whose first content is a literal has no verb at all and is
         refused rather than having a word read out of the literal
 
+    A leading WITH is a read only when the statement after the CTE list is a
+    SELECT: `WITH x AS (...) INSERT ...` is refused, naming INSERT, and so is
+    a CTE whose body the walker cannot identify (a parenthesised body).
+
     Fails closed: SQL the scanner cannot make sense of is refused.
     """
     try:
@@ -83,6 +89,16 @@ def assert_read_only(sql: str) -> None:
                 f"read-only against Snowflake and never writes to or drops "
                 f"from the source, regardless of what the credential permits. "
                 f"Allowed: {', '.join(READ_ONLY_VERBS)}.")
+        if verb == "WITH":
+            body = lexer.cte_body_verb(part)
+            if body != "SELECT":
+                raise SourceWriteRefused(
+                    f"WITH ... {body or '<no keyword>'}: a common table "
+                    f"expression is only a read when the statement after the "
+                    f"CTE list is a SELECT; refused. This plugin is strictly "
+                    f"read-only against Snowflake and never writes to or drops "
+                    f"from the source, regardless of what the credential "
+                    f"permits. Allowed: {', '.join(READ_ONLY_VERBS)}.")
 
 
 def _read_secret_file(path: str, label: str) -> str:
