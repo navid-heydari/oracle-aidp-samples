@@ -365,3 +365,51 @@ def test_plan_stdout_names_a_custom_architecture(tmp_path, capsys):
     main(["plan", "--out-dir", str(tmp_path)])
     out = capsys.readouterr().out
     assert "Their Pattern" in out and "not assessed" in out
+
+
+# --- --out-dir placement and `clean` --------------------------------------
+
+def test_out_dir_is_honoured_before_and_after_the_subcommand(tmp_path):
+    # The top-level usage line advertises `snowmig [--out-dir X] <stage>`, and
+    # the subparser used to re-apply its own None default over the root value,
+    # so that placement was silently discarded.
+    import snowmig
+    chosen = str(tmp_path / "chosen")
+    after = snowmig.build_parser().parse_args(["stages", "--out-dir", chosen])
+    before = snowmig.build_parser().parse_args(["--out-dir", chosen, "stages"])
+    assert after.out_dir == chosen
+    assert before.out_dir == chosen
+
+
+def _clean_fixture(tmp_path, monkeypatch):
+    import snowmig
+    plugin = tmp_path / "plugin"
+    default = plugin / snowmig.ARTIFACTS_DIRNAME
+    default.mkdir(parents=True)
+    (default / "plan.json").write_text("{}", encoding="utf-8")
+    chosen = tmp_path / "chosen"
+    chosen.mkdir()
+    (chosen / "x").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(snowmig, "plugin_root", lambda: plugin)
+    return default, chosen
+
+
+def test_clean_refuses_a_chosen_directory_regardless_of_flag_position(
+        tmp_path, monkeypatch, capsys):
+    default, chosen = _clean_fixture(tmp_path, monkeypatch)
+    assert main(["clean", "--out-dir", str(chosen)]) == 1
+    assert "refusing" in capsys.readouterr().err
+    assert (default / "plan.json").is_file()
+    # Same flag, before the subcommand: the same refusal, not a deletion of
+    # the default directory the operator did not name.
+    assert main(["--out-dir", str(chosen), "clean"]) == 1
+    assert "refusing" in capsys.readouterr().err
+    assert (default / "plan.json").is_file()
+    assert (chosen / "x").is_file()
+
+
+def test_clean_removes_only_the_default_directory(tmp_path, monkeypatch):
+    default, chosen = _clean_fixture(tmp_path, monkeypatch)
+    assert main(["clean"]) == 0
+    assert not default.exists()
+    assert (chosen / "x").is_file()

@@ -1367,10 +1367,10 @@ def _add_snowflake_args(p) -> None:
     p.add_argument("--password-path")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    # --out-dir lives on a parent parser so it is accepted AFTER the subcommand,
-    # which is how every caller writes it: `snowmig plan --out-dir ...`.
-    common = argparse.ArgumentParser(add_help=False)
+def _out_dir_parent(default) -> argparse.ArgumentParser:
+    """A parent parser carrying `--out-dir`, with the default the caller asks
+    for. Built twice: see `build_parser`."""
+    parent = argparse.ArgumentParser(add_help=False)
     # ONE artifact directory, and it explains itself. `snowmig_out` was the
     # right idea with the wrong presentation: an unexplained directory of
     # JSON appearing beside the plugin reads as a bug rather than as output.
@@ -1379,15 +1379,28 @@ def build_parser() -> argparse.ArgumentParser:
     # reads the `inventory.json` that `assess` wrote -- so it cannot be
     # temporary scratch. What it CAN be is obvious: a name that says what it
     # holds, a README inside it, and a permanent ignore rule.
-    common.add_argument(
-        "--out-dir", default=None,
+    parent.add_argument(
+        "--out-dir", default=default,
         help=f"where run artifacts go. Default: the plugin's "
              f"{ARTIFACTS_DIRNAME}/ — one clearly-named directory that "
              f"explains itself in a README, is gitignored permanently, and "
              f"is removed by `snowmig clean`")
+    return parent
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # --out-dir is accepted on BOTH sides of the subcommand: after it, which
+    # is how every caller writes it (`snowmig plan --out-dir ...`), and
+    # before it, which is what the top-level usage line advertises. The two
+    # copies need different defaults: argparse applies the chosen
+    # subparser's defaults over the root namespace, so a `None` default on
+    # the subparser copy silently discarded a root-level value -- and
+    # `snowmig --out-dir X clean` then deleted the default directory the
+    # operator had not named. SUPPRESS leaves the root value alone.
+    common = _out_dir_parent(argparse.SUPPRESS)
 
     ap = argparse.ArgumentParser(prog="snowmig", description=__doc__,
-                                 parents=[common])
+                                 parents=[_out_dir_parent(None)])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     st = sub.add_parser("stages", parents=[common],
