@@ -279,7 +279,8 @@ def _assess_inventory(args) -> dict:
     if not getattr(args, "no_census", False):
         inv["census"] = build_census(
             run_sql, inv["databases_in_scope"],
-            include_definitions=getattr(args, "capture_definitions", False))
+            include_definitions=getattr(args, "capture_definitions", False),
+            role=(inv.get("session") or {}).get("ROLE"))
     return inv
 
 

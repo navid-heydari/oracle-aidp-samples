@@ -20,6 +20,14 @@ Two source choices worth keeping:
   * Reads are scoped per DATABASE, not per schema. INFORMATION_SCHEMA is a
     per-database view and SHOW accepts `IN DATABASE`, so the whole census costs
     about ten queries per database rather than ten per schema.
+
+And one limit that shapes every number here: SHOW and INFORMATION_SCHEMA are
+PRIVILEGE-FILTERED. An object the current role holds no privilege on is simply
+absent from the result, and the statement still succeeds. So a count is a lower
+bound as seen by that role, a zero means "none visible" rather than "none
+exist", and the scope statement says so instead of declaring the migratable
+count to be the whole estate. `unreadable` remains the separate case where the
+statement itself failed.
 """
 from __future__ import annotations
 
@@ -29,7 +37,26 @@ from typing import Callable
 
 from ..dialect import lexer
 
-__all__ = ["KINDS", "LANGUAGE_VERDICTS", "build_census"]
+__all__ = ["KINDS", "LANGUAGE_VERDICTS", "VISIBILITY_GRANTS", "build_census"]
+
+# What a COMPLETE census needs the role to hold, per Snowflake's documentation
+# of each source. Listed in CENSUS.md's header. Documentation, not a probe:
+# confirm against SHOW GRANTS in the account before relying on it.
+VISIBILITY_GRANTS: tuple[tuple[str, str], ...] = (
+    ("procedures and UDFs", "USAGE on each (or OWNERSHIP); INFORMATION_SCHEMA "
+                            "lists only those"),
+    ("sequences, stages, file formats", "USAGE on each (or OWNERSHIP)"),
+    ("pipes", "MONITOR or OPERATE on each (or OWNERSHIP)"),
+    ("tasks", "MONITOR or OPERATE on each (or OWNERSHIP)"),
+    ("streams", "SELECT on each (or OWNERSHIP)"),
+    ("materialized views, dynamic tables", "any privilege on each; SELECT is "
+                                           "enough"),
+    ("all of the above at once", "an owner or governance role that holds a "
+                                 "privilege on every object -- or cross-check "
+                                 "the counts against SNOWFLAKE.ACCOUNT_USAGE, "
+                                 "which is not privilege-filtered and needs "
+                                 "IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE"),
+)
 
 # language -> what it would take on AIDP. Effort is a triage band, not an
 # estimate: it says which pile the object belongs in.
@@ -151,8 +178,25 @@ def _read_show(run_sql, db: str, spec: dict) -> list[dict]:
     return run_sql(f'show {spec["relation"]} in database {lexer.qualify(db)}')
 
 
+def _role_text(role: str | None) -> str:
+    return f"role `{role}`" if role else "the current role"
+
+
+def _visibility_note(role: str | None) -> str:
+    lines = [
+        f"**Counted as visible to {_role_text(role)}.** Snowflake's SHOW and "
+        "INFORMATION_SCHEMA return only the objects the current role holds a "
+        "privilege on, and a statement that returns nothing still succeeds -- "
+        "so every count below is a lower bound, and a zero means *none "
+        "visible*, not *none exist*. A complete census needs (per Snowflake "
+        "documentation; confirm against `SHOW GRANTS` in your account):", ""]
+    lines += [f"- {what}: {grant}" for what, grant in VISIBILITY_GRANTS]
+    return "\n".join(lines)
+
+
 def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
-                 include_definitions: bool = False) -> dict:
+                 include_definitions: bool = False,
+                 role: str | None = None) -> dict:
     notes: list[str] = []
     kinds: dict[str, dict] = {}
     objects: list[dict] = []
@@ -177,6 +221,9 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
                 objects.append(_entry(kind, spec, db, row,
                                       include_definitions=include_definitions))
                 count += 1
+        if readable and not count:
+            note = (f"0 visible to {_role_text(role)}; a lower bound, not a "
+                    f"total")
         kinds[kind] = {"count": count if readable else None,
                        "readable": readable,
                        "note": note or f"{count} found"}
@@ -197,7 +244,10 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
         "by_language": dict(by_language),
         "by_effort": dict(by_effort),
         "unreadable": notes,
-        "scope_statement": _scope_statement(len(objects), by_kind, kinds),
+        "role": role,
+        "completeness": "visible-to-role",
+        "visibility_note": _visibility_note(role),
+        "scope_statement": _scope_statement(len(objects), by_kind, kinds, role),
     }
 
 
@@ -247,21 +297,30 @@ def _entry(kind: str, spec: dict, db: str, row: dict, *,
     return entry
 
 
-def _scope_statement(total: int, by_kind, kinds: dict) -> str:
+def _scope_statement(total: int, by_kind, kinds: dict,
+                     role: str | None = None) -> str:
     denied = [k for k, v in kinds.items() if not v["readable"]]
+    who = _role_text(role)
     if total == 0 and not denied:
-        return ("This estate contains **only tables and views** — no "
-                "procedures, UDFs, tasks, streams, materialized or dynamic "
-                "tables, stages, pipes, sequences or file formats were found. "
-                "So the migratable count is the whole estate, not a subset "
-                "of it.")
+        # Every statement succeeded and returned nothing. With a minimal
+        # read-only role that is the EXPECTED result on an estate full of
+        # tasks and procedures, so it must not become a claim of completeness.
+        return (f"**No procedures, UDFs, tasks, streams, materialized or "
+                f"dynamic tables, stages, pipes, sequences or file formats "
+                f"were visible to {who}.** SHOW and INFORMATION_SCHEMA return "
+                f"only the objects the role holds a privilege on, so this zero "
+                f"means *none visible*, not *none exist*, and it is a lower "
+                f"bound. Do not treat the migratable count as the size of the "
+                f"estate until a role that can see these kinds has run the census "
+                f"— CENSUS.md lists the grants.")
     parts = ", ".join(f"{n} {k.lower().replace('_', ' ')}(s)"
                       for k, n in sorted(by_kind.items()))
     text = (f"**{total} object(s) in this estate cannot be migrated by this "
             f"plugin**: {parts}. They are code, schedulers or storage "
             f"definitions rather than structure, so the migratable count "
             f"covers tables and views only — it is not the size of the "
-            f"estate.")
+            f"estate. Counted as visible to {who}: SHOW and INFORMATION_SCHEMA "
+            f"are privilege-filtered, so {total} is a lower bound.")
     if denied:
         text += (f" **{', '.join(denied)} could not be read**, so even this "
                  f"count is a floor, not a total.")

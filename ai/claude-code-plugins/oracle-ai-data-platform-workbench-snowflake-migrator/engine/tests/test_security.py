@@ -248,3 +248,14 @@ def test_unenumerable_policy_objects_cannot_corroborate_an_empty_attachment_list
     st = s["statement"].lower()
     assert "no masking" not in st
     assert "could not be enumerated" in st or "cannot corroborate" in st
+
+
+def test_zero_visible_policy_objects_are_noted_as_role_filtered():
+    # SHOW MASKING / ROW ACCESS POLICIES lists only policies the role owns or
+    # can APPLY. The account-wide verdict comes from ACCOUNT_USAGE; this table
+    # is context, and its zero must say what it is.
+    s = build_security(FakeSql(_responses()), _inv())
+    for key in ("masking", "row_access"):
+        info = s["policies"][key]
+        assert info["count"] == 0 and info["readable"] is True
+        assert "visible" in info["note"], info["note"]

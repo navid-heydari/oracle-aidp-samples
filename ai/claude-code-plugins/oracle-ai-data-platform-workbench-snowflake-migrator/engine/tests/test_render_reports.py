@@ -390,3 +390,20 @@ def test_security_report_keeps_the_plain_sentence_when_attachments_are_accounted
     md = render_security(_security(policies_defined_without_attachment=0))
     assert "Defined is not the same as attached" in md
     assert "all-clear" not in md
+
+
+def test_planned_objects_with_an_empty_census_carries_the_visibility_caveat():
+    # The scope statement travels into PLANNED_OBJECTS.md and SUMMARY.md, so
+    # the "whole estate" claim would travel with it.
+    from fake_sql import FakeSql
+    from snowflake_source.extract.census import build_census
+    empty = {"information_schema.procedures": [], "information_schema.functions": [],
+             "information_schema.sequences": [], "information_schema.stages": [],
+             "information_schema.file_formats": [], "information_schema.pipes": [],
+             "show tasks": [], "show streams": [], "show materialized views": [],
+             "show dynamic tables": []}
+    plan = dict(PLAN)
+    plan["census"] = build_census(FakeSql(empty), ["DB"], role="R")
+    md = render_planned_objects(plan)
+    assert "whole estate" not in md.lower()
+    assert "visible" in md.lower()

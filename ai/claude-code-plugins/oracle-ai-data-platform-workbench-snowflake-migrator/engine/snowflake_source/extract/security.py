@@ -85,6 +85,14 @@ def _collect(run_sql, what: str, databases: list[str],
             readable = False
             note = str(exc)[:200]
             notes.append(f"SHOW {what.upper()} in {db}: {note}")
+    if readable and not items:
+        # SHOW is privilege-filtered, so this zero is a statement about the
+        # role. The verdict that matters comes from ACCOUNT_USAGE, which is
+        # account-wide; this table is context and must not read as proof.
+        note = (f"0 visible to the current role: SHOW {what.upper()} lists "
+                f"only objects the role owns or holds a privilege on. The "
+                f"attachment verdict comes from ACCOUNT_USAGE and is "
+                f"account-wide.")
     return {"readable": readable, "note": note or f"{len(items)} found",
             "count": len(items) if readable else None, "items": items}
 

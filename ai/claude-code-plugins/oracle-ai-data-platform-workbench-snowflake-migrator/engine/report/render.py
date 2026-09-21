@@ -929,13 +929,18 @@ def render_census(census: dict) -> str:
            "plausible-but-wrong procedure translation is worse than an honest "
            "gap.", ""]
 
+    if census.get("visibility_note"):
+        out += [census["visibility_note"], ""]
+
     if kinds:
         out += ["## Counts by kind", "", "| Kind | Count | Read |", "|---|---:|---|"]
         for kind, info in sorted(kinds.items()):
             count = info.get("count")
+            read = (("yes" if count else "yes (0 visible; lower bound)")
+                    if info.get("readable") else "**denied**")
             out.append(f'| {kind.replace("_", " ").title()} | '
                        f'{count if count is not None else "*not measured*"} | '
-                       f'{"yes" if info.get("readable") else "**denied**"} |')
+                       f'{read} |')
         out.append("")
 
     by_effort = census.get("by_effort") or {}
