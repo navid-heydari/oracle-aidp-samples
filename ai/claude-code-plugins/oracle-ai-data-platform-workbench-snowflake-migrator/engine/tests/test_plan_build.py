@@ -101,6 +101,20 @@ def test_can_migrate_entries_carry_the_risk_bearing_facts():
     assert c["omitted_properties"] == [], "is_secure=false is unset, owner is informational"
 
 
+def test_a_view_carries_no_maintenance_facts_because_ddl_reports_none_for_it():
+    # SHOW VIEWS reports change_tracking too and catalog.py records it, but
+    # ddl scans source_metadata only in build_create_table; build_create_view
+    # reads is_secure/is_materialized alone. SUMMARY.md and DDL_PLAN.md must
+    # name the same settings, so a view's plan entry carries none -- or
+    # SUMMARY.md says "change_tracking=ON not applied" for a view whose DDL
+    # plan says nothing of the kind.
+    v = rec("D.PUBLIC.V", kind="VIEW")
+    v["source_metadata"].update({"change_tracking": "ON", "retention_time": "1"})
+    plan = build_plan({"inventory": [rec("D.PUBLIC.T"), v]}, {"edges": []})
+    c = next(c for c in plan["can_migrate"] if c["source_identifier"] == "D.PUBLIC.V")
+    assert c["deferred_properties"] == [] and c["omitted_properties"] == []
+
+
 def test_a_plain_record_still_carries_empty_facts():
     c = build_plan({"inventory": [rec("D.S.T")]}, {"edges": []})["can_migrate"][0]
     assert c["warnings"] == [] and c["deferred_properties"] == []

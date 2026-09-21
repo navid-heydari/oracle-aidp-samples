@@ -131,7 +131,11 @@ def build_plan(inventory: dict, dependencies: dict, *,
                     "category": category, "reason": reason})
                 continue
 
-        deferred, omitted = _maintenance_facts(rec)
+        # ddl reports maintenance settings for tables only (build_create_view
+        # reads is_secure/is_materialized alone); the plan mirrors that split
+        # so SUMMARY.md and DDL_PLAN.md name the same settings.
+        deferred, omitted = (([], []) if rec.get("object_type") == "VIEW"
+                             else _maintenance_facts(rec))
         can.append({"source_identifier": ident,
                     "object_type": rec.get("object_type"),
                     "target": targets[ident],

@@ -104,6 +104,11 @@ def test_risk_column_reflects_deferred_properties_and_timezone_warnings():
     # The facts the plan entry carries (see plan.build) must reach the Risk
     # column: a clustered table with a timezone caveat is MEDIUM, and the
     # note names both.
+    # A pass-through guard only: the fixture hand-crafts the facts, so this
+    # passes against a tree where build.py never produced them. The wiring
+    # is pinned by test_plan_build::
+    # test_can_migrate_entries_carry_the_risk_bearing_facts and test_demo::
+    # test_the_demo_summary_rates_the_clustered_table_medium.
     orders = dict(PLAN["can_migrate"][0],
                   warnings=["CREATED_AT: TIMESTAMP_NTZ -> TIMESTAMP: "
                             "TIMEZONE SEMANTICS DIFFER"],
