@@ -184,17 +184,39 @@ def _match(items: list[dict], display_name: str) -> dict | None:
     return None
 
 
-def _poll(list_fn, display_name: str, delays: tuple[float, ...]) -> dict | None:
+def _is_conflict(exc: Exception) -> bool:
+    """A 409 "ongoing operation": the workspace is still settling after its
+    own POST returned. Retried with the bounded backoff, as catalog_deploy
+    does for a table posted into a settling schema."""
+    text = str(exc)
+    return "409" in text or "ongoing" in text.lower()
+
+
+def _active(item: dict) -> bool:
+    """ACTIVE -- or carrying no lifecycleState at all, since an absent field
+    is not evidence of settling."""
+    return str(item.get("lifecycleState") or "ACTIVE").upper() == "ACTIVE"
+
+
+def _poll(list_fn, display_name: str, delays: tuple[float, ...], *,
+          require_active: bool = False) -> dict | None:
+    """The item once it is visible (and ACTIVE, when asked for); None when it
+    never appeared. With `require_active`, an item that appeared but was
+    still settling when the budget ran out is returned as last seen, so the
+    caller can tell "never visible" from "visible, not yet ACTIVE"."""
+    last = None
     for attempt in range(len(delays) + 1):
         try:
             found = _match(list_fn().get("items") or [], display_name)
         except Exception:
             found = None
         if found is not None:
-            return found
+            last = found
+            if not require_active or _active(found):
+                return found
         if attempt < len(delays):
             time.sleep(delays[attempt])
-    return None
+    return last
 
 
 def _key(item: dict, fallback: str) -> str:
@@ -307,17 +329,29 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     if call is None:
         raise ValueError("execute=True requires a transport callable")
 
-    # 1 · workspace: look, create if absent, poll until visible -------------
+    # 1 · workspace: look, create if absent, poll until visible AND ACTIVE --
     found = _match(call("list_workspaces").get("items") or [], ws_name.name)
+    ws_created = False
     if found is None:
         call("create_workspace",
              body=build_workspace_body(ws_name.name,
                                        description="snowflake-migrator "
                                                    "migration workspace",
                                        subnet_id=subnet_id))
-        found = _poll(lambda: call("list_workspaces"), ws_name.name, delays)
+        ws_created = True
+        # A workspace reports ACTIVE seconds after its POST returns, and a
+        # cluster created inside that window is a 409. So wait for ACTIVE,
+        # not just for the name to appear; a slow ACTIVE is recorded, not a
+        # stop, because the cluster POST below retries on the 409 anyway.
+        found = _poll(lambda: call("list_workspaces"), ws_name.name, delays,
+                      require_active=True)
+        settling = found is not None and not _active(found)
         step("workspace", "create_requested" if found is None else "created",
-             found is not None, ws_name.name)
+             found is not None,
+             f'{ws_name.name}: visible, but lifecycleState='
+             f'{found.get("lifecycleState")} after the poll budget; the '
+             f'cluster POST is retried on 409 while it settles'
+             if settling else ws_name.name)
     elif reuse_existing:
         step("workspace", "reused", True, _key(found, ws_name.name))
     else:
@@ -326,7 +360,10 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
              f"a workspace named {ws_name.name!r} already exists and this "
              f"migration does not reuse what it did not create. Choose "
              f"another --workspace-name, or pass --reuse-existing if you "
-             f"really mean to migrate into someone else's workspace.")
+             f"really mean to migrate into someone else's workspace. If a "
+             f"previous run of THIS migration created it (its PROVISION.md "
+             f"lists the workspace step), --reuse-existing is the intended "
+             f"resume, not a rule violation.")
         return out
     ws_key = _key(found or {}, ws_name.name)
     out["workspace"]["key"] = ws_key
@@ -336,11 +373,48 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         return out
 
     # 2 · cluster ------------------------------------------------------------
-    found = _match(call("list_clusters", workspace=ws_key).get("items") or [],
-                   cl_name.name)
+    # From here on the workspace EXISTS, so nothing below may raise out of
+    # this function: an exception would lose the record of it, and the next
+    # run would halt on name_taken and call the operator's own workspace
+    # "someone else's". A failure is a recorded step plus a halt that says
+    # how to resume.
+    resume = (
+        f"workspace {ws_name.name!r} (key {ws_key}) WAS created by this run "
+        f"and is recorded above. Re-run the same command with "
+        f"--reuse-existing to continue into it; do not pick a new "
+        f"--workspace-name, or this one is orphaned."
+        if ws_created else
+        f"workspace {ws_name.name!r} (key {ws_key}) is the one being reused; "
+        f"fix the cause above and re-run the same command.")
+    try:
+        found = _match(
+            call("list_clusters", workspace=ws_key).get("items") or [],
+            cl_name.name)
+    except Exception as exc:
+        step("cluster", "failed", False, f"list_clusters: {str(exc)[:200]}")
+        step("halt", "stopped", False, resume)
+        return out
     if found is None:
-        call("create_cluster", workspace=ws_key,
-             body=build_cluster_body(cl_name.name))
+        # A cluster POSTed before the workspace reports ACTIVE is a 409
+        # "ongoing operation". Retried with the bounded backoff, each retry
+        # on the record; anything else fails the step and halts with the
+        # record intact.
+        for attempt in range(len(delays) + 1):
+            try:
+                call("create_cluster", workspace=ws_key,
+                     body=build_cluster_body(cl_name.name))
+                break
+            except Exception as exc:
+                if _is_conflict(exc) and attempt < len(delays):
+                    step("cluster", "retried", None,
+                         f"attempt {attempt + 1}: 409/ongoing operation on "
+                         f"workspace {ws_key}; waiting {delays[attempt]:g}s")
+                    time.sleep(delays[attempt])
+                    continue
+                step("cluster", "failed", False,
+                     f"create_cluster: {str(exc)[:200]}")
+                step("halt", "stopped", False, resume)
+                return out
         found = _poll(lambda: call("list_clusters", workspace=ws_key),
                       cl_name.name, delays)
         step("cluster", "create_requested" if found is None else "created",

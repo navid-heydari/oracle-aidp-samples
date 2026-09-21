@@ -617,3 +617,140 @@ def test_provision_list_commands_carry_the_page_token():
         uri = build_provision_command("oci_raw", op, OCID, page="T2", **kw)
         uri = uri[uri.index("--target-uri") + 1]
         assert uri.endswith("page=T2") and uri.count("?") == 1, (op, uri)
+
+
+# --- the cluster POST fails: the workspace record must survive -------------
+#
+# GAPS.md records that a cluster POSTed before the workspace reports ACTIVE
+# is a 409 "ongoing operation". That POST was not guarded, so the
+# ProvisionTransportError propagated out of provision(), cmd_provision never
+# wrote provision_result.json or PROVISION.md, and the workspace created two
+# seconds earlier was on record nowhere -- the next run halted on name_taken
+# and called it someone else's.
+
+_409 = ("create_cluster failed (exit 0): 409 Conflict ongoing operation on "
+        "workspace")
+
+
+class ClusterConflicts(Fake):
+    """The first `fail_times` cluster POSTs raise `text`, then it works."""
+
+    def __init__(self, fail_times, text=_409, **kw):
+        super().__init__(**kw)
+        self.fail_times = fail_times
+        self.text = text
+
+    def __call__(self, operation, **kw):
+        if operation == "create_cluster" and self.fail_times:
+            self.fail_times -= 1
+            self.ops.append((operation, kw))
+            from target.provisioning import ProvisionTransportError
+            raise ProvisionTransportError(self.text)
+        return super().__call__(operation, **kw)
+
+
+def test_a_409_on_the_cluster_post_is_retried_then_recorded(scripts):
+    fake = ClusterConflicts(2)
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(0, 0))
+    cluster = [s for s in res["steps"] if s["step"] == "cluster"]
+    assert [s["action"] for s in cluster] == ["retried", "retried", "created"]
+    assert [s["verified"] for s in cluster] == [None, None, True]
+    assert [op for op, _ in fake.ops].count("create_cluster") == 3
+    assert any(s["step"] == "job" for s in res["steps"]), \
+        "a retry that succeeds is not a halt"
+
+
+def test_a_cluster_post_that_keeps_failing_returns_the_partial_record(scripts):
+    fake = ClusterConflicts(99)
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(0, 0))          # returns, no raise
+    steps = [(s["step"], s["action"], s["verified"]) for s in res["steps"]]
+    assert ("workspace", "created", True) in steps
+    assert ("cluster", "failed", False) in steps
+    halt = next(s for s in res["steps"] if s["step"] == "halt")
+    assert "--reuse-existing" in halt["detail"]
+    assert "ws-acme" in halt["detail"], "the record names the key"
+    assert res["workspace"]["key"] == "ws-acme"
+    ops = [op for op, _ in fake.ops]
+    assert "upload_ws_file" not in ops and "create_job" not in ops
+
+
+def test_a_non_conflict_cluster_error_is_not_retried(scripts):
+    fake = ClusterConflicts(
+        99, text="create_cluster failed (exit 1): 403 NotAuthorized")
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(0, 0))
+    assert [op for op, _ in fake.ops].count("create_cluster") == 1
+    actions = {(s["step"], s["action"]) for s in res["steps"]}
+    assert ("cluster", "failed") in actions
+    assert ("cluster", "retried") not in actions
+    assert any(s["step"] == "halt" for s in res["steps"])
+
+
+def test_a_failed_cluster_listing_is_recorded_not_raised(scripts):
+    fake = Fake(fail={"list_clusters"})
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=())
+    steps = [(s["step"], s["action"], s["verified"]) for s in res["steps"]]
+    assert ("workspace", "created", True) in steps
+    assert ("cluster", "failed", False) in steps
+    assert any(s["step"] == "halt" for s in res["steps"])
+    assert "create_cluster" not in [op for op, _ in fake.ops], \
+        "could not look is not absent"
+
+
+class Settling(Fake):
+    """A created workspace reports CREATING until the `active_after`-th
+    listing, then ACTIVE -- the way the live API behaves for a few seconds
+    after the POST returns."""
+
+    def __init__(self, active_after):
+        super().__init__()
+        self.active_after = active_after
+        self.lists = 0
+
+    def __call__(self, operation, **kw):
+        if operation == "create_workspace":
+            self.ops.append((operation, kw))
+            name = kw["body"]["displayName"]
+            self.workspaces.append({"displayName": name, "key": f"ws-{name}",
+                                    "lifecycleState": "CREATING"})
+            return {}
+        if operation == "list_workspaces":
+            self.lists += 1
+            if self.lists >= self.active_after:
+                for w in self.workspaces:
+                    w["lifecycleState"] = "ACTIVE"
+        return super().__call__(operation, **kw)
+
+
+def test_the_workspace_is_waited_on_until_active(scripts):
+    fake = Settling(active_after=4)      # 1 look-first + 3 polls
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(0, 0, 0))
+    ops = [op for op, _ in fake.ops]
+    before_cluster = ops[:ops.index("create_cluster")]
+    assert before_cluster.count("list_workspaces") == 4, \
+        "the cluster POST waits for ACTIVE, not just for visibility"
+    ws = next(s for s in res["steps"] if s["step"] == "workspace")
+    assert ws["action"] == "created" and ws["verified"] is True
+
+
+def test_a_workspace_that_stays_creating_is_recorded_and_not_halted(scripts):
+    fake = Settling(active_after=10 ** 6)
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(0,))
+    assert "create_cluster" in [op for op, _ in fake.ops], \
+        "a slow ACTIVE is not a reason to stop; the 409 retry covers it"
+    ws = next(s for s in res["steps"] if s["step"] == "workspace")
+    assert ws["action"] == "created" and "CREATING" in ws["detail"]
+
+
+def test_the_name_taken_halt_names_the_operator_s_own_orphan(scripts):
+    fake = Fake(workspaces=("acme",))
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=())
+    halt = next(s for s in res["steps"] if s["step"] == "halt")
+    assert "previous run" in halt["detail"].lower()
+    assert "--reuse-existing" in halt["detail"]
