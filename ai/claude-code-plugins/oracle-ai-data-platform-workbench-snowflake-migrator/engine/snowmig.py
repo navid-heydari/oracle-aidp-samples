@@ -903,24 +903,42 @@ def cmd_catalog(args) -> int:
                   f'EXTERNAL catalog registers the whole database '
                   f'({block.get("database")}). It scopes the source side.')
 
+    # The name to register, resolved ONCE and keyed strictly by catalog type:
+    # `aidp.external_catalog` is the Snowflake source's EXTERNAL catalog,
+    # `aidp.catalog` the INTERNAL target. Neither stands in for the other --
+    # ensure_catalog reuses ANY catalog carrying the name, whatever its type,
+    # so registering the source under the target's name would make the later
+    # `--catalog-type standard` step silently "reuse" the EXTERNAL one.
+    coords = _target_coords(args)
+    aidp = aidp_block(_load_migration_config(args)) if config_path else {}
+    key = "external_catalog" if catalog_type == "EXTERNAL" else "catalog"
+    name = args.catalog or aidp.get(key)
+    if not name or not str(name).strip():
+        raise MissingTarget(
+            f"catalog name not supplied: pass --catalog <name> or set "
+            f"`aidp.{key}:` in {config_path or 'the migration config'}")
+    name = str(name).strip()
+
     if not args.execute:
-        result = {"dry_run": True, "catalog": args.catalog,
+        result = {"dry_run": True, "catalog": name,
                   "catalog_type": catalog_type,
                   "source_type": args.source_type.upper(),
                   "connection_config": (str(config_path) if config_path
                                         else None),
                   "connection_fields": sorted(connection or {})}
     else:
-        target = resolve_target(**_target_coords(args))
+        # The Target carries the name being registered, not the config's
+        # INTERNAL `catalog:`, which need not exist yet at this step.
+        target = resolve_target(**{**coords, "catalog": name})
         backend = args.backend or detect_backend()
         print(f"  backend: {backend}")
         result = ensure_catalog(
-            display_name=args.catalog,
+            display_name=name,
             call=make_call(target, backend=backend),
             catalog_type=catalog_type, source_type=args.source_type.upper(),
             connection=connection,
             description=args.description or
-            f"Snowflake {args.catalog}, registered by the snowflake-migrator")
+            f"Snowflake {name}, registered by the snowflake-migrator")
         result["dry_run"] = False
         result["source_type"] = args.source_type.upper()
 
@@ -937,7 +955,7 @@ def cmd_catalog(args) -> int:
                 "--test-connection needs --connection-config: the API "
                 "requires the connection details inline, not just the "
                 "catalog key")
-        ocid = _target_coords(args)["datalake_ocid"]
+        ocid = coords["datalake_ocid"]
         if not ocid:
             raise MissingTarget(
                 "--test-connection needs the aiDataPlatform OCID: put it "
@@ -950,10 +968,10 @@ def cmd_catalog(args) -> int:
         # ensure_catalog reported back -- not necessarily the display name.
         probe = pcall("test_connection",
                       body=build_test_connection_body(
-                          str(result.get("key") or args.catalog),
+                          str(result.get("key") or name),
                           source_type=args.source_type.upper(),
                           connection_properties=connection,
-                          display_name=args.catalog))
+                          display_name=name))
         # The response body is empty; the async key rides in a header the
         # raw-request JSON parser does not surface, so when it is absent the
         # result is reported PENDING, never assumed. When present, poll.
@@ -976,7 +994,7 @@ def cmd_catalog(args) -> int:
 
     _write(out, "catalog_result.json", result)
     _write(out, "CATALOG.md", render_catalog(result))
-    print(f'  catalog {args.catalog}: '
+    print(f'  catalog {name}: '
           f'{"dry run — nothing created" if not args.execute else result["action"]}')
     return 0
 
