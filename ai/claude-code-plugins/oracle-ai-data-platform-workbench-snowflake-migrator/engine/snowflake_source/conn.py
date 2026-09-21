@@ -129,7 +129,8 @@ def build_connect_kwargs(auth: str, *, account: str, user: str | None = None,
                          database: str | None = None, key_path: str | None = None,
                          key_passphrase: str | None = None,
                          pat_path: str | None = None,
-                         password_path: str | None = None) -> dict[str, Any]:
+                         password_path: str | None = None,
+                         host: str | None = None) -> dict[str, Any]:
     if auth not in _MODES:
         raise AuthError(f"unknown auth mode {auth!r}; expected one of {sorted(_MODES)}")
     if not account:
@@ -138,6 +139,13 @@ def build_connect_kwargs(auth: str, *, account: str, user: str | None = None,
         raise AuthError(f"user is required for auth mode {auth!r}")
 
     kw: dict[str, Any] = {"account": account, "client_session_keep_alive": False}
+    # An explicit host (locator form, PrivateLink) is what the EXTERNAL
+    # catalog registers; without it the driver derives
+    # <account>.snowflakecomputing.com, which is right only for an
+    # org-account identifier. Passed through so preflight tests the same
+    # endpoint AIDP will use.
+    if host and host.strip():
+        kw["host"] = host.strip()
     if user:
         kw["user"] = user
     for value, key in ((role, "role"), (warehouse, "warehouse"), (database, "database")):

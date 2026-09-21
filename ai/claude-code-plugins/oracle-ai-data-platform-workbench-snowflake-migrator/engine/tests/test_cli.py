@@ -421,3 +421,593 @@ def test_smoke_without_target_coordinates_is_partial_and_exits_1(tmp_path, monke
     assert smoke["verdict"] == "PARTIAL"
     md = (tmp_path / "SMOKE_TEST.md").read_text(encoding="utf-8")
     assert "Verdict: **PASS**" not in md and "PARTIAL" in md
+
+
+# --- --out-dir placement and `clean` --------------------------------------
+
+def test_out_dir_is_honoured_before_and_after_the_subcommand(tmp_path):
+    # The top-level usage line advertises `snowmig [--out-dir X] <stage>`, and
+    # the subparser used to re-apply its own None default over the root value,
+    # so that placement was silently discarded.
+    import snowmig
+    chosen = str(tmp_path / "chosen")
+    after = snowmig.build_parser().parse_args(["stages", "--out-dir", chosen])
+    before = snowmig.build_parser().parse_args(["--out-dir", chosen, "stages"])
+    assert after.out_dir == chosen
+    assert before.out_dir == chosen
+
+
+def _clean_fixture(tmp_path, monkeypatch):
+    import snowmig
+    plugin = tmp_path / "plugin"
+    default = plugin / snowmig.ARTIFACTS_DIRNAME
+    default.mkdir(parents=True)
+    (default / "plan.json").write_text("{}", encoding="utf-8")
+    chosen = tmp_path / "chosen"
+    chosen.mkdir()
+    (chosen / "x").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(snowmig, "plugin_root", lambda: plugin)
+    return default, chosen
+
+
+def test_clean_refuses_a_chosen_directory_regardless_of_flag_position(
+        tmp_path, monkeypatch, capsys):
+    default, chosen = _clean_fixture(tmp_path, monkeypatch)
+    assert main(["clean", "--out-dir", str(chosen)]) == 1
+    assert "refusing" in capsys.readouterr().err
+    assert (default / "plan.json").is_file()
+    # Same flag, before the subcommand: the same refusal, not a deletion of
+    # the default directory the operator did not name.
+    assert main(["--out-dir", str(chosen), "clean"]) == 1
+    assert "refusing" in capsys.readouterr().err
+    assert (default / "plan.json").is_file()
+    assert (chosen / "x").is_file()
+
+
+def test_clean_removes_only_the_default_directory(tmp_path, monkeypatch):
+    default, chosen = _clean_fixture(tmp_path, monkeypatch)
+    assert main(["clean"]) == 0
+    assert not default.exists()
+    assert (chosen / "x").is_file()
+
+
+# --- bad inputs are one `error:` line, never a traceback -------------------
+
+def test_out_dir_that_is_a_file_exits_1_with_an_error_line(tmp_path, capsys):
+    f = tmp_path / "afile.txt"
+    f.write_text("not a directory", encoding="utf-8")
+    assert main(["stages", "--out-dir", str(f)]) == 1
+    err = capsys.readouterr().err
+    assert "error:" in err and "afile.txt" in err
+    assert "Traceback" not in err
+
+
+def test_list_shaped_restrictions_file_exits_1(tmp_path, capsys):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    (tmp_path / "r.json").write_text("[1, 2]", encoding="utf-8")
+    rc = main(["plan", "--out-dir", str(tmp_path), "--restrictions",
+               str(tmp_path / "r.json")])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "error:" in err and "JSON object" in err
+    assert "Traceback" not in err
+
+
+def test_unparseable_restrictions_file_names_the_file(tmp_path, capsys):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    (tmp_path / "r.json").write_text("{not json", encoding="utf-8")
+    rc = main(["plan", "--out-dir", str(tmp_path), "--restrictions",
+               str(tmp_path / "r.json")])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "error:" in err and "r.json" in err
+
+
+def test_corrupt_artifact_names_the_file(tmp_path, capsys):
+    (tmp_path / "inventory.json").write_text("{not json", encoding="utf-8")
+    write(tmp_path, "dependencies.json", DEPS)
+    assert main(["plan", "--out-dir", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert "error:" in err and "inventory.json" in err
+
+
+# --- a dry run never overwrites an executed record -------------------------
+
+EXECUTED_DEPLOY = {"dry_run": False, "executed": 4, "verified": 2,
+                   "statement_count": 4, "poisoned_names": ["x"],
+                   "failed_targets": ["y"], "failed": ["y"],
+                   "mismatched_targets": []}
+
+
+def test_dry_run_deploy_refuses_to_overwrite_an_executed_record(tmp_path, capsys):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    main(["ddl", "--out-dir", str(tmp_path)])
+    write(tmp_path, "deploy_result.json", EXECUTED_DEPLOY)
+    (tmp_path / "PREFLIGHT.md").unlink(missing_ok=True)
+    assert main(["deploy", "--out-dir", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert "EXECUTED" in err and "deploy_result.json" in err
+    assert "--out-dir" in err
+    kept = json.loads((tmp_path / "deploy_result.json").read_text(encoding="utf-8"))
+    assert kept["dry_run"] is False and kept["poisoned_names"] == ["x"]
+    # Re-reading PREFLIGHT.md is the reason people re-run a dry run; it is
+    # still rendered before the refusal.
+    assert (tmp_path / "PREFLIGHT.md").is_file()
+
+
+def test_the_stage_board_still_shows_the_executed_deploy_after_a_refused_dry_run(
+        tmp_path):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    main(["ddl", "--out-dir", str(tmp_path)])
+    write(tmp_path, "deploy_result.json", EXECUTED_DEPLOY)
+    assert main(["deploy", "--out-dir", str(tmp_path)]) == 1
+    assert main(["stages", "--out-dir", str(tmp_path)]) == 0
+    board = (tmp_path / "STAGES.md").read_text(encoding="utf-8")
+    deploy_row = next(l for l in board.splitlines()
+                      if l.startswith("| `deploy`"))
+    assert "verified 2/4" in deploy_row
+    assert "DRY RUN" not in deploy_row
+
+
+def test_dry_run_provision_refuses_to_overwrite_an_executed_record(
+        tmp_path, capsys):
+    write(tmp_path, "provision_result.json",
+          {"dry_run": False, "workspace": {"name": "w"},
+           "steps": [{"step": "workspace", "action": "created",
+                      "verified": True, "detail": "w"}]})
+    rc = main(["provision", "--out-dir", str(tmp_path), "--workspace-name",
+               "w", "--skip-libraries"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "EXECUTED" in err and "provision_result.json" in err
+    kept = json.loads((tmp_path / "provision_result.json").read_text(encoding="utf-8"))
+    assert kept["dry_run"] is False
+    assert kept["steps"][0]["verified"] is True
+
+
+# --- the two opt-in writes are gated by --execute like every other write ---
+
+OCID = "ocid1.aidataplatform.oc1.iad.fakefakefakefake"
+TARGET_FLAGS = ["--datalake-ocid", OCID, "--workspace", "ws-fake",
+                "--cluster-id", "cl-fake"]
+
+
+def _sf_ok(sql, params=None):
+    low = sql.lower()
+    if "current_user" in low:
+        return [{"U": "SVC", "A": "ORGACCT", "R": "AWS_US_EAST_2",
+                 "ROLE": "READER"}]
+    if "show databases" in low:
+        return [{"name": "SALES_DB"}]
+    if "information_schema" in low:
+        return [{"N": 7}]
+    return []
+
+
+class _DestRecorder:
+    """Catalog-API double for `smoke`: one INTERNAL catalog, creates visible."""
+
+    def __init__(self):
+        self.ops: list[str] = []
+        self.schemas: list[str] = []
+
+    def __call__(self, operation, **kw):
+        self.ops.append(operation)
+        if operation == "list_catalogs":
+            return {"items": [{"displayName": "lake", "key": "lake",
+                               "catalogType": "INTERNAL"}]}
+        if operation == "list_schemas":
+            return {"items": [{"key": f"lake.{s}"} for s in self.schemas]}
+        if operation == "create_schema":
+            self.schemas.append(kw["schema"])
+            return {}
+        if operation == "delete_schema":
+            self.schemas.remove(kw["schema"])
+            return {}
+        raise AssertionError(operation)
+
+
+def _smoke_env(monkeypatch):
+    import snowmig
+    rec = _DestRecorder()
+    monkeypatch.setattr(snowmig, "_run_sql_from_args", lambda args: _sf_ok)
+    monkeypatch.setattr(snowmig, "detect_backend", lambda: "oci_raw")
+    monkeypatch.setattr(snowmig, "make_call",
+                        lambda target, *, backend, **kw: rec)
+    return rec
+
+
+def test_smoke_write_probe_without_execute_issues_no_writes(
+        tmp_path, monkeypatch, capsys):
+    rec = _smoke_env(monkeypatch)
+    rc = main(["smoke", "--write-probe", "--out-dir", str(tmp_path),
+               "--account", "a", "--user", "u", "--auth", "password",
+               "--password-path", "/p", *TARGET_FLAGS, "--catalog", "lake"])
+    assert rc == 0
+    assert "create_schema" not in rec.ops and "delete_schema" not in rec.ops
+    out = capsys.readouterr().out
+    assert "dry run" in out and "--execute" in out
+    smoke = json.loads((tmp_path / "smoke.json").read_text(encoding="utf-8"))
+    assert smoke["destination"]["write_verified"] is False
+    assert "--execute" in smoke["destination"]["write_note"]
+
+
+def test_smoke_write_probe_with_execute_creates_then_deletes(
+        tmp_path, monkeypatch):
+    rec = _smoke_env(monkeypatch)
+    rc = main(["smoke", "--write-probe", "--execute", "--out-dir",
+               str(tmp_path), "--account", "a", "--user", "u", "--auth",
+               "password", "--password-path", "/p", *TARGET_FLAGS,
+               "--catalog", "lake"])
+    assert rc == 0
+    assert rec.ops.index("create_schema") < rec.ops.index("delete_schema")
+    smoke = json.loads((tmp_path / "smoke.json").read_text(encoding="utf-8"))
+    assert smoke["destination"]["write_verified"] is True
+
+
+def _no_subprocess(monkeypatch):
+    import subprocess
+
+    def refuse(*a, **k):
+        raise AssertionError("no CLI may be invoked from this test")
+    monkeypatch.setattr(subprocess, "run", refuse)
+
+
+def test_notebook_upload_without_execute_is_a_dry_run(
+        tmp_path, monkeypatch, capsys):
+    _no_subprocess(monkeypatch)
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    main(["ddl", "--out-dir", str(tmp_path)])
+    rc = main(["notebook", "--upload", "--out-dir", str(tmp_path),
+               *TARGET_FLAGS, "--catalog", "d"])
+    assert rc == 0
+    assert (tmp_path / "snowmig_shallow_clone_d.ipynb").is_file()
+    md = (tmp_path / "NOTEBOOK.md").read_text(encoding="utf-8")
+    assert "dry run" in md.lower()
+    assert "Uploaded to" not in md
+    out = capsys.readouterr().out
+    assert "dry run" in out and "--execute" in out
+
+
+def test_notebook_upload_with_execute_is_refused_and_points_at_provision(
+        tmp_path, monkeypatch, capsys):
+    # The Jupyter-contents transport 200s and cannot read the file back
+    # (GAPS.md 13). Refusing is honest; "uploaded" was not.
+    _no_subprocess(monkeypatch)
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    main(["ddl", "--out-dir", str(tmp_path)])
+    rc = main(["notebook", "--upload", "--execute", "--out-dir",
+               str(tmp_path), *TARGET_FLAGS, "--catalog", "d"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "provision" in err and "run" in err
+    assert "aidp notebook run" not in err
+    md = (tmp_path / "NOTEBOOK.md").read_text(encoding="utf-8")
+    assert "Uploaded to" not in md and "aidp notebook run" not in md
+
+
+def test_notebook_still_generates_offline_without_upload(tmp_path):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    main(["ddl", "--out-dir", str(tmp_path)])
+    assert main(["notebook", "--out-dir", str(tmp_path)]) == 0
+    md = (tmp_path / "NOTEBOOK.md").read_text(encoding="utf-8")
+    assert "aidp notebook run" not in md
+
+
+def test_every_writing_subcommand_accepts_execute():
+    import snowmig
+    parser = snowmig.build_parser()
+    for argv in (["deploy", "--execute"],
+                 ["provision", "--workspace-name", "w", "--execute"],
+                 ["catalog", "--execute"],
+                 ["smoke", "--write-probe", "--execute"],
+                 ["notebook", "--upload", "--execute"]):
+        assert parser.parse_args(argv).execute is True, argv
+
+
+# --- ddl --timestamp-ntz: the mapping decision, made offline ----------------
+
+NTZ_COLUMN = {"COLUMN_NAME": "CREATED_AT", "DATA_TYPE": "TIMESTAMP_NTZ",
+              "target_type": "TIMESTAMP_NTZ", "IS_NULLABLE": "YES",
+              "ORDINAL_POSITION": 2, "COMMENT": None}
+
+
+def _inv_with_ntz(mode="preserve", target_type="TIMESTAMP_NTZ"):
+    inv = json.loads(json.dumps(INV))
+    col = dict(NTZ_COLUMN, target_type=target_type)
+    inv["inventory"][0]["columns"].append(col)
+    inv["timestamp_ntz_mode"] = mode
+    return inv
+
+
+def _plan_ntz(tmp_path, inv):
+    write(tmp_path, "inventory.json", inv)
+    write(tmp_path, "dependencies.json", DEPS)
+    assert main(["plan", "--out-dir", str(tmp_path)]) == 0
+    return (tmp_path / "inventory.json").read_bytes()
+
+
+def _ddl_plan(tmp_path):
+    return json.loads((tmp_path / "ddl_plan.json").read_text(encoding="utf-8"))
+
+
+def test_ddl_halts_on_timestamp_ntz_and_names_the_offline_remedy(tmp_path, capsys):
+    _plan_ntz(tmp_path, _inv_with_ntz())
+    assert main(["ddl", "--out-dir", str(tmp_path)]) == 3
+    err = capsys.readouterr().err
+    assert "CREATED_AT -> TIMESTAMP_NTZ" in err
+    assert "ddl --timestamp-ntz timestamp" in err
+    assert _ddl_plan(tmp_path)["target_rejected"]
+
+
+def test_ddl_timestamp_ntz_flag_remaps_offline_without_touching_inventory(
+        tmp_path, capsys):
+    before = _plan_ntz(tmp_path, _inv_with_ntz())
+    rc = main(["ddl", "--out-dir", str(tmp_path), "--timestamp-ntz", "timestamp"])
+    assert rc == 0
+    plan = _ddl_plan(tmp_path)
+    stmt = plan["statements"][0]
+    assert "`CREATED_AT` TIMESTAMP\n" in stmt["sql"]
+    assert "TIMESTAMP_NTZ" not in stmt["sql"]
+    assert {"name": "CREATED_AT", "type": "TIMESTAMP"} in stmt["expected_columns"]
+    caveats = [w for w in stmt["warnings"] if w.startswith("CREATED_AT:")]
+    assert len(caveats) == 1 and "timezone" in caveats[0].lower()
+    assert plan["timestamp_ntz_mode"] == "timestamp"
+    assert plan["remapped_columns"] == ["D.PUBLIC.ORDERS.CREATED_AT"]
+    assert plan["target_rejected"] == []
+    # inventory.json is the record of what `assess` observed; it is not
+    # rewritten by a mapping decision taken at `ddl`.
+    assert (tmp_path / "inventory.json").read_bytes() == before
+    assert "re-mapped 1" in capsys.readouterr().out
+
+
+def test_ddl_timestamp_ntz_preserve_never_reupgrades(tmp_path, capsys):
+    _plan_ntz(tmp_path, _inv_with_ntz(mode="timestamp", target_type="TIMESTAMP"))
+    rc = main(["ddl", "--out-dir", str(tmp_path), "--timestamp-ntz", "preserve"])
+    assert rc == 0
+    stmt = _ddl_plan(tmp_path)["statements"][0]
+    assert "`CREATED_AT` TIMESTAMP\n" in stmt["sql"]
+    assert "not re-upgraded" in capsys.readouterr().err
+
+
+def test_ddl_remap_is_a_noop_when_no_ntz_columns(tmp_path):
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    main(["plan", "--out-dir", str(tmp_path)])
+    rc = main(["ddl", "--out-dir", str(tmp_path), "--timestamp-ntz", "timestamp"])
+    assert rc == 0
+    assert _ddl_plan(tmp_path)["remapped_columns"] == []
+
+
+# --- accepted `aidp:` keys are consumed, not just accepted -----------------
+
+def _cwd_config(tmp_path, monkeypatch, aidp_lines):
+    """A discoverable config in the working directory: `provision` and
+    `catalogs` take no --config flag, so this is how the file reaches them."""
+    cfg = tmp_path / "snowmig-config.yaml"
+    body = ("snowflake:\n  account: ORG-ACC\n  user: SVC\n  warehouse: WH\n"
+            "  database: SALES_DB\n  auth: password\n"
+            "  password: not-a-real-password\naidp:\n")
+    body += "".join(f"  {line}\n" for line in aidp_lines)
+    cfg.write_text(body, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    return cfg
+
+
+def test_oci_profile_from_config_reaches_oci_calls_only(
+        tmp_path, monkeypatch, capsys):
+    import subprocess
+    import types
+
+    import snowmig
+    _cwd_config(tmp_path, monkeypatch,
+                [f"datalake_ocid: {OCID}", "oci_profile: FAKE_PROFILE"])
+    seen = []
+
+    def fake_run(argv, **kw):
+        seen.append(list(argv))
+        return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    args = snowmig.build_parser().parse_args(["catalogs", "--out-dir", str(tmp_path)])
+    runner = snowmig._oci_runner(args)
+    assert runner is not None
+    runner(["oci", "raw-request", "--http-method", "GET",
+            "--target-uri", "https://example.invalid/x"])
+    runner(["aidp", "workspace", "list"])
+    assert seen[0][:3] == ["oci", "--profile", "FAKE_PROFILE"]
+    assert seen[0][3:] == ["raw-request", "--http-method", "GET",
+                           "--target-uri", "https://example.invalid/x"]
+    # The aidp CLI's flag set is unverified: its argv is left alone.
+    assert seen[1] == ["aidp", "workspace", "list"]
+    out = capsys.readouterr().out
+    assert "FAKE_PROFILE" in out and "oci" in out
+
+
+def test_no_oci_profile_means_the_default_transport(tmp_path, monkeypatch):
+    import snowmig
+    _cwd_config(tmp_path, monkeypatch, [f"datalake_ocid: {OCID}"])
+    args = snowmig.build_parser().parse_args(["catalogs", "--out-dir", str(tmp_path)])
+    assert snowmig._oci_runner(args) is None
+
+
+def test_catalogs_hands_the_profile_runner_to_the_transport(tmp_path, monkeypatch):
+    import snowmig
+    _cwd_config(tmp_path, monkeypatch,
+                [f"datalake_ocid: {OCID}", "oci_profile: FAKE_PROFILE"])
+    captured = {}
+
+    def fake_make_call(target, *, backend, run_process=None):
+        captured["run_process"] = run_process
+        return lambda operation, **kw: {"items": []}
+    monkeypatch.setattr(snowmig, "make_call", fake_make_call)
+    monkeypatch.setattr(snowmig, "detect_backend", lambda: "oci_raw")
+    assert main(["catalogs", "--out-dir", str(tmp_path)]) == 0
+    assert captured["run_process"] is not None
+
+
+def test_provision_dry_run_takes_the_catalogs_from_the_config(
+        tmp_path, monkeypatch, capsys):
+    _cwd_config(tmp_path, monkeypatch,
+                [f"datalake_ocid: {OCID}", "external_catalog: cfg_external_cat",
+                 "target_catalog: cfg_target_cat",
+                 "subnet_id: ocid1.subnet.oc1.iad.fakesubnet"])
+    rc = main(["provision", "--workspace-name", "w", "--out-dir", str(tmp_path),
+               "--skip-libraries"])
+    assert rc == 0
+    res = json.loads((tmp_path / "provision_result.json").read_text(encoding="utf-8"))
+    assert res["external_catalog"] == "cfg_external_cat"
+    assert res["target_catalog"] == "cfg_target_cat"
+    out = capsys.readouterr().out
+    assert "external_catalog=cfg_external_cat" in out
+    assert "target_catalog=cfg_target_cat" in out
+    assert "subnet_id=ocid1.subnet.oc1.iad.fakesubnet (not used by any stage yet)" in out
+
+
+def test_provision_flag_overrides_the_config_catalog(tmp_path, monkeypatch):
+    _cwd_config(tmp_path, monkeypatch,
+                [f"datalake_ocid: {OCID}", "external_catalog: cfg_external_cat",
+                 "target_catalog: cfg_target_cat"])
+    rc = main(["provision", "--workspace-name", "w", "--out-dir", str(tmp_path),
+               "--skip-libraries", "--target-catalog", "flag_cat"])
+    assert rc == 0
+    res = json.loads((tmp_path / "provision_result.json").read_text(encoding="utf-8"))
+    assert res["target_catalog"] == "flag_cat"
+    assert res["external_catalog"] == "cfg_external_cat"
+
+
+# --- no Snowflake secret is ever taken inline on the command line ----------
+
+def _every_option_string():
+    import snowmig
+    subs = snowmig.build_parser()._subparsers._group_actions[0].choices
+    return {o for sp in subs.values() for a in sp._actions
+            for o in a.option_strings}
+
+
+def test_no_stage_accepts_a_secret_inline():
+    # PRIVACY.md: secrets are read from files named by path, never as
+    # inline arguments. Any secret-looking flag must therefore be a *-path.
+    secretish = {o for o in _every_option_string()
+                 if any(w in o for w in ("pass", "token", "secret",
+                                         "private-key", "pat-"))}
+    assert secretish, "the guard found no secret-looking flags at all"
+    assert all(o.endswith("-path") for o in secretish), sorted(secretish)
+    assert "--key-passphrase" not in _every_option_string()
+
+
+def test_the_removed_passphrase_flag_is_refused_and_names_the_config_keys(
+        tmp_path, capsys):
+    rc = main(["assess", "--out-dir", str(tmp_path), "--account", "a",
+               "--user", "u", "--key-path", "/k", "--key-passphrase",
+               "NOT-A-REAL-PASSPHRASE"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "key_passphrase_path" in err and "key_passphrase" in err
+    assert "NOT-A-REAL-PASSPHRASE" not in err, "the value is never echoed"
+    # The = spelling is the same leak.
+    rc = main(["assess", "--out-dir", str(tmp_path), "--account", "a",
+               "--user", "u", "--key-path", "/k",
+               "--key-passphrase=NOT-A-REAL-PASSPHRASE"])
+    assert rc == 1
+    assert "NOT-A-REAL-PASSPHRASE" not in capsys.readouterr().err
+
+
+def _capture_connect_kwargs(monkeypatch):
+    import snowmig
+    captured = {}
+
+    def fake_build(auth, **kw):
+        captured.update(kw)
+        return {}
+    monkeypatch.setattr(snowmig, "build_connect_kwargs", fake_build)
+    monkeypatch.setattr(snowmig, "connect", lambda **kw: "CONN")
+    monkeypatch.setattr(snowmig, "make_run_sql", lambda conn: "CALLABLE")
+    return captured
+
+
+def _keypair_config(tmp_path, *extra_lines):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("snowflake:\n  account: ORG-ACC\n  user: SVC\n"
+                   "  auth: keypair\n  key_path: /k\n"
+                   + "".join(f"  {line}\n" for line in extra_lines),
+                   encoding="utf-8")
+    return str(cfg)
+
+
+def test_key_passphrase_is_read_from_the_config_inline(tmp_path, monkeypatch):
+    import snowmig
+    captured = _capture_connect_kwargs(monkeypatch)
+    cfg = _keypair_config(tmp_path, "key_passphrase: from-config")
+    args = snowmig.build_parser().parse_args(
+        ["assess", "--out-dir", str(tmp_path), "--config", cfg])
+    assert snowmig._run_sql_from_args(args) == "CALLABLE"
+    assert captured["key_passphrase"] == "from-config"
+
+
+def test_key_passphrase_is_read_from_the_file_the_config_names(
+        tmp_path, monkeypatch):
+    import snowmig
+    captured = _capture_connect_kwargs(monkeypatch)
+    pp = tmp_path / "pp"
+    pp.write_text("  from-file\n", encoding="utf-8")
+    cfg = _keypair_config(tmp_path, f"key_passphrase_path: {pp}")
+    args = snowmig.build_parser().parse_args(
+        ["assess", "--out-dir", str(tmp_path), "--config", cfg])
+    snowmig._run_sql_from_args(args)
+    assert captured["key_passphrase"] == "from-file"
+
+
+# --- host from the config reaches the laptop-side connector ----------------
+
+def test_run_sql_from_args_threads_host_from_config(tmp_path, monkeypatch):
+    # The same `host:` is what the EXTERNAL catalog body registers, so a
+    # preflight that ignored it PASSed against a different endpoint than
+    # AIDP would then use -- and a wrong host surfaced minutes into a job.
+    import snowmig
+    from migration_config import load_config, snowflake_block
+    from target.snowflake_catalog_connection import (
+        build_snowflake_connection_details)
+    captured = _capture_connect_kwargs(monkeypatch)
+    host = "ORG-ACC.us-east-2.aws.snowflakecomputing.com"
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(f"snowflake:\n  account: ORG-ACC\n  host: {host}\n"
+                   "  user: SVC\n  warehouse: WH\n  database: SALES_DB\n"
+                   "  auth: password\n  password: not-a-real-password\n",
+                   encoding="utf-8")
+    args = snowmig.build_parser().parse_args(
+        ["preflight", "--test-source", "--config", str(cfg),
+         "--out-dir", str(tmp_path)])
+    snowmig._run_sql_from_args(args)
+    assert captured["host"] == host
+    registered = build_snowflake_connection_details(
+        snowflake_block(load_config(cfg)))["SNOWFLAKE_HOST"]
+    assert captured["host"] == registered, "preflight and catalog must agree"
+
+
+def test_run_sql_from_args_leaves_host_unset_when_the_config_has_none(
+        tmp_path, monkeypatch):
+    import snowmig
+    captured = _capture_connect_kwargs(monkeypatch)
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("snowflake:\n  account: ORG-ACC\n  user: SVC\n"
+                   "  auth: password\n  password: not-a-real-password\n",
+                   encoding="utf-8")
+    args = snowmig.build_parser().parse_args(
+        ["assess", "--out-dir", str(tmp_path), "--config", str(cfg)])
+    snowmig._run_sql_from_args(args)
+    assert not captured.get("host")

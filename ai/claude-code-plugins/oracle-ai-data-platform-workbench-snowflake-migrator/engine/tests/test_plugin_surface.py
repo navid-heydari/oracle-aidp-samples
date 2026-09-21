@@ -512,3 +512,16 @@ def test_privacy_doc_describes_the_current_credential_and_data_flows():
         assert stale not in flat, f"stale claim still in PRIVACY.md: {stale!r}"
     # And it still says what a reviewer must hear plainly.
     assert "rotate" in flat, "advise rotating the credential after the run"
+
+
+def test_no_operator_surface_mentions_the_nonexistent_notebook_run_command():
+    """`aidp notebook run` is not a command the aidp CLI has, and the
+    notebookRuns API does not exist (GAPS.md 13). Neither may be offered to
+    an operator as the way to run a notebook."""
+    paths = list((ROOT / "skills").rglob("SKILL.md")) \
+        + list((ROOT / "commands").glob("*.md")) \
+        + [p for p in (ROOT / "engine").rglob("*.py")
+           if "tests" not in p.parts]
+    offenders = [str(p.relative_to(ROOT)) for p in paths
+                 if "aidp notebook run" in p.read_text(encoding="utf-8")]
+    assert offenders == []

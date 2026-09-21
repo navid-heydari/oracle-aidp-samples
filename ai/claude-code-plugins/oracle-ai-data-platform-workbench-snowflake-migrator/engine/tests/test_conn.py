@@ -98,3 +98,19 @@ def test_missing_secret_file_is_a_clear_error(tmp_path):
     with pytest.raises(AuthError, match="not readable"):
         build_connect_kwargs("pat", account=ACC, user="u",
                              pat_path=str(tmp_path / "nope"))
+
+
+
+# --- host: the laptop connects where the catalog registration points -------
+
+def test_host_is_passed_to_the_driver_when_set():
+    kw = build_connect_kwargs("externalbrowser", account=ACC,
+                              host=" x.us-east-2.aws.snowflakecomputing.com ")
+    assert kw["host"] == "x.us-east-2.aws.snowflakecomputing.com"
+
+
+def test_host_is_omitted_when_absent_so_the_driver_derives_it():
+    kw = build_connect_kwargs("externalbrowser", account=ACC)
+    assert "host" not in kw
+    kw = build_connect_kwargs("externalbrowser", account=ACC, host="")
+    assert "host" not in kw
