@@ -171,3 +171,16 @@ def test_collision_resolved_by_excluding_the_quoted_twin():
     assert [c["source_identifier"] for c in plan["can_migrate"]] == ["D.S.T"]
     assert [(c["source_identifier"], c["category"])
             for c in plan["cannot_migrate"]] == [("D.S.t", "restriction")]
+
+
+def test_unknown_count_under_a_cap_lands_in_cannot_migrate_with_the_reason():
+    # Views carry no count under the default --row-counts metadata; a cap
+    # that cannot be evaluated excludes rather than silently admitting.
+    uncounted = rec("D.S.T")
+    uncounted["row_count_exact"] = None
+    inv = {"inventory": [uncounted, rec("D.S.SMALL", rows=3)]}
+    plan = build_plan(inv, {"edges": []}, restrictions={"max_rows": 10})
+    assert [c["source_identifier"] for c in plan["can_migrate"]] == ["D.S.SMALL"]
+    c = plan["cannot_migrate"][0]
+    assert c["category"] == "restriction"
+    assert "cannot be evaluated" in c["reason"] and "max_rows" in c["reason"]

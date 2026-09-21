@@ -152,3 +152,96 @@ def test_unquoted_entry_still_folds_and_the_reason_says_so():
     assert all("'d1.public.orders'" in e["reason"] for e in excluded)
     # The twin the operator did not name must not be blamed on the operator.
     assert all("explicitly" not in e["reason"] for e in excluded)
+
+
+# --- degenerate values are errors, not silent no-ops ----------------------
+#
+# An empty allowlist admitted the whole estate while PLANNED_OBJECTS.md said
+# the restriction was "in force"; an empty pattern excluded everything; a
+# negative cap excluded every counted table; JSON true passed as an integer.
+# The module's own rule -- a typo'd key must not apply nothing while appearing
+# to succeed -- applies to values as much as keys.
+
+INCLUDE_KEYS = ("include_databases", "include_schemas", "include_object_types",
+                "include_objects", "include_name_patterns")
+EXCLUDE_KEYS = ("exclude_databases", "exclude_schemas", "exclude_object_types",
+                "exclude_objects", "exclude_name_patterns")
+
+
+@pytest.mark.parametrize("key", INCLUDE_KEYS)
+def test_empty_include_list_is_rejected(key):
+    with pytest.raises(InvalidRestriction, match="empty"):
+        validate_restrictions({key: []})
+
+
+def test_empty_include_objects_does_not_admit_the_whole_estate():
+    with pytest.raises(InvalidRestriction, match="include_objects"):
+        apply_restrictions(RECS, {"include_objects": []})
+
+
+@pytest.mark.parametrize("key", EXCLUDE_KEYS)
+def test_empty_exclude_list_is_rejected(key):
+    with pytest.raises(InvalidRestriction, match="empty"):
+        validate_restrictions({key: []})
+
+
+@pytest.mark.parametrize("pattern", ["", "  "])
+def test_empty_or_blank_pattern_is_rejected(pattern):
+    with pytest.raises(InvalidRestriction, match="exclude_name_patterns"):
+        validate_restrictions({"exclude_name_patterns": [pattern]})
+
+
+def test_non_string_list_entries_are_rejected():
+    with pytest.raises(InvalidRestriction, match="include_objects"):
+        validate_restrictions({"include_objects": [None, 123]})
+
+
+@pytest.mark.parametrize("bad", [{"max_rows": -1}, {"max_bytes": -1},
+                                 {"max_rows": True}, {"max_bytes": False}])
+def test_negative_or_bool_caps_are_rejected(bad):
+    with pytest.raises(InvalidRestriction, match="integer|>= 0"):
+        validate_restrictions(bad)
+
+
+def test_zero_cap_is_a_legitimate_cap():
+    assert validate_restrictions({"max_rows": 0}) == {"max_rows": 0}
+
+
+def test_unknown_object_type_is_rejected():
+    # `VIEWS` excluded nothing, silently. The vocabulary is TABLE and VIEW.
+    with pytest.raises(InvalidRestriction, match="VIEWS"):
+        validate_restrictions({"exclude_object_types": ["VIEWS"]})
+    assert validate_restrictions({"exclude_object_types": ["view"]})
+
+
+# --- a cap that cannot be evaluated is not a pass -------------------------
+
+def test_unknown_row_count_under_max_rows_is_excluded_with_the_reason():
+    big = rec("D.S.BIG", rows=None)
+    big["row_count_note"] = "not counted: --row-counts none"
+    kept, excluded = apply_restrictions([big, rec("D.S.SMALL", rows=5)],
+                                        {"max_rows": 10})
+    assert [k["source_identifier"] for k in kept] == ["D.S.SMALL"]
+    assert excluded[0]["source_identifier"] == "D.S.BIG"
+    assert excluded[0]["restriction"] == "max_rows"
+    assert "unknown" in excluded[0]["reason"]
+    assert "cannot be evaluated" in excluded[0]["reason"]
+    assert "--row-counts none" in excluded[0]["reason"]
+
+
+def test_unknown_size_under_max_bytes_is_excluded_with_the_reason():
+    nosize = rec("D.S.T")
+    nosize["source_metadata"] = {}
+    _, excluded = apply_restrictions([nosize], {"max_bytes": 10})
+    assert excluded[0]["restriction"] == "max_bytes"
+    assert "unknown" in excluded[0]["reason"]
+    assert "cannot be evaluated" in excluded[0]["reason"]
+
+
+def test_upper_case_BYTES_metadata_is_still_capped():
+    # The in-AIDP discovery bridge writes the key upper-case; the cap must
+    # read it, or max_bytes is a no-op on every manifest-sourced inventory.
+    r = rec("D.S.T")
+    r["source_metadata"] = {"BYTES": 10**12}
+    _, excluded = apply_restrictions([r], {"max_bytes": 1000})
+    assert excluded and "exceeds max_bytes" in excluded[0]["reason"]

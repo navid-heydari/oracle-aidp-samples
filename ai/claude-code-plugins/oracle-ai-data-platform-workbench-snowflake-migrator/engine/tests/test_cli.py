@@ -365,3 +365,16 @@ def test_plan_stdout_names_a_custom_architecture(tmp_path, capsys):
     main(["plan", "--out-dir", str(tmp_path)])
     out = capsys.readouterr().out
     assert "Their Pattern" in out and "not assessed" in out
+
+
+def test_empty_include_allowlist_exits_1_and_writes_no_plan(tmp_path, capsys):
+    # `{"include_objects": []}` used to plan the whole estate and print the
+    # allowlist under "Restrictions in force".
+    write(tmp_path, "inventory.json", INV)
+    write(tmp_path, "dependencies.json", DEPS)
+    (tmp_path / "r.json").write_text(json.dumps({"include_objects": []}), encoding="utf-8")
+    rc = main(["plan", "--out-dir", str(tmp_path), "--restrictions",
+               str(tmp_path / "r.json")])
+    assert rc == 1
+    assert "include_objects" in capsys.readouterr().err
+    assert not (tmp_path / "plan.json").exists()

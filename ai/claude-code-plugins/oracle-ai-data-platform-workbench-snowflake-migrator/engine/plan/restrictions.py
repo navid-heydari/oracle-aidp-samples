@@ -7,7 +7,17 @@ cannot be migrated and why -- an object that silently vanished from the plan is
 indistinguishable from one that was never there.
 
 An unrecognised restriction key is an ERROR, not an ignored line. A typo'd key
-would apply nothing while appearing to succeed.
+would apply nothing while appearing to succeed. The same goes for values: an
+empty list, a blank pattern, a non-string entry, a negative cap, a JSON boolean
+where an integer belongs, or an object type outside TABLE/VIEW is rejected
+rather than applied as a no-op that the report then lists as "in force".
+
+A cap that cannot be evaluated excludes the object, with that as the reason.
+A table whose count was never captured (`--row-counts none`, a count that
+errored, a view under the default metadata mode, a manifest without sizes) is
+not known to be under `max_rows`, and keeping it would be a guess; the
+exclusion is listed in PLANNED_OBJECTS.md like any other, so the operator can
+drop the cap or count exactly and re-plan.
 
 `include_objects` / `exclude_objects` entries follow Snowflake's own case rule:
 an unquoted part folds to upper (`d.s.orders` is D.S.ORDERS), a double-quoted
@@ -24,7 +34,7 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["InvalidRestriction", "SCHEMA", "apply_restrictions",
+__all__ = ["InvalidRestriction", "OBJECT_TYPES", "SCHEMA", "apply_restrictions",
            "validate_restrictions"]
 
 
@@ -48,6 +58,9 @@ SCHEMA: dict[str, type] = {
     "max_bytes": int,
 }
 
+# The only kinds the inventory produces and the plan decides on.
+OBJECT_TYPES = ("TABLE", "VIEW")
+
 
 def validate_restrictions(restrictions: dict | None) -> dict:
     if not restrictions:
@@ -57,12 +70,34 @@ def validate_restrictions(restrictions: dict | None) -> dict:
             raise InvalidRestriction(
                 f"unknown restriction {key!r}; expected one of {sorted(SCHEMA)}")
         expected = SCHEMA[key]
-        if expected is list and not isinstance(value, list):
-            raise InvalidRestriction(f"{key!r} must be a list, got "
-                                     f"{type(value).__name__}")
-        if expected is int and not isinstance(value, int):
-            raise InvalidRestriction(f"{key!r} must be an integer, got "
-                                     f"{type(value).__name__}")
+        if expected is list:
+            if not isinstance(value, list):
+                raise InvalidRestriction(f"{key!r} must be a list, got "
+                                         f"{type(value).__name__}")
+            if not value:
+                what = ("an empty allowlist admits nothing or everything -- "
+                        "say which" if key.startswith("include_")
+                        else "an empty denylist excludes nothing")
+                raise InvalidRestriction(f"{key!r} is an empty list; {what}. "
+                                         "Omit the key or list entries")
+            for entry in value:
+                if not isinstance(entry, str) or not entry.strip():
+                    raise InvalidRestriction(f"{key!r} entries must be non-empty "
+                                             f"strings, got {entry!r}")
+        if expected is int:
+            # bool is an int subclass, so JSON true would otherwise pass and
+            # then compare as 1.
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise InvalidRestriction(f"{key!r} must be an integer, got "
+                                         f"{type(value).__name__}")
+            if value < 0:
+                raise InvalidRestriction(f"{key!r} must be >= 0, got {value}")
+    for key in ("include_object_types", "exclude_object_types"):
+        for entry in restrictions.get(key) or []:
+            if entry.upper() not in OBJECT_TYPES:
+                raise InvalidRestriction(
+                    f"{key} entry {entry!r} is not an object type this plan "
+                    f"knows; expected one of {list(OBJECT_TYPES)}")
     for key in ("include_name_patterns", "exclude_name_patterns"):
         for pattern in restrictions.get(key) or []:
             try:
@@ -213,16 +248,33 @@ def apply_restrictions(records: list[dict],
                                        "name matches no include pattern"))
             continue
 
-        rows = rec.get("row_count_exact")
-        if max_rows is not None and rows is not None and rows > max_rows:
-            excluded.append(_exclusion(rec, "max_rows",
-                                       f"{rows} rows exceeds max_rows {max_rows}"))
-            continue
-        byts = (rec.get("source_metadata") or {}).get("bytes")
-        if max_bytes is not None and byts is not None and byts > max_bytes:
-            excluded.append(_exclusion(rec, "max_bytes",
-                                       f"{byts} bytes exceeds max_bytes {max_bytes}"))
-            continue
+        if max_rows is not None:
+            rows = rec.get("row_count_exact")
+            if rows is None:
+                note = rec.get("row_count_note")
+                excluded.append(_exclusion(
+                    rec, "max_rows",
+                    "row count unknown; max_rows cannot be evaluated"
+                    + (f" ({note})" if note else "")))
+                continue
+            if rows > max_rows:
+                excluded.append(_exclusion(
+                    rec, "max_rows", f"{rows} rows exceeds max_rows {max_rows}"))
+                continue
+        if max_bytes is not None:
+            # The in-AIDP discovery bridge writes the key upper-case.
+            meta = rec.get("source_metadata") or {}
+            byts = meta.get("bytes", meta.get("BYTES"))
+            if byts is None:
+                excluded.append(_exclusion(
+                    rec, "max_bytes",
+                    "byte size unknown; max_bytes cannot be evaluated"))
+                continue
+            if byts > max_bytes:
+                excluded.append(_exclusion(
+                    rec, "max_bytes",
+                    f"{byts} bytes exceeds max_bytes {max_bytes}"))
+                continue
 
         kept.append(rec)
     return kept, excluded
