@@ -358,3 +358,27 @@ def test_the_census_report_says_nothing_is_migratable():
 def test_a_task_gets_the_cutover_warning():
     md = render_census(_CENSUS)
     assert "stops being populated" in md or "stops being" in md
+
+
+# --------------------------------------------------------------------------
+# plan.json may carry `target_catalog_note` (how the target catalog comes to
+# exist: a container at S4, structure at S10). It is the approval artifact's
+# business to show it, and an older plan.json without it must still render.
+# --------------------------------------------------------------------------
+
+def test_planned_objects_renders_the_target_catalog_note_when_present():
+    note = ("The target catalog is created as a CONTAINER at S4 by "
+            "`catalog --catalog-type standard --execute`; its schemas and "
+            "tables are created at S10 on AIDP compute.")
+    md = render_planned_objects(dict(PLAN, target_catalog_note=note))
+    assert note in md
+    structure = md.split("## Target structure to exist first", 1)[1]
+    assert note in structure.split("\n## ", 1)[0], \
+        "the note belongs with the target-structure section"
+
+
+def test_planned_objects_without_the_note_still_renders():
+    plan = {k: v for k, v in PLAN.items() if k != "target_catalog_note"}
+    md = render_planned_objects(plan)
+    assert "Target structure to exist first" in md
+    assert "None" not in md.split("## Target structure to exist first", 1)[1].split("\n## ", 1)[0]

@@ -150,6 +150,10 @@ def render_ddl_plan(ddl: dict) -> str:
     stmts = ddl.get("statements") or []
     out = ["# Target DDL plan", "",
            f"{len(stmts)} statement(s). Nothing has been executed.", ""]
+    # Carried from plan.json when present: how the target catalog comes to
+    # exist. Guarded, so an older ddl_plan.json renders as before.
+    if ddl.get("target_catalog_note"):
+        out += [ddl["target_catalog_note"], ""]
     # LEAD with what the target will refuse. Buried at the bottom this reads
     # as a footnote; it is the reason the whole plan would fail.
     rejected = ddl.get("target_rejected") or []
@@ -249,8 +253,12 @@ def render_planned_objects(plan: dict) -> str:
     out += ["## Target structure to exist first", "",
             "Catalogs (create these, or confirm they exist and are INTERNAL): "
             + ", ".join(f'`{c}`' for c in plan.get("catalogs_to_create") or []),
-            "",
-            "Schemas the clone will create: "
+            ""]
+    # How the target catalog comes to exist (container at S4, structure at
+    # S10), when the plan records it. An older plan.json carries no note.
+    if plan.get("target_catalog_note"):
+        out += [plan["target_catalog_note"], ""]
+    out += ["Schemas the clone will create: "
             + ", ".join(f'`{a}.{b}`' for a, b in plan.get("schemas_to_create") or []),
             ""]
 
