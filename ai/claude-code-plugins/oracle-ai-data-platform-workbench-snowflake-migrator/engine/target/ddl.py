@@ -291,12 +291,14 @@ def build_create_view(record: dict, target_fqn: str,
 
     try:
         body = extract_view_body(ddl)
+        # Inside the guard on purpose: a translator that cannot read one view
+        # blocks THAT view with the reason, it does not abort the stage.
+        translated = translate_view_body(body)
     except ValueError as exc:
         res.blocked = True
         res.blocked_reason = str(exc)
         return res
 
-    translated = translate_view_body(body)
     if translated.unsupported:
         res.blocked = True
         res.blocked_reason = "Snowflake-only SQL: " + "; ".join(

@@ -59,10 +59,18 @@ def _iff(sql: str) -> tuple[str, str | None]:
     return lexer.sub_code(r"\bIFF\s*\(", "IF(", sql)[0], None
 
 
+# A single-quoted literal exactly as lexer._closing_quote reads it: `\'`, `\\`
+# and `''` are escapes, not the end. The old `'[^']*'` stopped at the first
+# quote, so `'don\'t'::string` matched the tail `'t'::string` and the rewrite
+# was spliced into the middle of the literal.
+_LITERAL = r"'(?:[^'\\]|\\.|'')*'"
+
 # Only a bare identifier, qualified column or literal. Anything else (a closing
-# paren, an operator) means the operand's left edge is ambiguous.
+# paren, an operator) means the operand's left edge is ambiguous. A preceding
+# backslash is excluded too: that is the inside of a literal, never an operand.
 _CAST_SIMPLE = (
-    r"(?<![\w).\"'])([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*|'[^']*'|\d+(?:\.\d+)?)"
+    r"(?<![\w).\"'\\])([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*|" + _LITERAL
+    + r"|\d+(?:\.\d+)?)"
     r"\s*(?P<op>::)\s*([A-Za-z_][\w$]*(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)")
 
 
@@ -259,7 +267,17 @@ def translate_sql(sql: str) -> TranslationResult:
                 "rule_id": rule.rule_id, "construct": rule.construct,
                 "detail": rule.detail or rule.description})
             continue
-        new_sql, problem = rule.translate(result.sql)
+        try:
+            new_sql, problem = rule.translate(result.sql)
+        except lexer.UnterminatedLiteral as exc:
+            # A rule that produced SQL the lexer cannot read has a bug. That is
+            # a per-view refusal naming the rule, not a stage-wide exit 1 that
+            # names nothing.
+            result.unsupported.append({
+                "rule_id": rule.rule_id, "construct": rule.construct,
+                "detail": f"translator rule {rule.rule_id} produced SQL the "
+                          f"lexer cannot read ({exc}); left untranslated"})
+            continue
         if problem:
             result.unsupported.append({
                 "rule_id": rule.rule_id, "construct": rule.construct,

@@ -268,3 +268,28 @@ def test_trailing_semicolon_and_whitespace_are_stripped():
 def test_unterminated_literal_in_the_ddl_is_reported():
     with pytest.raises(ValueError):
         extract_view_body("create view v as select 'oops")
+
+
+# --------------------------------------------------------------------------
+# A backslash-escaped quote inside a cast operand used to raise out of the
+# translator and abort the whole ddl stage with no view named.
+# --------------------------------------------------------------------------
+
+def test_build_create_view_with_escaped_quote_in_cast():
+    ddl = "create view V_BAD as select 'don\\'t'::string as w, a from DB.SC.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V_BAD")
+    assert res.blocked is False, res.blocked_reason
+    assert "CAST('don\\'t' AS" in res.sql
+    assert "::" not in res.sql
+
+
+def test_translator_value_error_blocks_the_view_not_the_payload(monkeypatch):
+    import target.ddl as ddl_mod
+
+    def raise_value_error(body):
+        raise ValueError("translator could not read this body")
+
+    monkeypatch.setattr(ddl_mod, "translate_view_body", raise_value_error)
+    res = build_create_view(view_record(), "D.S.V")
+    assert res.blocked is True
+    assert "translator could not read this body" in res.blocked_reason

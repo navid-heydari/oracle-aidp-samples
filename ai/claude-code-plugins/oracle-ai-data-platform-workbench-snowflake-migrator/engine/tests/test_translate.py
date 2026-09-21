@@ -226,3 +226,47 @@ def test_dateadd_inside_a_literal_is_not_rewritten():
 def test_comment_text_does_not_trigger_a_declared_rule():
     out = translate_sql("-- QUALIFY is discussed here\nselect 1")
     assert [u["rule_id"] for u in out.unsupported] == []
+
+
+# --------------------------------------------------------------------------
+# A cast operand that is a literal with an escaped quote. The rule's literal
+# pattern used to stop at the first `'`, so `'don\\'t'::string` was spliced in
+# the middle of the literal and the re-lex raised UnterminatedLiteral -- out of
+# translate_sql, out of the planner, out of the CLI: exit 1 for the whole
+# estate with no view named.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("sql,expected_operand", [
+    ("select 'it\\'s'::varchar as v from t", "'it\\'s'"),
+    ("select 'don\\'t'::string as w, a from DB.SC.T", "'don\\'t'"),
+    ("select '\\''::varchar as v from t", "'\\''"),
+    ("select 'a\\\\'::varchar as v from t", "'a\\\\'"),
+])
+def test_cast_shorthand_honours_backslash_escaped_quote_in_literal(sql, expected_operand):
+    r = t(sql)
+    assert f"CAST({expected_operand} AS" in r.sql, r.sql
+    assert "::" not in r.sql
+    assert r.fully_translated is True
+
+
+def test_cast_shorthand_honours_doubled_quote_in_literal():
+    r = t("select 'it''s'::varchar as v from t")
+    assert "::" not in r.sql
+    assert r.fully_translated is True
+    assert r.sql.startswith("select CAST('it")
+
+
+def test_a_rule_that_raises_unterminated_literal_blocks_only_that_construct(monkeypatch):
+    from snowflake_source.dialect import lexer, translate
+
+    def boom(sql):
+        raise lexer.UnterminatedLiteral("boom")
+
+    fake = translate.TranslationRule(
+        "T99_FAKE", "FAKE", "fake rule for the guard", "implemented",
+        r"\bselect\b", boom)
+    monkeypatch.setattr(translate, "RULES", (fake,))
+    r = translate.translate_sql("select x from t")
+    assert r.sql == "select x from t"
+    assert [u["rule_id"] for u in r.unsupported] == ["T99_FAKE"]
+    assert "boom" in r.unsupported[0]["detail"]
