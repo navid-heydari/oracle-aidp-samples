@@ -154,7 +154,9 @@ def build_connect_kwargs(auth: str, *, account: str, user: str | None = None,
         if not pat_path:
             raise AuthError("pat auth requires pat_path")
         kw["authenticator"] = "PROGRAMMATIC_ACCESS_TOKEN"
-        kw["password"] = _read_secret_file(pat_path, "PAT file")
+        # The connector builds its PAT authenticator from `token`. A PAT
+        # handed over as `password` goes to the wire as TOKEN: null.
+        kw["token"] = _read_secret_file(pat_path, "PAT file")
     elif auth == "password":
         if not password_path:
             raise AuthError("password auth requires password_path")
