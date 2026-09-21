@@ -244,9 +244,12 @@ same name** on the AIDP default config, the workspace folder
 being pre-declared for the job parameters, not catalogs that must already
 exist. Read `PROVISION.md`: pending is pending, never rounded up.
 
-**Hand-off.** `PROVISION.md` and the CLI output print the **workspace key**
-and the **cluster key**. Paste them into `aidp.workspace` and
-`aidp.cluster_id` of `snowmig-config.yaml` (the commented lines in the
+**Hand-off.** After `--execute`, `provision_result.json` records the
+**workspace key** under `workspace.key` and the **cluster key** under
+`cluster.key`. `PROVISION.md` shows the display names, which are NOT the
+keys (its steps table carries the key only with `--reuse-existing`), and
+the CLI output prints neither. Paste those two values into `aidp.workspace`
+and `aidp.cluster_id` of `snowmig-config.yaml` (the commented lines in the
 template) before the next step — `provision` does not write them back, and
 the next step cannot run without them.
 

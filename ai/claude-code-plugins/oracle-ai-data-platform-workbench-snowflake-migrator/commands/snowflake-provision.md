@@ -14,3 +14,7 @@ Thin wrapper over
 3. On the user's go-ahead, re-run with `--execute`.
 4. Report each step's `verified` from `provision_result.json` — pending is
    pending, never rounded up.
+5. Hand-off: read `workspace.key` and `cluster.key` from
+   `provision_result.json` (`PROVISION.md` shows display names, not keys)
+   and have the user put them in the config's `aidp:` block before
+   `/snowflake-catalog`.

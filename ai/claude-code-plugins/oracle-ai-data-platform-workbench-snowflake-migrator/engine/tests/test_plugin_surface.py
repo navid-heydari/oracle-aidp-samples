@@ -547,9 +547,35 @@ def test_the_readme_does_not_bracket_workspace_and_cluster_for_catalog_execute()
     catalog_step = catalog_step[:catalog_step.index("\n### ", 10)]
     assert not re.search(r"\[--datalake-ocid <ocid> --workspace <ws> --cluster-id <cl>\]",
                          catalog_step), "required for --execute; the bracket said optional"
-    # And the hand-off: provision prints the keys, the operator pastes them.
+    # And the hand-off. The keys live in provision_result.json under
+    # workspace.key / cluster.key; PROVISION.md and the CLI output show the
+    # display names, which are NOT the keys. The README must send the
+    # operator to the file, not to the printout.
     assert "aidp.workspace" in runbook and "aidp.cluster_id" in runbook
     assert "does not write them back" in runbook
+    assert "provision_result.json" in runbook
+    assert "workspace.key" in runbook and "cluster.key" in runbook
+    assert "`PROVISION.md` and the CLI output print" not in runbook, \
+        "render_provision prints names, not keys; cmd_provision prints a step count"
+
+
+def test_every_hand_off_sends_the_operator_to_provision_result_json_for_the_keys():
+    # render_provision prints `Workspace: <name>` / `Cluster: <name>` and, on
+    # the created path, the display name in the steps table (the key appears
+    # there only with --reuse-existing); cmd_provision prints a step count.
+    # The keys are recorded in provision_result.json under workspace.key /
+    # cluster.key and nowhere else, so every surface that describes the
+    # hand-off must point there. A display name pasted as a key addresses
+    # nothing that exists.
+    arch = (ROOT / "MIGRATION-ARCHITECTURE.md").read_text(encoding="utf-8")
+    row = next(l for l in arch.splitlines() if "Provision the AIDP environment" in l)
+    assert "provision_result.json" in row, row
+    assert "Paste the printed workspace and cluster keys" not in arch
+    for rel in ("skills/snowflake-provision-environment/SKILL.md",
+                "commands/snowflake-provision.md"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert "provision_result.json" in text, rel
+        assert "workspace.key" in text and "cluster.key" in text, rel
 
 
 def test_the_readme_labels_laptop_assess_as_an_optional_preview():

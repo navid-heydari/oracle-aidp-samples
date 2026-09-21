@@ -80,6 +80,12 @@ not the same as an empty database.
   API accepted and the object never became visible in the poll budget — say
   it is pending and point at the console. `name_taken` is neither: it means
   something of that name was already there and this run did **not** adopt it.
+- **Hand-off.** After `--execute`, read `workspace.key` and `cluster.key`
+  from `provision_result.json` and have the user put them under `aidp:` in
+  `snowmig-config.yaml` (`aidp.workspace`, `aidp.cluster_id`) before
+  `/snowflake-catalog`. `PROVISION.md` shows the display names, which are
+  not the keys; the catalog step needs the keys, and `provision` does not
+  write them back.
 - **Never reuse, never "ensure".** Do not list existing workspaces or
   clusters and offer the user a choice among them. The only question is *may
   I create this*.

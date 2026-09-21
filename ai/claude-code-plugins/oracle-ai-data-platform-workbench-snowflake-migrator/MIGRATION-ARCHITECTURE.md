@@ -108,7 +108,7 @@ See `README.md` for the runnable form of this table, and
 | 1 | Preview the estate from the laptop (objects, census, lineage, security, maintenance, warehouses) — optional; the migration's own discovery is step 6 | `assess` `deps` `security` `maintenance` `compute` | no |
 | 2 | Plan + generate DDL, get sign-off (S7–S9) | `plan` `ddl` | no |
 | 3 | Prove both ends | `smoke` | opt-in probe |
-| 4 | Provision the AIDP environment: workspace (named after the source account), `migration_assets` cluster, **one cluster per Snowflake warehouse**, `backup-snowflake-migration/` (scripts + plan), 4 unscheduled jobs (S1, S2, S5). Paste the printed workspace and cluster keys into the config's `aidp:` block | `provision --execute` | yes |
+| 4 | Provision the AIDP environment: workspace (named after the source account), `migration_assets` cluster, **one cluster per Snowflake warehouse**, `backup-snowflake-migration/` (scripts + plan), 4 unscheduled jobs (S1, S2, S5). Copy `workspace.key` and `cluster.key` from `provision_result.json` into the config's `aidp:` block — `PROVISION.md` shows display names, not keys | `provision --execute` | yes |
 | 5 | Register Snowflake as an EXTERNAL catalog (S3), then create the INTERNAL target catalog as a container (S4) | `catalog --execute`, then `catalog --catalog-type standard --execute` | yes |
 | 5b | Confirm the environment from inside AIDP | `diagnose_environment.ipynb` | no |
 | 6 | Discover the estate as a workflow inside AIDP; back up the manifest (S6) | `run --job snowmig_00_discover` | yes (workspace files) |
