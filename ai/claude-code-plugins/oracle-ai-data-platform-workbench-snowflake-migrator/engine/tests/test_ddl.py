@@ -322,3 +322,64 @@ def test_the_payload_carries_the_verdict_so_no_caller_can_forget_to_ask():
     stmts = [{"target_fqn": "c.s.t", "source_identifier": "DB.S.T",
               "sql": "CREATE TABLE `c`.`s`.`t` (`A` TIMESTAMP_NTZ) USING DELTA"}]
     assert ddl.unsupported_target_types(stmts)[0]["type"] == "TIMESTAMP_NTZ"
+
+
+# --- the NTZ gate must see every column the emitter writes -------------------
+
+def _ntz_table(*names):
+    cols = [col(n, "TIMESTAMP_NTZ", "TIMESTAMP_NTZ", pos=i)
+            for i, n in enumerate(names, 1)]
+    return build_create_table(record(cols), "c.s.t")
+
+
+def _stmt(res, with_columns=True):
+    st = {"target_fqn": res.target_fqn, "source_identifier": res.source_identifier,
+          "object_type": "TABLE", "sql": res.sql}
+    if with_columns:
+        st["expected_columns"] = res.expected_columns
+    return st
+
+
+def test_ntz_gate_catches_quoted_identifiers_with_spaces_and_punctuation():
+    # The gate anchored on `(\w+)`, which cannot match the names the emitter
+    # itself backticks: a plan whose only NTZ columns were so named passed the
+    # gate and failed per table on the cluster instead.
+    res = _ntz_table("order date", "order-ts", "a.b", "ok_col")
+    found = ddl.unsupported_target_types([_stmt(res)])
+    assert len(found) == 1
+    assert found[0]["columns"] == ["order date", "order-ts", "a.b", "ok_col"]
+
+
+def test_ntz_gate_reports_the_full_name_of_a_column_with_an_embedded_backtick():
+    res = _ntz_table("we`ird")
+    assert ddl.unsupported_target_types([_stmt(res)])[0]["columns"] == ["we`ird"]
+    # And through the sql-only fallback, for callers that pass raw SQL.
+    assert ddl.unsupported_target_types(
+        [_stmt(res, with_columns=False)])[0]["columns"] == ["we`ird"]
+
+
+def test_ntz_gate_fallback_regex_matches_the_emitter_quoting():
+    stmts = [{"target_fqn": "c.s.t", "source_identifier": "DB.S.T",
+              "sql": "CREATE TABLE `c`.`s`.`t` (`order date` TIMESTAMP_NTZ) USING DELTA"}]
+    found = ddl.unsupported_target_types(stmts)
+    assert [f["columns"] for f in found] == [["order date"]]
+
+
+def test_ntz_gate_ignores_views_even_when_their_source_columns_are_ntz():
+    # A view declares no types; its expected_columns carry the SOURCE types.
+    stmts = [{"target_fqn": "c.s.v", "source_identifier": "DB.S.V",
+              "object_type": "VIEW",
+              "sql": "CREATE VIEW IF NOT EXISTS `c`.`s`.`v` AS select ts from t",
+              "expected_columns": [{"name": "ts", "type": "TIMESTAMP_NTZ"}]}]
+    assert ddl.unsupported_target_types(stmts) == []
+
+
+def test_ntz_gate_fires_through_the_payload_for_a_space_named_column():
+    inv = {"inventory": [record(
+        [col("order date", "TIMESTAMP_NTZ", "TIMESTAMP_NTZ")],
+        source_identifier="D.PUBLIC.T")]}
+    plan = {"waves": [["D.PUBLIC.T"]], "clone_targets": ["D.PUBLIC.T"],
+            "target_names": {"D.PUBLIC.T": "c.s.t"}}
+    payload = ddl.build_ddl_payload(inv, plan)
+    assert payload["target_rejected"], "the HALT gate must fire"
+    assert payload["target_rejected"][0]["columns"] == ["order date"]

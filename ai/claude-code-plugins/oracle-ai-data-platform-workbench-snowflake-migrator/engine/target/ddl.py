@@ -57,18 +57,31 @@ TARGET_REJECTED_COLUMN_TYPES: dict[str, str] = {
 def unsupported_target_types(statements: list[dict]) -> list[dict]:
     """Column types in `statements` that the target will refuse.
 
-    Reads the EMITTED sql, not the source inventory: the question is what this
-    plan would actually declare, after every mapping flag has been applied.
+    Reads what this plan would actually DECLARE, after every mapping flag has
+    been applied: the statement's expected_columns, which build_ddl_plan fills
+    from the same target_type the SQL was written from, or -- for a caller that
+    hands over raw SQL -- the emitted text itself.
     """
     found: list[dict] = []
     for stmt in statements:
         sql = stmt.get("sql") or ""
+        # Views carry their SOURCE column types in expected_columns and declare
+        # none in their SQL, so they are out regardless of the path taken.
         if "CREATE TABLE" not in sql.upper():
             continue
+        columns = stmt.get("expected_columns") or []
         for type_name, remedy in TARGET_REJECTED_COLUMN_TYPES.items():
-            # Anchored on the backtick-quoted column the emitter writes, so a
-            # type NAMED in a comment or a rule note is not a false positive.
-            hits = re.findall(r"`(\w+)`\s+" + type_name + r"\b", sql)
+            if columns:
+                hits = [c["name"] for c in columns
+                        if str(c.get("type") or "").upper() == type_name]
+            else:
+                # Anchored on the backtick-quoted column the emitter writes, so
+                # a type NAMED in a comment or a rule note is not a false
+                # positive. Any character may appear inside the backticks --
+                # `(\w+)` missed every name with a space, hyphen or dot, and
+                # truncated one with an embedded (doubled) backtick.
+                hits = [h.replace("``", "`") for h in re.findall(
+                    r"`((?:[^`]|``)+)`\s+" + re.escape(type_name) + r"\b", sql)]
             if hits:
                 found.append({"target_fqn": stmt.get("target_fqn"),
                               "source_identifier": stmt.get(
