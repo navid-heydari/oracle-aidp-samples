@@ -268,8 +268,11 @@ resumable: a re-run skips what its report already records as done.
 
 **`MIGRATION_REPORT.md` is the deliverable.** A table reads `NOT_MIGRATED`
 when it was never attempted — expected while the migration is still running —
-and only `MISSING_DESPITE_REPORT`, `STRUCTURE_ONLY_COPY_FAILED` or
-`TARGET_UNREADABLE` mean something is wrong.
+and only `MISSING_DESPITE_REPORT`, `STRUCTURE_FAILED`, `STRUCTURE_TYPE_DRIFT`,
+`STRUCTURE_ONLY_COPY_FAILED`, `COUNT_DRIFT` (with `--counts`) or
+`TARGET_UNREADABLE` mean something is wrong (the full status vocabulary is in
+`data-migration-scripts/README.md`). Views are listed there too; the jobs
+create tables only.
 
 ### Before a production cutover
 
