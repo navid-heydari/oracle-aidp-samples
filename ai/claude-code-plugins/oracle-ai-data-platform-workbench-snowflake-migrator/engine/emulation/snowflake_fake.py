@@ -202,7 +202,16 @@ _TAG_REFS = [
     {"TAG_DATABASE": "SNOWDEMO", "TAG_SCHEMA": "SALES", "TAG_NAME": "PII",
      "TAG_VALUE": "EMAIL", "OBJECT_DATABASE": "SNOWDEMO",
      "OBJECT_SCHEMA": "SALES", "OBJECT_NAME": "CUSTOMERS",
-     "COLUMN_NAME": "EMAIL", "DOMAIN": "COLUMN"},
+     "COLUMN_NAME": "EMAIL", "DOMAIN": "COLUMN", "LEVEL": "COLUMN"},
+    # A TABLE-level tag comes back once per column of the table, which is one
+    # finding and not four -- the shape that fooled the first reading of a
+    # real estate.
+    *[{"TAG_DATABASE": "SNOWDEMO", "TAG_SCHEMA": "SALES",
+       "TAG_NAME": "SENSITIVITY", "TAG_VALUE": "RESTRICTED",
+       "OBJECT_DATABASE": "SNOWDEMO", "OBJECT_SCHEMA": "SALES",
+       "OBJECT_NAME": "CUSTOMERS", "COLUMN_NAME": col, "DOMAIN": "TABLE",
+       "LEVEL": "TABLE"}
+      for col in ("CUSTOMER_ID", "EMAIL", "SIGNUP_TS")],
 ]
 
 _CLUSTERING_HISTORY = [
@@ -241,6 +250,19 @@ _TAGS = [
     {"name": "PII", "database_name": "SNOWDEMO", "schema_name": "SALES",
      "kind": "TAG"},
 ]
+
+
+def _names_object(flat: str, row: dict, prefix: str = "") -> bool:
+    """Is this per-object statement asking about the object in `row`?
+
+    The statement carries the object as a quoted three-part literal, so the
+    name is matched inside it rather than anywhere in the SQL.
+    """
+    name = str(row.get(f"{prefix}ENTITY_NAME")
+               or row.get("OBJECT_NAME") or "")
+    schema = str(row.get(f"{prefix}SCHEMA_NAME")
+                 or row.get("OBJECT_SCHEMA") or "")
+    return f'"{schema}"."{name}"'.lower() in flat
 
 
 def _schema_in(flat: str) -> str:
@@ -345,6 +367,15 @@ def demo_run_sql(sql: str, params: dict | None = None) -> list[dict]:
         return []
     if "show tags" in flat:
         return [dict(r) for r in _TAGS]
+    # The per-object reads: <db>.INFORMATION_SCHEMA.POLICY_REFERENCES and
+    # TAG_REFERENCES_ALL_COLUMNS take one object and answer for that object
+    # only. They are what the security stage trusts, because unlike the
+    # ACCOUNT_USAGE views they carry no ~2 h lag.
+    if "tag_references_all_columns" in flat:
+        return [dict(r) for r in _TAG_REFS if _names_object(flat, r)]
+    if "information_schema.policy_references" in flat:
+        return [dict(r) for r in _POLICY_REFS
+                if _names_object(flat, r, prefix="REF_")]
     if "tag_references" in flat:
         return [dict(r) for r in _TAG_REFS]
     if "policy_references" in flat:

@@ -106,6 +106,23 @@ _ATTACHMENT_SOURCE = ("SNOWFLAKE.ACCOUNT_USAGE.POLICY_REFERENCES (lags up to "
 _TAG_ATTACHMENT_SOURCE = ("SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES (lags up to "
                           "~2 hours behind DDL)")
 
+# The read that does not lag. Live 2026-09-22: a masking policy, a row-access
+# policy and a tag were attached to a seeded table while both ACCOUNT_USAGE
+# views still returned nothing, so the report hedged (correctly) over an
+# answer that was readable the whole time. <db>.INFORMATION_SCHEMA holds two
+# table functions that answer per object with no lag and need no IMPORTED
+# PRIVILEGES ON DATABASE SNOWFLAKE -- one round trip per object, so they are
+# what decides, and the account-wide views become corroboration.
+_LIVE_POLICY_SOURCE = ("<db>.INFORMATION_SCHEMA.POLICY_REFERENCES, read per "
+                       "object (no lag)")
+_LIVE_TAG_SOURCE = ("<db>.INFORMATION_SCHEMA.TAG_REFERENCES_ALL_COLUMNS, read "
+                    "per object (no lag)")
+
+# One round trip per in-scope object. Past this, the per-object read is
+# skipped and said to be skipped: a stage that silently takes twenty minutes
+# is its own failure, and the pre-existing lagging verdict still stands.
+LIVE_ATTACHMENT_BUDGET = 500
+
 _TAG_CONSEQUENCE = (
     "the tag and its value do not travel, so anything keyed off this "
     "classification -- a policy, an access rule, an audit query -- has "
@@ -172,8 +189,143 @@ def _collect(run_sql, what: str, databases: list[str],
             "count": len(items) if readable else None, "items": items}
 
 
+def _entity_literal(db, schema, name) -> str:
+    """The object as the table functions want it: a single-quoted literal
+    holding a double-quoted three-part identifier.
+
+    Both layers of quoting matter. A name holding a double quote has to reach
+    Snowflake with that quote doubled and the whole name quoted, and the
+    result then sits inside a SQL string literal, so its single quotes are
+    doubled in turn.
+    """
+    return lexer.qualify(str(db), str(schema), str(name)).replace("'", "''")
+
+
+def _live_attachments(run_sql, records: list[dict], notes: list[str], *,
+                      budget: int) -> dict:
+    """Policy and tag attachments read per object, with no ~2 h lag.
+
+    Returns what was read AND whether every object answered. An object that
+    could not be read is named, never dropped: a partial read that renders as
+    a complete one is the failure this whole module exists to prevent (I3).
+    """
+    total = len(records)
+    if not total:
+        return {"attempted": False, "complete": False, "objects": 0,
+                "probed": 0, "failed": [], "policy_attachments": [],
+                "tag_attachments": [], "budget": budget,
+                "reason": "no in-scope objects to read"}
+    if total > budget:
+        return {"attempted": False, "complete": False, "objects": total,
+                "probed": 0, "failed": [], "policy_attachments": [],
+                "tag_attachments": [], "budget": budget,
+                "reason": (f"{total} in-scope object(s) is over the "
+                           f"{budget}-object budget for a read that costs one "
+                           f"round trip per object, so it was not attempted. "
+                           f"The lagging account-wide view is the only source "
+                           f"below. Raise the budget to read them.")}
+
+    policies: list[dict] = []
+    tags: list[dict] = []
+    failed: list[dict] = []
+    probed = 0
+    # Two reads per object, and they fail independently: a role can hold one
+    # and not the other. Counting them together let an all-denied tag read
+    # ride on a successful policy read and report itself as measured.
+    policy_ok = tag_ok = 0
+    for rec in records:
+        ident = rec["source_identifier"]
+        db = rec.get("source_database")
+        schema = rec.get("source_schema")
+        name = ident.split(".", 2)[2] if ident.count(".") >= 2 else ident
+        literal = _entity_literal(db, schema, name)
+        qdb = lexer.quote_ident(str(db))
+        # POLICY_REFERENCES takes the object's own domain; the tag function
+        # rejects every domain but `table` (live: "Please use object type
+        # TABLE for all kinds of table-like objects").
+        domain = "VIEW" if rec.get("object_type") == "VIEW" else "TABLE"
+        object_read = True
+        try:
+            rows = run_sql(
+                f"select policy_name POLICY_NAME, policy_kind POLICY_KIND, "
+                f"ref_column_name REF_COLUMN_NAME "
+                f"from table({qdb}.information_schema.policy_references("
+                f"ref_entity_name => '{literal}', "
+                f"ref_entity_domain => '{domain}'))")
+        except Exception as exc:
+            object_read = False
+            failed.append({"object": ident, "error": str(exc)[:200]})
+            rows = []
+        else:
+            policy_ok += 1
+        for r in rows:
+            kind = str(r.get("POLICY_KIND") or "").upper()
+            policies.append({
+                "object": ident,
+                "column": r.get("REF_COLUMN_NAME"),
+                "policy": r.get("POLICY_NAME"),
+                "policy_kind": kind,
+                "source": "live",
+                "severity": "HIGH",
+                "consequence": POLICY_CONSEQUENCE.get(kind,
+                                                      _GENERIC_CONSEQUENCE),
+                "aidp_path": _AIDP_PATH,
+            })
+        try:
+            rows = run_sql(
+                f"select tag_database TAG_DATABASE, tag_schema TAG_SCHEMA, "
+                f"tag_name TAG_NAME, tag_value TAG_VALUE, level LEVEL, "
+                f"column_name COLUMN_NAME "
+                f"from table({qdb}.information_schema."
+                f"tag_references_all_columns('{literal}', 'table'))")
+        except Exception as exc:
+            if object_read:
+                failed.append({"object": ident, "error": str(exc)[:200]})
+            object_read = False
+            rows = []
+        else:
+            tag_ok += 1
+        seen_table_level: set[str] = set()
+        for r in rows:
+            level = str(r.get("LEVEL") or "").upper()
+            tag = (f'{r.get("TAG_DATABASE")}.{r.get("TAG_SCHEMA")}.'
+                   f'{r.get("TAG_NAME")}')
+            # A table-level tag comes back once per column. Four columns are
+            # not four findings, and the tag is not on a column at all.
+            if level == "TABLE":
+                if tag in seen_table_level:
+                    continue
+                seen_table_level.add(tag)
+            tags.append({
+                "source": "live",
+                "object": ident,
+                "column": None if level == "TABLE" else r.get("COLUMN_NAME"),
+                "level": level or None,
+                "domain": rec.get("object_type"),
+                "tag": tag,
+                "value": r.get("TAG_VALUE"),
+                "consequence": _TAG_CONSEQUENCE,
+                "aidp_path": _TAG_AIDP_PATH,
+            })
+        if object_read:
+            probed += 1
+
+    for f in failed:
+        notes.append(f'per-object attachment read on {f["object"]}: '
+                     f'{f["error"]}')
+    return {"attempted": True, "complete": not failed, "objects": total,
+            "probed": probed, "failed": failed, "budget": budget,
+            "policy_read_objects": policy_ok, "tag_read_objects": tag_ok,
+            "policy_complete": policy_ok == total,
+            "tag_complete": tag_ok == total,
+            "policy_attachments": policies, "tag_attachments": tags,
+            "reason": ""}
+
+
 def build_security(run_sql: Callable[..., list[dict]], inventory: dict, *,
-                   include_grants: bool = True) -> dict:
+                   include_grants: bool = True,
+                   live_attachment_budget: int = LIVE_ATTACHMENT_BUDGET
+                   ) -> dict:
     notes: list[str] = []
     databases = inventory.get("databases_in_scope") or []
     records = inventory.get("inventory") or []
@@ -213,6 +365,7 @@ def build_security(run_sql: Callable[..., list[dict]], inventory: dict, *,
             "column": r.get("REF_COLUMN_NAME"),
             "policy": r.get("POLICY_NAME"),
             "policy_kind": kind,
+            "source": "account_usage",
             "severity": "HIGH",
             "consequence": POLICY_CONSEQUENCE.get(kind, _GENERIC_CONSEQUENCE),
             "aidp_path": _AIDP_PATH,
@@ -231,10 +384,64 @@ def build_security(run_sql: Callable[..., list[dict]], inventory: dict, *,
         and str((r.get("source_metadata") or {}).get("is_secure", "")).lower()
         in ("true", "y", "yes", "on")]
 
+    # The lag-free read. Where it answered for every object it is the
+    # verdict, and the account-wide views above become corroboration; where it
+    # could not, the lagging source and its hedge are all there is.
+    live = _live_attachments(run_sql, records, notes,
+                             budget=live_attachment_budget)
+    if live["attempted"]:
+        # UNION, not replacement. The two sources disagree in both directions:
+        # the account view lags behind an attachment just made, and it also
+        # keeps showing one that was just removed. Dropping either side would
+        # hide an exposure, so both are kept and each says where it came from.
+        # A row only the lagging view has is flagged as needing confirmation
+        # rather than silently believed or silently dropped.
+        seen = {(e["object"], e.get("column"), e.get("policy"))
+                for e in live["policy_attachments"]}
+        stale_only = []
+        for e in exposures:
+            if (e["object"], e.get("column"), e.get("policy")) in seen:
+                continue
+            e = dict(e)
+            if live["complete"] or e["object"] not in {
+                    f["object"] for f in live["failed"]}:
+                e["needs_confirmation"] = (
+                    "seen only in the ~2 h-stale account view and not in the "
+                    "per-object read: either it was detached inside the lag "
+                    "window, or the per-object read could not see it. Confirm "
+                    "before treating it either way.")
+            stale_only.append(e)
+        exposures = list(live["policy_attachments"]) + stale_only
+
     # Tag OBJECTS were counted and their attachments never read, so a
     # classification-driven governance model rendered as an empty table. Same
     # unreadable handling and same latency caveat as POLICY_REFERENCES.
     tag_references = _tag_references(run_sql, in_scope, notes)
+    if live["attempted"] and (live["tag_read_objects"]
+                              or tag_references.get("measured")):
+        seen_tags = {(a["object"], a.get("column"), a.get("tag"))
+                     for a in live["tag_attachments"]}
+        stale_tags = [a for a in (tag_references.get("attachments") or [])
+                      if (a["object"], a.get("column"), a.get("tag"))
+                      not in seen_tags]
+        merged_tags = list(live["tag_attachments"]) + stale_tags
+        source = _LIVE_TAG_SOURCE
+        if not live["tag_read_objects"]:
+            source = _TAG_ATTACHMENT_SOURCE
+        elif stale_tags:
+            source = f"{_LIVE_TAG_SOURCE}; and {_TAG_ATTACHMENT_SOURCE}"
+        tag_references = {
+            "measured": True,
+            "attachments": merged_tags,
+            "count": len(merged_tags),
+            "out_of_scope": tag_references.get("out_of_scope", 0),
+            "carried_over": False,
+            "source": source,
+            "note": (f"{len(merged_tags)} in-scope tag attachment(s); "
+                     f'{live["tag_read_objects"]} of {live["objects"]} '
+                     f"object(s) read directly"),
+            "complete": live["tag_complete"],
+        }
 
     grants = {"measured": False, "by_object": {}, "note": "not requested",
               "classes_requested": list(GRANT_CLASSES)}
@@ -251,10 +458,24 @@ def build_security(run_sql: Callable[..., list[dict]], inventory: dict, *,
                   if policies[k]["readable"]]
     unenumerated = [POLICY_KIND_LABELS[k] for k in POLICY_KINDS
                     if not policies[k]["readable"]]
+    # A defined policy attached to nothing is only UNCONFIRMED while the
+    # lagging view is the only source. Once every in-scope object has been
+    # read directly, an empty list is a read result, not a maybe.
+    live_settled = live["attempted"] and live.get("policy_complete", False)
     unattached = (defined if (references_readable and not exposures
-                              and out_of_scope == 0) else 0)
+                              and out_of_scope == 0 and not live_settled)
+                  else 0)
 
-    count = None if not references_readable else len(exposures)
+    count = None if (not references_readable and not live_settled) \
+        else len(exposures)
+    if live_settled:
+        attachment_source = _LIVE_POLICY_SOURCE
+    elif live["attempted"]:
+        attachment_source = (f'{_LIVE_POLICY_SOURCE}, for the '
+                             f'{live["probed"]} of {live["objects"]} object(s) '
+                             f'it could read; {_ATTACHMENT_SOURCE} otherwise')
+    else:
+        attachment_source = _ATTACHMENT_SOURCE
     return {
         "probed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "policies": policies,
@@ -263,16 +484,19 @@ def build_security(run_sql: Callable[..., list[dict]], inventory: dict, *,
         "policy_references_readable": references_readable,
         "policy_references_out_of_scope": out_of_scope,
         "policies_defined_without_attachment": unattached,
-        "attachment_source": _ATTACHMENT_SOURCE,
+        "attachment_source": attachment_source,
+        "live_attachments": live,
         "exposures": exposures,
         "exposure_count": count,
         "secure_views": secure_views,
         "tag_references": tag_references,
         "grants": grants,
         "unreadable": notes,
-        "statement": _statement(count, secure_views, references_readable,
+        "statement": _statement(count, secure_views,
+                                references_readable or live_settled,
                                 unattached, kinds_enumerated=enumerated,
-                                kinds_unenumerated=unenumerated),
+                                kinds_unenumerated=unenumerated,
+                                live=live),
     }
 
 
@@ -413,7 +637,7 @@ def _join(labels) -> str:
 
 def _statement(count, secure_views: list[dict], references_readable: bool,
                defined_without_attachment: int = 0, *,
-               kinds_enumerated=(), kinds_unenumerated=()) -> str:
+               kinds_enumerated=(), kinds_unenumerated=(), live=None) -> str:
     """The one sentence a reader takes away. It may only name what was asked.
 
     I3: "could not look" never renders as zero. The clean verdict is built
@@ -422,6 +646,8 @@ def _statement(count, secure_views: list[dict], references_readable: bool,
     """
     kinds_enumerated = list(kinds_enumerated)
     kinds_unenumerated = list(kinds_unenumerated)
+    live = live or {}
+    live_settled = bool(live.get("attempted") and live.get("complete"))
     if not references_readable:
         return ("**Policy attachments could not be read**, so whether any "
                 "column is masked or any table row-filtered is UNKNOWN. This "
@@ -458,7 +684,23 @@ def _statement(count, secure_views: list[dict], references_readable: bool,
             f"corroborated for those kinds. {_LAG}. Re-run with a role that "
             f"can see them before anyone concludes the estate is unprotected "
             f"data")
+    # Objects the per-object read could not reach are the ones the verdict
+    # cannot speak for, so they are named rather than counted as clean.
+    unreachable = [f["object"] for f in (live.get("failed") or [])]
+    if unreachable:
+        shown = ", ".join(f"`{o}`" for o in unreachable[:5])
+        if len(unreachable) > 5:
+            shown += f" and {len(unreachable) - 5} more"
+        parts.append(
+            f"**{len(unreachable)} object(s) could not be read directly** "
+            f"({shown}), so nothing above is a verdict about them")
     if not parts:
+        if live_settled:
+            return (f"No {_join(kinds_enumerated)} policy and no tag is "
+                    f"attached to anything being migrated, and no secure "
+                    f"views are in scope. Read per object from "
+                    f"INFORMATION_SCHEMA, so this is current rather than "
+                    f"subject to the ~2 h ACCOUNT_USAGE lag.")
         return (f"No {_join(kinds_enumerated)} policy is attached to anything "
                 "being migrated, and no secure views are in scope. Nothing is "
                 "protected today that the migration would strip -- as of "

@@ -1078,13 +1078,16 @@ def test_run_sql_from_args_leaves_host_unset_when_the_config_has_none(
 def test_security_console_hedges_when_a_policy_exists_but_no_attachment_shows(
         tmp_path, monkeypatch, capsys):
     # SHOW lists a masking policy; ACCOUNT_USAGE.POLICY_REFERENCES (which lags
-    # ~2 h) shows nothing attached. SECURITY.md and the board call that
+    # ~2 h) shows nothing attached, and the per-object read that would settle
+    # it is denied to this role. SECURITY.md and the board call that
     # UNCONFIRMED; the console printed a bare "0 policy exposure(s)".
     import snowmig
     write(tmp_path, "inventory.json", INV)
 
     def fake(sql, params=None):
         low = " ".join(sql.split()).lower()
+        if "information_schema.policy_references" in low:
+            raise RuntimeError("Insufficient privileges")
         if "masking policies" in low:
             return [{"name": "MASK_SSN", "database_name": "D",
                      "schema_name": "PUBLIC", "kind": "MASKING_POLICY"}]
@@ -1096,6 +1099,22 @@ def test_security_console_hedges_when_a_policy_exists_but_no_attachment_shows(
     assert rc == 0
     assert "0 policy exposure(s)" in out
     assert "UNCONFIRMED" in err and "POLICY_REFERENCES" in err
+    assert "could not be read directly" in err
+
+
+def test_security_console_says_when_the_answer_carries_no_lag(
+        tmp_path, monkeypatch, capsys):
+    """The opposite case, and the one that should now be normal: every object
+    was read directly, so the operator is told the count is current."""
+    import snowmig
+    write(tmp_path, "inventory.json", INV)
+    monkeypatch.setattr(snowmig, "_run_sql_from_args",
+                        lambda args: (lambda sql, params=None: []))
+    rc = main(["security", "--out-dir", str(tmp_path), "--no-grants"])
+    out, err = capsys.readouterr()
+    assert rc == 0
+    assert "read per object" in out
+    assert "UNCONFIRMED" not in err
 
 
 def test_security_console_stays_quiet_when_nothing_is_defined(

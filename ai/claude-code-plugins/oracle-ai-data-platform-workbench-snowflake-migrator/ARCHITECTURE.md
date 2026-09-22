@@ -175,9 +175,21 @@ the field list. "The planned columns are there" is the claim. `ensure_catalog`
 polls the same way; a listing that fails mid-poll counts as "not visible yet",
 because it is not evidence either way.
 
+**I3a — ask the source that can answer, not the one that is convenient.**
+Two sources answer "what is attached to this object": the account-wide
+`ACCOUNT_USAGE` views, one statement for the estate but up to ~2 hours stale
+and gated behind `IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE`; and the
+`INFORMATION_SCHEMA` table functions, one round trip per object, current, and
+needing no extra grant. A hedge about staleness is not a substitute for the
+read that is not stale. Both are read and UNIONed, each attachment says which
+source saw it, and a row only the stale one has is marked for confirmation
+rather than believed or dropped. Where the per-object read cannot run --
+denied, or an estate over the budget for one round trip per object -- the
+older verdict and its hedge stand, and the report says which case produced
+the number.
+
 **I3 — "Could not look" never renders as zero.** An unreadable `ACCOUNT_USAGE`
 reports `measured: false` with null counts, because *0 reclustering credits*
-and *we could not check* lead to opposite decisions. Same for unreadable
 and *we could not check* lead to opposite decisions. Same for unreadable
 scopes in the census and unresolvable policy references. The rule has a
 second half: a verdict may not name a kind that was never enumerated. A

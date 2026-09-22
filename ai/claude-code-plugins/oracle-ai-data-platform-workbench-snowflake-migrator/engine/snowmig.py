@@ -736,6 +736,20 @@ def cmd_security(args) -> int:
         print('  policy objects could not be enumerated - the empty '
               'attachment list is UNCORROBORATED, see SECURITY.md',
               file=sys.stderr)
+    live = sec.get("live_attachments") or {}
+    if live.get("attempted") and live.get("failed"):
+        # A per-object read that skipped objects has not answered for them,
+        # and the count above is not a verdict about those objects.
+        print(f'  {len(live["failed"])} object(s) could not be read directly '
+              f'({live["probed"]} of {live["objects"]} read) - the count above '
+              f'does not speak for them, see SECURITY.md', file=sys.stderr)
+    elif live.get("attempted") and not live.get("reason"):
+        print(f'  read per object from INFORMATION_SCHEMA '
+              f'({live["objects"]} object(s)), so this is current rather than '
+              f'subject to the ~2 h ACCOUNT_USAGE lag')
+    elif live.get("reason"):
+        print(f'  attachments NOT read per object: {live["reason"]}',
+              file=sys.stderr)
     if count or extra:
         print("  these objects are created WITHOUT their protection - see "
               "SECURITY.md", file=sys.stderr)

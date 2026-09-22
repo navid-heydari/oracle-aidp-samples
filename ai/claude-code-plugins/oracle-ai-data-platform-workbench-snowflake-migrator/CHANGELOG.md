@@ -604,6 +604,39 @@ on its first colon, which is how the file passed before.
   always read and reports the distinction as *not distinguishable*, never as
   none. Every new read is a `SHOW` or a `SELECT`; the transport is unchanged.
 
+### Fixed — an attachment the account-wide view had not caught up to
+
+- Live run, 2026-09-22: a masking policy, a row-access policy and two tags
+  were attached to a seeded table and `SECURITY.md` reported *defined, but
+  not seen attached*. `SNOWFLAKE.ACCOUNT_USAGE.POLICY_REFERENCES` and
+  `TAG_REFERENCES` lag up to ~2 hours and were still empty. The hedge was
+  right, and the answer had been readable the whole time:
+  `<db>.INFORMATION_SCHEMA.POLICY_REFERENCES` and
+  `TAG_REFERENCES_ALL_COLUMNS` answer per object with no lag, and need no
+  `IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE`. Both are now read, one round
+  trip per in-scope object, and they are what the verdict is built from.
+- The two sources are UNIONed, never substituted: the lag runs both ways, so
+  the account view also keeps showing an attachment that was just removed.
+  Every attachment says which source saw it, and one only the stale view has
+  is kept and marked *confirm* rather than believed or dropped.
+- A defined policy attached to nothing is now a read result instead of
+  UNCONFIRMED, once every in-scope object has answered. Where the per-object
+  read is denied, or the estate is over the 500-object budget for a read that
+  costs a round trip each, the previous lagging verdict and its hedge stand
+  unchanged and the report says which case it is.
+- An object the per-object read could not reach is named in the statement, on
+  the console and in `SECURITY.md`. Nothing above it is a verdict about that
+  object (I3).
+- A table-level tag comes back once per column from
+  `TAG_REFERENCES_ALL_COLUMNS`. Four columns are one finding, on the table and
+  not on a column.
+- The policy read and the tag read fail independently, because a role can
+  hold one and not the other. Counting them together let an all-denied tag
+  read ride on a successful policy read and report itself as measured.
+- The emulated estate answers both per-object functions for the object asked
+  about, so `demo` teaches the same lesson; answering them account-wide
+  inflated the demo's own exposure count sevenfold.
+
 ### Fixed — a clean security verdict on a question never asked
 
 - `SECURITY.md` could state that no masking, row-access, aggregation or

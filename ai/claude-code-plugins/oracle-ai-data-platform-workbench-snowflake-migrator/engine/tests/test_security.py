@@ -27,6 +27,15 @@ def _inv():
                  "source_metadata": {"is_secure": "true"}}]}
 
 
+# Two different sources answer the same question and must not share a needle:
+# SNOWFLAKE.ACCOUNT_USAGE.POLICY_REFERENCES is account-wide and lags ~2 h, and
+# <db>.INFORMATION_SCHEMA.POLICY_REFERENCES(...) is per object and does not.
+_ACCOUNT_USAGE_NEEDLE = {
+    "policy_references": "account_usage.policy_references",
+    "tag_references": "account_usage.tag_references",
+}
+
+
 def _responses(**over):
     base = {
         "show masking policies": [],
@@ -34,11 +43,14 @@ def _responses(**over):
         "show aggregation policies": [],
         "show projection policies": [],
         "show tags": [],
-        "policy_references": [],
-        "tag_references": [],
+        "information_schema.policy_references": [],
+        "tag_references_all_columns": [],
+        "account_usage.policy_references": [],
+        "account_usage.tag_references": [],
         "grants_to_roles": [],
     }
-    base.update(over)
+    for key, rows in over.items():
+        base[_ACCOUNT_USAGE_NEEDLE.get(key, key)] = rows
     return base
 
 
@@ -159,19 +171,39 @@ def test_one_denied_probe_does_not_lose_the_others():
     assert s["policies"]["masking"]["readable"] is False
 
 
-def test_when_policy_references_cannot_be_read_the_answer_is_unknown():
+def test_when_no_attachment_source_can_be_read_the_answer_is_unknown():
     # The dangerous case: we cannot prove there are no policies, so we must
-    # not imply there are none.
+    # not imply there are none. It takes BOTH sources failing to get here.
     class Denied(FakeSql):
         def __call__(self, sql, params=None):
             if "policy_references" in sql.lower():
-                raise RuntimeError("Insufficient privileges on ACCOUNT_USAGE")
+                raise RuntimeError("Insufficient privileges")
             return super().__call__(sql, params)
 
     s = build_security(Denied(_responses()), _inv())
     assert s["exposure_count"] is None
     assert "could not" in s["statement"].lower() or "unknown" in s["statement"].lower()
     assert "no masking" not in s["statement"].lower()
+
+
+def test_the_per_object_read_answers_when_the_account_view_is_denied():
+    """ACCOUNT_USAGE needs IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE.
+    INFORMATION_SCHEMA does not, so a role without that grant is no longer
+    left with UNKNOWN."""
+    class DeniedAccountUsage(FakeSql):
+        def __call__(self, sql, params=None):
+            if "account_usage.policy_references" in sql.lower():
+                raise RuntimeError("Insufficient privileges on ACCOUNT_USAGE")
+            return super().__call__(sql, params)
+
+    # One object: FakeSql answers by substring, so a two-object inventory
+    # would hand the same canned row to both.
+    s = build_security(DeniedAccountUsage(_responses(**{
+        "information_schema.policy_references": [_live_policy()]})),
+        _table_only_inv())
+    assert s["exposure_count"] == 1, "the per-object read stands on its own"
+    assert s["exposures"][0]["source"] == "live"
+    assert "unknown" not in s["statement"].lower()
 
 
 # ------------------------------------------------- defined, but not seen attached
@@ -195,8 +227,11 @@ def _masking_policy(name="MASK_SSN"):
 
 
 def test_a_defined_policy_with_no_visible_attachment_is_not_reported_clean():
+    # With the per-object read unavailable (here: ruled out by budget), the
+    # ~2 h-stale account view is the only source and cannot settle this.
     s = build_security(FakeSql(_responses(**{
-        "show masking policies": [_masking_policy()]})), _table_only_inv())
+        "show masking policies": [_masking_policy()]})), _table_only_inv(),
+        live_attachment_budget=0)
     assert s["exposure_count"] == 0, "still an int: nothing was SEEN attached"
     assert s["policies_defined_without_attachment"] == 1
     st = s["statement"].lower()
@@ -211,13 +246,14 @@ def test_a_defined_row_access_policy_triggers_the_same_hedge():
         "show row access policies": [{"name": "RAP_REGION", "database_name": "DB",
                                       "schema_name": "PUBLIC",
                                       "kind": "ROW_ACCESS_POLICY"}]})),
-        _table_only_inv())
+        _table_only_inv(), live_attachment_budget=0)
     assert s["policies_defined_without_attachment"] == 1
     assert "unconfirmed" in s["statement"].lower()
 
 
 def test_the_clean_statement_names_the_source_and_its_lag():
-    s = build_security(FakeSql(_responses()), _table_only_inv())
+    s = build_security(FakeSql(_responses()), _table_only_inv(),
+                       live_attachment_budget=0)
     st = s["statement"].lower()
     assert "no masking" in st
     assert "policy_references" in st and "lag" in st, \
@@ -296,7 +332,8 @@ def test_aggregation_and_projection_policy_objects_are_enumerated():
 
 def test_a_defined_aggregation_policy_with_no_attachment_is_not_clean():
     s = build_security(FakeSql(_responses(**{
-        "show aggregation policies": [_agg_policy()]})), _table_only_inv())
+        "show aggregation policies": [_agg_policy()]})), _table_only_inv(),
+        live_attachment_budget=0)
     assert s["policies_defined_without_attachment"] == 1, \
         "the staleness tripwire must cover aggregation policies too"
     st = s["statement"].lower()
@@ -306,7 +343,8 @@ def test_a_defined_aggregation_policy_with_no_attachment_is_not_clean():
 
 def test_a_defined_projection_policy_with_no_attachment_is_not_clean():
     s = build_security(FakeSql(_responses(**{
-        "show projection policies": [_proj_policy()]})), _table_only_inv())
+        "show projection policies": [_proj_policy()]})), _table_only_inv(),
+        live_attachment_budget=0)
     assert s["policies_defined_without_attachment"] == 1
     assert "unconfirmed" in s["statement"].lower()
 
@@ -489,3 +527,211 @@ def test_an_exposure_statement_still_flags_a_kind_that_could_not_be_read():
     st = s["statement"].lower()
     assert "exposure" in st
     assert "aggregation" in st and "could not be enumerated" in st
+
+
+# ------------------------------------- the lag, and the read that does not lag
+#
+# Live 2026-09-22: a masking policy, a row-access policy and a tag were
+# attached to a seeded table, and SNOWFLAKE.ACCOUNT_USAGE.POLICY_REFERENCES /
+# TAG_REFERENCES returned nothing -- both views lag up to ~2 hours. The report
+# hedged correctly ("defined, not seen attached, treat as UNCONFIRMED") but the
+# truth was readable the whole time: <db>.INFORMATION_SCHEMA.POLICY_REFERENCES
+# and TAG_REFERENCES_ALL_COLUMNS answer per object with no lag, and need no
+# IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE. So the per-object read is what
+# decides, and the account view becomes corroboration.
+
+def _live_policy(obj="CUSTOMERS", col="EMAIL", kind="MASKING_POLICY",
+                 name="PII_MASK", schema="PUBLIC", db="DB"):
+    return {"POLICY_DB": db, "POLICY_SCHEMA": schema, "POLICY_NAME": name,
+            "POLICY_KIND": kind, "REF_DATABASE_NAME": db,
+            "REF_SCHEMA_NAME": schema, "REF_ENTITY_NAME": obj,
+            "REF_ENTITY_DOMAIN": "TABLE", "REF_COLUMN_NAME": col,
+            "POLICY_STATUS": "ACTIVE"}
+
+
+def _live_tag(obj="CUSTOMERS", col="EMAIL", name="PII", value="EMAIL",
+              level="COLUMN", schema="PUBLIC", db="DB"):
+    return {"TAG_DATABASE": db, "TAG_SCHEMA": schema, "TAG_NAME": name,
+            "TAG_VALUE": value, "LEVEL": level, "OBJECT_DATABASE": db,
+            "OBJECT_SCHEMA": schema, "OBJECT_NAME": obj, "DOMAIN": "TABLE",
+            "COLUMN_NAME": col}
+
+
+def test_an_attachment_the_lagging_view_has_not_caught_up_to_is_still_found():
+    """The exact live failure: ACCOUNT_USAGE empty, the policy attached."""
+    s = build_security(FakeSql(_responses(**{
+        "show masking policies": [_masking_policy()],
+        "information_schema.policy_references": [_live_policy()]})),
+        _table_only_inv())
+    assert s["exposure_count"] == 1, "the per-object read decides"
+    assert s["exposures"][0]["object"] == "DB.PUBLIC.CUSTOMERS"
+    assert s["exposures"][0]["column"] == "EMAIL"
+    assert s["policies_defined_without_attachment"] == 0, \
+        "the policy is accounted for: it is attached"
+    st = s["statement"].lower()
+    assert "unconfirmed" not in st, "nothing is unconfirmed once it was read"
+    assert "exposure" in st
+
+
+def test_the_per_object_read_is_what_the_report_names_as_its_source():
+    s = build_security(FakeSql(_responses(**{
+        "information_schema.policy_references": [_live_policy()]})), _inv())
+    src = s["attachment_source"].lower()
+    assert "information_schema" in src
+    assert "per object" in src or "no lag" in src
+    assert s["live_attachments"]["complete"] is True
+
+
+def test_an_empty_per_object_read_corroborates_the_empty_account_view():
+    s = build_security(FakeSql(_responses(**{
+        "show masking policies": [_masking_policy()]})), _table_only_inv())
+    assert s["exposure_count"] == 0
+    assert s["policies_defined_without_attachment"] == 0, \
+        "a defined policy attached to nothing was READ as attached to nothing"
+    st = s["statement"].lower()
+    assert "unconfirmed" not in st
+    assert "no masking" in st or "not attached" in st
+
+
+def test_a_refused_per_object_read_leaves_the_lagging_hedge_standing():
+    """I3: the fallback is the old uncertainty, never a clean verdict."""
+    class Denied(FakeSql):
+        def __call__(self, sql, params=None):
+            if "information_schema.policy_references" in sql.lower():
+                raise RuntimeError("Insufficient privileges")
+            return super().__call__(sql, params)
+
+    s = build_security(Denied(_responses(**{
+        "show masking policies": [_masking_policy()]})), _table_only_inv())
+    assert s["live_attachments"]["complete"] is False
+    assert s["policies_defined_without_attachment"] == 1
+    st = s["statement"].lower()
+    assert "unconfirmed" in st and "lag" in st
+
+
+def test_one_unreadable_object_does_not_discard_the_others():
+    class PartlyDenied(FakeSql):
+        def __call__(self, sql, params=None):
+            if "V_SECURE" in sql:
+                raise RuntimeError("does not exist or not authorized")
+            return super().__call__(sql, params)
+
+    s = build_security(PartlyDenied(_responses(**{
+        "information_schema.policy_references": [_live_policy()]})), _inv())
+    live = s["live_attachments"]
+    assert live["probed"] == 1 and len(live["failed"]) == 1
+    assert live["complete"] is False
+    assert s["exposure_count"] == 1, "what was read is still reported"
+    assert "V_SECURE" in s["statement"] or "1 object" in s["statement"].lower(), \
+        "an object that could not be read has to be named, not dropped"
+
+
+def test_a_tag_the_lagging_view_missed_is_still_reported():
+    s = build_security(FakeSql(_responses(**{
+        "tag_references_all_columns": [_live_tag()]})), _table_only_inv())
+    tags = s["tag_references"]
+    assert tags["measured"] is True
+    assert tags["count"] == 1
+    assert tags["attachments"][0]["column"] == "EMAIL"
+    assert "information_schema" in tags["source"].lower()
+
+
+def test_a_table_level_tag_is_not_reported_once_per_column():
+    """Live: TAG_REFERENCES_ALL_COLUMNS repeats a table-level tag on every
+    column, with LEVEL=TABLE. Four columns must not read as four findings."""
+    rows = [_live_tag(col=c, name="SENSITIVITY", value="RESTRICTED",
+                      level="TABLE")
+            for c in ("EMPLOYEE_ID", "SSN", "SALARY", "REGION")]
+    rows.append(_live_tag(col="SALARY", name="SENSITIVITY",
+                          value="CONFIDENTIAL", level="COLUMN"))
+    s = build_security(FakeSql(_responses(**{
+        "tag_references_all_columns": rows})), _table_only_inv())
+    attached = s["tag_references"]["attachments"]
+    table_level = [a for a in attached if a.get("level") == "TABLE"]
+    assert len(table_level) == 1, table_level
+    assert table_level[0]["column"] is None, "a table tag has no column"
+    assert len([a for a in attached if a.get("level") == "COLUMN"]) == 1
+
+
+def test_the_per_object_read_asks_for_the_domain_the_object_has():
+    """Live: POLICY_REFERENCES takes VIEW for a view; TAG_REFERENCES_ALL_COLUMNS
+    rejects VIEW and wants 'table' for every table-like object."""
+    fake = FakeSql(_responses())
+    build_security(fake, _inv())
+    pol = [c for c in fake.calls
+           if "information_schema.policy_references" in c.lower()]
+    tag = [c for c in fake.calls if "tag_references_all_columns" in c.lower()]
+    assert any("'VIEW'" in c for c in pol), "the view is asked for as a VIEW"
+    assert any("'TABLE'" in c for c in pol)
+    assert tag and all("'table'" in c for c in tag), \
+        "TAG_REFERENCES_ALL_COLUMNS refuses any domain but table"
+
+
+def test_every_per_object_statement_passes_the_read_only_guard():
+    from snowflake_source.conn import assert_read_only
+    fake = FakeSql(_responses())
+    build_security(fake, _inv())
+    for call in fake.calls:
+        assert_read_only(call)
+
+
+def test_a_quoted_name_is_escaped_into_the_literal_the_function_wants():
+    inv = {"databases_in_scope": ["DB"],
+           "inventory": [{"source_identifier": 'DB.EDGE.Mixed "Case"',
+                          "object_type": "TABLE", "source_database": "DB",
+                          "source_schema": "EDGE", "source_metadata": {}}]}
+    fake = FakeSql(_responses())
+    build_security(fake, inv)
+    call = next(c for c in fake.calls
+                if "information_schema.policy_references" in c.lower())
+    assert '"Mixed ""Case"""' in call, call
+
+
+def test_an_estate_over_the_budget_is_not_probed_object_by_object():
+    """A per-object read costs a round trip. Past the budget it is skipped and
+    said to be skipped -- never quietly, and never as a clean verdict."""
+    inv = {"databases_in_scope": ["DB"],
+           "inventory": [{"source_identifier": f"DB.PUBLIC.T{i}",
+                          "object_type": "TABLE", "source_database": "DB",
+                          "source_schema": "PUBLIC", "source_metadata": {}}
+                         for i in range(5)]}
+    s = build_security(FakeSql(_responses(**{
+        "show masking policies": [_masking_policy()]})), inv,
+        live_attachment_budget=4)
+    live = s["live_attachments"]
+    assert live["attempted"] is False
+    assert live["complete"] is False
+    assert "budget" in live["reason"].lower() or "5" in live["reason"]
+    assert s["policies_defined_without_attachment"] == 1, \
+        "unprobed is unconfirmed, which is the pre-existing hedge"
+    assert "unconfirmed" in s["statement"].lower()
+
+
+def test_an_aggregation_policy_read_per_object_settles_the_same_hedge():
+    """The tripwire fires on an unresolved question, not on a resolved one:
+    once every in-scope object has been read, a defined-but-unattached
+    aggregation policy is a fact rather than a maybe."""
+    s = build_security(FakeSql(_responses(**{
+        "show aggregation policies": [_agg_policy()]})), _table_only_inv())
+    assert s["policies_defined_without_attachment"] == 0
+    assert "unconfirmed" not in s["statement"].lower()
+    assert s["live_attachments"]["policy_complete"] is True
+
+
+def test_the_clean_statement_names_the_per_object_read_when_it_answered():
+    s = build_security(FakeSql(_responses()), _table_only_inv())
+    st = s["statement"]
+    assert "INFORMATION_SCHEMA" in st
+    assert "lag" in st.lower(), "it still says what it is NOT subject to"
+
+
+def test_a_stale_account_row_the_live_read_contradicts_is_kept_and_flagged():
+    """The lag runs both ways: the account view also keeps showing an
+    attachment that has just been removed. Neither source may erase the
+    other -- the row is kept, attributed, and marked for confirmation."""
+    s = build_security(FakeSql(_responses(policy_references=[_policy_ref()])),
+                       _inv())
+    assert s["exposure_count"] == 1
+    e = s["exposures"][0]
+    assert e["source"] == "account_usage"
+    assert "confirm" in (e.get("needs_confirmation") or "").lower()

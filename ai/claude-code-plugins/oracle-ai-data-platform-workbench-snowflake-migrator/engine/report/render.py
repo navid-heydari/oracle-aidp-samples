@@ -1202,15 +1202,41 @@ def render_security(sec: dict) -> str:
                 "does not fail, it succeeds without the protection. Anyone who "
                 "can read the target table sees what Snowflake was hiding.", ""]
 
+    live = sec.get("live_attachments") or {}
+    if sec.get("attachment_source"):
+        out += [f'Attachment source: `{sec["attachment_source"]}`.', ""]
+    if live.get("attempted"):
+        if live.get("failed"):
+            out += [f'> **{len(live["failed"])} of {live["objects"]} object(s) '
+                    "could not be read directly.** Nothing in this report is a "
+                    "verdict about them; the ~2 h-stale account view is all "
+                    "there is for those. They are listed under *Could not be "
+                    "read* below.", ""]
+        else:
+            out += [f'Every one of the {live["objects"]} in-scope object(s) '
+                    "was read directly, so this is current rather than "
+                    "subject to the ~2 h `ACCOUNT_USAGE` lag.", ""]
+    elif live.get("reason"):
+        out += [f'> **Attachments were not read per object.** '
+                f'{live["reason"]}', ""]
+
     if exposures:
         out += ["## Policies that do not travel", "",
-                "| Object | Column | Policy | Kind | Severity |",
-                "|---|---|---|---|---|"]
+                "| Object | Column | Policy | Kind | Seen by | Severity |",
+                "|---|---|---|---|---|---|"]
         for e in exposures:
+            seen = ("per-object read" if e.get("source") == "live"
+                    else "stale account view")
+            if e.get("needs_confirmation"):
+                seen += " — **confirm**"
             out.append(f'| `{e["object"]}` | '
                        f'{("`" + e["column"] + "`") if e.get("column") else "*whole table*"} | '
-                       f'`{e["policy"]}` | {e["policy_kind"]} | **{e["severity"]}** |')
+                       f'`{e["policy"]}` | {e["policy_kind"]} | {seen} '
+                       f'| **{e["severity"]}** |')
         out.append("")
+        flagged = [e for e in exposures if e.get("needs_confirmation")]
+        if flagged:
+            out += [flagged[0]["needs_confirmation"], ""]
         seen: set[str] = set()
         for e in exposures:
             if e["policy_kind"] in seen:
