@@ -277,7 +277,7 @@ def _function(name="UDF_X", lang="PYTHON", data_type="NUMBER(38,0)",
     return {"FUNCTION_NAME": name, "FUNCTION_SCHEMA": "SALES",
             "FUNCTION_LANGUAGE": lang, "ARGUMENT_SIGNATURE": "(A NUMBER)",
             "FUNCTION_OWNER": "ETL", "DATA_TYPE": data_type,
-            "IS_EXTERNAL_FUNCTION": external, "API_INTEGRATION": api}
+            "IS_EXTERNAL": external, "API_INTEGRATION": api}
 
 
 def test_the_function_read_selects_the_columns_that_split_the_three():
@@ -286,7 +286,7 @@ def test_the_function_read_selects_the_columns_that_split_the_three():
     select = next(c for c in fake.calls
                   if "information_schema.functions" in c.lower())
     low = select.lower()
-    for col in ("data_type", "is_external_function", "api_integration"):
+    for col in ("data_type", "is_external", "api_integration"):
         assert col in low, col
 
 
@@ -337,8 +337,8 @@ def test_a_table_function_in_an_unknown_language_keeps_both_findings():
 def test_a_function_select_without_the_new_columns_still_lists_functions():
     class OldAccount(FakeSql):
         def __call__(self, sql, params=None):
-            if "is_external_function" in sql.lower():
-                raise RuntimeError("invalid identifier 'IS_EXTERNAL_FUNCTION'")
+            if "is_external" in sql.lower():
+                raise RuntimeError("invalid identifier 'IS_EXTERNAL'")
             return super().__call__(sql, params)
 
     census = build_census(OldAccount(_responses(**{
@@ -405,3 +405,27 @@ def test_the_empty_scope_statement_does_not_still_list_only_the_old_kinds():
         "the sentence claims what was looked at; it must name the new reads"
     assert "whole estate" not in s
     assert "lower bound" in s
+
+
+def test_the_function_read_does_not_select_the_documented_but_rejected_name():
+    """Live 2026-09-22: INFORMATION_SCHEMA.FUNCTIONS has IS_EXTERNAL, and the
+    documented IS_EXTERNAL_FUNCTION is an invalid identifier. Selecting the
+    wrong name silently cost the UDTF/external-function distinction on a
+    real account (reported as not distinguishable, correctly, but avoidably)."""
+    fake = FakeSql(_responses())
+    build_census(fake, ["DB"])
+    select = next(c for c in fake.calls
+                  if "information_schema.functions" in c.lower())
+    assert "is_external_function" not in select.lower()
+    assert "is_external" in select.lower()
+
+
+def test_an_external_function_is_recognised_from_a_no_yes_or_y_flag():
+    for flag in ("YES", "Y"):
+        census = build_census(FakeSql(_responses(**{
+            "information_schema.functions": [
+                _function("EF", lang=None, external=flag, api="API_X")]})), ["DB"])
+        assert census["objects"][0]["kind"] == "EXTERNAL_FUNCTION", flag
+    census = build_census(FakeSql(_responses(**{
+        "information_schema.functions": [_function("F", external="NO")]})), ["DB"])
+    assert census["objects"][0]["kind"] == "FUNCTION"

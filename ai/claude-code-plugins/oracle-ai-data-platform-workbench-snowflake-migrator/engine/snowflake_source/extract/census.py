@@ -218,13 +218,16 @@ def _refine_share(row: dict) -> dict | None:
 def _refine_function(row: dict) -> dict | None:
     """A scalar UDF, a UDTF and an external function are three verdicts.
 
-    `IS_EXTERNAL_FUNCTION` and `API_INTEGRATION` are documented columns of
-    INFORMATION_SCHEMA.FUNCTIONS. There is no `IS_TABLE_FUNCTION` column: a
+    `IS_EXTERNAL` and `API_INTEGRATION` are columns of
+    INFORMATION_SCHEMA.FUNCTIONS (live-verified 2026-09-22; the documented
+    name `IS_EXTERNAL_FUNCTION` is rejected as an invalid identifier, which is
+    the failure the degraded path below exists for). There is no
+    `IS_TABLE_FUNCTION` column: a
     UDTF is identified by its return type, which `DATA_TYPE` reports as
     `TABLE (...)`. If none of the three is present the row is a FUNCTION, which
     is what it was before.
     """
-    if str(row.get("IS_EXTERNAL_FUNCTION") or "").strip().upper() == "YES":
+    if str(row.get("IS_EXTERNAL") or "").strip().upper() in ("YES", "Y", "TRUE"):
         api = str(row.get("API_INTEGRATION") or "").strip()
         detail = str(row.get("ARGUMENT_SIGNATURE") or "")
         if api:
@@ -253,7 +256,7 @@ KINDS: tuple[dict, ...] = (
      "relation": "functions", "name_col": "FUNCTION_NAME",
      "schema_col": "FUNCTION_SCHEMA", "lang_col": "FUNCTION_LANGUAGE",
      "sig_col": "ARGUMENT_SIGNATURE", "owner_col": "FUNCTION_OWNER",
-     "extra_cols": ("DATA_TYPE", "IS_EXTERNAL_FUNCTION", "API_INTEGRATION"),
+     "extra_cols": ("DATA_TYPE", "IS_EXTERNAL", "API_INTEGRATION"),
      "sub_kinds": ("UDTF", "EXTERNAL_FUNCTION"), "refine": _refine_function,
      "reason": "a UDF is code. Spark UDFs exist but the handler contract "
                "differs, so the body has to be reworked rather than copied."},
