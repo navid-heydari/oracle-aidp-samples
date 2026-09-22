@@ -34,7 +34,10 @@ import json
 from snowflake_source.dialect.views import (
     detect_unsupported_constructs, extract_view_body,
 )
-from target.ddl import DEFERRED_EQUIVALENT_PROPERTIES, SCRUBBED_PROPERTIES
+from target.ddl import (
+    DEFERRED_EQUIVALENT_PROPERTIES, SCRUBBED_PROPERTIES,
+    uncarried_column_facts,
+)
 
 from .medallion import bronze_target, detect_target_collisions, layer_jobs
 from .restrictions import apply_restrictions
@@ -280,6 +283,20 @@ def build_plan(inventory: dict, dependencies: dict, *,
         # so SUMMARY.md and DDL_PLAN.md name the same settings.
         deferred, omitted = (([], []) if rec.get("object_type") == "VIEW"
                              else _maintenance_facts(rec))
+        # A column DEFAULT or an IDENTITY that does not travel changes what
+        # an INSERT DOES after cutover -- NULL, or a failure, where Snowflake
+        # supplied a value -- so it goes in `warnings`, which assess_risk
+        # counts and PLANNED_OBJECTS.md prints. The sentences come from
+        # target.ddl so this and DDL_PLAN.md cannot say different things.
+        column_facts = ([] if rec.get("object_type") == "VIEW"
+                        else uncarried_column_facts(rec))
+        # Constraints are kept OUT of `warnings` on purpose: PK/UNIQUE/FK are
+        # unenforced metadata on BOTH sides, so nothing behaves differently
+        # after cutover, and raising every table with a primary key to MEDIUM
+        # would drown the settings that do change behaviour. They are carried
+        # as a fact per object instead, and named in DDL_PLAN.md (R20).
+        constraints = ([] if rec.get("object_type") == "VIEW"
+                       else list(rec.get("constraints") or []))
         can.append({"source_identifier": ident,
                     "object_type": rec.get("object_type"),
                     "target": targets[ident],
@@ -287,8 +304,11 @@ def build_plan(inventory: dict, dependencies: dict, *,
                     "columns": len(rec.get("columns") or []),
                     # The facts assess_risk reads. Column warnings (timezone,
                     # semi-structured-as-string, declared lengths) come from
-                    # the type mapper; the maintenance settings from SHOW.
-                    "warnings": list(rec.get("warnings") or []),
+                    # the type mapper; the maintenance settings from SHOW;
+                    # the DEFAULT/IDENTITY sentences from target.ddl.
+                    "warnings": list(rec.get("warnings") or []) + column_facts,
+                    # Declared on the source, created on neither target path.
+                    "constraints_not_created": constraints,
                     # Kept apart from the column warnings: assess_risk counts
                     # those, but a TRANSIENT/TEMPORARY table planned as a
                     # permanent one is a sentence about the object itself.

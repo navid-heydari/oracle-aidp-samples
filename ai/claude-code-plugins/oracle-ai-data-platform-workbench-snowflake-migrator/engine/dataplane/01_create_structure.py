@@ -31,6 +31,14 @@ The CREATE returning is not the claim: IF NOT EXISTS is a silent no-op on a
 table that is already there, so every table is DESCRIBEd afterwards and
 compared with the plan, column by column and in order.
 
+In --mode ddl-plan the plan's `NOT NULL`, column COMMENTs and table COMMENT
+are applied, not just its names and types: they are in the CREATE TABLE the
+reviewer approved, and this stage used to render `name type` and then compare
+against the same reduced shape, so a table that differed from the approved
+SQL still read back as matching. Nullability is read from the table's schema
+(DESCRIBE does not report it); when that read fails the table's record says
+the property is UNCHECKED rather than counting it as applied.
+
 Writes `structure_report_<schema>.json` per schema, one status per table:
   created          it was not there before, and it reads back as planned
   already_existed  it was there before, and it matches the plan (in
@@ -133,31 +141,96 @@ def _describe_columns(spark, fqn: str) -> list[tuple[str, str]] | None:
     return out
 
 
+def _describe_comments(spark, fqn: str) -> dict[str, str] | None:
+    """{column: comment} from DESCRIBE's third column, upper-cased keys.
+
+    None when the read-back carries no comment column at all -- a comment
+    that was NOT LOOKED AT must not read as a comment that is missing.
+    DESCRIBE reports comments; it does NOT report nullability, which is why
+    that is read from the table's schema instead.
+    """
+    try:
+        rows = spark.sql(f"DESCRIBE {fqn}").collect()
+    except Exception:
+        return None
+    out: dict[str, str] = {}
+    carried = False
+    for row in rows:
+        name = str(row["col_name"] or "").strip()
+        if not name or name.startswith("#"):
+            break
+        try:
+            value = row["comment"]
+            carried = True
+        except Exception:
+            value = None
+        out[name.upper()] = str(value or "")
+    return out if carried else None
+
+
+def _nullability(spark, fqn: str) -> dict[str, bool] | None:
+    """{column: nullable} from the table's schema, or None when unreadable.
+
+    DESCRIBE has no nullability column, so the read-back for `NOT NULL` is
+    the StructType. None means NOT CHECKED -- reported as such rather than
+    passed off as a match, because "we did not look" and "it is right" are
+    the two answers this whole stage exists to keep apart.
+    """
+    try:
+        fields = spark.table(fqn).schema.fields
+        return {str(f.name).upper(): bool(f.nullable) for f in fields}
+    except Exception:
+        return None
+
+
 def _norm_type(value: str) -> str:
     """Compare types ignoring case and internal spacing only."""
     return "".join(str(value).split()).upper()
 
 
 def _compare_columns(expected: list[dict],
-                     actual: list[tuple[str, str]]) -> str | None:
+                     actual: list[tuple[str, str]],
+                     nullable: dict[str, bool] | None = None,
+                     comments: dict[str, str] | None = None) -> str | None:
     """None if the structures match, else a one-line description of the diff.
 
     Same rule as the control-plane deploy: names and types, in order. A
     same-count layout in another order is a diff -- the copy is a positional
     INSERT, so that is the case that lands rows in the wrong columns with
     matching counts.
+
+    `NOT NULL` and column COMMENTs are part of the approved DDL, so they are
+    compared too when the read-back supplies them: a table created with the
+    reviewed SQL and reported "verified" against a name-and-type-only
+    comparison is how the reviewed artifact and the applied one came apart in
+    the first place. `nullable=None` means the schema could not be read; the
+    caller says so rather than counting it as a match.
     """
     want = [(str(c.get("name", "")).upper(), _norm_type(c.get("type", "")))
             for c in expected]
     got = [(n.upper(), _norm_type(ty)) for n, ty in actual]
-    if want == got:
-        return None
-    if len(want) != len(got):
-        return (f"column count differs: planned {len(want)}, found {len(got)} "
-                f"(planned {[n for n, _ in want]}, found {[n for n, _ in got]})")
-    diffs = [f"position {i + 1}: planned {w[0]} {w[1]}, found {g[0]} {g[1]}"
-             for i, (w, g) in enumerate(zip(want, got)) if w != g]
-    return "; ".join(diffs)
+    if want != got:
+        if len(want) != len(got):
+            return (f"column count differs: planned {len(want)}, found {len(got)} "
+                    f"(planned {[n for n, _ in want]}, found {[n for n, _ in got]})")
+        diffs = [f"position {i + 1}: planned {w[0]} {w[1]}, found {g[0]} {g[1]}"
+                 for i, (w, g) in enumerate(zip(want, got)) if w != g]
+        return "; ".join(diffs)
+
+    property_diffs: list[str] = []
+    for col in expected:
+        name = str(col.get("name", "")).upper()
+        if nullable is not None and col.get("nullable") is False \
+                and nullable.get(name, True):
+            property_diffs.append(
+                f"{name}: planned NOT NULL, found nullable")
+        if comments is not None:
+            planned = str(col.get("description") or "")
+            found = str(comments.get(name) or "")
+            if planned and planned != found:
+                property_diffs.append(
+                    f"{name}: planned comment {planned!r}, found {found!r}")
+    return "; ".join(property_diffs) or None
 
 
 def create_table_ctas(source: SnowflakeSource, schema: str, name: str,
@@ -184,17 +257,51 @@ def create_table_ctas(source: SnowflakeSource, schema: str, name: str,
     return "created"
 
 
+def lit(value: str) -> str:
+    """A single-quoted Spark string literal, escaped the way Spark expects.
+
+    Backslash, not doubling: Spark reads `'it\\'\\'s'` as two adjacent
+    literals and concatenates them, so a doubled quote silently eats the
+    apostrophe. Identical to `target.ddl.quote_spark_string`, which this
+    stage cannot import (it is uploaded as a single standalone file).
+    """
+    escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
+    return "'" + escaped + "'"
+
+
+def _column_sql(col: dict) -> str:
+    """One column of the CREATE TABLE, from one `expected_columns` entry.
+
+    The SAME rules as `target.ddl.render_column_sql`, which wrote the SQL the
+    operator approved in DDL_PLAN.md -- a parity test in the engine's suite
+    holds the two together. This stage used to render `name type` only, so
+    the `NOT NULL` and the COMMENT in the approved SQL were dropped here and
+    the comparison below then agreed with itself.
+    """
+    piece = f'{q(col["name"])} {col["type"]}'
+    if col.get("nullable") is False:
+        piece += " NOT NULL"
+    if col.get("description"):
+        piece += " COMMENT " + lit(col["description"])
+    return piece
+
+
 def create_table_from_columns(spark, columns: list[dict],
                               target_catalog: str, target_schema: str,
-                              name: str) -> str:
+                              name: str, description: str = "",
+                              notes: list | None = None) -> str:
     """CREATE TABLE from an explicit column list, then READ IT BACK.
 
-    Types are used verbatim. `CREATE TABLE IF NOT EXISTS` is a silent no-op
-    on a table that is already there, so the CREATE returning is not the
-    claim: the table is DESCRIBEd afterwards and compared with the plan.
+    Types are used verbatim, and so are the plan's `nullable` and
+    `description` -- the properties the approved SQL shows. `CREATE TABLE IF
+    NOT EXISTS` is a silent no-op on a table that is already there, so the
+    CREATE returning is not the claim: the table is DESCRIBEd afterwards and
+    compared with the plan, nullability included.
     Returns `created` (it was not there before and now matches),
     `already_existed` (it was there and matches), or raises TypeDrift when
     what is there differs from the plan -- the table is left as found.
+    `notes` collects what could NOT be checked, so an unverified property is
+    never reported as a verified one.
     """
     if not columns:
         raise ValueError("no column list for this table; rediscover it or "
@@ -202,15 +309,37 @@ def create_table_from_columns(spark, columns: list[dict],
     fqn = three(target_catalog, target_schema, name)
     before = _describe_columns(spark, fqn)
     if before is None:
-        cols = ", ".join(f'{q(c["name"])} {c["type"]}' for c in columns)
-        spark.sql(f"CREATE TABLE IF NOT EXISTS {fqn} ({cols}) USING DELTA")
+        cols = ", ".join(_column_sql(c) for c in columns)
+        spark.sql(f"CREATE TABLE IF NOT EXISTS {fqn} ({cols}) USING DELTA"
+                  + (f" COMMENT {lit(description)}" if description else ""))
         after = _describe_columns(spark, fqn)
         if after is None:
             raise RuntimeError("CREATE TABLE returned but the table does not "
                                "DESCRIBE afterwards; NOT created")
     else:
         after = before
-    diff = _compare_columns(columns, after)
+
+    # Both extra read-backs are skipped when the plan asks for nothing they
+    # would check: a table with no NOT NULL and no comments costs exactly
+    # what it cost before.
+    wants_not_null = any(c.get("nullable") is False for c in columns)
+    wants_comments = any(c.get("description") for c in columns)
+    nullable = _nullability(spark, fqn) if wants_not_null else None
+    comments = _describe_comments(spark, fqn) if wants_comments else None
+    # Not a match and not a failure: it was not looked at. Said out loud,
+    # because a property reported as applied when nobody checked is the
+    # defect this stage is guarding against.
+    if notes is not None:
+        if wants_not_null and nullable is None:
+            notes.append(
+                "NOT NULL was requested but could not be verified: the "
+                "table's schema could not be read back, so nullability is "
+                "UNCHECKED on this table")
+        if wants_comments and comments is None:
+            notes.append(
+                "column COMMENTs were requested but DESCRIBE carried no "
+                "comment column, so they are UNCHECKED on this table")
+    diff = _compare_columns(columns, after, nullable, comments)
     if diff is None:
         return "created" if before is None else "already_existed"
     if before is None:
@@ -252,6 +381,24 @@ def columns_from_ddl_plan(ddl_plan: dict) -> dict[tuple[str, str], list[dict]]:
         if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
             continue                    # views are not created by this path
         out[(parts[1], parts[2])] = stmt["expected_columns"]
+    return out
+
+
+def descriptions_from_ddl_plan(ddl_plan: dict) -> dict[tuple[str, str], str]:
+    """{(source_schema, table): table COMMENT} from the engine's ddl_plan.
+
+    The source table's COMMENT is in the approved CREATE TABLE, so it is
+    applied here too rather than being the one property the reviewer sees
+    and the target never gets.
+    """
+    out: dict[tuple[str, str], str] = {}
+    for stmt in ddl_plan.get("statements") or []:
+        parts = str(stmt.get("source_identifier") or "").split(".")
+        if len(parts) != 3 or not stmt.get("description"):
+            continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue
+        out[(parts[1], parts[2])] = str(stmt["description"])
     return out
 
 
@@ -322,6 +469,7 @@ def main(argv: list[str] | None = None) -> int:
     spark = SparkSession.builder.getOrCreate()
 
     planned_columns: dict = {}
+    planned_descriptions: dict = {}
     planned_views: set | None = None
     if args.mode == "ddl-plan":
         ddl_path = (pathlib.Path(args.ddl_plan) if args.ddl_plan
@@ -332,6 +480,7 @@ def main(argv: list[str] | None = None) -> int:
                         f"`provision` upload it, or pass --ddl-plan")
         ddl_plan = json.loads(ddl_path.read_text(encoding="utf-8"))
         planned_columns = columns_from_ddl_plan(ddl_plan)
+        planned_descriptions = descriptions_from_ddl_plan(ddl_plan)
         planned_views = views_from_ddl_plan(ddl_plan)
         log(f"ddl plan: {len(planned_columns)} table(s) with engine-"
             f"translated types, from {ddl_path}"
@@ -375,6 +524,7 @@ def main(argv: list[str] | None = None) -> int:
 
         for table in record["tables"]:
             name = table["name"]
+            notes: list[str] = []
             prior = report["objects"].get(name, {})
             if prior.get("status") in ("created", "already_existed") \
                     and not args.force:
@@ -404,9 +554,12 @@ def main(argv: list[str] | None = None) -> int:
                         log(f"{schema}.{name}: not in the approved plan")
                         not_in_plan_total += 1
                         continue
-                    status = create_table_from_columns(spark, columns,
-                                                       args.target_catalog,
-                                                       target_schema, name)
+                    status = create_table_from_columns(
+                        spark, columns, args.target_catalog, target_schema,
+                        name,
+                        description=planned_descriptions.get((schema, name),
+                                                             ""),
+                        notes=notes)
                 else:
                     columns = table.get("columns") or []
                     if _looks_like_snowflake_types(columns):
@@ -415,10 +568,15 @@ def main(argv: list[str] | None = None) -> int:
                             "built in connector mode), which Delta will not "
                             "accept verbatim. Use --mode ddl-plan (engine-"
                             "translated types) or --mode ctas.")
-                    status = create_table_from_columns(spark, columns,
-                                                       args.target_catalog,
-                                                       target_schema, name)
+                    status = create_table_from_columns(
+                        spark, columns, args.target_catalog, target_schema,
+                        name, notes=notes)
                 report["objects"][name] = {"status": status}
+                if notes:
+                    # Properties that could NOT be read back. Recorded next
+                    # to the status so "created" never implies "and every
+                    # property was checked".
+                    report["objects"][name]["unverified_properties"] = notes
                 if args.mode == "ctas" and status == "already_existed":
                     # CTAS has no plan to compare the layout with: the
                     # table was there before this run and nobody has

@@ -2,11 +2,14 @@
 
 Issues only SHOW / SELECT / GET_DDL. Cannot modify the estate.
 
-Three things are captured HERE rather than reconstructed later, because they
+Things are captured HERE rather than reconstructed later, because they
 cannot be recovered afterwards:
   * identifier_case_form -- SHOW output tells us which form was used
   * numeric precision/scale -- from INFORMATION_SCHEMA, never from sampled data
   * view SQL, verbatim -- both SHOW VIEWS.text and GET_DDL()
+  * column DEFAULT and IDENTITY -- the two facts that change what an INSERT
+    does after cutover; read here, decided in ddl/plan
+  * PK / UNIQUE / FK -- see extract/constraints.py
 
 A per-object failure is recorded in extraction_notes and extraction continues.
 "no objects" and "extraction failed" are different outcomes and must not be
@@ -31,6 +34,7 @@ from typing import Callable
 from ..dialect import lexer
 from ..dialect.identifiers import case_form, detect_collisions
 from ..dialect.types import map_type
+from .constraints import build_constraints
 
 __all__ = ["build_inventory", "SYSTEM_DBS", "ROW_COUNT_MODES", "SHOW_PAGE_SIZE"]
 
@@ -139,6 +143,10 @@ def build_inventory(run_sql: Callable[..., list[dict]],
             notes.append(f"database {db}: {exc}")
             continue
 
+        # Once per database, not once per schema: the three SHOWs are
+        # database-scoped. A failure is a note, not an empty estate.
+        constraints = build_constraints(run_sql, db, notes)
+
         for schema in schemas:
             columns = _columns(run_sql, db, schema, notes)
             for kind, show in (("TABLE", "tables"), ("VIEW", "views")):
@@ -156,7 +164,9 @@ def build_inventory(run_sql: Callable[..., list[dict]],
                                 row_counts=row_counts, notes=notes,
                                 semi_structured=semi_structured,
                                 geospatial=geospatial,
-                                timestamp_ntz=timestamp_ntz))
+                                timestamp_ntz=timestamp_ntz,
+                                constraints=constraints.get(
+                                    f'{db}.{schema}.{obj["name"]}', [])))
 
     collisions = detect_collisions([r["source_identifier"] for r in inventory])
     return {
@@ -187,7 +197,13 @@ def _columns(run_sql, db: str, schema: str, notes: list[str]) -> dict[str, list[
         rows = run_sql(
             f"select table_schema, table_name, ordinal_position, column_name, "
             f"data_type, is_nullable, numeric_precision, numeric_scale, "
-            f"character_maximum_length, datetime_precision, comment "
+            f"character_maximum_length, datetime_precision, comment, "
+            # A column's DEFAULT and its identity sequence are the two facts
+            # that make a post-cutover INSERT behave differently: an insert
+            # Snowflake would have populated arrives NULL, or fails. They are
+            # columns of INFORMATION_SCHEMA.COLUMNS and cost nothing extra to
+            # read here; what is DONE with them is decided in ddl/plan.
+            f"column_default, identity_start, identity_increment "
             f"from {lexer.qualify(db)}.information_schema.columns "
             f"where table_schema = %(schema)s "
             f"order by table_name, ordinal_position", {"schema": schema})
@@ -232,7 +248,8 @@ def _row_count(run_sql, db: str, schema: str, name: str, kind: str, *,
 def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
             columns: list[dict], *, row_counts: str, notes: list[str],
             semi_structured: str = "block", geospatial: str = "block",
-            timestamp_ntz: str = "preserve") -> dict:
+            timestamp_ntz: str = "preserve",
+            constraints: list[dict] | None = None) -> dict:
     name = obj["name"]
     blocked_reasons: list[str] = []
     warnings: list[str] = []
@@ -270,6 +287,10 @@ def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
         "type_notes": type_notes,
         "evidence_location": f"show {kind.lower()}s in {db}.{schema}",
         "columns": enriched,
+        # PK/UNIQUE/FK as the source declares them. The DDL rule that says
+        # they are "captured in the inventory, not emitted as DDL" is only
+        # true because this key is populated.
+        "constraints": list(constraints or []),
         "source_metadata": {k: _jsonable(obj[k]) for k in _META_KEYS if k in obj},
     }
     rec.update(_row_count(run_sql, db, schema, name, kind,

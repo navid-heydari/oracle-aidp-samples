@@ -63,6 +63,14 @@ TWO BEHAVIOURS LEARNED FROM A LIVE RUN, both of which broke the first attempt:
     bounded backoff rather than reported as a failure. The retry is still
     recorded, because a run that needed three attempts is worth knowing about.
 
+  * THIS TRANSPORT CANNOT CARRY `NOT NULL`. The field entry the API takes has
+    no nullability key, so a plan that declares a column NOT NULL is applied
+    with less than it says. Nothing is invented: the gap is recorded per
+    object in `properties_not_applied`, and DDL_PLAN.md names it per object
+    too (rule R21). Column and table COMMENTs DO travel -- `fieldDescription`
+    and `description` -- and are compared on the read-back, so a comment the
+    target quietly dropped is reported rather than assumed applied.
+
 `call(operation, **kwargs)` is injected so every decision here is unit-tested
 with no environment.
 """
@@ -76,7 +84,8 @@ import time
 import uuid
 
 from .catalog_api import (
-    build_schema_body, build_table_body, build_view_body)
+    PROPERTIES_THIS_BODY_CANNOT_CARRY, build_schema_body, build_table_body,
+    build_view_body)
 
 __all__ = ["deploy_catalog", "RefusedToExecute"]
 
@@ -257,6 +266,58 @@ def _actual(payload: dict, key: str = "tableFields") -> list[tuple[str, str]]:
             for f in (payload.get(key) or [])]
 
 
+def _descriptions(columns: list[dict]) -> dict[str, str]:
+    """`{COLUMN: description}` as the body will SEND them.
+
+    Built through the same body builder as the fields, so the TIMESTAMP_NTZ
+    note the mapper appends is compared as sent rather than as planned.
+    """
+    out = {}
+    for col in columns:
+        field = build_table_body("c", "s", "t", [col])["tableFields"][0]
+        out[str(field["fieldName"]).upper()] = str(
+            field.get("fieldDescription") or "")
+    return out
+
+
+def _actual_descriptions(payload: dict, key: str = "tableFields"
+                         ) -> dict[str, str]:
+    return {str(f.get("fieldName")).upper():
+            str(f.get("fieldDescription") or "")
+            for f in (payload.get(key) or [])}
+
+
+def _check_descriptions(out: dict, ident: str, stmt: dict,
+                        columns: list[dict], payload: dict,
+                        description: str) -> None:
+    """Record any COMMENT the plan sent that the target did not keep.
+
+    Structure is already verified when this runs, so nothing here changes
+    that verdict: a comment is documentation, not shape. It is still
+    reported, because "the plan showed it and the object does not have it"
+    is the same class of defect as a dropped NOT NULL, only cheaper.
+    """
+    want = _descriptions(columns)
+    got = _actual_descriptions(payload)
+    lost = [f'{name}: planned {want[name]!r}, found {got.get(name, "")!r}'
+            for name in want
+            if want[name] and want[name] != got.get(name, "")]
+    table_planned = str(description or "")
+    table_got = str(payload.get("description") or "")
+    if table_planned and table_planned != table_got:
+        lost.append(f"table COMMENT: planned {table_planned!r}, found "
+                    f"{table_got!r}")
+    if not lost:
+        return
+    out["description_drift_targets"].append(ident)
+    out["description_drift"].append({
+        "source_identifier": ident, "target_fqn": stmt["target_fqn"],
+        "reason": ("created with the planned columns, but "
+                   + "; ".join(lost)
+                   + ". The structure matches the plan; the documentation "
+                     "the plan showed did not survive.")})
+
+
 def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                    call: Callable[..., dict] | None = None,
                    retry_delays: tuple[float, ...] = (2.0, 5.0, 10.0),
@@ -302,6 +363,15 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         # silently behind in someone's catalog.
         "diagnosis_probes": [],
         "unverified_structure_targets": [], "unverified_structure": [],
+        # Planned properties this TRANSPORT cannot express (NOT NULL). The
+        # object is still created and still verified for structure -- but a
+        # plan that said NOT NULL and a table that is nullable is exactly the
+        # reviewed-versus-applied gap, so it is named per object here as well
+        # as in DDL_PLAN.md rather than being visible nowhere.
+        "properties_not_applied_targets": [], "properties_not_applied": [],
+        # Sent with a description the target did not keep. Structure is
+        # unaffected, so these still count as verified.
+        "description_drift_targets": [], "description_drift": [],
         "failed": [],
         "catalog_type": None,
     }
@@ -441,15 +511,18 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
 
         # Build the body FIRST. A type the API silently rejects must fail
         # here, not become an accepted-then-vanished table.
+        # The source object's COMMENT. It is in the reviewed CREATE TABLE, so
+        # it travels here too; it used to be dropped by defaulting to "".
+        description = str(stmt.get("description") or "")
         try:
             if is_view:
                 body = build_view_body(
                     catalog, server_schema, name,
-                    stmt.get("view_text") or "", columns,
+                    stmt.get("view_text") or "", columns, description,
                     timestamp_ntz_as_timestamp=timestamp_ntz_as_timestamp)
             else:
                 body = build_table_body(
-                    catalog, server_schema, name, columns,
+                    catalog, server_schema, name, columns, description,
                     timestamp_ntz_as_timestamp=timestamp_ntz_as_timestamp)
         except Exception as exc:
             out["failed_targets"].append(ident)
@@ -457,6 +530,20 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 "source_identifier": ident, "target_fqn": stmt["target_fqn"],
                 "reason": f"cannot build a valid catalog body: {exc}"})
             continue
+
+        # Said before the create, not discovered after it: this transport has
+        # no field for nullability, so a plan that declares NOT NULL is being
+        # applied with less than it says.
+        not_null = [str(c.get("name")) for c in columns
+                    if c.get("nullable") is False]
+        if not_null:
+            out["properties_not_applied_targets"].append(ident)
+            out["properties_not_applied"].append({
+                "source_identifier": ident, "target_fqn": stmt["target_fqn"],
+                "property": "NOT NULL", "columns": not_null,
+                "reason": (f'{", ".join(not_null)} are NOT NULL in the '
+                           f"reviewed plan and are created NULLABLE here: "
+                           + PROPERTIES_THIS_BODY_CANNOT_CARRY["not_null"])})
 
         # Schema creation is async, so a 409 here means "not settled yet".
         accepted = False
@@ -587,6 +674,12 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         if want == got:
             out["verified"] += 1
             out["verified_targets"].append(ident)
+            # Structure is right; did the DESCRIPTIONS the plan showed
+            # survive? A table's are ours to declare. A view's fields are
+            # re-derived by the target, so they are not compared.
+            if not is_view:
+                _check_descriptions(out, ident, stmt, columns, payload,
+                                    description)
         elif is_view and [n for n, _ in want] == [n for n, _ in got]:
             # Same columns in the same order, different types: the engine
             # derived them from the SQL. The view IS ours.
