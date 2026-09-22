@@ -20,6 +20,23 @@ to ~2 hours, so a policy attached shortly before the run is not in it yet
 while SHOW MASKING/ROW ACCESS POLICIES already lists the policy object. When
 policy objects exist and no attachment is visible, the verdict is
 UNCONFIRMED, not clean. Neither case may read as "no policies found".
+
+There is a third source, and it is the worst one: naming a policy kind the
+tool never enumerated. The summary sentence used to state that no masking,
+row-access, AGGREGATION or PROJECTION policy was attached while the last two
+were never asked for, and the staleness tripwire summed only masking +
+row_access, so a defined-but-unattached aggregation policy could not raise
+UNCONFIRMED. All four kinds are now enumerated, all four feed the tripwire,
+and the sentence is built from the kinds that actually answered -- a kind
+whose SHOW was denied is named as "not visible to this role", never counted
+as zero and never covered by a clean verdict.
+
+Tag attachments (ACCOUNT_USAGE.TAG_REFERENCES) and grants beyond
+TABLE / VIEW / MATERIALIZED_VIEW are read for the same reason: a tag count
+with no attachment list is a number with no verdict, and an access model
+missing every schema, database, warehouse, stage, procedure and function
+grant cannot be reconstructed on the target. Both are reported; neither is
+replayed.
 """
 from __future__ import annotations
 
@@ -29,7 +46,28 @@ from typing import Callable
 
 from ..dialect import lexer
 
-__all__ = ["build_security", "POLICY_CONSEQUENCE"]
+__all__ = ["build_security", "POLICY_CONSEQUENCE", "POLICY_KINDS",
+           "POLICY_KIND_LABELS", "GRANT_CLASSES"]
+
+# The policy kinds this module enumerates as OBJECTS, in report order. The
+# summary sentence is built from this tuple and from which of them actually
+# answered, so it can never name a kind that was not asked for.
+POLICY_KINDS = ("masking", "row_access", "aggregation", "projection")
+
+POLICY_KIND_LABELS = {
+    "masking": "masking",
+    "row_access": "row-access",
+    "aggregation": "aggregation",
+    "projection": "projection",
+}
+
+# The SHOW behind each kind. All four are on the read-only allowlist.
+_POLICY_SHOW = {
+    "masking": "masking policies",
+    "row_access": "row access policies",
+    "aggregation": "aggregation policies",
+    "projection": "projection policies",
+}
 
 POLICY_CONSEQUENCE = {
     "MASKING_POLICY": (
@@ -62,6 +100,38 @@ _AIDP_PATH = (
 _ATTACHMENT_SOURCE = ("SNOWFLAKE.ACCOUNT_USAGE.POLICY_REFERENCES (lags up to "
                       "~2 hours behind DDL)")
 
+# Tag attachments have their own view and its own identical lag. Counting tag
+# OBJECTS without reading attachments made a classification-driven governance
+# model look empty, which is the same false negative as above.
+_TAG_ATTACHMENT_SOURCE = ("SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES (lags up to "
+                          "~2 hours behind DDL)")
+
+_TAG_CONSEQUENCE = (
+    "the tag and its value do not travel, so anything keyed off this "
+    "classification -- a policy, an access rule, an audit query -- has "
+    "nothing to key off on the target.")
+
+_TAG_AIDP_PATH = (
+    "AIDP has no tag API verified here. The nearest equivalent is ontology "
+    "sensitivity classification applied per object, which is a design "
+    "decision rather than a translation.")
+
+# What GRANTS_TO_ROLES.granted_on is asked for. Reading only TABLE / VIEW /
+# MATERIALIZED_VIEW made every grant on a schema, database, warehouse, stage,
+# procedure or function invisible, so the target access model could not be
+# reconstructed from the report. Reported, never replayed, either way.
+GRANT_CLASSES = (
+    "TABLE", "VIEW", "MATERIALIZED_VIEW", "EXTERNAL_TABLE", "DYNAMIC_TABLE",
+    "DATABASE", "SCHEMA", "WAREHOUSE", "STAGE", "PROCEDURE", "FUNCTION",
+    "FILE_FORMAT", "SEQUENCE", "STREAM", "TASK", "PIPE", "TAG",
+    "MASKING_POLICY", "ROW_ACCESS_POLICY", "AGGREGATION_POLICY",
+    "PROJECTION_POLICY", "INTEGRATION",
+)
+
+# Classes that have no database of their own, so a scope filter on
+# DATABASE_NAME would silently drop them.
+_ACCOUNT_SCOPED_CLASSES = ("WAREHOUSE", "INTEGRATION")
+
 
 def _show(run_sql, what: str, db: str) -> list[dict]:
     return run_sql(f"show {what} in database {lexer.qualify(db)}")
@@ -93,6 +163,11 @@ def _collect(run_sql, what: str, databases: list[str],
                 f"only objects the role owns or holds a privilege on. The "
                 f"attachment verdict comes from ACCOUNT_USAGE and is "
                 f"account-wide.")
+    elif not readable:
+        # The count is None, and the words have to agree with it: a refused
+        # SHOW means "not visible to this role", which is not a zero.
+        note = (f"not visible to this role: SHOW {what.upper()} was refused "
+                f"-- {note}")
     return {"readable": readable, "note": note or f"{len(items)} found",
             "count": len(items) if readable else None, "items": items}
 
@@ -104,11 +179,9 @@ def build_security(run_sql: Callable[..., list[dict]], inventory: dict, *,
     records = inventory.get("inventory") or []
     in_scope = {r["source_identifier"].upper() for r in records}
 
-    policies = {
-        "masking": _collect(run_sql, "masking policies", databases, notes),
-        "row_access": _collect(run_sql, "row access policies", databases, notes),
-        "tags": _collect(run_sql, "tags", databases, notes),
-    }
+    policies = {k: _collect(run_sql, _POLICY_SHOW[k], databases, notes)
+                for k in POLICY_KINDS}
+    policies["tags"] = _collect(run_sql, "tags", databases, notes)
 
     # The load-bearing query: which objects and columns actually have a policy
     # attached. Policies existing is not the risk; policies ATTACHED to
@@ -158,18 +231,26 @@ def build_security(run_sql: Callable[..., list[dict]], inventory: dict, *,
         and str((r.get("source_metadata") or {}).get("is_secure", "")).lower()
         in ("true", "y", "yes", "on")]
 
-    grants = {"measured": False, "by_object": {}, "note": "not requested"}
+    # Tag OBJECTS were counted and their attachments never read, so a
+    # classification-driven governance model rendered as an empty table. Same
+    # unreadable handling and same latency caveat as POLICY_REFERENCES.
+    tag_references = _tag_references(run_sql, in_scope, notes)
+
+    grants = {"measured": False, "by_object": {}, "note": "not requested",
+              "classes_requested": list(GRANT_CLASSES)}
     if include_grants:
-        grants = _grants(run_sql, in_scope, notes)
+        grants = _grants(run_sql, in_scope, databases, notes)
 
     # Policy OBJECTS that exist while POLICY_REFERENCES shows no attachment
     # anywhere. The view lags up to ~2 hours, so this is the signature of a
     # policy attached shortly before the run -- the empty attachment list is
     # then unconfirmed, not clean. A reference to an out-of-scope object
     # accounts for the policy and does not trigger it.
-    defined = sum((policies[k]["count"] or 0) for k in ("masking", "row_access"))
-    defined_unreadable = any(not policies[k]["readable"]
-                             for k in ("masking", "row_access"))
+    defined = sum((policies[k]["count"] or 0) for k in POLICY_KINDS)
+    enumerated = [POLICY_KIND_LABELS[k] for k in POLICY_KINDS
+                  if policies[k]["readable"]]
+    unenumerated = [POLICY_KIND_LABELS[k] for k in POLICY_KINDS
+                    if not policies[k]["readable"]]
     unattached = (defined if (references_readable and not exposures
                               and out_of_scope == 0) else 0)
 
@@ -177,6 +258,8 @@ def build_security(run_sql: Callable[..., list[dict]], inventory: dict, *,
     return {
         "probed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "policies": policies,
+        "policy_kinds_enumerated": enumerated,
+        "policy_kinds_unenumerated": unenumerated,
         "policy_references_readable": references_readable,
         "policy_references_out_of_scope": out_of_scope,
         "policies_defined_without_attachment": unattached,
@@ -184,49 +267,161 @@ def build_security(run_sql: Callable[..., list[dict]], inventory: dict, *,
         "exposures": exposures,
         "exposure_count": count,
         "secure_views": secure_views,
+        "tag_references": tag_references,
         "grants": grants,
         "unreadable": notes,
         "statement": _statement(count, secure_views, references_readable,
-                                unattached, defined_unreadable),
+                                unattached, kinds_enumerated=enumerated,
+                                kinds_unenumerated=unenumerated),
     }
 
 
-def _grants(run_sql, in_scope: set[str], notes: list[str]) -> dict:
-    """Who can read what today. Reported, never replayed."""
+def _tag_references(run_sql, in_scope: set[str], notes: list[str]) -> dict:
+    """Which migrated objects and columns carry a tag. Reported, never replayed.
+
+    A tag count with no attachment list is a number with no verdict. This
+    mirrors the POLICY_REFERENCES block exactly, including the rule that an
+    unreadable view yields `measured: False` and a `count` of None, never 0.
+    """
+    try:
+        rows = run_sql(
+            "select tag_database TAG_DATABASE, tag_schema TAG_SCHEMA, "
+            "tag_name TAG_NAME, tag_value TAG_VALUE, "
+            "object_database OBJECT_DATABASE, object_schema OBJECT_SCHEMA, "
+            "object_name OBJECT_NAME, column_name COLUMN_NAME, "
+            "domain DOMAIN "
+            "from snowflake.account_usage.tag_references")
+    except Exception as exc:
+        notes.append(f"ACCOUNT_USAGE.TAG_REFERENCES (tag attachments): "
+                     f"{str(exc)[:200]}")
+        return {"measured": False, "attachments": [], "count": None,
+                "out_of_scope": 0, "carried_over": False,
+                "source": _TAG_ATTACHMENT_SOURCE, "note": str(exc)[:200]}
+
+    attachments: list[dict] = []
+    out_of_scope = 0
+    for r in rows:
+        ident = (f'{r.get("OBJECT_DATABASE")}.{r.get("OBJECT_SCHEMA")}.'
+                 f'{r.get("OBJECT_NAME")}')
+        if ident.upper() not in in_scope:
+            out_of_scope += 1
+            continue
+        attachments.append({
+            "object": ident,
+            "column": r.get("COLUMN_NAME"),
+            "domain": r.get("DOMAIN"),
+            "tag": (f'{r.get("TAG_DATABASE")}.{r.get("TAG_SCHEMA")}.'
+                    f'{r.get("TAG_NAME")}'),
+            "value": r.get("TAG_VALUE"),
+            "consequence": _TAG_CONSEQUENCE,
+            "aidp_path": _TAG_AIDP_PATH,
+        })
+    return {"measured": True, "attachments": attachments,
+            "count": len(attachments), "out_of_scope": out_of_scope,
+            "carried_over": False, "source": _TAG_ATTACHMENT_SOURCE,
+            "note": f"{len(attachments)} in-scope tag attachment(s)"}
+
+
+def _grants(run_sql, in_scope: set[str], databases: list[str],
+            notes: list[str]) -> dict:
+    """Who can read what today. Reported, never replayed.
+
+    `by_object` stays what it always was: the migrated tables and views and
+    the roles that hold a privilege on them. `by_class` is everything else in
+    the scoped databases -- schema, database, warehouse, stage, procedure,
+    function and the rest of GRANT_CLASSES -- which used to be read as
+    nothing at all. The report names the classes that were asked for, so a
+    class that is absent from the answer is distinguishable from a class that
+    was never in the question.
+    """
+    classes = ", ".join(f"'{c}'" for c in GRANT_CLASSES)
     try:
         rows = run_sql(
             "select name NAME, table_schema TABLE_SCHEMA, "
-            "table_catalog DATABASE_NAME, privilege PRIVILEGE, "
-            "grantee_name GRANTEE_NAME, count(*) GRANTS "
+            "table_catalog DATABASE_NAME, granted_on GRANTED_ON, "
+            "privilege PRIVILEGE, grantee_name GRANTEE_NAME, count(*) GRANTS "
             "from snowflake.account_usage.grants_to_roles "
-            "where deleted_on is null and granted_on in "
-            "('TABLE', 'VIEW', 'MATERIALIZED_VIEW') "
-            "group by 1, 2, 3, 4, 5")
+            f"where deleted_on is null and granted_on in ({classes}) "
+            "group by 1, 2, 3, 4, 5, 6")
     except Exception as exc:
         notes.append(f"ACCOUNT_USAGE.GRANTS_TO_ROLES (grants): {str(exc)[:200]}")
-        return {"measured": False, "by_object": {},
+        return {"measured": False, "by_object": {}, "by_class": {},
+                "classes_requested": list(GRANT_CLASSES), "out_of_scope": 0,
                 "note": str(exc)[:200]}
 
+    scope = {str(d).upper() for d in databases if d}
     by_object: dict[str, list[dict]] = collections.defaultdict(list)
+    classed: dict[str, dict] = {}
+    out_of_scope = 0
     for r in rows:
-        ident = (f'{r.get("DATABASE_NAME")}.{r.get("TABLE_SCHEMA")}.'
-                 f'{r.get("NAME")}')
-        if ident.upper() not in in_scope:
+        granted_on = str(r.get("GRANTED_ON") or "").upper() or "UNSPECIFIED"
+        db = r.get("DATABASE_NAME")
+        ident = ".".join(str(p) for p in (db, r.get("TABLE_SCHEMA"),
+                                          r.get("NAME")) if p)
+        if ident.upper() in in_scope:
+            by_object[ident].append({"role": r.get("GRANTEE_NAME"),
+                                     "privilege": r.get("PRIVILEGE")})
+        if not _grant_in_scope(granted_on, db, r.get("NAME"), scope):
+            out_of_scope += 1
             continue
-        by_object[ident].append({"role": r.get("GRANTEE_NAME"),
-                                 "privilege": r.get("PRIVILEGE")})
+        entry = classed.setdefault(
+            granted_on, {"grants": 0, "roles": set(), "objects": set()})
+        entry["grants"] += 1
+        entry["roles"].add(r.get("GRANTEE_NAME"))
+        entry["objects"].add(ident)
+    by_class = {k: {"grants": v["grants"],
+                    "roles": sorted(x for x in v["roles"] if x),
+                    "objects": len(v["objects"])}
+                for k, v in sorted(classed.items())}
     return {"measured": True, "by_object": dict(by_object),
-            "note": f"{len(by_object)} in-scope object(s) with explicit grants",
+            "by_class": by_class,
+            "classes_requested": list(GRANT_CLASSES),
+            "out_of_scope": out_of_scope,
+            "note": f"{len(by_object)} in-scope object(s) with explicit "
+                    f"grants; {len(by_class)} object class(es) seen",
             "carried_over": False}
+
+
+def _grant_in_scope(granted_on: str, db, name, scope: set[str]) -> bool:
+    """Is this grant about something inside the migration scope?
+
+    A DATABASE grant names the database in NAME, not in TABLE_CATALOG, and a
+    WAREHOUSE or INTEGRATION grant has no database at all -- filtering on
+    TABLE_CATALOG alone would drop both classes silently.
+    """
+    if not scope:
+        return True
+    if granted_on == "DATABASE":
+        return str(name or "").upper() in scope
+    if db:
+        return str(db).upper() in scope
+    return granted_on in _ACCOUNT_SCOPED_CLASSES
 
 
 _LAG = ("ACCOUNT_USAGE.POLICY_REFERENCES lags up to ~2 hours behind DDL, so "
         "a policy attached inside that window is not visible here yet")
 
 
+def _join(labels) -> str:
+    labels = list(labels)
+    if not labels:
+        return ""
+    if len(labels) == 1:
+        return labels[0]
+    return ", ".join(labels[:-1]) + f" or {labels[-1]}"
+
+
 def _statement(count, secure_views: list[dict], references_readable: bool,
-               defined_without_attachment: int = 0,
-               defined_unreadable: bool = False) -> str:
+               defined_without_attachment: int = 0, *,
+               kinds_enumerated=(), kinds_unenumerated=()) -> str:
+    """The one sentence a reader takes away. It may only name what was asked.
+
+    I3: "could not look" never renders as zero. The clean verdict is built
+    from the kinds that actually answered, so a kind whose SHOW was denied
+    cannot be covered by it -- it gets said out loud instead.
+    """
+    kinds_enumerated = list(kinds_enumerated)
+    kinds_unenumerated = list(kinds_unenumerated)
     if not references_readable:
         return ("**Policy attachments could not be read**, so whether any "
                 "column is masked or any table row-filtered is UNKNOWN. This "
@@ -243,24 +438,29 @@ def _statement(count, secure_views: list[dict], references_readable: bool,
         parts.append(f"**{len(secure_views)} secure view(s)** lose SECURE")
     if defined_without_attachment:
         parts.append(
-            f"**{defined_without_attachment} masking/row-access policy "
-            f"object(s) exist in the migrated database(s) but "
-            f"ACCOUNT_USAGE.POLICY_REFERENCES lists no attachment.** {_LAG}. "
-            f"Treat exposure as UNCONFIRMED, not zero: re-run `security` "
-            f"after the lag, or check the attachments live (`DESCRIBE MASKING "
-            f"POLICY`, the INFORMATION_SCHEMA POLICY_REFERENCES table "
-            f"function) before the clone is used")
+            f"**{defined_without_attachment} policy object(s) "
+            f"({_join(kinds_enumerated) or 'no kind enumerated'}) exist in "
+            f"the migrated database(s) but ACCOUNT_USAGE.POLICY_REFERENCES "
+            f"lists no attachment.** {_LAG}. Treat exposure as UNCONFIRMED, "
+            f"not zero: re-run `security` after the lag, or check the "
+            f"attachments live (`DESCRIBE MASKING POLICY`, the "
+            f"INFORMATION_SCHEMA POLICY_REFERENCES table function) before the "
+            f"clone is used")
+    if kinds_unenumerated:
+        # Naming the kind is the whole point: a verdict that silently covers
+        # a policy kind whose SHOW was denied is the clean-verdict-on-an-
+        # unasked-question failure this module exists to prevent.
+        parts.append(
+            f"**{_join(kinds_unenumerated)} policy objects could not be "
+            f"enumerated** (the SHOW was denied to this role, so they are "
+            f"*not visible to this role* rather than absent). Nothing here "
+            f"covers them, and the empty attachment list cannot be "
+            f"corroborated for those kinds. {_LAG}. Re-run with a role that "
+            f"can see them before anyone concludes the estate is unprotected "
+            f"data")
     if not parts:
-        if defined_unreadable:
-            return ("No policy attachment is visible in "
-                    "ACCOUNT_USAGE.POLICY_REFERENCES, but the policy objects "
-                    "themselves could not be enumerated (SHOW MASKING / ROW "
-                    "ACCESS POLICIES failed), so the empty attachment list "
-                    f"cannot be corroborated. {_LAG}. Re-run with a role that "
-                    "can see the policies before anyone concludes the estate "
-                    "is unprotected data.")
-        return ("No masking, row-access, aggregation or projection policy is "
-                "attached to anything being migrated, and no secure views are "
-                "in scope. Nothing is protected today that the migration "
-                f"would strip -- as of {_LAG}.")
+        return (f"No {_join(kinds_enumerated)} policy is attached to anything "
+                "being migrated, and no secure views are in scope. Nothing is "
+                "protected today that the migration would strip -- as of "
+                f"{_LAG}.")
     return " · ".join(parts) + ". Resolve before the clone is used for anything real."

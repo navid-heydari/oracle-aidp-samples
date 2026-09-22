@@ -1202,12 +1202,66 @@ def render_security(sec: dict) -> str:
         out += ["## Policy objects defined in the source", "", lead, "",
                 "| Kind | Count | Read |", "|---|---:|---|"]
         for label, key in (("Masking", "masking"),
-                           ("Row access", "row_access"), ("Tags", "tags")):
+                           ("Row access", "row_access"),
+                           ("Aggregation", "aggregation"),
+                           ("Projection", "projection"),
+                           ("Tags", "tags")):
+            # Three different facts, three different cells. A kind that was
+            # never asked for, a kind the role cannot see, and a kind that
+            # answered zero are not interchangeable, and only the last one is
+            # a zero.
+            if key not in pol:
+                out.append(f"| {label} | *not enumerated* | **not asked** |")
+                continue
             info = pol.get(key) or {}
             c = info.get("count")
+            if not info.get("readable"):
+                out.append(f"| {label} | *not visible to this role* "
+                           f"| **denied** |")
+                continue
             out.append(f'| {label} | {c if c is not None else "*not measured*"} '
-                       f'| {"yes" if info.get("readable") else "**denied**"} |')
+                       f"| yes |")
         out.append("")
+        missing = [label for label, key in (("aggregation", "aggregation"),
+                                            ("projection", "projection"))
+                   if key not in pol]
+        if missing:
+            out += [f'> This artefact predates {" and ".join(missing)} policy '
+                    "enumeration, so those kinds were never asked for. Re-run "
+                    "`security` before treating the statement above as "
+                    "covering them.", ""]
+
+    # A tag count with no attachment list is a number with no verdict, so the
+    # attachments get their own section with the same unreadable handling and
+    # the same latency caveat as the policy attachments above.
+    tags = sec.get("tag_references")
+    if tags is not None:
+        out += ["## Tag attachments", ""]
+        if not tags.get("measured"):
+            out += [f'**Not measured** — {tags.get("note", "unknown")}. '
+                    "Whether any migrated object carries a classification tag "
+                    "is UNKNOWN, which is not the same as none.", ""]
+        else:
+            attached = tags.get("attachments") or []
+            out += [f'Source: `{tags.get("source", "-")}`.', ""]
+            if attached:
+                out += [f"{len(attached)} tag attachment(s) on objects being "
+                        "migrated. **No tag is recreated on the target.**", "",
+                        "| Object | Column | Tag | Value |",
+                        "|---|---|---|---|"]
+                for a in attached:
+                    col = (f'`{a["column"]}`' if a.get("column")
+                           else "*whole object*")
+                    out.append(f'| `{a["object"]}` | {col} '
+                               f'| `{a.get("tag")}` | {a.get("value") or "-"} |')
+                out += ["", attached[0].get("consequence", ""), "",
+                        attached[0].get("aidp_path", ""), ""]
+            else:
+                out += ["No tag is attached to anything being migrated, as of "
+                        "the lag named above.", ""]
+            if tags.get("out_of_scope"):
+                out += [f'{tags["out_of_scope"]} tag attachment(s) exist on '
+                        "objects outside this migration. Context only.", ""]
 
     grants = sec.get("grants") or {}
     if grants.get("measured"):
@@ -1217,6 +1271,26 @@ def render_security(sec: dict) -> str:
                 "**No grant is replayed on the target** — AIDP roles and "
                 "per-resource permissions are a separate model, so access has "
                 "to be re-granted deliberately rather than copied.", ""]
+        requested = grants.get("classes_requested") or []
+        if requested:
+            out += ["Object classes asked for in "
+                    "`ACCOUNT_USAGE.GRANTS_TO_ROLES`: "
+                    + ", ".join(f"`{c}`" for c in requested)
+                    + ". A class that is absent from the table below was "
+                    "asked for and returned nothing; a class absent from this "
+                    "list was never asked for.", ""]
+        by_class = grants.get("by_class") or {}
+        if by_class:
+            out += ["| Granted on | Privileges | Objects | Roles |",
+                    "|---|---:|---:|---|"]
+            for cls, info in sorted(by_class.items()):
+                roles = info.get("roles") or []
+                shown = ", ".join(f"`{r}`" for r in roles[:6])
+                if len(roles) > 6:
+                    shown += f" …and {len(roles) - 6} more"
+                out.append(f'| {cls} | {info.get("grants", 0)} '
+                           f'| {info.get("objects", 0)} | {shown or "-"} |')
+            out.append("")
         if by_obj:
             out += ["| Object | Roles |", "|---|---|"]
             for ident, entries in sorted(by_obj.items()):

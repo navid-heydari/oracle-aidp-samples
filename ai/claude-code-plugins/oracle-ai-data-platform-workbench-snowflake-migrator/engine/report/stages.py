@@ -43,8 +43,9 @@ STAGES: tuple[dict, ...] = (
      "purpose": "clustering, retention and churn — who inherits OPTIMIZE/VACUUM"},
     {"stage": "security", "needs": "Snowflake", "writes": False,
      "artifact": "security.json",
-     "purpose": "masking/row-access policies, secure views, grants — what "
-                "arrives unprotected"},
+     "purpose": "masking/row-access/aggregation/projection policies, tag "
+                "attachments, secure views, grants — what arrives "
+                "unprotected"},
     {"stage": "compute", "needs": "Snowflake", "writes": False,
      "artifact": "compute.json",
      "purpose": "warehouse-to-cluster sizing proposal"},
@@ -185,10 +186,19 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
                     'attachment UNCONFIRMED (ACCOUNT_USAGE.POLICY_REFERENCES '
                     'lags ~2 h)**', True)
         pol = data.get("policies") or {}
-        if any(not (pol.get(k) or {}).get("readable", True)
-               for k in ("masking", "row_access")):
-            return (text + '; **policy objects could not be enumerated — '
-                    'empty attachment list uncorroborated**', True)
+        denied = [k for k in ("masking", "row_access", "aggregation",
+                              "projection")
+                  if not (pol.get(k) or {}).get("readable", True)]
+        if denied:
+            return (text + f'; **{", ".join(denied)} policy objects could not '
+                    'be enumerated — empty attachment list uncorroborated**',
+                    True)
+        # Tag attachments are a separate ACCOUNT_USAGE view with the same
+        # failure mode: unreadable is UNKNOWN, never "no tags attached".
+        tags = data.get("tag_references")
+        if tags is not None and not tags.get("measured", True):
+            return (text + '; **tag attachments unreadable — classification '
+                    'UNKNOWN, not zero**', True)
         return (text, bool(count or secure))
 
     if stage == "compute":

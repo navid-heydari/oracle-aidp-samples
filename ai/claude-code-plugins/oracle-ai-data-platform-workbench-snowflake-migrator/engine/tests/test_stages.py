@@ -407,3 +407,59 @@ def test_enumerated_and_unattached_policies_read_clean(tmp_path):
                          "tags": {"count": 0, "readable": True}}})
     sec = _row(tmp_path, "security")
     assert sec["attention"] is False
+
+
+def test_an_unenumerable_aggregation_policy_is_flagged(tmp_path):
+    # The kind that used to be missing entirely: a denied SHOW AGGREGATION
+    # POLICIES must reach the board, or the row reads clean about a question
+    # nobody asked.
+    _write(tmp_path, "security.json",
+           {"exposure_count": 0, "secure_views": [], "grants": {},
+            "policies": {"masking": {"count": 0, "readable": True},
+                         "row_access": {"count": 0, "readable": True},
+                         "aggregation": {"count": None, "readable": False},
+                         "projection": {"count": 0, "readable": True},
+                         "tags": {"count": 0, "readable": True}}})
+    sec = _row(tmp_path, "security")
+    assert sec["attention"] is True
+    assert "could not be enumerated" in sec["found"].lower(), sec["found"]
+
+
+def test_an_unenumerable_projection_policy_is_flagged(tmp_path):
+    _write(tmp_path, "security.json",
+           {"exposure_count": 0, "secure_views": [], "grants": {},
+            "policies": {"masking": {"count": 0, "readable": True},
+                         "row_access": {"count": 0, "readable": True},
+                         "aggregation": {"count": 0, "readable": True},
+                         "projection": {"count": None, "readable": False},
+                         "tags": {"count": 0, "readable": True}}})
+    sec = _row(tmp_path, "security")
+    assert sec["attention"] is True
+
+
+def test_unreadable_tag_attachments_are_flagged_rather_than_read_as_none(tmp_path):
+    _write(tmp_path, "security.json",
+           {"exposure_count": 0, "secure_views": [], "grants": {},
+            "policies": {"masking": {"count": 0, "readable": True},
+                         "row_access": {"count": 0, "readable": True},
+                         "aggregation": {"count": 0, "readable": True},
+                         "projection": {"count": 0, "readable": True},
+                         "tags": {"count": 0, "readable": True}},
+            "tag_references": {"measured": False, "count": None}})
+    sec = _row(tmp_path, "security")
+    assert sec["attention"] is True
+    assert "tag attachment" in sec["found"].lower(), sec["found"]
+
+
+def test_all_four_policy_kinds_enumerated_and_clean_reads_clean(tmp_path):
+    _write(tmp_path, "security.json",
+           {"exposure_count": 0, "secure_views": [], "grants": {},
+            "policies_defined_without_attachment": 0,
+            "policies": {"masking": {"count": 0, "readable": True},
+                         "row_access": {"count": 0, "readable": True},
+                         "aggregation": {"count": 0, "readable": True},
+                         "projection": {"count": 0, "readable": True},
+                         "tags": {"count": 0, "readable": True}},
+            "tag_references": {"measured": True, "count": 0}})
+    sec = _row(tmp_path, "security")
+    assert sec["attention"] is False

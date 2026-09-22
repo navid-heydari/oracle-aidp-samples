@@ -181,9 +181,28 @@ _POLICY_REFS = [
 
 _GRANTS = [
     {"NAME": "ORDERS", "TABLE_SCHEMA": "SALES", "DATABASE_NAME": "SNOWDEMO",
+     "GRANTED_ON": "TABLE",
      "PRIVILEGE": "SELECT", "GRANTEE_NAME": "ANALYST_ROLE", "GRANTS": 1},
     {"NAME": "CUSTOMERS", "TABLE_SCHEMA": "SALES", "DATABASE_NAME": "SNOWDEMO",
+     "GRANTED_ON": "TABLE",
      "PRIVILEGE": "SELECT", "GRANTEE_NAME": "ANALYST_ROLE", "GRANTS": 1},
+    # Grants the old three-class read never saw: on a schema, and on a
+    # warehouse (which has no database at all).
+    {"NAME": "SALES", "TABLE_SCHEMA": None, "DATABASE_NAME": "SNOWDEMO",
+     "GRANTED_ON": "SCHEMA",
+     "PRIVILEGE": "USAGE", "GRANTEE_NAME": "ANALYST_ROLE", "GRANTS": 1},
+    {"NAME": "ANALYTICS_WH", "TABLE_SCHEMA": None, "DATABASE_NAME": None,
+     "GRANTED_ON": "WAREHOUSE",
+     "PRIVILEGE": "USAGE", "GRANTEE_NAME": "ANALYST_ROLE", "GRANTS": 1},
+]
+
+# One tag attachment, so the demo's SECURITY.md teaches that a classification
+# does not travel: PII on the e-mail column of a migrated table.
+_TAG_REFS = [
+    {"TAG_DATABASE": "SNOWDEMO", "TAG_SCHEMA": "SALES", "TAG_NAME": "PII",
+     "TAG_VALUE": "EMAIL", "OBJECT_DATABASE": "SNOWDEMO",
+     "OBJECT_SCHEMA": "SALES", "OBJECT_NAME": "CUSTOMERS",
+     "COLUMN_NAME": "EMAIL", "DOMAIN": "COLUMN"},
 ]
 
 _CLUSTERING_HISTORY = [
@@ -290,8 +309,13 @@ def demo_run_sql(sql: str, params: dict | None = None) -> list[dict]:
                  "schema_name": "SALES", "kind": "MASKING_POLICY"}]
     if "show row access policies" in flat:
         return []
+    # Enumerated, and empty: the report may say so because it asked.
+    if "show aggregation policies" in flat or "show projection policies" in flat:
+        return []
     if "show tags" in flat:
         return [dict(r) for r in _TAGS]
+    if "tag_references" in flat:
+        return [dict(r) for r in _TAG_REFS]
     if "policy_references" in flat:
         return [dict(r) for r in _POLICY_REFS]
     if "grants_to_roles" in flat:

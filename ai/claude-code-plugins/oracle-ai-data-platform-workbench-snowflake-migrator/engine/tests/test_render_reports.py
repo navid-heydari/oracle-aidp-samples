@@ -584,3 +584,85 @@ def test_a_plan_without_the_note_keeps_the_legacy_two_lines():
     section = _structure_section(render_planned_objects(plan))
     assert "create these" in section
     assert "Schemas the clone will create: `D.PUBLIC`" in section
+
+
+# --------------------------------------------------------------------------
+# SECURITY.md: the policy-object table, tag attachments and grant classes.
+# I3 again -- a kind nobody asked for and a kind the role cannot see are two
+# different cells, and neither of them is a zero.
+# --------------------------------------------------------------------------
+
+def _all_kinds(**over):
+    base = {"masking": {"count": 0, "readable": True, "note": ""},
+            "row_access": {"count": 0, "readable": True, "note": ""},
+            "aggregation": {"count": 0, "readable": True, "note": ""},
+            "projection": {"count": 0, "readable": True, "note": ""},
+            "tags": {"count": 0, "readable": True, "note": ""}}
+    base.update(over)
+    return base
+
+
+def test_security_report_lists_aggregation_and_projection_policy_objects():
+    from report.render import render_security
+    md = render_security(_security(policies=_all_kinds(
+        projection={"count": 2, "readable": True, "note": ""})))
+    assert "| Aggregation |" in md
+    assert "| Projection | 2" in md
+
+
+def test_security_report_shows_a_denied_kind_as_not_visible_not_zero():
+    from report.render import render_security
+    md = render_security(_security(policies=_all_kinds(
+        aggregation={"count": None, "readable": False, "note": "denied"})))
+    assert "not visible to this role" in md
+    assert "| Aggregation | 0" not in md
+
+
+def test_security_report_says_when_a_kind_was_never_enumerated():
+    # _security()'s payload predates aggregation/projection enumeration, so
+    # the report must say those kinds were never asked for rather than
+    # leaving the reader to assume they were covered.
+    from report.render import render_security
+    md = render_security(_security())
+    assert "not enumerated" in md
+    assert "never asked for" in md
+
+
+def test_security_report_lists_tag_attachments():
+    from report.render import render_security
+    md = render_security(_security(tag_references={
+        "measured": True, "count": 1, "out_of_scope": 0, "carried_over": False,
+        "source": "SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES (lags up to ~2 "
+                  "hours behind DDL)",
+        "attachments": [{"object": "DB.SC.CUSTOMERS", "column": "EMAIL",
+                         "domain": "COLUMN", "tag": "DB.SC.PII",
+                         "value": "HIGH",
+                         "consequence": "the tag does not travel",
+                         "aidp_path": "ontology sensitivity classification"}]}))
+    assert "Tag attachments" in md
+    assert "DB.SC.PII" in md and "DB.SC.CUSTOMERS" in md
+    assert "lags up to ~2 hours" in md
+
+
+def test_security_report_never_reports_zero_tag_attachments_when_unreadable():
+    from report.render import render_security
+    md = render_security(_security(tag_references={
+        "measured": False, "count": None, "attachments": [],
+        "out_of_scope": 0, "carried_over": False,
+        "source": "SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES",
+        "note": "Insufficient privileges"}))
+    assert "Tag attachments" in md
+    assert "Not measured" in md
+    assert "0 tag attachment" not in md
+
+
+def test_security_report_names_the_grant_classes_it_covered():
+    from report.render import render_security
+    md = render_security(_security(grants={
+        "measured": True, "by_object": {}, "carried_over": False,
+        "classes_requested": ["TABLE", "VIEW", "SCHEMA", "WAREHOUSE"],
+        "by_class": {"SCHEMA": {"grants": 2, "roles": ["LOADER"],
+                                "objects": 1}},
+        "out_of_scope": 0, "note": "0 in-scope object(s)"}))
+    assert "SCHEMA" in md and "WAREHOUSE" in md
+    assert "No grant is replayed" in md
