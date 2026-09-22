@@ -604,6 +604,30 @@ on its first colon, which is how the file passed before.
   always read and reports the distinction as *not distinguishable*, never as
   none. Every new read is a `SHOW` or a `SELECT`; the transport is unchanged.
 
+### Fixed — a diagnosis that generalised from the wrong kind of object
+
+- The probe that tells a burned name from a bad request always created a
+  TABLE. Live 2026-09-22, four `create view` calls failed on a catalog where
+  every view create returned 500; the table probe landed, and its success was
+  read as *"the schema and your request are both fine"* about the views. A
+  table landing says nothing about whether a view can be created there.
+- The probe is now of the same kind as the object that failed, the verdict is
+  cached per schema **and** kind, and the probe record says which kind it
+  was. `delete_view` exists so a view probe cleans up after itself.
+
+### Added — a 4xx is taken at its word, a 5xx is investigated
+
+- A client error carries the reason and the fix (`Invalid name: ... Only
+  lower-case characters, numbers and underscores are allowed`), so it is
+  reported as-is and costs no probe.
+- A server error carries nothing, and the operator's next move turns on
+  something it does not say: was THIS object rejected, or can this catalog
+  not perform this operation at all? One probe per schema and kind answers
+  it, and the report says which: *"this catalog CAN create a view, so the
+  error is about this object"*, or *"this catalog cannot create a view
+  through the catalog API at all -- nothing here will succeed on a retry or
+  in a fresh schema; create the structure on AIDP compute instead"*.
+
 ### Fixed — a create the target refused, reported as a burned name
 
 - Live 2026-09-22: AIDP answered one create with 400 `Invalid name` and four

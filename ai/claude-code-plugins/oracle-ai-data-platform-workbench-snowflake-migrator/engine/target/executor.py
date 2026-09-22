@@ -241,6 +241,15 @@ def _build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
                 "--target-uri", f"{_endpoint(target)}/dataLakes/"
                                 f"{target.datalake_ocid}/tables/{key}"]
 
+    if operation == "delete_view":
+        key = f'{kwargs["catalog"]}.{kwargs["schema"]}.{kwargs["view"]}'
+        if backend == "aidp_cli":
+            return ["aidp", "schema", "delete-view", "--instance-id",
+                    target.datalake_ocid, "--key", key]
+        return ["oci", "raw-request", "--http-method", "DELETE",
+                "--target-uri", f"{_endpoint(target)}/dataLakes/"
+                                f"{target.datalake_ocid}/views/{key}"]
+
     if operation == "delete_schema":
         key = f'{kwargs["catalog"]}.{kwargs["schema"]}'
         if backend == "aidp_cli":

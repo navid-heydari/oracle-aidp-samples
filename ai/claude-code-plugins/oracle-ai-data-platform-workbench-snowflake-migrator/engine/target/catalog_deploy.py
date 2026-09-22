@@ -173,9 +173,30 @@ def _is_narrowing(declared: str, derived: str) -> bool:
     return False
 
 
+def _is_client_error(exc) -> bool:
+    """Did the target explain what was wrong with this request?
+
+    A 4xx carries the reason and the fix -- `Invalid name: ... Only
+    lower-case characters, numbers and underscores are allowed` needs no
+    investigation. A 5xx carries nothing, and the next move depends on
+    whether this object was rejected or the whole operation is unavailable
+    here, which only a probe can tell apart.
+    """
+    text = str(exc)
+    return any(f" {code}" in f" {text}" for code in (
+        "400", "401", "403", "404", "409", "422"))
+
+
 def _diagnose_never_appeared(call, catalog: str, schema_key: str,
-                             probes: list | None = None) -> bool:
+                             probes: list | None = None, *,
+                             is_view: bool = False) -> bool:
     """Is this schema refusing OUR names, or refusing everything?
+
+    The probe is of the SAME KIND as the object that failed. Live
+    2026-09-22, a table probe landed in a schema where every `create view`
+    returned 500, and its success was read as "the schema and your request
+    are both fine" about the views. A table says nothing about whether this
+    catalog can create a view.
 
     A failed create permanently poisons that name in that schema -- every
     later create returns 202 and is silently dropped, and DELETE does not
@@ -190,17 +211,22 @@ def _diagnose_never_appeared(call, catalog: str, schema_key: str,
     per run -- a fixed probe name would burn itself on its first failure.
     """
     probe = f"snowmig_probe_{uuid.uuid4().hex[:8]}"
+    schema = schema_key.split(".", 1)[-1]
+    columns = [{"name": "probe", "type": "STRING"}]
     try:
-        call("create_table", catalog=catalog, schema=schema_key.split(".", 1)[-1],
-             table=probe,
-             body=build_table_body(catalog, schema_key.split(".", 1)[-1], probe,
-                                   [{"name": "probe", "type": "STRING"}]))
+        if is_view:
+            call("create_view", catalog=catalog, schema=schema, view=probe,
+                 body=build_view_body(catalog, schema, probe,
+                                      "select 'probe' as probe", columns))
+        else:
+            call("create_table", catalog=catalog, schema=schema, table=probe,
+                 body=build_table_body(catalog, schema, probe, columns))
     except Exception:
         return False
 
     try:
         landed = _resolve_object(call, catalog, schema_key, probe,
-                                 False) is not None
+                                 is_view) is not None
         list_error = None
     except Exception as exc:
         # Could not look. The probe may well exist, so the delete is
@@ -210,13 +236,17 @@ def _diagnose_never_appeared(call, catalog: str, schema_key: str,
     deleted = False
     if landed is not False:
         try:
-            call("delete_table", catalog=catalog,
-                 schema=schema_key.split(".", 1)[-1], table=probe)
+            if is_view:
+                call("delete_view", catalog=catalog, schema=schema, view=probe)
+            else:
+                call("delete_table", catalog=catalog, schema=schema,
+                     table=probe)
             deleted = True
         except Exception:
             deleted = False
     if probes is not None:
         entry = {"name": probe, "schema": schema_key,
+                 "kind": "VIEW" if is_view else "TABLE",
                  "created": landed, "deleted": deleted,
                  "note": ("removed" if deleted else
                           "NOT removed — deletes are asynchronous and "
@@ -610,19 +640,54 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                     f"was written.")})
             continue
         if listed is None and not accepted:
-            # The target REFUSED this create and said why. That answer is
-            # about this request, and it outranks any inference drawn from
-            # another object's success: no probe is run, the name is not
-            # called burned, and the operator is pointed at the response.
+            # The target REFUSED this create. That answer is about this
+            # request and outranks any inference from another object's
+            # success, so the name is never called burned here.
+            kind = "view" if is_view else "table"
+            reason = (
+                f"the create was REFUSED by the target and the object does "
+                f"not exist: {str(create_error)[:300]}. ")
+            if _is_client_error(create_error):
+                reason += (
+                    "The target named what was wrong with this request, so "
+                    "the name is not burned and a fresh schema would not "
+                    "help -- fix what the message says, or exclude the "
+                    "object, and re-run.")
+            else:
+                # A server error says nothing about which of the two it is,
+                # and the operator's next move differs completely. One probe
+                # per schema and kind answers it.
+                probe_key = (schema_key, bool(is_view))
+                if diagnose and probe_key not in diagnosed:
+                    diagnosed[probe_key] = _diagnose_never_appeared(
+                        call, catalog, schema_key, out["diagnosis_probes"],
+                        is_view=is_view)
+                verdict = diagnosed.get(probe_key)
+                if verdict is True:
+                    reason += (
+                        f"A trivial {kind} with a novel name was created in "
+                        f"{schema_key} straight afterwards, so this catalog "
+                        f"CAN create a {kind} and the server error is about "
+                        f"THIS object -- its SQL or one of its column types. "
+                        f"The name is not burned.")
+                elif verdict is False:
+                    reason += (
+                        f"A trivial {kind} with a novel name failed in "
+                        f"{schema_key} too, so this is not about your object: "
+                        f"**this catalog cannot create a {kind} through the "
+                        f"catalog API at all.** Nothing here will succeed on "
+                        f"a retry or in a fresh schema. Create the structure "
+                        f"on AIDP compute instead -- `provision` + `run` -- "
+                        f"or raise the server error with the platform.")
+                else:
+                    reason += (
+                        f"The server gave no detail and the {kind} probe "
+                        f"could not be read back, so whether this catalog "
+                        f"can create a {kind} at all is unknown.")
             out["failed_targets"].append(ident)
             out["failed"].append({
                 "source_identifier": ident, "target_fqn": stmt["target_fqn"],
-                "reason": (
-                    f"the create was REFUSED by the target and the object "
-                    f"does not exist: {str(create_error)[:300]}. This is the "
-                    f"target's answer about this request, so the name is not "
-                    f"burned and a fresh schema would not help -- fix what "
-                    f"the message names, or exclude the object, and re-run.")})
+                "reason": reason})
             continue
         if listed is None:
             base = (f"the create returned 202 Accepted but no object matching "
@@ -630,15 +695,22 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                     f"create reported nothing. ")
             # Ask the schema whether it is refusing OUR name or everything.
             # Once per schema: the answer is a property of the schema.
-            if diagnose and schema_key not in diagnosed:
-                diagnosed[schema_key] = _diagnose_never_appeared(
-                    call, catalog, schema_key, out["diagnosis_probes"])
-            verdict = diagnosed.get(schema_key)
+            # Keyed by kind as well as schema: "a table lands here" and
+            # "a view lands here" are different facts, and only the matching
+            # one can speak for this object.
+            probe_key = (schema_key, bool(is_view))
+            if diagnose and probe_key not in diagnosed:
+                diagnosed[probe_key] = _diagnose_never_appeared(
+                    call, catalog, schema_key, out["diagnosis_probes"],
+                    is_view=is_view)
+            verdict = diagnosed.get(probe_key)
 
             if verdict is True:
                 out["poisoned_names"].append(stmt["target_fqn"])
+                kind = "view" if is_view else "table"
                 reason = base + (
-                    f"A NOVEL name in {schema_key} was created successfully, "
+                    f"A NOVEL {kind} name in {schema_key} was created "
+                    f"successfully, "
                     f"so the schema and your request are both fine and this "
                     f"NAME IS BURNED: a create that failed here once is "
                     f"refused for ever after, and DELETE does not recover it. "
@@ -646,7 +718,8 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                     f"will keep returning 202 and keep creating nothing.")
             elif verdict is False:
                 reason = base + (
-                    "A novel name in the same schema failed too, so this is "
+                    f'A novel {"view" if is_view else "table"} name in the '
+                    "same schema failed too, so this is "
                     "not a burned name: suspect the request itself (an "
                     "unsupported field type is the usual cause) or the "
                     "permissions on this catalog.")

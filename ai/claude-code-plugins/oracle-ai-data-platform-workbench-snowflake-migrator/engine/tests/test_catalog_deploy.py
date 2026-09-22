@@ -1053,3 +1053,133 @@ def test_an_accepted_create_that_vanishes_is_still_a_burned_name():
     assert "202 Accepted" in reason
     assert "BURNED" in reason
     assert out["poisoned_names"] == ["lake.DB.T0"]
+
+
+# ------------------------------- the diagnosis probe must be of the kind
+#                                 that failed
+#
+# Live 2026-09-22: four `create view` calls failed on a DataLake where every
+# view create returned 500. The probe created a TABLE, it landed, and the
+# verdict "a NOVEL name in this schema was created successfully, so the
+# schema and your request are both fine" was applied to the views. A table
+# landing says nothing about whether a view can be created here.
+
+class ViewsVanish(Recorder):
+    """Tables work. Views are accepted and never appear -- including the
+    probe, which is what a catalog that cannot make views looks like."""
+
+    def __call__(self, operation, **kw):
+        if operation in ("create_view", "list_views_in", "delete_view"):
+            self.ops.append((operation, kw))    # record, like the base does
+            return {"items": []} if operation == "list_views_in" else {
+                "key": "accepted"}
+        return super().__call__(operation, **kw)
+
+
+def _one_view_plan():
+    return {"statements": [
+        {"source_identifier": "DB.PUBLIC.V0", "object_type": "VIEW",
+         "target_fqn": "lake.DB.V0", "sql": "CREATE VIEW ...",
+         "view_text": "select 1 as a",
+         "expected_columns": [{"name": "A", "type": "STRING"}]}],
+        "blocked": []}
+
+
+def test_a_failed_view_is_probed_with_a_view():
+    rec = ViewsVanish()
+    deploy_catalog(_one_view_plan(), target=TARGET, execute=True, call=rec,
+                   retry_delays=(), verify_delays=())
+    probes = [kw for op, kw in rec.ops if op == "create_view"
+              and str(kw.get("view", "")).startswith("snowmig_probe")]
+    assert probes, "the probe for a failed view has to be a view"
+    assert not [kw for op, kw in rec.ops if op == "create_table"
+                and str(kw.get("table", "")).startswith("snowmig_probe")]
+
+
+def test_a_catalog_that_cannot_make_views_is_not_a_burned_name():
+    out = deploy_catalog(_one_view_plan(), target=TARGET, execute=True,
+                         call=ViewsVanish(), retry_delays=(), verify_delays=())
+    reason = out["failed"][0]["reason"]
+    assert "BURNED" not in reason, reason
+    assert "novel view name" in reason.lower()
+    assert out["poisoned_names"] == []
+
+
+def test_the_probe_records_which_kind_it_was():
+    out = deploy_catalog(_one_view_plan(), target=TARGET, execute=True,
+                         call=ViewsVanish(), retry_delays=(), verify_delays=())
+    assert out["diagnosis_probes"][0]["kind"] == "VIEW"
+
+
+def test_a_failed_table_is_still_probed_with_a_table():
+    class TablesVanish(Recorder):
+        def __call__(self, operation, **kw):
+            if operation == "create_table" and kw.get("table") == "T0":
+                return {"key": "accepted"}
+            return super().__call__(operation, **kw)
+
+    rec = TablesVanish()
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=rec,
+                         retry_delays=(), verify_delays=())
+    assert out["diagnosis_probes"][0]["kind"] == "TABLE"
+    assert "BURNED" in out["failed"][0]["reason"]
+    assert out["poisoned_names"] == ["lake.DB.T0"]
+
+
+# ------------------------- a 4xx explains itself; a 5xx needs the probe
+#
+# Live 2026-09-22: `create table mixed case table` returned 400 with the rule
+# it broke -- nothing to investigate. Four `create view` calls returned 500
+# `InternalError` with no detail, where the operator's next move depends
+# entirely on something the message does not say: was THIS view rejected, or
+# can this catalog not create a view at all? On that DataLake it was the
+# second, and the answer changes the plan from "fix the SQL" to "create the
+# structure on compute instead".
+
+def test_a_client_error_is_taken_at_its_word_and_costs_no_probe():
+    rec = Refusing(refuse=("T0",),
+                   message="400 Bad Request: Invalid name: mixed case table")
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=rec,
+                         retry_delays=(), verify_delays=())
+    assert out["diagnosis_probes"] == []
+    reason = out["failed"][0]["reason"]
+    assert "Invalid name" in reason
+    assert "named what was wrong" in reason
+
+
+def test_a_server_error_is_probed_because_it_explains_nothing():
+    rec = Refusing(refuse=("T0",), message="500 Server Error: InternalError")
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=rec,
+                         retry_delays=(), verify_delays=())
+    assert out["diagnosis_probes"], "a 5xx leaves the real question open"
+    assert out["diagnosis_probes"][0]["kind"] == "TABLE"
+
+
+def test_a_server_error_with_a_working_probe_points_at_this_object():
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True,
+                         call=Refusing(refuse=("T0",),
+                                       message="500 Server Error: InternalError"),
+                         retry_delays=(), verify_delays=())
+    reason = out["failed"][0]["reason"]
+    assert "about THIS object" in reason
+    assert "not burned" in reason
+
+
+def test_a_catalog_that_refuses_every_view_says_so_and_names_the_way_round():
+    """The live case. Every create_view returns 500, including the probe."""
+    class NoViewsAtAll(Recorder):
+        def __call__(self, operation, **kw):
+            if operation == "create_view":
+                raise RuntimeError("500 Server Error: InternalError")
+            if operation == "list_views_in":
+                return {"items": []}
+            return super().__call__(operation, **kw)
+
+    out = deploy_catalog(_one_view_plan(), target=TARGET, execute=True,
+                         call=NoViewsAtAll(), retry_delays=(),
+                         verify_delays=())
+    reason = out["failed"][0]["reason"]
+    assert "cannot create a view through the catalog API at all" in reason
+    assert "provision" in reason and "run" in reason
+    assert "fresh schema" in reason.lower()
+    assert out["poisoned_names"] == []
