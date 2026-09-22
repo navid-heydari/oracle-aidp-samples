@@ -277,6 +277,28 @@ def demo_run_sql(sql: str, params: dict | None = None) -> list[dict]:
     if ("show materialized views in database" in flat
             or "show dynamic tables in database" in flat):
         return []
+    # One alert, so CENSUS.md teaches the lesson it can now teach: an alert
+    # that watched a migrated table stops firing at cutover, unannounced.
+    if "show alerts in database" in flat:
+        return [{"name": "LOW_STOCK_ALERT", "database_name": DEMO_DB,
+                 "schema_name": "SALES", "state": "started",
+                 "condition": "select 1 from SNOWDEMO.SALES.ORDERS"}]
+    if ("show secrets in database" in flat
+            or "show network rules in database" in flat
+            or "show streamlits in database" in flat
+            or "show notebooks in database" in flat
+            or "show services in database" in flat):
+        return []
+    # Account-scoped reads, issued once per run. One outbound share: a live
+    # contract with a consumer account, which finds out at cutover.
+    if flat.startswith("show shares"):
+        return [{"name": "SNOWDEMO_SALES_SHARE", "kind": "OUTBOUND",
+                 "database_name": DEMO_DB, "to": "PARTNER_ACCOUNT",
+                 "owner": "ACCOUNTADMIN"}]
+    if (flat.startswith("show roles") or flat.startswith("show network policies")
+            or flat.startswith("show applications")
+            or flat.startswith("show compute pools")):
+        return []
 
     # --- lineage / compute / security / maintenance ------------------------
     if "object_dependencies" in flat:

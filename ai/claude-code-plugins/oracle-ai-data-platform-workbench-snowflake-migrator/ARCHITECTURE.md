@@ -178,7 +178,11 @@ because it is not evidence either way.
 **I3 — "Could not look" never renders as zero.** An unreadable `ACCOUNT_USAGE`
 reports `measured: false` with null counts, because *0 reclustering credits*
 and *we could not check* lead to opposite decisions. Same for unreadable
-scopes in the census and unresolvable policy references.
+scopes in the census and unresolvable policy references. There is a third
+state between counted and unreadable: *not distinguishable*, when rows were
+read and counted under their parent kind but the column that tells a UDTF
+from a UDF, or an external stage from an internal one, could not be read.
+That is reported as such, never folded into either neighbour.
 
 **I4 — Refuse rather than guess.** An unmappable type, an unknown OCI region,
 a `LISTAGG … WITHIN GROUP`, a `::` cast over an expression: all raise. A

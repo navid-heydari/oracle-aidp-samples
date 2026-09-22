@@ -524,8 +524,12 @@ can address a field inside the value.
 
 ## What is not a table or a view
 
-`assess` also censuses procedures, UDFs, tasks, streams, materialized and
-dynamic tables, stages, pipes, sequences and file formats → `CENSUS.md`.
+`assess` also censuses procedures, UDFs and UDTFs, external functions, tasks,
+streams, alerts, materialized and dynamic tables, stages (internal and
+external, told apart), pipes, sequences, file formats, secrets, network
+rules, Streamlit apps, notebooks and container services per database, and
+the account's shares, roles, network policies, applications and compute
+pools once per run → `CENSUS.md`.
 **None of them migrate**, and no equivalent is generated — a
 plausible-but-wrong procedure translation is worse than an honest gap. The
 scope statement travels into `PLANNED_OBJECTS.md` and `SUMMARY.md`, so the
