@@ -557,6 +557,23 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
                 for u in res["unverified_structure"]]
         out.append("")
 
+    if res.get("properties_not_applied"):
+        out += ["## Properties this transport cannot carry", "",
+                "The reviewed DDL declares these. The catalog API body has no "
+                "field for them, so the objects were created without them; the "
+                "plan names the same gap per object (rule R21).", ""]
+        out += [f'- `{p["target_fqn"]}` — {p["property"]}: {p["reason"]}'
+                for p in res["properties_not_applied"]]
+        out.append("")
+
+    if res.get("description_drift"):
+        out += ["## Descriptions the target dropped", "",
+                "The structure matches the plan; the documentation the plan "
+                "showed did not survive the create.", ""]
+        out += [f'- `{d["target_fqn"]}` — {d["reason"]}'
+                for d in res["description_drift"]]
+        out.append("")
+
     if res.get("failed"):
         out += ["## Failed verification", ""]
         out += [f'- `{f["target_fqn"]}` — {f["reason"]}' for f in res["failed"]]

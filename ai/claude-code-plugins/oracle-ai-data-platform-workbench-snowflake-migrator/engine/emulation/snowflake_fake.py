@@ -308,6 +308,15 @@ def demo_run_sql(sql: str, params: dict | None = None) -> list[dict]:
             or "show notebooks in database" in flat
             or "show services in database" in flat):
         return []
+    # Constraints: one primary key, so DDL_PLAN.md's R20 names a real one.
+    if "show primary keys in database" in flat:
+        return [{"database_name": DEMO_DB, "schema_name": "SALES",
+                 "table_name": "ORDERS", "column_name": "ORDER_ID",
+                 "key_sequence": 1, "constraint_name": "ORDERS_PK",
+                 "rely": "false"}]
+    if ("show unique keys in database" in flat
+            or "show imported keys in database" in flat):
+        return []
     # Account-scoped reads, issued once per run. One outbound share: a live
     # contract with a consumer account, which finds out at cutover.
     if flat.startswith("show shares"):

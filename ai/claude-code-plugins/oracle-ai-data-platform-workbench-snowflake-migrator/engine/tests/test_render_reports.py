@@ -670,3 +670,42 @@ def test_security_report_names_the_grant_classes_it_covered():
         "out_of_scope": 0, "note": "0 in-scope object(s)"}))
     assert "SCHEMA" in md and "WAREHOUSE" in md
     assert "No grant is replayed" in md
+
+
+# --- the deploy report says what the deploy result records ---------------
+# catalog_deploy records a NOT NULL the catalog API cannot carry and a
+# COMMENT the target dropped; the summary used to print neither, so the
+# operator read "verified" and nothing else.
+
+_DEPLOYED = {"dry_run": False, "statement_count": 1, "executed": 1, "verified": 1,
+             "failed": [], "chunk_errors": [], "blocked_count": 0,
+             "catalog_in_scope": "D", "out_of_scope_count": 0,
+             "out_of_scope_catalogs": []}
+
+
+def test_soft_clone_summary_names_the_properties_the_api_cannot_carry():
+    md = render_soft_clone_summary(PLAN, {
+        **_DEPLOYED,
+        "properties_not_applied": [{
+            "source_identifier": "D.PUBLIC.ORDERS", "target_fqn": "d.public.orders",
+            "property": "NOT NULL", "columns": ["ORDER_ID"],
+            "reason": "ORDER_ID are NOT NULL in the reviewed plan and are "
+                      "created NULLABLE here: the field entry has no nullability key"}]})
+    assert "## Properties this transport cannot carry" in md
+    assert "`d.public.orders` — NOT NULL:" in md and "R21" in md
+
+
+def test_soft_clone_summary_names_a_dropped_description():
+    md = render_soft_clone_summary(PLAN, {
+        **_DEPLOYED,
+        "description_drift": [{
+            "source_identifier": "D.PUBLIC.ORDERS", "target_fqn": "d.public.orders",
+            "reason": "created with the planned columns, but table COMMENT: "
+                      "planned 'orders' found ''."}]})
+    assert "## Descriptions the target dropped" in md
+    assert "`d.public.orders`" in md and "table COMMENT" in md
+
+
+def test_soft_clone_summary_is_silent_when_nothing_was_dropped():
+    md = render_soft_clone_summary(PLAN, dict(_DEPLOYED))
+    assert "cannot carry" not in md and "Descriptions the target dropped" not in md
