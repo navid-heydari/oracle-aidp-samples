@@ -28,6 +28,18 @@ def _responses(**over):
         "show streams": [],
         "show materialized views": [],
         "show dynamic tables": [],
+        "show alerts": [],
+        "show secrets": [],
+        "show network rules": [],
+        "show streamlits": [],
+        "show notebooks": [],
+        "show services": [],
+        # Account-scoped: read once for the account, not once per database.
+        "show shares": [],
+        "show roles": [],
+        "show network policies": [],
+        "show applications": [],
+        "show compute pools": [],
     }
     empty.update(over)
     return empty
@@ -88,8 +100,13 @@ def test_nothing_in_the_census_is_ever_marked_migratable():
 
 
 def test_every_declared_kind_appears_in_the_summary_even_at_zero():
+    # Including the sub-kinds a single read splits into: a UDTF and an
+    # external function come out of the FUNCTIONS read, and a kind that is
+    # only ever reported inside another one is a kind nobody can count.
     c = build_census(FakeSql(_responses()), ["DB"])
-    assert set(c["kinds"]) == {k["kind"] for k in KINDS}
+    declared = {k["kind"] for k in KINDS}
+    declared |= {s for k in KINDS for s in (k.get("sub_kinds") or ())}
+    assert set(c["kinds"]) == declared
 
 
 # ------------------------------------------------------------ language triage

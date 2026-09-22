@@ -401,7 +401,11 @@ def test_planned_objects_with_an_empty_census_carries_the_visibility_caveat():
              "information_schema.sequences": [], "information_schema.stages": [],
              "information_schema.file_formats": [], "information_schema.pipes": [],
              "show tasks": [], "show streams": [], "show materialized views": [],
-             "show dynamic tables": []}
+             "show dynamic tables": [], "show alerts": [], "show secrets": [],
+             "show network rules": [], "show streamlits": [],
+             "show notebooks": [], "show services": [], "show shares": [],
+             "show roles": [], "show network policies": [],
+             "show applications": [], "show compute pools": []}
     plan = dict(PLAN)
     plan["census"] = build_census(FakeSql(empty), ["DB"], role="R")
     md = render_planned_objects(plan)
