@@ -442,13 +442,33 @@ def _visibility_note(role: str | None) -> str:
 
 
 def _summary(count: int, readable: bool, scope: str, note: str,
-             role: str | None) -> dict:
-    """One row of the counts table. `count` is None whenever nobody looked."""
+             role: str | None, *, denied: list[str] | None = None,
+             answered: int = 0) -> dict:
+    """One row of the counts table.
+
+    `count` is None only when NOBODY looked. Where some databases answered
+    and others were denied, the count is what was actually seen -- hiding it
+    would contradict the object table it came from -- and the note says which
+    databases are missing from it.
+    """
+    denied = list(denied or [])
+    if denied and answered:
+        return {
+            "count": count,
+            "readable": False,
+            "unread": "partial",
+            "denied_databases": denied,
+            "scope": scope,
+            "note": (f"{count} found in the database(s) that answered; "
+                     f"not visible to {_role_text(role)} in "
+                     f'{", ".join(denied)}, so this is a lower bound'),
+        }
     if readable and not count:
         note = f"0 visible to {_role_text(role)}; a lower bound, not a total"
     return {"count": count if readable else None,
             "readable": readable,
             "unread": None if readable else "denied",
+            "denied_databases": denied,
             "scope": scope,
             "note": note or f"{count} found"}
 
@@ -474,7 +494,11 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
         scope = spec.get("scope", "database")
         sub_kinds = tuple(spec.get("sub_kinds") or ())
         tally: dict[str, int] = {k: 0 for k in (kind,) + sub_kinds}
-        readable = True
+        # Per database, because a role's privileges are. One denial used to
+        # null the count for the whole kind, including rows already counted
+        # in the databases that did answer.
+        denied: list[str] = []
+        answered = 0
         degraded = False
         note = ""
         # An account-scoped kind is read once. `None` is the "no database"
@@ -488,17 +512,20 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
                 else:
                     rows = _read_show(run_sql, db, spec)
             except Exception as exc:
-                readable = False
+                denied.append(db if db else "account")
                 note = str(exc)[:200]
                 where = f"in {db}" if db else "account-scoped read"
                 notes.append(f"{kind} {where}: {note}")
                 continue
+            answered += 1
             for row in rows:
                 entry = _entry(kind, spec, db, row,
                                include_definitions=include_definitions)
                 objects.append(entry)
                 tally[entry["kind"]] = tally.get(entry["kind"], 0) + 1
-        kinds[kind] = _summary(tally[kind], readable, scope, note, role)
+        readable = not denied
+        kinds[kind] = _summary(tally[kind], readable, scope, note, role,
+                               denied=denied, answered=answered)
         if readable and degraded:
             kinds[kind]["note"] += (
                 f"; the detail columns were not readable, so every row is "
@@ -510,7 +537,8 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
             # the truth is that they are not currently distinguishable.
             kinds[sub] = (
                 _not_distinguishable(kind, scope) if readable and degraded
-                else _summary(tally[sub], readable, scope, note, role))
+                else _summary(tally[sub], readable, scope, note, role,
+                              denied=denied, answered=answered))
 
     by_language = collections.Counter(
         o["language"] for o in objects if o.get("language"))

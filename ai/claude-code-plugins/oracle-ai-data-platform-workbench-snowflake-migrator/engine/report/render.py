@@ -1135,6 +1135,11 @@ def render_census(census: dict) -> str:
             count = info.get("count")
             if info.get("readable"):
                 read = "yes" if count else "yes (0 visible; lower bound)"
+            elif info.get("unread") == "partial":
+                # A real count that is also incomplete. Calling this denied
+                # would contradict the objects listed below it.
+                missing = ", ".join(info.get("denied_databases") or [])
+                read = f"**partial** — denied in {missing}; lower bound"
             elif info.get("unread") == "degraded":
                 # The rows were read and counted under another kind. Saying
                 # "not visible" would be a different, and false, claim.

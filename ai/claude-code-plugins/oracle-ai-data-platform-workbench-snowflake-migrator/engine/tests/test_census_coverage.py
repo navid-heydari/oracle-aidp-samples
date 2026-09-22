@@ -429,3 +429,92 @@ def test_an_external_function_is_recognised_from_a_no_yes_or_y_flag():
     census = build_census(FakeSql(_responses(**{
         "information_schema.functions": [_function("F", external="NO")]})), ["DB"])
     assert census["objects"][0]["kind"] == "FUNCTION"
+
+
+# --------------------------- a kind readable in one database, denied in another
+#
+# Reported by the repo owner on the review PR, and required before merge. The
+# per-kind `readable` flag was one value for the whole run: a kind that answers
+# in DB A and is denied in DB B reported as "not visible to this role" with a
+# null count, while the rows counted in DB A sat in the same report's by_kind
+# and object table. The report contradicted itself, and the count it hid was
+# real.
+#
+# Three states, not two: every database answered; none did; or some did, which
+# is a real number that is also a lower bound, and has to say so.
+
+class _DeniedIn(FakeSql):
+    """Denies one kind in one database, exactly like a mixed-privilege role."""
+
+    def __init__(self, responses, *, database, needle):
+        super().__init__(responses)
+        self.database = database
+        self.needle = needle
+
+    def __call__(self, sql, params=None):
+        flat = " ".join(sql.split()).lower()
+        if self.needle in flat and self.database.lower() in flat:
+            raise RuntimeError(f"Insufficient privileges in {self.database}")
+        return super().__call__(sql, params)
+
+
+def _two_db_tasks():
+    return _responses(**{"show tasks": [
+        {"name": "T", "schema_name": "S", "state": "started"}]})
+
+
+def test_a_kind_denied_in_one_database_still_reports_what_it_counted():
+    census = build_census(
+        _DeniedIn(_two_db_tasks(), database="DB2", needle="show tasks"),
+        ["DB1", "DB2"])
+    info = census["kinds"]["TASK"]
+    assert info["count"] == 1, "DB1 answered and the row is in the report"
+    assert census["by_kind"]["TASK"] == 1
+    assert info["count"] == census["by_kind"]["TASK"], \
+        "the count and the object table may not contradict each other"
+
+
+def test_a_partially_read_kind_says_which_database_was_denied():
+    census = build_census(
+        _DeniedIn(_two_db_tasks(), database="DB2", needle="show tasks"),
+        ["DB1", "DB2"])
+    info = census["kinds"]["TASK"]
+    assert info["unread"] == "partial"
+    assert info["denied_databases"] == ["DB2"]
+    assert "DB2" in info["note"]
+    assert "lower bound" in info["note"].lower()
+
+
+def test_a_kind_denied_everywhere_is_still_not_a_zero():
+    class DeniedAll(FakeSql):
+        def __call__(self, sql, params=None):
+            if "show tasks" in sql.lower():
+                raise RuntimeError("Insufficient privileges")
+            return super().__call__(sql, params)
+
+    census = build_census(DeniedAll(_two_db_tasks()), ["DB1", "DB2"])
+    info = census["kinds"]["TASK"]
+    assert info["count"] is None
+    assert info["readable"] is False
+    assert info["unread"] == "denied"
+
+
+def test_a_kind_readable_everywhere_is_unchanged():
+    census = build_census(FakeSql(_two_db_tasks()), ["DB1", "DB2"])
+    info = census["kinds"]["TASK"]
+    assert info["readable"] is True
+    assert info["unread"] is None
+    assert info["count"] == 2, "one per database"
+
+
+def test_the_report_marks_a_partial_count_rather_than_calling_it_denied():
+    from report.render import render_census
+    census = build_census(
+        _DeniedIn(_two_db_tasks(), database="DB2", needle="show tasks"),
+        ["DB1", "DB2"])
+    md = render_census(census)
+    row = next(line for line in md.splitlines()
+               if line.startswith("| Task "))
+    assert "not visible to this role" not in row, row
+    assert "1" in row
+    assert "partial" in row.lower(), row
