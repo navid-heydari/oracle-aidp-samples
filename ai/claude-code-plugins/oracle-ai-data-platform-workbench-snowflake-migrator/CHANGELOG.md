@@ -604,6 +604,32 @@ on its first colon, which is how the file passed before.
   always read and reports the distinction as *not distinguishable*, never as
   none. Every new read is a `SHOW` or a `SELECT`; the transport is unchanged.
 
+### Fixed — the view reference the target could not resolve
+
+- **Root cause of every failed view create on the live run.** Snowflake's
+  `GET_DDL` writes a view body that references its own schema unqualified --
+  `select ... from ORDERS`. The reference rewriter only ever matched
+  three-part names, so `ORDERS` travelled verbatim into the target, where it
+  means nothing. The AIDP catalog API answered `500 InternalError` with no
+  detail, four times.
+- Proven directly against the DataLake: a view whose body says `from orders`
+  returns 500; the identical view with
+  `from <catalog>.<schema>.orders` is created ACTIVE. So the transport was
+  never the problem and neither was the SQL -- only the reference.
+- A view's unqualified reference resolves in the VIEW'S OWN schema in
+  Snowflake, so the target name is known rather than guessed. One- and
+  two-part references to objects in that schema are now rewritten to the
+  planned target (`R41`). Only for the view's own database and schema: a bare
+  `ORDERS` in a view in SALES cannot mean `MARKETING.ORDERS`, and guessing
+  across schemas is how a view silently reads the wrong table.
+- A bare name is rewritten only where nothing but a table can appear --
+  directly after `FROM` or `JOIN` -- so `select ORDERS from ...` stays the
+  column it is. String literals and comments are masked as before.
+- A reference that is still unqualified afterwards belongs to an object
+  outside this migration, so there is no target name for it. It is named in
+  a warning and in a new rule `R42_VIEW_REFS_UNRESOLVED`, because on the
+  catalog-API transport it is an undetailed 500 later.
+
 ### Fixed — a diagnosis that generalised from the wrong kind of object
 
 - The probe that tells a burned name from a bad request always created a

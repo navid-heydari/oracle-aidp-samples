@@ -5,7 +5,7 @@ from target import ddl
 
 from target.ddl import (
     DEFERRED_EQUIVALENT_PROPERTIES, RewriteResult, SCRUBBED_PROPERTIES, build_create_schema, build_create_table,
-    quote_spark_string,
+    build_create_view, quote_spark_string,
 )
 
 
@@ -455,3 +455,97 @@ def test_a_clone_target_outside_the_waves_but_not_in_a_cycle_is_still_emitted():
     assert "D.S.OK_VW" in [s["source_identifier"] for s in payload["statements"]]
     assert {b["source_identifier"] for b in payload["blocked"]} == {
         "D.S.A_VW", "D.S.B_VW"}
+
+
+# ------------------------------- an unqualified reference the target cannot
+#                                 resolve
+#
+# Live 2026-09-22, root cause of four failed view creates. Snowflake's
+# GET_DDL emits a view body that references its own schema unqualified --
+# `select ... from ORDERS`. The rewriter only ever matched three-part names,
+# so the reference travelled verbatim, and the AIDP catalog API answered
+# `500 InternalError` with no detail. Proven directly against the live
+# DataLake: a view whose body says `from orders` returns 500, and the same
+# view with `from <catalog>.<schema>.orders` is created ACTIVE.
+#
+# In Snowflake a view's unqualified reference resolves in the VIEW'S OWN
+# schema, so the target name is not a guess.
+
+def _view_rec(sql, ident="DB.SALES.V1"):
+    db, schema, _ = ident.split(".")
+    return {"source_identifier": ident, "object_type": "VIEW",
+            "source_database": db, "source_schema": schema,
+            "source_metadata": {}, "view_ddl_get_ddl": sql,
+            "columns": [{"name": "A", "type": "NUMBER"}]}
+
+
+_MAP = {"DB.SALES.V1": "lake.db_sales.v1",
+        "DB.SALES.ORDERS": "lake.db_sales.orders"}
+
+
+def test_an_unqualified_from_is_qualified_to_the_target():
+    res = build_create_view(
+        _view_rec("create view V1 as select A from ORDERS"),
+        "lake.db_sales.v1", _MAP)
+    assert not res.blocked, res.blocked_reason
+    assert "lake.db_sales.orders" in res.sql
+    assert "R41_VIEW_REFS_REWRITTEN" in [r.rule_id for r in res.rules_applied]
+
+
+def test_an_unqualified_join_is_qualified_too():
+    res = build_create_view(
+        _view_rec("create view V1 as select A from ORDERS o "
+                  "join ORDERS p on o.A = p.A"),
+        "lake.db_sales.v1", _MAP)
+    assert res.sql.lower().count("lake.db_sales.orders") == 2
+
+
+def test_a_two_part_reference_is_qualified():
+    res = build_create_view(
+        _view_rec("create view V1 as select A from SALES.ORDERS"),
+        "lake.db_sales.v1", _MAP)
+    assert "lake.db_sales.orders" in res.sql
+    assert "sales.orders" not in res.sql.lower().replace(
+        "lake.db_sales.orders", "")
+
+
+def test_a_column_that_shares_a_table_name_is_not_rewritten():
+    """The whole reason a bare name is only rewritten after FROM or JOIN."""
+    res = build_create_view(
+        _view_rec("create view V1 as select ORDERS from DB.SALES.ORDERS"),
+        "lake.db_sales.v1", _MAP)
+    assert "select ORDERS" in res.sql or "select orders" in res.sql.lower()[:60]
+    assert res.sql.lower().count("lake.db_sales.orders") == 1
+
+
+def test_a_name_inside_a_string_literal_is_left_alone():
+    res = build_create_view(
+        _view_rec("create view V1 as select 'from ORDERS' as note "
+                  "from ORDERS"),
+        "lake.db_sales.v1", _MAP)
+    assert "'from ORDERS'" in res.sql
+    assert res.sql.lower().count("lake.db_sales.orders") == 1
+
+
+def test_a_three_part_reference_still_works():
+    res = build_create_view(
+        _view_rec("create view V1 as select A from DB.SALES.ORDERS"),
+        "lake.db_sales.v1", _MAP)
+    assert "lake.db_sales.orders" in res.sql
+
+
+def test_an_unqualified_reference_with_no_mapping_is_warned_about():
+    """It cannot be qualified -- the object is not in the migration -- and
+    on the catalog-API transport it is what a 500 looks like."""
+    res = build_create_view(
+        _view_rec("create view V1 as select A from SOMETHING_ELSE"),
+        "lake.db_sales.v1", _MAP)
+    assert any("SOMETHING_ELSE" in w for w in res.warnings), res.warnings
+    assert any("unqualified" in w.lower() for w in res.warnings)
+
+
+def test_a_fully_qualified_body_records_no_leftover_warning():
+    res = build_create_view(
+        _view_rec("create view V1 as select A from DB.SALES.ORDERS"),
+        "lake.db_sales.v1", _MAP)
+    assert not [w for w in res.warnings if "unqualified" in w.lower()]

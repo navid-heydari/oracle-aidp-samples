@@ -444,7 +444,35 @@ def _ref_part_pattern(part: str) -> str:
     return f"(?:(?-i:{backticked}|{double_quoted})|{re.escape(part)})"
 
 
-def _rewrite_view_refs(body: str, name_map: dict[str, str]
+# A bare or two-part name may only be read as a table where nothing else
+# can appear. FROM and JOIN are those places in a view body.
+_TABLE_POSITION = r"(?i)\b(from|join)(\s+)"
+
+
+def _context_refs(name_map: dict[str, str], db: str, schema: str
+                  ) -> dict[str, str]:
+    """The one- and two-part forms of every mapped object in this view's own
+    schema, which is where Snowflake resolves an unqualified reference.
+
+    Only for the view's own database and schema: a bare `ORDERS` in a view
+    in SALES cannot mean `MARKETING.ORDERS`, and guessing across schemas is
+    how a view silently reads from the wrong table.
+    """
+    out: dict[str, str] = {}
+    if not db or not schema:
+        return out
+    prefix = f"{db}.{schema}.".upper()
+    for src, tgt in name_map.items():
+        if not src.upper().startswith(prefix):
+            continue
+        name = src.split(".", 2)[2]
+        out[f"{schema}.{name}"] = tgt
+        out[name] = tgt
+    return out
+
+
+def _rewrite_view_refs(body: str, name_map: dict[str, str],
+                       positional: dict[str, str] | None = None
                        ) -> tuple[str, list[str]]:
     """Rewrite whole 3-part object references in `body` per `name_map`.
 
@@ -461,13 +489,27 @@ def _rewrite_view_refs(body: str, name_map: dict[str, str]
         for kind, text in lexer.segments(body))
     edits: list[tuple[int, int, str]] = []
     changed: list[str] = []
-    for src, tgt in sorted(name_map.items(), key=lambda kv: -len(kv[0])):
+    # Longest first, and the fully-qualified map before the positional one:
+    # a three-part hit is unambiguous and blanks the span before any shorter
+    # form is tried against it.
+    ordered = [(s, t, False)
+               for s, t in sorted(name_map.items(), key=lambda kv: -len(kv[0]))]
+    ordered += [(s, t, True)
+                for s, t in sorted((positional or {}).items(),
+                                   key=lambda kv: -len(kv[0]))]
+    for src, tgt, after_keyword in ordered:
         if src == tgt:
             continue
-        pattern = (r'(?<![\w`"$.])'
-                   + r"\s*\.\s*".join(_ref_part_pattern(p) for p in src.split("."))
-                   + r'(?![\w`"$])')
-        hits = [m.span() for m in re.finditer(pattern, mask, re.IGNORECASE)]
+        ref = (r"\s*\.\s*".join(_ref_part_pattern(p) for p in src.split("."))
+               + r'(?![\w`"$])')
+        if after_keyword:
+            # The keyword is matched so the span is unambiguous, and put back
+            # verbatim so spacing and case are untouched.
+            pattern = _TABLE_POSITION + ref
+        else:
+            pattern = r'(?<![\w`"$.])' + ref
+        hits = [(m.span(), (m.group(1) + m.group(2)) if after_keyword else "")
+                for m in re.finditer(pattern, mask, re.IGNORECASE)]
         if not hits:
             continue
         # A target part the Spark parser would not read as one word (a hyphen
@@ -475,14 +517,29 @@ def _rewrite_view_refs(body: str, name_map: dict[str, str]
         # as-is, so the common case stays byte-identical to the planned name.
         replacement = ".".join(p if _PLAIN_PART.match(p) else _q(p)
                                for p in tgt.split("."))
-        for start, end in hits:
-            edits.append((start, end, replacement))
+        for (start, end), keep in hits:
+            edits.append((start, end, keep + replacement))
             mask = mask[:start] + " " * (end - start) + mask[end:]
         changed.append(f"{src} -> {tgt}")
     out = body
     for start, end, replacement in sorted(edits, reverse=True):
         out = out[:start] + replacement + out[end:]
     return out, changed
+
+
+def _unqualified_refs(sql: str) -> set[str]:
+    """Bare names still sitting where only a table can go."""
+    mask = "".join(
+        "".join("\n" if c == "\n" else " " for c in text)
+        if kind in ("string", "comment") else text
+        for kind, text in lexer.segments(sql))
+    out = set()
+    for m in re.finditer(_TABLE_POSITION + r'([\w$]+)(?![\w`"$.])', mask):
+        name = m.group(3)
+        if name.lower() in ("lateral", "select", "unnest", "values", "table"):
+            continue
+        out.add(name)
+    return out
 
 
 def build_create_view(record: dict, target_fqn: str,
@@ -534,7 +591,29 @@ def build_create_view(record: dict, target_fqn: str,
     # the view, the same way a column's mapping warning travels with a table.
     res.warnings.extend(translated.warnings)
 
-    rewritten, changed = _rewrite_view_refs(translated.sql, name_map or {})
+    positional = _context_refs(name_map or {},
+                               str(record.get("source_database") or ""),
+                               str(record.get("source_schema") or ""))
+    rewritten, changed = _rewrite_view_refs(translated.sql, name_map or {},
+                                            positional)
+
+    # Anything still unqualified after FROM or JOIN is a reference the target
+    # has no way to resolve. On the catalog-API transport that is a bare 500
+    # with no detail, so it is named here instead of discovered there.
+    leftover = _unqualified_refs(rewritten)
+    if leftover:
+        res.warnings.append(
+            "unqualified object reference(s) remain in the view SQL: "
+            + ", ".join(sorted(leftover))
+            + ". They are not part of this migration, so there is no target "
+              "name to qualify them with. A view whose body the target cannot "
+              "resolve is rejected -- the catalog API answers 500 with no "
+              "detail -- so create this view only once those objects exist "
+              "and are named in full.")
+        res.rules_applied.append(RuleApplication(
+            "R42_VIEW_REFS_UNRESOLVED",
+            "left unqualified, no target name known: "
+            + ", ".join(sorted(leftover))))
 
     if changed:
         res.rules_applied.append(RuleApplication(
