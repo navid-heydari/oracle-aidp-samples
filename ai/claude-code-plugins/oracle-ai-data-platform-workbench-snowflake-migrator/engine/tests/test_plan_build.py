@@ -481,3 +481,48 @@ def test_unordered_views_are_listed_only_if_they_are_planned():
     inv = {"inventory": [rec("D.S.T"), rec("D.S.V2", kind="VIEW", ddl=SNOWFLAKE_VIEW)]}
     plan = build_plan(inv, {"edges": []})
     assert plan["views_without_dependency_edge"] == []
+
+
+# --- a target name the destination refuses --------------------------------
+#
+# Live 2026-09-22: `"Mixed Case Table"` folded to `mixed case table`, was
+# planned, had DDL generated for it, and was attempted -- AIDP returned
+# 400 `Invalid name ... Only lower-case characters, numbers and underscores
+# are allowed`, and the name was burned for the rest of the run. It belongs
+# with every other object that cannot land: refused at plan time.
+
+def test_a_target_name_the_destination_refuses_is_not_planned():
+    plan = build_plan({"inventory": [rec("D.EDGE.Mixed Case Table")]},
+                      {"edges": []})
+    assert plan["can_migrate"] == []
+    entry = plan["cannot_migrate"][0]
+    assert entry["category"] == "unacceptable_target_name"
+    assert "mixed case table" in entry["reason"]
+    assert "lower-case" in entry["reason"]
+
+
+def test_the_refusal_says_the_plugin_will_not_rename_it():
+    plan = build_plan({"inventory": [rec("D.EDGE.Mixed Case Table")]},
+                      {"edges": []})
+    reason = plan["cannot_migrate"][0]["reason"].lower()
+    assert "rename" in reason
+    assert "different table" in reason
+
+
+def test_a_view_whose_name_has_a_space_is_refused_too():
+    plan = build_plan({"inventory": [rec("D.EDGE.V Quoted", kind="VIEW")]},
+                      {"edges": []})
+    assert plan["can_migrate"] == []
+    assert plan["cannot_migrate"][0]["category"] == "unacceptable_target_name"
+
+
+def test_a_schema_name_with_a_space_refuses_its_objects():
+    plan = build_plan({"inventory": [rec("D.MY SCHEMA.T")]}, {"edges": []})
+    assert plan["cannot_migrate"][0]["category"] == "unacceptable_target_name"
+    assert "my schema" in plan["cannot_migrate"][0]["reason"]
+
+
+def test_an_ordinary_name_still_plans():
+    plan = build_plan({"inventory": [rec("D.EDGE.ORDERS")]}, {"edges": []})
+    assert [c["source_identifier"] for c in plan["can_migrate"]] == [
+        "D.EDGE.ORDERS"]

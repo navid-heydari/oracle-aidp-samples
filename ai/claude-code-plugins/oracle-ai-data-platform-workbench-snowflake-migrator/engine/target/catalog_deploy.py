@@ -709,4 +709,16 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 "source_identifier": ident, "target_fqn": stmt["target_fqn"],
                 "reason": f"planned {want}, found {got}. The object was left "
                           f"as it was found and has NOT been cloned."})
+    # A gap is stated before the create, deliberately: it is a property of
+    # this transport rather than something discovered afterwards. It may not
+    # survive into the artifact for an object whose create then failed --
+    # live 2026-09-22, `v_customer_totals` was reported as arriving NULLABLE
+    # when it had not arrived at all.
+    failed_idents = set(out["failed_targets"])
+    out["properties_not_applied"] = [
+        p for p in out["properties_not_applied"]
+        if p.get("source_identifier") not in failed_idents]
+    out["properties_not_applied_targets"] = [
+        i for i in out["properties_not_applied_targets"]
+        if i not in failed_idents]
     return out

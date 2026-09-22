@@ -604,6 +604,32 @@ on its first colon, which is how the file passed before.
   always read and reports the distinction as *not distinguishable*, never as
   none. Every new read is a `SHOW` or a `SELECT`; the transport is unchanged.
 
+### Fixed — a target name the destination can never accept
+
+- Live 2026-09-22: Snowflake's `"Mixed Case Table"` folded to the planned
+  target `mixed case table`, DDL was generated for it, and the create was
+  attempted. AIDP answered 400 `InvalidParameter: Invalid name: mixed case
+  table. Only lower-case characters, numbers and underscores are allowed.`,
+  and a view from `"V Quoted"` got `Should start with a letter, no spaces or
+  special characters except for underscore`. The name is then burned for the
+  rest of the run, which is the worst place to learn it.
+- The planner now refuses such an object where every other impossible object
+  is refused, with the destination's rule, the part that breaks it, and why
+  the source was allowed to have it. **No name is rewritten**: `orders 2024`
+  quietly becoming `orders_2024` is a different table to everything that
+  reads it, so the choice stays with whoever owns the estate.
+- This is a naming rule, not a case rule. Folding was already handled, and
+  the identifier-case collision HALT is unchanged.
+
+### Fixed — a NOT NULL gap reported against an object that was never created
+
+- Live 2026-09-22: `v_customer_totals` failed to create and the run still
+  reported its two `NOT NULL` columns as "created NULLABLE here". The gap is
+  recorded before the create deliberately -- it is a property of the
+  catalog-API transport rather than something discovered afterwards -- but it
+  may not survive into the artifact for an object that does not exist. It is
+  dropped for anything that ended up in `failed`.
+
 ### Fixed — an `--execute` that matched nothing and exited 0
 
 - Live 2026-09-22: `deploy --execute --catalog snowmig_coverage_internal`,

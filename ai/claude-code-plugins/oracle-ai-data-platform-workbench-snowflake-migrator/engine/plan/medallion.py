@@ -40,6 +40,32 @@ class UnknownStrategy(ValueError):
     """An identifier or option is not usable as an AIDP catalog/schema name."""
 
 
+# What the destination accepts for a schema, table or view name. Live
+# 2026-09-22, AIDP answered a create of `mixed case table` with 400
+# `InvalidParameter: Invalid name: mixed case table. Only lower-case
+# characters, numbers and underscores are allowed.`, and a view named
+# `v quoted` with `Should start with a letter, no spaces or special
+# characters except for underscore`. A Snowflake identifier is far wider than
+# that -- anything inside double quotes -- so the difference is a migration
+# fact, not an edge case.
+TARGET_NAME_RULE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+TARGET_NAME_RULE_TEXT = (
+    "the destination accepts a name of lower-case letters, digits and "
+    "underscores, starting with a letter")
+
+
+def unacceptable_target_names(target_fqn: str) -> list[str]:
+    """The parts of a planned FQN the destination will refuse, if any.
+
+    Checked at plan time because the alternative is what happened live: the
+    plan shows the name, the DDL is generated, the create returns 400, and
+    the name is burned for the rest of the run.
+    """
+    return [part for part in str(target_fqn).split(".")
+            if not TARGET_NAME_RULE.match(part)]
+
+
 def bronze_target(source_db: str, source_schema: str, object_name: str, *,
                   catalog_prefix: str | None = None,
                   schema_style: str = "db_schema",

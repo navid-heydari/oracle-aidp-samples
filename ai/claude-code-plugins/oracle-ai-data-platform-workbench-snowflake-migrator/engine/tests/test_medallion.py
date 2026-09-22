@@ -170,3 +170,40 @@ def test_two_source_names_differing_only_by_case_collide_after_folding():
     assert a == b
     collisions = detect_target_collisions({"D.S.ORDERS": a, "D.S.orders": b})
     assert collisions, "folding two distinct tables into one must HALT"
+
+
+# --------------------------------------------- names the destination refuses
+#
+# Live 2026-09-22: AIDP answered `create table mixed case table` with 400
+# `InvalidParameter: Invalid name: mixed case table. Only lower-case
+# characters, numbers and underscores are allowed.`, and a view named
+# `v quoted` with `Should start with a letter, no spaces or special
+# characters except for underscore`. Both came from double-quoted Snowflake
+# identifiers, which are far wider than that.
+
+def test_a_plain_folded_name_is_acceptable():
+    from plan.medallion import unacceptable_target_names
+    assert unacceptable_target_names("db.sales.orders") == []
+    assert unacceptable_target_names("db_1.s_2.t_3") == []
+
+
+def test_a_name_with_a_space_is_named_as_unacceptable():
+    from plan.medallion import unacceptable_target_names
+    assert unacceptable_target_names("db.edge.mixed case table") == [
+        "mixed case table"]
+
+
+def test_every_offending_part_is_returned_not_just_the_first():
+    from plan.medallion import unacceptable_target_names
+    assert unacceptable_target_names("db.my schema.my table") == [
+        "my schema", "my table"]
+
+
+def test_a_name_starting_with_a_digit_is_unacceptable():
+    from plan.medallion import unacceptable_target_names
+    assert unacceptable_target_names("db.s.2023_orders") == ["2023_orders"]
+
+
+def test_an_upper_case_name_is_unacceptable_because_the_plan_folds_first():
+    from plan.medallion import unacceptable_target_names
+    assert unacceptable_target_names("db.s.ORDERS") == ["ORDERS"]

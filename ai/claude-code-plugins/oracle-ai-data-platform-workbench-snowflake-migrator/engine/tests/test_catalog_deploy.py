@@ -934,3 +934,35 @@ def test_the_report_says_the_catalog_name_is_what_did_not_match():
     assert "wrong_name" in md
     assert "snowmig_coverage" in md
     assert "nothing was created" in md.lower()
+
+
+# ------------------------- no property gap for an object that was not created
+#
+# Live 2026-09-22: `v_customer_totals` failed to create (the backend returned
+# 500) and the run still reported its two NOT NULL columns as "created
+# NULLABLE here". The gap is recorded before the create on purpose, because
+# it is a property of this transport rather than a discovery -- but it may
+# not survive into the artifact for an object that does not exist.
+
+def _plan_not_null(fqn="lake.DB.T0", ident="DB.PUBLIC.T0"):
+    return {"statements": [
+        {"source_identifier": ident, "object_type": "TABLE",
+         "target_fqn": fqn, "sql": "CREATE TABLE ...",
+         "expected_columns": [{"name": "A", "type": "STRING",
+                               "nullable": False}]}], "blocked": []}
+
+
+def test_a_not_null_gap_is_reported_for_an_object_that_was_created():
+    out = deploy_catalog(_plan_not_null(), target=TARGET, execute=True,
+                         call=Recorder(), retry_delays=(), verify_delays=())
+    assert out["verified"] == 1
+    assert [p["property"] for p in out["properties_not_applied"]] == ["NOT NULL"]
+
+
+def test_no_not_null_gap_is_reported_for_an_object_that_failed_to_create():
+    out = deploy_catalog(_plan_not_null(), target=TARGET, execute=True,
+                         call=Recorder(fail_on=("T0",)), retry_delays=(),
+                         verify_delays=())
+    assert out["failed"], "the create must have failed for this to mean anything"
+    assert out["properties_not_applied"] == []
+    assert out["properties_not_applied_targets"] == []

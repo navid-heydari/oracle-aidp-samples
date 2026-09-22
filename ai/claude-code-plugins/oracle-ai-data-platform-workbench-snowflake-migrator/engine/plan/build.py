@@ -39,7 +39,9 @@ from target.ddl import (
     uncarried_column_facts,
 )
 
-from .medallion import bronze_target, detect_target_collisions, layer_jobs
+from .medallion import (TARGET_NAME_RULE_TEXT, bronze_target,
+                        detect_target_collisions, layer_jobs,
+                        unacceptable_target_names)
 from .restrictions import apply_restrictions
 from .waves import compute_waves
 
@@ -258,6 +260,27 @@ def build_plan(inventory: dict, dependencies: dict, *,
         targets[ident] = bronze_target(db, schema, name,
                                        catalog_prefix=bronze_catalog_prefix,
                                        schema_style=bronze_schema_style)
+
+        # A name the destination will refuse is refused here, not at the
+        # create. Planning it means generating DDL for it, attempting it, and
+        # burning the name on a 400 -- which is how it was found.
+        bad = unacceptable_target_names(targets[ident])
+        if bad:
+            cannot.append({
+                "source_identifier": ident,
+                "object_type": rec.get("object_type"),
+                "category": "unacceptable_target_name",
+                "reason": (
+                    f'the target name {targets[ident]!r} is not one the '
+                    f'destination accepts: '
+                    + ", ".join(repr(b) for b in bad)
+                    + f' -- {TARGET_NAME_RULE_TEXT}. Snowflake allows it '
+                      f'because the source name is double-quoted. Rename it '
+                      f'in Snowflake, or exclude it, and re-run: this plugin '
+                      f'does not rewrite an object name, because a renamed '
+                      f'table is a different table to everything that reads '
+                      f'it.')})
+            continue
 
         if rec.get("compatibility_status") == "blocked":
             cannot.append({
