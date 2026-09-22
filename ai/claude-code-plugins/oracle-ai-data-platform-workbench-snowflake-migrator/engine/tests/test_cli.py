@@ -765,7 +765,12 @@ def test_ddl_timestamp_ntz_flag_remaps_offline_without_touching_inventory(
     stmt = plan["statements"][0]
     assert "`CREATED_AT` TIMESTAMP\n" in stmt["sql"]
     assert "TIMESTAMP_NTZ" not in stmt["sql"]
-    assert {"name": "CREATED_AT", "type": "TIMESTAMP"} in stmt["expected_columns"]
+    # expected_columns also carries `nullable` and `description` (the
+    # properties the reviewed SQL shows), so this asserts the re-map, not the
+    # whole spec.
+    assert {"name": "CREATED_AT", "type": "TIMESTAMP"}.items() <= next(
+        c for c in stmt["expected_columns"]
+        if c["name"] == "CREATED_AT").items()
     caveats = [w for w in stmt["warnings"] if w.startswith("CREATED_AT:")]
     assert len(caveats) == 1 and "timezone" in caveats[0].lower()
     assert plan["timestamp_ntz_mode"] == "timestamp"
