@@ -100,9 +100,13 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig security \
 
 `assess` used to look at tables and views only, so "N of N objects can move"
 was true of what had been examined and overstated the estate. `CENSUS.md` now
-counts procedures, UDFs, tasks, streams, materialized and dynamic tables,
-stages, pipes, sequences and file formats. **None of them migrate**, and no
-equivalent is generated.
+counts procedures, UDFs and UDTFs, external functions, tasks, streams, alerts,
+materialized and dynamic tables, internal and external stages, pipes,
+sequences, file formats, secrets, network rules, Streamlit apps, notebooks
+and container services, plus the account's shares, roles, network policies,
+applications and compute pools. **None of them migrate**, and no equivalent
+is generated. An outbound share is a live contract with another account:
+read that row first.
 
 Two things to carry to the user:
 

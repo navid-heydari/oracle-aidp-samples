@@ -1058,9 +1058,11 @@ def render_maintenance(maint: dict) -> str:
 _NO_CENSUS_SCOPE = (
     "**Scope: tables and views only.** No census of the rest of the estate was "
     "run, so this count is not the size of the estate — procedures, UDFs, "
-    "tasks, streams, materialized and dynamic tables, stages, pipes, sequences "
-    "and file formats were not examined. Run `assess` with the census enabled "
-    "to find out what else is there."
+    "tasks, streams, materialized and dynamic tables, stages, pipes, sequences, "
+    "file formats, alerts, secrets, network rules, Streamlit apps, notebooks "
+    "and services, and the account's shares, roles, network policies, "
+    "applications and compute pools, were not examined. Run `assess` with the "
+    "census enabled to find out what else is there."
 )
 
 
@@ -1070,6 +1072,15 @@ def census_scope(plan_or_inventory: dict) -> str:
     if not census:
         return _NO_CENSUS_SCOPE
     return census.get("scope_statement") or _NO_CENSUS_SCOPE
+
+
+# `.title()` turns UDTF into "Udtf". Acronyms get spelled the way the source
+# spells them; everything else keeps the generic rule.
+_CENSUS_KIND_LABELS = {"UDTF": "UDTF", "STREAMLIT": "Streamlit"}
+
+
+def _census_kind_label(kind: str) -> str:
+    return _CENSUS_KIND_LABELS.get(kind, kind.replace("_", " ").title())
 
 
 def render_census(census: dict) -> str:
@@ -1089,15 +1100,26 @@ def render_census(census: dict) -> str:
         out += [census["visibility_note"], ""]
 
     if kinds:
-        out += ["## Counts by kind", "", "| Kind | Count | Read |", "|---|---:|---|"]
+        out += ["## Counts by kind", "",
+                "| Kind | Count | Read | Scope |", "|---|---:|---|---|"]
         for kind, info in sorted(kinds.items()):
             count = info.get("count")
-            read = (("yes" if count else "yes (0 visible; lower bound)")
-                    if info.get("readable") else "**denied**")
-            out.append(f'| {kind.replace("_", " ").title()} | '
+            if info.get("readable"):
+                read = "yes" if count else "yes (0 visible; lower bound)"
+            elif info.get("unread") == "degraded":
+                # The rows were read and counted under another kind. Saying
+                # "not visible" would be a different, and false, claim.
+                read = "**not distinguishable**"
+            else:
+                read = "**not visible to this role**"
+            out.append(f'| {_census_kind_label(kind)} | '
                        f'{count if count is not None else "*not measured*"} | '
-                       f'{read} |')
-        out.append("")
+                       f'{read} | {info.get("scope") or "database"} |')
+        out += ["", "Scope says where the read was aimed: a *database* kind is "
+                "asked for once per database in scope, an *account* kind once "
+                "for the whole account. A kind the role cannot read reports "
+                "*not visible to this role* — never 0, because *we could not "
+                "look* and *there are none* lead to opposite decisions.", ""]
 
     by_effort = census.get("by_effort") or {}
     if by_effort:

@@ -1,0 +1,407 @@
+"""What the census could not see at all, and what it saw as the wrong thing.
+
+The census answered for ten kinds. An alert, a secret, a network rule, a
+Streamlit app, a Snowflake notebook, a container service, a share, a role, a
+network policy, an application and a compute pool were not absent from the
+report -- they were absent from the *questions*, which is worse, because the
+report then reads as complete.
+
+Two kinds were present but wrong: a UDTF and an external function were both
+counted as scalar UDFs, and an external stage (already in object storage) got
+the same verdict as an internal one (must be unloaded first).
+
+Everything here is a SHOW or a SELECT, so the read-only transport takes it
+unchanged, and everything the role cannot read reports as unreadable rather
+than as zero -- "we could not look" and "there are none" lead to opposite
+decisions.
+"""
+import pytest
+
+from fake_sql import FakeSql
+from snowflake_source.extract.census import KINDS, build_census
+
+
+# The whole question set, all empty. Anything the census asks that is missing
+# from this dict raises inside FakeSql and shows up as an unreadable kind,
+# which is exactly how a forgotten read is caught.
+def _responses(**over):
+    empty = {
+        "information_schema.procedures": [],
+        "information_schema.functions": [],
+        "information_schema.sequences": [],
+        "information_schema.stages": [],
+        "information_schema.file_formats": [],
+        "information_schema.pipes": [],
+        "show tasks": [],
+        "show streams": [],
+        "show materialized views": [],
+        "show dynamic tables": [],
+        "show alerts": [],
+        "show secrets": [],
+        "show network rules": [],
+        "show streamlits": [],
+        "show notebooks": [],
+        "show services": [],
+        "show shares": [],
+        "show roles": [],
+        "show network policies": [],
+        "show applications": [],
+        "show compute pools": [],
+    }
+    empty.update(over)
+    return empty
+
+
+def _spec(kind):
+    return next(k for k in KINDS if k["kind"] == kind)
+
+
+def _issued(fake, needle):
+    return [c for c in fake.calls if needle in " ".join(c.split()).lower()]
+
+
+def test_every_statement_the_census_issues_is_a_read():
+    # The transport is the guarantee, not the convention: a new kind whose
+    # read is not a SELECT or a SHOW would be refused at the connection, and
+    # it must be refused here first.
+    from snowflake_source.conn import assert_read_only
+
+    fake = FakeSql(_responses())
+    build_census(fake, ["DB"])
+    assert fake.calls
+    for sql in fake.calls:
+        assert_read_only(sql)
+
+
+# --------------------------------------------------------- the missing kinds
+
+@pytest.mark.parametrize("kind,relation", [
+    ("ALERT", "alerts"),
+    ("SECRET", "secrets"),
+    ("NETWORK_RULE", "network rules"),
+    ("STREAMLIT", "streamlits"),
+    ("NOTEBOOK", "notebooks"),
+    ("SERVICE", "services"),
+])
+def test_each_new_database_kind_is_declared_and_asked_for(kind, relation):
+    spec = _spec(kind)
+    assert spec["source"] == "show", "SHOW is already on the read-only allowlist"
+    assert spec["relation"] == relation
+    assert spec.get("scope", "database") == "database"
+    assert len(spec["reason"]) > 60, "a kind with no consequence stated is a count"
+
+    fake = FakeSql(_responses())
+    census = build_census(fake, ["DB"])
+    assert _issued(fake, f"show {relation} in database"), \
+        f"{kind} is declared but never read"
+    assert census["kinds"][kind]["readable"] is True
+    assert census["kinds"][kind]["count"] == 0
+
+
+def test_an_alert_is_counted_and_carries_its_cutover_consequence():
+    census = build_census(FakeSql(_responses(**{
+        "show alerts": [{"name": "AL_STALE_ORDERS", "schema_name": "SALES",
+                         "database_name": "DB", "state": "started"}]})), ["DB"])
+    alert = next(o for o in census["objects"] if o["kind"] == "ALERT")
+    assert alert["source_identifier"] == "DB.SALES.AL_STALE_ORDERS"
+    assert alert["migratable"] is False
+    assert "stops firing" in alert["reason"]
+
+
+def test_a_secret_is_named_but_its_value_is_never_read():
+    fake = FakeSql(_responses(**{
+        "show secrets": [{"name": "S_API", "schema_name": "SALES",
+                          "database_name": "DB"}]}))
+    census = build_census(fake, ["DB"])
+    secret = next(o for o in census["objects"] if o["kind"] == "SECRET")
+    assert secret["source_identifier"] == "DB.SALES.S_API"
+    assert "credential store" in secret["reason"]
+    assert not any("describe secret" in c.lower() for c in fake.calls), \
+        "the census names secrets; it never reads a secret value"
+
+
+# ------------------------------------------------------------ account scope
+
+_ACCOUNT_KINDS = ("SHARE", "ROLE", "NETWORK_POLICY", "APPLICATION",
+                  "COMPUTE_POOL")
+
+
+@pytest.mark.parametrize("kind,relation", [
+    ("SHARE", "shares"),
+    ("ROLE", "roles"),
+    ("NETWORK_POLICY", "network policies"),
+    ("APPLICATION", "applications"),
+    ("COMPUTE_POOL", "compute pools"),
+])
+def test_an_account_scoped_kind_is_read_once_not_once_per_database(kind, relation):
+    assert _spec(kind)["scope"] == "account"
+    fake = FakeSql(_responses())
+    census = build_census(fake, ["DB_A", "DB_B", "DB_C"])
+    issued = _issued(fake, f"show {relation}")
+    assert len(issued) == 1, f"{kind} is account-scoped; {len(issued)} reads issued"
+    assert "in database" not in issued[0].lower()
+    assert census["kinds"][kind]["scope"] == "account"
+
+
+def test_a_share_is_a_live_contract_and_is_named_as_one():
+    census = build_census(FakeSql(_responses(**{
+        "show shares": [{"name": "ORG.ACCT.OUTBOUND_SALES", "kind": "OUTBOUND",
+                         "database_name": "DB", "to": "CONSUMER_ACCT"}]})),
+        ["DB"])
+    share = next(o for o in census["objects"] if o["kind"] == "SHARE")
+    assert share["source_identifier"] == "ORG.ACCT.OUTBOUND_SALES", \
+        "an account object has no database.schema prefix to invent"
+    assert "None" not in share["source_identifier"]
+    assert "?" not in share["source_identifier"]
+    assert "consumer" in share["reason"].lower()
+    assert census["by_kind"]["SHARE"] == 1
+
+
+def test_an_outbound_share_names_the_account_reading_through_it():
+    census = build_census(FakeSql(_responses(**{
+        "show shares": [{"name": "ORG.ACCT.OUTBOUND_SALES", "kind": "OUTBOUND",
+                         "database_name": "DB", "to": "CONSUMER_ACCT"}]})),
+        ["DB"])
+    share = census["objects"][0]
+    assert "OUTBOUND" in share["detail"]
+    assert "CONSUMER_ACCT" in share["detail"], \
+        "the consumer is who has to be told; naming the share is not enough"
+
+
+def test_an_inbound_share_is_a_source_lost_not_a_consumer_broken():
+    census = build_census(FakeSql(_responses(**{
+        "show shares": [{"name": "ORG.PROVIDER.MARKET_DATA", "kind": "INBOUND",
+                         "database_name": "MARKET", "owner": "PROVIDER"}]})),
+        ["DB"])
+    share = census["objects"][0]
+    assert "INBOUND" in share["detail"]
+    assert "consumer's queries" not in share["reason"], \
+        "an inbound share breaks this estate, not somebody else's"
+    assert "provider" in share["reason"].lower()
+
+
+def test_an_account_read_the_role_cannot_run_is_unreadable_never_zero():
+    class Denied(FakeSql):
+        def __call__(self, sql, params=None):
+            if "show shares" in " ".join(sql.split()).lower():
+                raise RuntimeError("Insufficient privileges to operate on shares")
+            return super().__call__(sql, params)
+
+    census = build_census(Denied(_responses()), ["DB"], role="READER")
+    share = census["kinds"]["SHARE"]
+    assert share["count"] is None, "'we could not look' must not render as zero"
+    assert share["readable"] is False
+    assert any("SHARE" in u for u in census["unreadable"])
+    assert "account" in " ".join(census["unreadable"]).lower(), \
+        "the note must say the read was account-scoped, not blame a database"
+    assert "SHARE" in census["scope_statement"]
+
+
+def test_an_account_read_that_fails_does_not_lose_the_database_kinds():
+    class Denied(FakeSql):
+        def __call__(self, sql, params=None):
+            if "show roles" in " ".join(sql.split()).lower():
+                raise RuntimeError("denied")
+            return super().__call__(sql, params)
+
+    census = build_census(Denied(_responses(**{
+        "show alerts": [{"name": "A", "schema_name": "S",
+                         "database_name": "DB"}]})), ["DB"])
+    assert census["total"] == 1
+    assert census["kinds"]["ROLE"]["readable"] is False
+    assert census["kinds"]["ALERT"]["count"] == 1
+
+
+# -------------------------------------------------------- internal vs external
+
+def _stage(name="ST_RAW", stage_type="Internal Named", url="", region=None):
+    return {"STAGE_NAME": name, "STAGE_SCHEMA": "SALES",
+            "STAGE_TYPE": stage_type, "STAGE_URL": url, "STAGE_REGION": region}
+
+
+def test_the_stage_read_selects_what_tells_the_two_apart():
+    fake = FakeSql(_responses())
+    build_census(fake, ["DB"])
+    select = next(c for c in fake.calls
+                  if "information_schema.stages" in c.lower())
+    low = select.lower()
+    for col in ("stage_type", "stage_url", "stage_region"):
+        assert col in low, f"{col} is what decides the verdict"
+
+
+def test_an_external_stage_and_an_internal_stage_get_different_verdicts():
+    census = build_census(FakeSql(_responses(**{
+        "information_schema.stages": [
+            _stage("ST_INTERNAL", "Internal Named"),
+            _stage("ST_EXTERNAL", "External Named",
+                   url="s3://example-bucket/raw/", region="us-east-1")]})),
+        ["DB"])
+    internal = next(o for o in census["objects"]
+                    if o["source_identifier"].endswith("ST_INTERNAL"))
+    external = next(o for o in census["objects"]
+                    if o["source_identifier"].endswith("ST_EXTERNAL"))
+    assert internal["reason"] != external["reason"]
+    assert "unloaded to object storage" in internal["reason"].lower(), \
+        "an internal stage has to be unloaded before AIDP can see anything"
+    assert "nothing has to be unloaded" in external["reason"].lower(), \
+        "an external stage is already in object storage; AIDP can be pointed "\
+        "at it"
+    assert "s3://example-bucket/raw/" in external["detail"]
+    assert "Internal" in internal["detail"]
+
+
+def test_a_stage_select_that_cannot_name_those_columns_keeps_the_old_answer():
+    # An account or edition where the detail column is not there must lose the
+    # distinction, not the stage. Never a crash, never an unreadable kind.
+    class OldAccount(FakeSql):
+        def __call__(self, sql, params=None):
+            if "stage_type" in sql.lower():
+                raise RuntimeError("invalid identifier 'STAGE_TYPE'")
+            return super().__call__(sql, params)
+
+    census = build_census(OldAccount(_responses(**{
+        "information_schema.stages": [{"STAGE_NAME": "ST", "STAGE_SCHEMA": "S"}]
+    })), ["DB"])
+    stage = next(o for o in census["objects"] if o["kind"] == "STAGE")
+    assert census["kinds"]["STAGE"]["readable"] is True
+    assert census["kinds"]["STAGE"]["count"] == 1
+    assert stage["reason"] == _spec("STAGE")["reason"]
+    assert "detail" in census["kinds"]["STAGE"]["note"].lower() \
+        or "distinguish" in census["kinds"]["STAGE"]["note"].lower()
+
+
+# --------------------------------------------- UDTF and the external function
+
+def _function(name="UDF_X", lang="PYTHON", data_type="NUMBER(38,0)",
+              external="NO", api=None):
+    return {"FUNCTION_NAME": name, "FUNCTION_SCHEMA": "SALES",
+            "FUNCTION_LANGUAGE": lang, "ARGUMENT_SIGNATURE": "(A NUMBER)",
+            "FUNCTION_OWNER": "ETL", "DATA_TYPE": data_type,
+            "IS_EXTERNAL_FUNCTION": external, "API_INTEGRATION": api}
+
+
+def test_the_function_read_selects_the_columns_that_split_the_three():
+    fake = FakeSql(_responses())
+    build_census(fake, ["DB"])
+    select = next(c for c in fake.calls
+                  if "information_schema.functions" in c.lower())
+    low = select.lower()
+    for col in ("data_type", "is_external_function", "api_integration"):
+        assert col in low, col
+
+
+def test_a_table_function_is_not_reported_as_a_scalar_udf():
+    census = build_census(FakeSql(_responses(**{
+        "information_schema.functions": [
+            _function("UDTF_SPLIT", data_type="TABLE (PART VARCHAR)"),
+            _function("UDF_PLAIN")]})), ["DB"])
+    udtf = next(o for o in census["objects"]
+                if o["source_identifier"].endswith("UDTF_SPLIT"))
+    plain = next(o for o in census["objects"]
+                 if o["source_identifier"].endswith("UDF_PLAIN"))
+    assert udtf["kind"] == "UDTF"
+    assert plain["kind"] == "FUNCTION"
+    assert udtf["reason"] != plain["reason"]
+    assert "table" in udtf["reason"].lower()
+    assert census["by_kind"]["UDTF"] == 1
+    assert census["kinds"]["UDTF"]["count"] == 1
+
+
+def test_an_external_function_names_the_endpoint_it_calls_out_to():
+    census = build_census(FakeSql(_responses(**{
+        "information_schema.functions": [
+            _function("EF_SCORE", lang=None, external="YES",
+                      api="SCORING_API_INT")]})), ["DB"])
+    ef = next(o for o in census["objects"] if o["kind"] == "EXTERNAL_FUNCTION")
+    assert "SCORING_API_INT" in ef["detail"]
+    assert "api integration" in ef["reason"].lower() \
+        or "remote endpoint" in ef["reason"].lower()
+    assert "not recognised" not in ef["reason"], \
+        "an external function has no handler language to fail to recognise"
+    assert ef["effort"] and ef["effort"] != "UNKNOWN"
+
+
+def test_a_table_function_in_an_unknown_language_keeps_both_findings():
+    census = build_census(FakeSql(_responses(**{
+        "information_schema.functions": [
+            _function("UDTF_ODD", lang="BRAINFUCK",
+                      data_type="TABLE (A VARCHAR)")]})), ["DB"])
+    udtf = census["objects"][0]
+    assert udtf["kind"] == "UDTF"
+    assert "table" in udtf["reason"].lower()
+    assert "not recognised" in udtf["reason"], \
+        "narrowing the kind must not swallow the unknown-handler finding"
+    assert udtf["effort"] == "UNKNOWN"
+
+
+def test_a_function_select_without_the_new_columns_still_lists_functions():
+    class OldAccount(FakeSql):
+        def __call__(self, sql, params=None):
+            if "is_external_function" in sql.lower():
+                raise RuntimeError("invalid identifier 'IS_EXTERNAL_FUNCTION'")
+            return super().__call__(sql, params)
+
+    census = build_census(OldAccount(_responses(**{
+        "information_schema.functions": [
+            {"FUNCTION_NAME": "F", "FUNCTION_SCHEMA": "S",
+             "FUNCTION_LANGUAGE": "SQL", "ARGUMENT_SIGNATURE": "()",
+             "FUNCTION_OWNER": "ETL"}]})), ["DB"])
+    assert census["kinds"]["FUNCTION"]["readable"] is True
+    assert census["kinds"]["FUNCTION"]["count"] == 1
+    assert census["objects"][0]["kind"] == "FUNCTION"
+    assert census["kinds"]["UDTF"]["count"] is None, \
+        "not distinguishable is not the same as none present"
+    assert census["kinds"]["EXTERNAL_FUNCTION"]["count"] is None
+
+
+# --------------------------------------------------------------- the report
+
+def test_census_md_lists_every_new_kind():
+    from report.render import render_census
+    md = render_census(build_census(FakeSql(_responses()), ["DB"], role="R"))
+    for kind in ("Alert", "Secret", "Network Rule", "Streamlit", "Notebook",
+                 "Service", "Share", "Role", "Network Policy", "Application",
+                 "Compute Pool", "UDTF", "External Function"):
+        assert f"| {kind} |" in md, f"{kind} is absent from CENSUS.md"
+
+
+def test_census_md_says_which_reads_were_account_scoped():
+    from report.render import render_census
+    md = render_census(build_census(FakeSql(_responses()), ["DB"], role="R"))
+    share_row = next(line for line in md.splitlines()
+                     if line.startswith("| Share |"))
+    assert "account" in share_row
+    alert_row = next(line for line in md.splitlines()
+                     if line.startswith("| Alert |"))
+    assert "database" in alert_row
+
+
+def test_an_account_read_the_role_cannot_run_reads_as_not_visible():
+    from report.render import render_census
+
+    class Denied(FakeSql):
+        def __call__(self, sql, params=None):
+            if "show shares" in " ".join(sql.split()).lower():
+                raise RuntimeError("Insufficient privileges")
+            return super().__call__(sql, params)
+
+    md = render_census(build_census(Denied(_responses()), ["DB"], role="R"))
+    row = next(line for line in md.splitlines() if line.startswith("| Share |"))
+    assert "| 0 |" not in row, row
+    assert "not visible to this role" in row
+
+
+def test_the_visibility_note_names_the_grants_the_new_reads_need():
+    census = build_census(FakeSql(_responses()), ["DB"], role="R")
+    note = census["visibility_note"].lower()
+    for what in ("share", "role", "network", "alert", "secret", "compute pool"):
+        assert what in note, what
+
+
+def test_the_empty_scope_statement_does_not_still_list_only_the_old_kinds():
+    census = build_census(FakeSql(_responses()), ["DB"], role="R")
+    s = census["scope_statement"].lower()
+    assert "share" in s and "alert" in s, \
+        "the sentence claims what was looked at; it must name the new reads"
+    assert "whole estate" not in s
+    assert "lower bound" in s

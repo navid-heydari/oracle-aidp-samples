@@ -178,12 +178,17 @@ because it is not evidence either way.
 **I3 — "Could not look" never renders as zero.** An unreadable `ACCOUNT_USAGE`
 reports `measured: false` with null counts, because *0 reclustering credits*
 and *we could not check* lead to opposite decisions. Same for unreadable
+and *we could not check* lead to opposite decisions. Same for unreadable
 scopes in the census and unresolvable policy references. The rule has a
 second half: a verdict may not name a kind that was never enumerated. A
 sentence like "no aggregation policy is attached" is only true if
 `SHOW AGGREGATION POLICIES` was issued and answered; the security report
 builds its clean sentence from the kinds that actually answered and names
-the rest as not enumerated.
+the rest as not enumerated. And there is a third state between counted
+and unreadable: *not distinguishable*, when rows were read and counted
+under their parent kind but the column that tells a UDTF from a UDF, or
+an external stage from an internal one, could not be read. That is
+reported as such, never folded into either neighbour.
 
 **I4 — Refuse rather than guess.** An unmappable type, an unknown OCI region,
 a `LISTAGG … WITHIN GROUP`, a `::` cast over an expression: all raise. A
