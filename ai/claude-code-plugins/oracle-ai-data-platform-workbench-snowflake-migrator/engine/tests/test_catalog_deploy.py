@@ -966,3 +966,90 @@ def test_no_not_null_gap_is_reported_for_an_object_that_failed_to_create():
     assert out["failed"], "the create must have failed for this to mean anything"
     assert out["properties_not_applied"] == []
     assert out["properties_not_applied_targets"] == []
+
+
+# ----------------------------------- a refused create is not a burned name
+#
+# Live 2026-09-22: AIDP answered one create with 400 `Invalid name` and four
+# with 500 `InternalError`. Every one of them was then reported as "the
+# create returned 202 Accepted ... a NOVEL name was created successfully, so
+# the schema and your request are both fine and this NAME IS BURNED ... Retry
+# into a FRESH SCHEMA". The create had raised, not returned 202; the request
+# was demonstrably not fine, the target had said so; and a fresh schema
+# would have produced the same 400 and the same 500.
+
+class Refusing(Recorder):
+    """A backend that rejects one create outright, as a real one does."""
+
+    def __init__(self, *, refuse=(), message="400 Bad Request: Invalid name",
+                 **kw):
+        super().__init__(**kw)
+        self.refuse = set(refuse)
+        self.message = message
+
+    def __call__(self, operation, **kw):
+        name = kw.get("table") or kw.get("view") or kw.get("schema")
+        if operation in ("create_table", "create_view") and name in self.refuse:
+            raise RuntimeError(self.message)
+        return super().__call__(operation, **kw)
+
+
+def test_a_refused_create_reports_what_the_target_said():
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True,
+                         call=Refusing(refuse=("T0",)), retry_delays=(),
+                         verify_delays=())
+    reason = out["failed"][0]["reason"]
+    assert "REFUSED" in reason
+    assert "Invalid name" in reason, "the target's own answer has to be in it"
+    assert "202" not in reason, "the create raised; it did not return 202"
+
+
+def test_a_refused_create_is_not_called_a_burned_name():
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True,
+                         call=Refusing(refuse=("T0",)), retry_delays=(),
+                         verify_delays=())
+    reason = out["failed"][0]["reason"].lower()
+    assert "burned" not in reason or "not burned" in reason
+    assert "fresh schema" not in reason or "would not help" in reason
+    assert out["poisoned_names"] == []
+
+
+def test_a_refused_create_does_not_claim_the_request_was_fine():
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True,
+                         call=Refusing(refuse=("T0",),
+                                       message="500 Server Error: InternalError"),
+                         retry_delays=(), verify_delays=())
+    reason = out["failed"][0]["reason"].lower()
+    assert "your request are both fine" not in reason
+    assert "internalerror" in reason
+
+
+def test_a_refused_create_runs_no_diagnosis_probe():
+    """The probe exists to tell a burned name from a bad request. The target
+    already answered that question for this object, so the probe is a write
+    to the customer's catalog for nothing."""
+    rec = Refusing(refuse=("T0",))
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=rec,
+                         retry_delays=(), verify_delays=())
+    assert out["diagnosis_probes"] == []
+    assert not [op for op, kw in rec.ops
+                if op == "create_table"
+                and str(kw.get("table", "")).startswith("snowmig_probe")]
+
+
+def test_an_accepted_create_that_vanishes_is_still_a_burned_name():
+    """The inference is sound where it belongs: the target took the create,
+    reported nothing, and the object never appeared."""
+    class Vanishing(Recorder):
+        def __call__(self, operation, **kw):
+            name = kw.get("table") or kw.get("view")
+            if operation == "create_table" and name == "T0":
+                return {"key": "accepted"}      # 202, and nothing created
+            return super().__call__(operation, **kw)
+
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True,
+                         call=Vanishing(), retry_delays=(), verify_delays=())
+    reason = out["failed"][0]["reason"]
+    assert "202 Accepted" in reason
+    assert "BURNED" in reason
+    assert out["poisoned_names"] == ["lake.DB.T0"]

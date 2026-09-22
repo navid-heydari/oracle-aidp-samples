@@ -551,6 +551,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
 
         # Schema creation is async, so a 409 here means "not settled yet".
         accepted = False
+        create_error = None
         for attempt in range(len(retry_delays) + 1):
             try:
                 if is_view:
@@ -563,6 +564,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 accepted = True
                 break
             except Exception as exc:
+                create_error = str(exc)
                 out["errors"].append(f"CREATE {stmt.get('object_type')} "
                                      f"{stmt['target_fqn']}: {exc}")
                 if _is_conflict(exc) and attempt < len(retry_delays):
@@ -599,12 +601,28 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 "source_identifier": ident, "target_fqn": stmt["target_fqn"],
                 "reason": (
                     f"the create "
-                    f"{'returned 202 Accepted' if accepted else 'failed'} and "
+                    f"{'returned 202 Accepted' if accepted else 'was REFUSED'}"
+                    f" and "
                     f"the object could not be read back: listing {relation} "
                     f"in {schema_key} failed ({str(list_error)[:200]}). Its "
                     f"existence is UNKNOWN, not absent -- fix the listing "
                     f"permission or endpoint and re-run; no diagnosis probe "
                     f"was written.")})
+            continue
+        if listed is None and not accepted:
+            # The target REFUSED this create and said why. That answer is
+            # about this request, and it outranks any inference drawn from
+            # another object's success: no probe is run, the name is not
+            # called burned, and the operator is pointed at the response.
+            out["failed_targets"].append(ident)
+            out["failed"].append({
+                "source_identifier": ident, "target_fqn": stmt["target_fqn"],
+                "reason": (
+                    f"the create was REFUSED by the target and the object "
+                    f"does not exist: {str(create_error)[:300]}. This is the "
+                    f"target's answer about this request, so the name is not "
+                    f"burned and a fresh schema would not help -- fix what "
+                    f"the message names, or exclude the object, and re-run.")})
             continue
         if listed is None:
             base = (f"the create returned 202 Accepted but no object matching "

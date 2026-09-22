@@ -604,6 +604,26 @@ on its first colon, which is how the file passed before.
   always read and reports the distinction as *not distinguishable*, never as
   none. Every new read is a `SHOW` or a `SELECT`; the transport is unchanged.
 
+### Fixed — a create the target refused, reported as a burned name
+
+- Live 2026-09-22: AIDP answered one create with 400 `Invalid name` and four
+  `create view` calls with 500 `InternalError`. Every one of those errors was
+  recorded, and every one of those objects was then reported as *"the create
+  returned 202 Accepted ... A NOVEL name in this schema was created
+  successfully, so the schema and your request are both fine and this NAME IS
+  BURNED ... Retry into a FRESH SCHEMA."*
+- Three things wrong at once. The create did not return 202, it raised. The
+  request was not fine, and the target had said so in the response for that
+  object. And the advice sends the operator to build a new schema, where the
+  400 and the 500 both happen again.
+- A create the target refused now reports the target's own answer, is not
+  called a burned name, does not enter `poisoned_names`, and runs no
+  diagnosis probe -- the probe exists to tell a burned name from a bad
+  request, and that question is already answered, so running it is a write
+  to the customer's catalog for nothing.
+- The burned-name inference is unchanged where it belongs: a create the
+  target ACCEPTED, reported nothing about, and never materialised.
+
 ### Fixed — a target name the destination can never accept
 
 - Live 2026-09-22: Snowflake's `"Mixed Case Table"` folded to the planned
