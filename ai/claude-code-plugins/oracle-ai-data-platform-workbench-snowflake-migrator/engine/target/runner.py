@@ -16,11 +16,32 @@ import subprocess
 import tempfile
 from typing import Callable
 
+from .coords import region_from_ocid
 from .executor import build_command, parse_cli_json
 
 __all__ = ["BackendError", "make_run_sql", "spool_body"]
 
 _MAX_STDERR = 500
+
+
+# The `oci` CLI answers an expired session profile by PROMPTING on stdout
+# ("Do you want to re-authenticate your CLI session profile? [Y/n]:") and,
+# with no tty, exiting 1 with "Abort:" on stderr. Truncated into a transport
+# error that reads "failed (exit 1): Abort:", which says nothing. The state
+# is ordinary and the remedy is one command, so it is named.
+_EXPIRED_SESSION = "this cli session has expired"
+
+
+def _session_expired(*streams: str | None) -> bool:
+    return any(_EXPIRED_SESSION in (s or "").lower() for s in streams)
+
+
+def expired_session_message(profile: str | None, region: str | None) -> str:
+    who = f" --profile {profile}" if profile else ""
+    where = f" --region {region}" if region else ""
+    return ("the OCI CLI session profile has expired; nothing was sent. "
+            f"Refresh it with `oci session authenticate{who}{where}` and "
+            "re-run this stage.")
 
 
 def spool_body(body: dict, *, prefix: str) -> str:
@@ -122,6 +143,12 @@ def make_call(target, *, backend: str, run_process=None):
             print("  $ " + " ".join(_printable(c) for c in cmd))
             proc = runner(cmd)
             if proc.returncode != 0:
+                if _session_expired(proc.stdout, proc.stderr):
+                    raise RuntimeError(
+                        f"{operation}: "
+                        + expired_session_message(
+                            getattr(target, "oci_profile", None),
+                            region_from_ocid(target.datalake_ocid)))
                 raise RuntimeError(
                     f"{operation} failed (exit {proc.returncode}): "
                     f"{(proc.stderr or proc.stdout or '')[:300]}")

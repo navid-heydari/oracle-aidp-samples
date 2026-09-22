@@ -3,6 +3,8 @@ import json
 import types
 import pytest
 
+OCID = "ocid1.aidataplatform.oc1.iad.amaaaaaaaifake"
+
 from target.coords import resolve_target
 from target.runner import make_call, BackendError, make_run_sql
 
@@ -375,3 +377,42 @@ def test_read_back_finds_an_object_created_past_page_one():
     assert out["verified"] == 3, out["failed"]
     assert out["failed_targets"] == []
     assert out["poisoned_names"] == [] and out["diagnosis_probes"] == []
+
+
+# --- an expired OCI session profile is named, not pasted --------------------
+# Live 2026-09-22: `oci` answers an expired session by PROMPTING on stdout and
+# exiting 1 with "Abort:" on stderr, which the transport truncated into
+# "failed (exit 1): Abort:".
+
+def _expired_proc(cmd):
+    import types
+    return types.SimpleNamespace(
+        returncode=1,
+        stdout=("ERROR: This CLI session has expired, so it cannot currently "
+                "be used to run commands\nDo you want to re-authenticate your "
+                "CLI session profile? [Y/n]: "),
+        stderr="Abort: \n")
+
+
+def test_an_expired_session_names_the_command_that_fixes_it():
+    from target.coords import Target
+    from target.runner import make_call
+    target = Target(datalake_ocid=OCID, workspace="w", cluster_id="c",
+                    catalog="cat")
+    with pytest.raises(RuntimeError) as err:
+        make_call(target, backend="oci_raw",
+                  run_process=_expired_proc)("list_catalogs")
+    message = str(err.value)
+    assert "session" in message and "expired" in message
+    assert "oci session authenticate" in message
+    assert "us-ashburn-1" in message
+    assert "Abort:" not in message, "the abort text says nothing on its own"
+
+
+def test_the_provisioning_transport_says_the_same_thing():
+    from target.provisioning import (ProvisionTransportError,
+                                     make_provision_call)
+    with pytest.raises(ProvisionTransportError) as err:
+        make_provision_call(OCID, run_process=_expired_proc)("list_workspaces")
+    message = str(err.value)
+    assert "oci session authenticate" in message and "expired" in message

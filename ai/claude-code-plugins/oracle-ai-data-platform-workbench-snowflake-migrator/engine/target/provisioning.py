@@ -107,11 +107,22 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
     """A `call(operation, **kwargs) -> dict` over the documented API."""
     import subprocess
 
-    from .runner import _printable, spool_body
+    from .coords import region_from_ocid
+    from .runner import (_printable, _session_expired,
+                         expired_session_message, spool_body)
     from .executor import collect_pages, parse_cli_envelope
 
     def _run(cmd):
-        return subprocess.run(cmd, capture_output=True, text=True, check=False, encoding="utf-8", errors="replace")
+        # A spawned CLI must not inherit variables that repoint its own
+        # interpreter; see cli_environment in snowmig.py.
+        env = dict(os.environ)
+        for name in ("PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE",
+                     "PYTHONNOUSERSITE", "PYTHONSTARTUP",
+                     "PYTHONEXECUTABLE", "PYTHONSAFEPATH"):
+            env.pop(name, None)
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              check=False, encoding="utf-8",
+                              errors="replace", env=env)
 
     runner = run_process or _run
 
@@ -141,6 +152,11 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
             print("  $ " + " ".join(_printable(c) for c in cmd))
             proc = runner(cmd)
             if proc.returncode != 0:
+                if _session_expired(proc.stdout, proc.stderr):
+                    raise ProvisionTransportError(
+                        f"{operation}: "
+                        + expired_session_message(
+                            None, region_from_ocid(platform_ocid)))
                 raise ProvisionTransportError(
                     f"{operation} failed (exit {proc.returncode}): "
                     f"{(proc.stderr or proc.stdout or '')[:300]}")

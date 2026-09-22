@@ -58,7 +58,7 @@ _REDACTED = "<redacted>"
 # typo cannot silently leave a destination unset.
 AIDP_FIELDS = ("datalake_ocid", "workspace", "cluster_id", "catalog",
                "external_catalog", "target_catalog", "oci_profile",
-               "subnet_id")
+               "oci_auth", "subnet_id")
 
 
 class ConfigError(ValueError):

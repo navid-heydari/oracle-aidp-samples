@@ -239,27 +239,105 @@ def _oci_profile(args) -> str | None:
                   .get("oci_profile") or "").strip()
     args._oci_profile = profile  # "" when absent, so this runs once
     if profile:
-        print(f"  oci profile from the config file: {profile} (passed as "
-              f"--profile to every `oci` call; the `aidp` CLI is not given "
-              f"a profile flag)")
+        print(f"  oci profile from the config file: {profile} (passed to "
+              f"every `oci` and `aidp` call)")
     return profile or None
 
 
+# A child CLI is another Python program with its own interpreter and its own
+# site-packages. These variables retarget that interpreter, and a virtual
+# environment built from Microsoft Store Python exports PYTHONUSERBASE
+# unconditionally -- which made `oci` die with "No module named
+# 'cryptography'", reported as a failed API call rather than a broken
+# environment. Nothing the plugin needs travels in them, so they are dropped.
+_INHERITED_PYTHON_VARS = (
+    "PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE", "PYTHONNOUSERSITE",
+    "PYTHONSTARTUP", "PYTHONEXECUTABLE", "PYTHONSAFEPATH",
+)
+
+
+def cli_environment(environ: dict | None = None) -> dict:
+    """The environment a spawned CLI should see: ours, minus the variables
+    that would repoint its interpreter."""
+    env = dict(os.environ if environ is None else environ)
+    for name in _INHERITED_PYTHON_VARS:
+        env.pop(name, None)
+    return env
+
+
+def _oci_auth_mode(args) -> str | None:
+    """`aidp.oci_auth`, or the mode the chosen profile implies.
+
+    A profile carrying `security_token_file` is a session profile: both CLIs
+    need `--auth security_token`, and without it the call is a 401 that reads
+    as a permissions problem. `oci` defaults to api_key and `aidp` defaults to
+    security_token, so neither default is safe to rely on -- the mode is
+    always stated.
+    """
+    cached = getattr(args, "_oci_auth", None)
+    if cached is not None:
+        return cached or None
+    block = aidp_block(_load_migration_config(args))
+    mode = str(block.get("oci_auth") or "").strip()
+    if not mode:
+        mode = _profile_auth_mode(str(block.get("oci_profile") or "").strip()
+                                  or "DEFAULT")
+    args._oci_auth = mode
+    if mode:
+        print(f"  oci auth mode: {mode} (passed as --auth to the `oci` and "
+              f"`aidp` CLIs)")
+    return mode or None
+
+
+def _profile_auth_mode(profile: str) -> str:
+    """security_token when that profile names a token file, else api_key.
+
+    Read-only, and it reads only the section headers and key NAMES -- never a
+    value, so no credential is loaded to decide this.
+    """
+    path = pathlib.Path(os.environ.get("OCI_CONFIG_FILE")
+                        or (pathlib.Path.home() / ".oci" / "config"))
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    current, found = None, False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current = stripped[1:-1].strip()
+            continue
+        if current == profile and stripped.split("=", 1)[0].strip() == \
+                "security_token_file":
+            found = True
+    return "security_token" if found else "api_key"
+
+
 def _oci_runner(args):
-    """The `run_process` for the transports: adds `--profile <p>` to every
-    `oci` argv when the config names a profile, else None (the transport's
-    own default runner)."""
-    profile = _oci_profile(args)
-    if not profile:
-        return None
+    """The `run_process` every transport uses.
+
+    It states the profile and the auth mode on both CLIs -- `oci` takes
+    `--profile`, `aidp` takes `-p`, and both take `--auth` -- and hands the
+    child an environment that cannot repoint its interpreter.
+    """
     import subprocess
+
+    profile = _oci_profile(args)
+    mode = _oci_auth_mode(args)
 
     def run(cmd):
         argv = list(cmd)
-        if argv and argv[0] == "oci" and "--profile" not in argv:
-            argv[1:1] = ["--profile", profile]
+        if argv and argv[0] in ("oci", "aidp"):
+            if profile and "--profile" not in argv and "-p" not in argv:
+                argv[1:1] = ["--profile", profile]
+            if mode:
+                if "--auth" in argv:
+                    argv[argv.index("--auth") + 1] = mode
+                else:
+                    argv[1:1] = ["--auth", mode]
         return subprocess.run(argv, capture_output=True, text=True,
-                              check=False, encoding="utf-8", errors="replace")
+                              check=False, encoding="utf-8", errors="replace",
+                              env=cli_environment())
     return run
 
 

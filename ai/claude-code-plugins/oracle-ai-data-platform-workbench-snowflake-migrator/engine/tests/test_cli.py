@@ -810,14 +810,20 @@ def _cwd_config(tmp_path, monkeypatch, aidp_lines):
     return cfg
 
 
-def test_oci_profile_from_config_reaches_oci_calls_only(
+def test_the_profile_and_auth_mode_reach_both_clis(
         tmp_path, monkeypatch, capsys):
+    """Live 2026-09-22: the `aidp` CLI takes `-p/--profile` and `--auth`
+    (api_key | security_token | instance_principal | resource_principal), and
+    its own default is security_token. Forcing api_key on it and passing
+    nothing to `oci` makes every call on a session profile a 401 that reads
+    as a permissions problem."""
     import subprocess
     import types
 
     import snowmig
     _cwd_config(tmp_path, monkeypatch,
-                [f"datalake_ocid: {OCID}", "oci_profile: FAKE_PROFILE"])
+                [f"datalake_ocid: {OCID}", "oci_profile: FAKE_PROFILE",
+                 "oci_auth: security_token"])
     seen = []
 
     def fake_run(argv, **kw):
@@ -827,24 +833,70 @@ def test_oci_profile_from_config_reaches_oci_calls_only(
 
     args = snowmig.build_parser().parse_args(["catalogs", "--out-dir", str(tmp_path)])
     runner = snowmig._oci_runner(args)
-    assert runner is not None
     runner(["oci", "raw-request", "--http-method", "GET",
             "--target-uri", "https://example.invalid/x"])
-    runner(["aidp", "workspace", "list"])
-    assert seen[0][:3] == ["oci", "--profile", "FAKE_PROFILE"]
-    assert seen[0][3:] == ["raw-request", "--http-method", "GET",
+    runner(["aidp", "workspace", "list", "--auth", "api_key"])
+    assert seen[0][:5] == ["oci", "--auth", "security_token",
+                           "--profile", "FAKE_PROFILE"]
+    assert seen[0][5:] == ["raw-request", "--http-method", "GET",
                            "--target-uri", "https://example.invalid/x"]
-    # The aidp CLI's flag set is unverified: its argv is left alone.
-    assert seen[1] == ["aidp", "workspace", "list"]
+    # An --auth the transport already appended is CORRECTED, never doubled.
+    assert seen[1].count("--auth") == 1
+    assert "api_key" not in seen[1]
+    # An --auth the transport already appended is corrected where it stands.
+    assert seen[1] == ["aidp", "--profile", "FAKE_PROFILE", "workspace",
+                       "list", "--auth", "security_token"]
     out = capsys.readouterr().out
-    assert "FAKE_PROFILE" in out and "oci" in out
+    assert "FAKE_PROFILE" in out and "security_token" in out
 
 
-def test_no_oci_profile_means_the_default_transport(tmp_path, monkeypatch):
+def test_the_auth_mode_is_read_from_the_profile_when_the_config_is_silent(
+        tmp_path, monkeypatch):
+    """A profile naming a security_token_file is a session profile. Only the
+    key NAMES are read; no credential is loaded to decide this."""
+    import snowmig
+    oci_dir = tmp_path / "oci"
+    oci_dir.mkdir()
+    (oci_dir / "config").write_text(
+        "[DEFAULT]\nuser=ocid1.user.oc1..x\nkey_file=~/.oci/k.pem\n\n"
+        "[SESSIONY]\nsecurity_token_file=~/.oci/token\n", encoding="utf-8")
+    monkeypatch.setenv("OCI_CONFIG_FILE", str(oci_dir / "config"))
+    assert snowmig._profile_auth_mode("SESSIONY") == "security_token"
+    assert snowmig._profile_auth_mode("DEFAULT") == "api_key"
+    assert snowmig._profile_auth_mode("ABSENT") == "api_key"
+
+
+def test_a_cli_child_never_inherits_our_interpreter_variables(
+        tmp_path, monkeypatch):
+    """Live 2026-09-22: a venv built from Microsoft Store Python exports
+    PYTHONUSERBASE. Inherited by the `oci` CLI it repoints that CLI's own
+    interpreter, which then dies with `ModuleNotFoundError: No module named
+    'cryptography'` -- reported as "list_catalogs failed (exit 1)" plus a
+    traceback, which reads as a broken OCI install."""
+    import subprocess
+    import types
+
     import snowmig
     _cwd_config(tmp_path, monkeypatch, [f"datalake_ocid: {OCID}"])
+    for name in ("PYTHONUSERBASE", "PYTHONPATH", "PYTHONHOME"):
+        monkeypatch.setenv(name, "poison")
+    monkeypatch.setenv("PATH", "keep-me")
+    captured = {}
+
+    def fake_run(argv, **kw):
+        captured["env"] = kw.get("env")
+        return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
     args = snowmig.build_parser().parse_args(["catalogs", "--out-dir", str(tmp_path)])
-    assert snowmig._oci_runner(args) is None
+    runner = snowmig._oci_runner(args)
+    assert runner is not None, "the env hygiene applies with or without a profile"
+    runner(["oci", "--version"])
+    env = captured["env"]
+    assert env is not None, "the child must be given a cleaned environment"
+    for name in ("PYTHONUSERBASE", "PYTHONPATH", "PYTHONHOME"):
+        assert name not in env, name
+    assert env.get("PATH") == "keep-me", "only the interpreter vars are dropped"
 
 
 def test_catalogs_hands_the_profile_runner_to_the_transport(tmp_path, monkeypatch):
