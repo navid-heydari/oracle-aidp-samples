@@ -557,6 +557,75 @@ on its first colon, which is how the file passed before.
   README's config path. `references/env-coords.template.md`, which described
   environment variables nothing reads, is removed.
 
+### Fixed — the DDL applied is the DDL the operator approved
+
+- `DDL_PLAN.md` showed `NOT NULL` and column comments; neither execution
+  path applied them, because the column list handed to the catalog API and
+  to the in-AIDP structure notebook carried name and type alone, and both
+  verifications compared that same reduced shape, so a table that differed
+  from the approved SQL read back as verified. The column spec is now
+  rendered from one place for the SQL, the API body and the notebook, both
+  verifications compare nullability and comments, and a property that could
+  not be read back is reported UNCHECKED rather than counted as applied.
+- The table and view `COMMENT` travel as the catalog's description (it was
+  always sent empty); a description the target drops is reported.
+- The catalog API body has no nullability field. That gap is stated per
+  object in `DDL_PLAN.md` next to the rules (`R21`) and in the deploy result
+  and report, and the generated SQL keeps the `NOT NULL`.
+- Column `DEFAULT`, `IDENTITY_START` and `IDENTITY_INCREMENT` are read from
+  `INFORMATION_SCHEMA.COLUMNS` and recorded as warnings (`R22`, `R23`),
+  raising the object to MEDIUM. They are not emitted: nothing offline
+  confirms the target accepts either, and a DDL the target rejects is worse
+  than a stated gap. After cutover an insert Snowflake would have populated
+  arrives NULL or fails; that is now a decision, not a discovery.
+- Rule `R20` claimed PK/FK/UNIQUE constraints were "captured in the
+  inventory" while no extractor captured them. A new extractor reads
+  `SHOW PRIMARY KEYS`, `SHOW UNIQUE KEYS` and `SHOW IMPORTED KEYS` per
+  database, and the rule names the constraints and their columns. Snowflake
+  has no `CHECK` constraint, so the one class Delta would enforce has nothing
+  to carry over, and the rule says so.
+
+### Added — the census sees the whole estate
+
+- Thirteen more artifact kinds are enumerated. Per database: alerts,
+  secrets, network rules, Streamlit apps, notebooks and container services.
+  Once per account, through a new `scope: account` on the census entry:
+  shares, roles, network policies, applications and compute pools. None of
+  them migrate; before this they were missing from the questions rather than
+  from the report, so `CENSUS.md` read as complete when it was not. An
+  outbound share is the sharpest case, a live contract whose consumer finds
+  out at cutover.
+- A UDTF and an external function were both counted as scalar UDFs; each now
+  has its own kind and verdict. An external stage, already in object storage
+  so AIDP can be pointed at it, no longer gets the same verdict as an
+  internal one, which has to be unloaded first.
+- Cost: six more `SHOW` statements per database and five per run. Where a
+  wider column select is refused, the census re-asks for the columns it has
+  always read and reports the distinction as *not distinguishable*, never as
+  none. Every new read is a `SHOW` or a `SELECT`; the transport is unchanged.
+
+### Fixed — a clean security verdict on a question never asked
+
+- `SECURITY.md` could state that no masking, row-access, aggregation or
+  projection policy was attached while `SHOW AGGREGATION POLICIES` and
+  `SHOW PROJECTION POLICIES` were never issued, and the two-hour
+  `POLICY_REFERENCES` staleness tripwire summed only masking and row-access.
+  All four kinds are enumerated, all four feed the tripwire, and the sentence
+  is built from the kinds that actually answered; a refused `SHOW` reads
+  "not visible to this role" and is named, never covered by a clean verdict.
+- Tag attachments are read from `ACCOUNT_USAGE.TAG_REFERENCES`, with the same
+  unreadable handling and latency caveat as policy references. A tag count
+  with no attachment list was a number with no verdict.
+- Grants are read for 22 object classes instead of three, so grants on a
+  schema, database, warehouse, stage, procedure or function are visible. The
+  report names the classes it asked for. Nothing is replayed on the target.
+- The stage board flags a denied policy `SHOW` and unreadable tag attachments
+  instead of reading clean. `ARCHITECTURE.md` I3 now states both halves of
+  the rule and its third state.
+- The demo estate answers every new read, with one alert, one outbound share
+  and one tag attachment, so `demo` teaches the lessons the census can now
+  teach.
+
 ## [0.25.0] — 2026-09-19
 
 ### Fixed — the data plane could not read the one config file it is given
