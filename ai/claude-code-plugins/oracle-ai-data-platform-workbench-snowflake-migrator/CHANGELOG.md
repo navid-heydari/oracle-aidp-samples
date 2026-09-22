@@ -604,6 +604,23 @@ on its first colon, which is how the file passed before.
   always read and reports the distinction as *not distinguishable*, never as
   none. Every new read is a `SHOW` or a `SELECT`; the transport is unchanged.
 
+### Fixed — an `--execute` that matched nothing and exited 0
+
+- Live 2026-09-22: `deploy --execute --catalog snowmig_coverage_internal`,
+  against a plan whose 11 objects target catalog `snowmig_coverage`, created
+  nothing, recorded `executed: 0, errors: []`, printed the dry-run pre-flight
+  and returned exit code 0. Every statement had been filtered out by the
+  catalog-scope check, which is correct on its own and is how a multi-catalog
+  plan is deployed one catalog at a time; what was missing is that *all* of
+  them being filtered out means this run can only do nothing. A caller
+  reading the exit code would have recorded a successful structural clone of
+  11 objects that do not exist.
+- The result now carries `matched_nothing`, the console prints
+  `NOTHING MATCHED` naming both catalogs, `SOFT_CLONE_SUMMARY.md` leads with
+  it instead of the ordinary "Not deployed in this run" note, and the stage
+  exits 1. An empty plan and a partial match are each still exactly what they
+  were: only *every* statement being out of scope is this case.
+
 ### Fixed — an attachment the account-wide view had not caught up to
 
 - Live run, 2026-09-22: a masking policy, a row-access policy and two tags

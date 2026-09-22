@@ -348,6 +348,10 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         "out_of_scope_count": len(out_of_scope),
         "out_of_scope_catalogs": sorted({
             _split(s["target_fqn"])[0] for s in out_of_scope}),
+        # Every statement filtered out by the catalog name: this run can only
+        # do nothing. Naming it here is what stops `executed: 0, errors: []`
+        # from reading like a clean deploy of an empty plan.
+        "matched_nothing": bool(all_statements and not statements),
         "executed": 0, "verified": 0,
         "schemas_created": [], "errors": [],
         "resolved_schema_keys": {}, "schemas_reused": [],

@@ -951,6 +951,15 @@ def cmd_deploy(args) -> int:
                         run_sql=run_sql, chunk_size=args.chunk_size)
     _write(out, "deploy_result.json", result)
     _write(out, "SOFT_CLONE_SUMMARY.md", render_soft_clone_summary(built, result))
+    if result.get("matched_nothing"):
+        print(f'  NOTHING MATCHED: all '
+              f'{result.get("out_of_scope_count", 0)} planned object(s) '
+              f'target '
+              + ", ".join(result.get("out_of_scope_catalogs") or [])
+              + f', not `{result.get("catalog_in_scope")}`. Nothing was '
+                f'created. Point --catalog at the catalog the plan targets, '
+                f'or re-plan with --bronze-catalog-prefix.', file=sys.stderr)
+        return 1
     return 1 if result.get("failed") or result.get("chunk_errors") \
         or result.get("mismatched_targets") else 0
 

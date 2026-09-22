@@ -878,3 +878,59 @@ def test_diagnosis_probe_is_deleted_when_its_listing_fails():
         "never leave the probe behind because we could not look"
     assert probes[0]["created"] is None
     assert "503" in probes[0]["list_error"]
+
+
+# ------------------------------------------- an execute that matches nothing
+#
+# Live 2026-09-22: `deploy --execute --catalog snowmig_coverage_internal` on a
+# plan whose every object targets catalog `snowmig_coverage` created nothing,
+# recorded `executed: 0, errors: []`, and exited 0. The report's only trace
+# was the ordinary "Not deployed in this run" note. A caller reading the exit
+# code would have called that a successful structural clone of 11 objects.
+
+def _elsewhere(n=2):
+    return {"statements": [
+        {"source_identifier": f"DB.PUBLIC.T{i}", "object_type": "TABLE",
+         "target_fqn": f"other_catalog.DB.T{i}", "sql": "CREATE TABLE ...",
+         "expected_columns": [{"name": "A", "type": "STRING"}]}
+        for i in range(n)], "blocked": []}
+
+
+def test_a_plan_that_matches_no_statement_is_not_a_clean_empty_deploy():
+    out = deploy_catalog(_elsewhere(2), target=TARGET, execute=True,
+                         call=Recorder(), retry_delays=(), verify_delays=())
+    assert out["matched_nothing"] is True
+    assert out["out_of_scope_count"] == 2
+    assert out["executed"] == 0
+
+
+def test_an_empty_plan_is_not_a_run_that_matched_nothing():
+    """Nothing to do and nothing matching are different facts: only the
+    second means the operator named a catalog the plan never mentions."""
+    out = deploy_catalog({"statements": [], "blocked": []}, target=TARGET,
+                         execute=True, call=Recorder(), retry_delays=(),
+                         verify_delays=())
+    assert out["matched_nothing"] is False
+
+
+def test_a_partial_match_is_not_a_run_that_matched_nothing():
+    plan = _plan(1)
+    plan["statements"] += _elsewhere(1)["statements"]
+    out = deploy_catalog(plan, target=TARGET, execute=True, call=Recorder(),
+                         retry_delays=(), verify_delays=())
+    assert out["matched_nothing"] is False
+    assert out["out_of_scope_count"] == 1
+
+
+def test_the_report_says_the_catalog_name_is_what_did_not_match():
+    from report.render import render_soft_clone_summary
+    md = render_soft_clone_summary(
+        {"can_migrate": [], "blocked": []},
+        {"dry_run": False, "executed": 0, "verified": 0, "statements": [],
+         "statement_count": 0, "blocked_count": 0, "errors": [],
+         "catalog_in_scope": "wrong_name", "matched_nothing": True,
+         "out_of_scope_count": 11,
+         "out_of_scope_catalogs": ["snowmig_coverage"]})
+    assert "wrong_name" in md
+    assert "snowmig_coverage" in md
+    assert "nothing was created" in md.lower()

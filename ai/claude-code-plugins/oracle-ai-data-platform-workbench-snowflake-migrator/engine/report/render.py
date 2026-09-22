@@ -492,7 +492,19 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
         out += [f"- {v} {k.lower()}(s)" for k, v in sorted(by_type.items())]
         out.append("")
 
-    if res.get("out_of_scope_count"):
+    if res.get("matched_nothing"):
+        out += ["## ⛔ Nothing in the plan belongs to this catalog", "",
+                f'Every one of the {res.get("out_of_scope_count", 0)} planned '
+                f'object(s) targets '
+                + ", ".join(f'`{c}`' for c in
+                            res.get("out_of_scope_catalogs") or [])
+                + f', and this run was pointed at '
+                  f'`{res.get("catalog_in_scope")}`. **Nothing was created, '
+                  f'and nothing was wrong with the plan** — the catalog name '
+                  f'does not match it.', "",
+                "Point the run at the catalog the plan targets, or re-run "
+                "`plan --bronze-catalog-prefix` to target this one.", ""]
+    elif res.get("out_of_scope_count"):
         out += ["## Not deployed in this run", "",
                 f'{res["out_of_scope_count"]} object(s) belong to other catalogs: '
                 + ", ".join(f'`{c}`' for c in res.get("out_of_scope_catalogs") or []),
