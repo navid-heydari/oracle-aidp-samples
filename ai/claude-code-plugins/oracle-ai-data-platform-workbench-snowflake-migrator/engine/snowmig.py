@@ -380,6 +380,12 @@ def _snowflake_coords(args) -> dict:
             "key_passphrase": (resolve_secret(config, "key_passphrase",
                                               "key_passphrase_path")
                                if config else None),
+            # A PAT may be inline (`token:`) or a path (`pat_path:`),
+            # the same as password and private_key. The config already
+            # treats `token` as a secret; it was validated and redacted and
+            # then never read at connect time.
+            "token": (resolve_secret(config, "token", "pat_path")
+                      if config and config.get("token") else None),
             "pat_path": pick("pat_path"),
             "password_path": pick("password_path"),
             "database": pick("database")}
@@ -413,7 +419,7 @@ def _run_sql_from_args(args):
             role=coords["role"], warehouse=coords["warehouse"],
             key_path=as_path(coords.get("private_key"), coords["key_path"]),
             key_passphrase=coords["key_passphrase"],
-            pat_path=coords["pat_path"],
+            pat_path=as_path(coords.get("token"), coords["pat_path"]),
             password_path=as_path(coords.get("password"),
                                   coords["password_path"]))
         return make_run_sql(connect(**kwargs))

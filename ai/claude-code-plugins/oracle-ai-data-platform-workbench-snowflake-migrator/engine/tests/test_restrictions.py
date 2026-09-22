@@ -245,3 +245,39 @@ def test_upper_case_BYTES_metadata_is_still_capped():
     r["source_metadata"] = {"BYTES": 10**12}
     _, excluded = apply_restrictions([r], {"max_bytes": 1000})
     assert excluded and "exceeds max_bytes" in excluded[0]["reason"]
+
+
+# ------------------------------- name patterns fold case, like every sibling
+#
+# Raised by the repo owner on the review PR. Snowflake upper-cases every
+# unquoted identifier, so a hand-written `^tmp_` matched nothing in a real
+# estate -- the one restriction that could look right and silently do
+# nothing, while `exclude_databases: [sales]` has always matched SALES.
+
+def _rec(ident, kind="TABLE"):
+    db, schema, name = ident.split(".")
+    return {"source_identifier": ident, "object_type": kind,
+            "source_database": db, "source_schema": schema,
+            "compatibility_status": "supported", "source_metadata": {}}
+
+
+def test_an_exclude_pattern_matches_an_upper_cased_name():
+    kept, excluded = apply_restrictions(
+        [_rec("D.S.TMP_ORDERS"), _rec("D.S.ORDERS")],
+        {"exclude_name_patterns": ["^tmp_"]})
+    assert [r["source_identifier"] for r in kept] == ["D.S.ORDERS"]
+    assert excluded[0]["restriction"] == "exclude_name_patterns"
+
+
+def test_an_include_pattern_matches_an_upper_cased_name():
+    kept, _ = apply_restrictions(
+        [_rec("D.S.DIM_DATE"), _rec("D.S.FACT_SALES")],
+        {"include_name_patterns": ["^dim_"]})
+    assert [r["source_identifier"] for r in kept] == ["D.S.DIM_DATE"]
+
+
+def test_a_pattern_written_in_upper_case_still_matches_a_lower_name():
+    kept, _ = apply_restrictions(
+        [_rec("D.S.tmp_x"), _rec("D.S.keep")],
+        {"exclude_name_patterns": ["^TMP_"]})
+    assert [r["source_identifier"] for r in kept] == ["D.S.keep"]

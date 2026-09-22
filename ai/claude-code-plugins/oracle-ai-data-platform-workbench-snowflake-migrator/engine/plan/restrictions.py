@@ -186,8 +186,14 @@ def apply_restrictions(records: list[dict],
     match_inc = _object_matcher(r.get("include_objects"))
     match_exc = _object_matcher(r.get("exclude_objects"))
     has_inc_ob = bool(r.get("include_objects"))
-    inc_pat = [re.compile(p) for p in r.get("include_name_patterns") or []]
-    exc_pat = [re.compile(p) for p in r.get("exclude_name_patterns") or []]
+    # Case-insensitive, like every sibling restriction. Snowflake
+    # upper-cases every unquoted identifier, so `^tmp_` written by hand
+    # matched nothing at all in a real estate -- the one restriction that
+    # could look right and silently do nothing.
+    inc_pat = [re.compile(p, re.IGNORECASE)
+               for p in r.get("include_name_patterns") or []]
+    exc_pat = [re.compile(p, re.IGNORECASE)
+               for p in r.get("exclude_name_patterns") or []]
     max_rows, max_bytes = r.get("max_rows"), r.get("max_bytes")
 
     kept, excluded = [], []

@@ -604,6 +604,33 @@ on its first colon, which is how the file passed before.
   always read and reports the distinction as *not distinguishable*, never as
   none. Every new read is a `SHOW` or a `SELECT`; the transport is unchanged.
 
+### Fixed — the four items raised on the review PR
+
+- **Required before merge: census readability was global, not per database.**
+  A kind that answered in one database and was denied in another reported as
+  *not visible to this role* with a null count, while the rows counted in the
+  database that answered sat in the same report's `by_kind` and object table.
+  The report contradicted itself and the number it hid was real. Three states
+  now, not two: all answered, none did, or some did -- the last keeps its
+  count, names the databases that were denied, and renders as **partial**.
+- **The in-AIDP transport refuses a write too.** `conn.py` was hardened
+  against CTE-prefixed writes while `dataplane/snowmig_source.py`'s
+  `pushdown()` had no verb enforcement at all, and that is the transport the
+  migration notebooks run on the cluster against the customer's live
+  Snowflake. It runs standalone and cannot import the engine's lexer, so the
+  guard is deliberately stricter rather than a second implementation of the
+  same analysis: one statement, one leading read verb, and a CTE refused
+  rather than followed to its body. It runs before the mode check, so the
+  refusal cannot depend on configuration being right.
+- **`include_name_patterns` / `exclude_name_patterns` fold case**, like every
+  sibling restriction. Snowflake upper-cases every unquoted identifier, so a
+  hand-written `^tmp_` matched nothing in a real estate -- the one
+  restriction that could look right and silently do nothing.
+- **An inline `token:` is resolved**, like an inline `password` or
+  `private_key`. The config already listed `token` as a secret field, so one
+  was accepted, validated and redacted, then ignored at connect time -- which
+  reads to the operator as "the PAT is wrong".
+
 ### Fixed — the view reference the target could not resolve
 
 - **Root cause of every failed view create on the live run.** Snowflake's

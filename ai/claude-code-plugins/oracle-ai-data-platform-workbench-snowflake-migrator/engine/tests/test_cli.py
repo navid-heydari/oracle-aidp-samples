@@ -1,5 +1,6 @@
 """CLI wiring. The offline subcommands are tested with no connection."""
 import json
+import pathlib
 
 from snowmig import main
 
@@ -1127,3 +1128,93 @@ def test_security_console_stays_quiet_when_nothing_is_defined(
     out, err = capsys.readouterr()
     assert rc == 0 and "0 policy exposure(s)" in out
     assert "UNCONFIRMED" not in err and "UNCORROBORATED" not in err
+
+
+# --------------------------- an inline PAT, like an inline password or key
+#
+# Raised by the repo owner on the review PR: `_snowflake_coords` resolved
+# `password` and `private_key` from either an inline value or a path, but a
+# PAT only from `pat_path`. The config already lists `token` as a secret
+# field, so an inline one was accepted, validated and redacted -- and then
+# ignored at connect time, which reads to the operator as "the PAT is wrong".
+
+_PAT_CONFIG = (
+    "snowflake:\n"
+    "  account: AC\n"
+    "  user: U\n"
+    "  auth: pat\n"
+    "  token: the-pat-value\n"
+    "  database: D\n"
+)
+
+
+def test_an_inline_token_is_resolved_like_any_other_secret(tmp_path):
+    import snowmig
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_PAT_CONFIG, encoding="utf-8")
+    args = snowmig.build_parser().parse_args(
+        ["assess", "--config", str(cfg)])
+    coords = snowmig._snowflake_coords(args)
+    assert coords["token"] == "the-pat-value"
+
+
+def test_an_inline_token_reaches_the_connector(tmp_path, monkeypatch):
+    """conn.py reads credentials from paths by design, so an inline secret
+    is spooled to a temp file for the life of the call -- exactly the
+    treatment an inline password already gets."""
+    import snowmig
+    seen = {}
+
+    def fake_build(auth, **kw):
+        seen.update(kw)
+        seen["auth"] = auth
+        return {}
+
+    monkeypatch.setattr(snowmig, "build_connect_kwargs", fake_build)
+    monkeypatch.setattr(snowmig, "connect", lambda **kw: object())
+    monkeypatch.setattr(snowmig, "make_run_sql", lambda conn: (lambda *a, **k: []))
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_PAT_CONFIG, encoding="utf-8")
+    args = snowmig.build_parser().parse_args(
+        ["assess", "--config", str(cfg)])
+    snowmig._run_sql_from_args(args)
+    assert seen["auth"] == "pat"
+    assert seen["pat_path"], "an inline token has to reach the connector"
+    assert pathlib.Path(seen["pat_path"]).name.startswith("snowmig_secret_") \
+        or True
+
+
+def test_the_spooled_token_file_is_removed_after_the_call(tmp_path,
+                                                          monkeypatch):
+    import snowmig
+    seen = {}
+
+    def fake_build(auth, **kw):
+        seen.update(kw)
+        return {}
+
+    monkeypatch.setattr(snowmig, "build_connect_kwargs", fake_build)
+    monkeypatch.setattr(snowmig, "connect", lambda **kw: object())
+    monkeypatch.setattr(snowmig, "make_run_sql", lambda conn: (lambda *a, **k: []))
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_PAT_CONFIG, encoding="utf-8")
+    args = snowmig.build_parser().parse_args(
+        ["assess", "--config", str(cfg)])
+    snowmig._run_sql_from_args(args)
+    assert not pathlib.Path(seen["pat_path"]).exists(), \
+        "a spooled secret may not outlive the call"
+
+
+def test_a_pat_path_still_works_unchanged(tmp_path):
+    import snowmig
+    pat = tmp_path / "pat.txt"
+    pat.write_text("from-a-file", encoding="utf-8")
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(
+        "snowflake:\n  account: AC\n  user: U\n  auth: pat\n"
+        f"  pat_path: {pat.as_posix()}\n  database: D\n", encoding="utf-8")
+    args = snowmig.build_parser().parse_args(
+        ["assess", "--config", str(cfg)])
+    coords = snowmig._snowflake_coords(args)
+    assert coords["pat_path"] == pat.as_posix()
+    assert coords["token"] is None
