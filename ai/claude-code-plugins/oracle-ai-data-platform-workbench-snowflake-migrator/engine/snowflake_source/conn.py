@@ -20,6 +20,7 @@ from typing import Any, Callable
 from .dialect import lexer
 
 __all__ = ["AuthError", "SourceWriteRefused", "READ_ONLY_VERBS",
+           "drop_secondary_roles",
            "build_connect_kwargs", "load_private_key_der", "connect",
            "make_run_sql"]
 
@@ -219,6 +220,20 @@ def connect(**kwargs):
         raise AuthError(
             f"{head}.\n  driver said ({code or 'no code'}): {exc}\n  "
             f"{_CONNECT_ADVICE}") from exc
+
+
+def drop_secondary_roles(conn) -> None:
+    """Scope the session to its primary role alone.
+
+    With secondary roles active -- the default on many accounts -- every role
+    granted to the user is in effect, so a read attributed to a restricted
+    role can have been served by ACCOUNTADMIN. A migration rehearsal meant to
+    prove a least-privilege role is sufficient has to turn them off, or it
+    proves nothing. Live-verified 2026-09-23: the same session read a
+    database it had no grant on until this ran.
+    """
+    with conn.cursor() as cur:
+        cur.execute("use secondary roles none")
 
 
 def make_run_sql(conn) -> Callable[..., list[dict]]:

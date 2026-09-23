@@ -64,12 +64,13 @@ from report.render import (
 )
 from snowflake_source.conn import (
     AuthError, SourceWriteRefused, build_connect_kwargs, connect,
-    make_run_sql,
+    drop_secondary_roles, make_run_sql,
 )
 from snowflake_source.extract.catalog import (
     ROW_COUNT_MODES, build_inventory)
 from snowflake_source.extract.maintenance import build_maintenance
-from snowflake_source.extract.census import build_census
+from snowflake_source.extract.census import (build_census,
+                                             secondary_roles_active)
 from snowflake_source.extract.security import build_security
 from snowflake_source.dialect.types import (
     GEOSPATIAL_MODES, SEMI_STRUCTURED_MODES, TIMESTAMP_NTZ_MODES, map_type)
@@ -422,7 +423,15 @@ def _run_sql_from_args(args):
             pat_path=as_path(coords.get("token"), coords["pat_path"]),
             password_path=as_path(coords.get("password"),
                                   coords["password_path"]))
-        return make_run_sql(connect(**kwargs))
+        conn = connect(**kwargs)
+        # Asked for, never assumed: dropping them changes what the whole run
+        # can see, so it is the operator's call and it is said out loud.
+        if getattr(args, "only_primary_role", False):
+            drop_secondary_roles(conn)
+            print("  session scoped to its PRIMARY role only (secondary "
+                  "roles dropped): every count is what THAT role can see",
+                  file=sys.stderr)
+        return make_run_sql(conn)
     finally:
         for path in spooled:
             try:
@@ -453,7 +462,9 @@ def _assess_inventory(args) -> dict:
         inv["census"] = build_census(
             run_sql, inv["databases_in_scope"],
             include_definitions=getattr(args, "capture_definitions", False),
-            role=(inv.get("session") or {}).get("ROLE"))
+            role=(inv.get("session") or {}).get("ROLE"),
+            secondary_roles=secondary_roles_active(
+                (inv.get("session") or {}).get("SECONDARY_ROLES")))
     return inv
 
 
@@ -1778,6 +1789,15 @@ def _add_snowflake_args(p) -> None:
     p.add_argument("--account")
     p.add_argument("--user")
     p.add_argument("--role")
+    p.add_argument("--only-primary-role", action="store_true",
+                   help="drop SECONDARY roles for the session, so the run "
+                        "sees exactly what --role can see and nothing more. "
+                        "Snowflake activates every role granted to the user "
+                        "by default, so without this a count attributed to a "
+                        "restricted role may have been served by "
+                        "ACCOUNTADMIN -- which is the difference between "
+                        "rehearsing a least-privilege migration and only "
+                        "appearing to")
     p.add_argument("--warehouse")
     p.add_argument("--auth", default="keypair",
                    choices=["keypair", "pat", "password", "externalbrowser"])

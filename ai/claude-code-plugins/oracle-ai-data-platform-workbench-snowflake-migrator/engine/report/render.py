@@ -5,6 +5,7 @@ anything that halted or was skipped rather than burying it.
 """
 from __future__ import annotations
 
+from snowflake_source.extract.census import secondary_roles_active
 from plan.data_movement import MAINTENANCE_TRAPS, architecture_decision
 from plan.smoke import smoke_verdict
 from plan.status import assess_risk, migration_status
@@ -87,16 +88,55 @@ def _row_cell(record: dict) -> str:
     return "-"
 
 
+def _unreadable_databases(inv: dict) -> list[str]:
+    """Databases in scope that yielded nothing because they were refused.
+
+    The note is already written by the extractor; this finds it so the
+    headline can carry the same fact. Matched on the extractor's own
+    `database <name>: ` prefix rather than by searching for the name inside
+    arbitrary error text, which would also match an object in that database.
+    """
+    out = []
+    for note in inv.get("extraction_notes") or []:
+        text = str(note)
+        if text.startswith("database ") and ":" in text:
+            name = text[len("database "):text.index(":")].strip()
+            if name and name not in out:
+                out.append(name)
+    return out
+
+
 def render_inventory(inv: dict) -> str:
     s = inv.get("session", {})
+    # Naming the primary role alone is wrong wherever secondary roles were
+    # active: those privileges served these reads too.
+    secondary = secondary_roles_active(s.get("SECONDARY_ROLES"))
+    role = f'role `{s.get("ROLE")}`'
+    if secondary:
+        role += (" **+ secondary "
+                 + ", ".join(f"`{r}`" for r in secondary) + "**")
+
+    # A database in scope that answered nothing is not part of this count,
+    # and the scope line may not imply it is.
+    refused = _unreadable_databases(inv)
+    scope = list(inv.get("databases_in_scope") or [])
+    scope_text = ", ".join(
+        f"{d} (**NOT READ**)" if d in refused else d for d in scope) or "-"
+
     out = ["# Snowflake estate inventory", "",
            f'Probed **{inv.get("probed_at")}** · account `{s.get("A")}` · '
-           f'region `{s.get("R")}` · role `{s.get("ROLE")}`',
-           f'Databases in scope: {", ".join(inv.get("databases_in_scope") or []) or "-"}',
+           f'region `{s.get("R")}` · {role}',
+           f'Databases in scope: {scope_text}',
            "",
            f'**{inv.get("object_count", 0)} objects** — '
            + " · ".join(f"{k} {v}" for k, v in (inv.get("counts_by_type") or {}).items()),
            ""]
+
+    if refused:
+        out += [f'> **{len(refused)} database(s) in scope could not be read '
+                f'at all**: {", ".join(f"`{d}`" for d in refused)}. The count '
+                f'above covers the rest. This is a privilege result, not an '
+                f'empty database — see Extraction notes.', ""]
 
     collisions = inv.get("identifier_case_collisions") or {}
     if collisions:

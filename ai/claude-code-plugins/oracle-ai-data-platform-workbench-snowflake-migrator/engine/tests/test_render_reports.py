@@ -1,7 +1,7 @@
 """The two headline reports: what is planned to move, and what got created."""
 from snowflake_source.extract.census import KINDS
 from report.render import (
-    render_census, render_ddl_plan, render_maintenance,
+    render_census, render_ddl_plan, render_inventory, render_maintenance,
     render_compute, render_planned_objects, render_soft_clone_summary,
 )
 
@@ -709,3 +709,77 @@ def test_soft_clone_summary_names_a_dropped_description():
 def test_soft_clone_summary_is_silent_when_nothing_was_dropped():
     md = render_soft_clone_summary(PLAN, dict(_DEPLOYED))
     assert "cannot carry" not in md and "Descriptions the target dropped" not in md
+
+
+# ----------------------------- the inventory headline agrees with the run
+#
+# Live 2026-09-23, two databases in scope and one of them wholly unreadable:
+#
+#     role `SNOWMIG_LIMITED`
+#     Databases in scope: SNOWMIG_COVERAGE, SNOWMIG_COV_B
+#     **16 objects** - TABLE 8 - VIEW 8
+#
+# Both lines mislead in the same direction as the census bug. The role line
+# named an authority that, without --only-primary-role, also held
+# ACCOUNTADMIN. The scope line listed two databases beside a count drawn from
+# one. The refusal was disclosed thirty-five lines lower, under Extraction
+# notes, where a reader who has taken the headline does not go.
+
+def _inv(**over):
+    base = {
+        "probed_at": "2026-09-23T00:00:00Z",
+        "session": {"A": "ACC", "R": "REG", "ROLE": "LIMITED"},
+        "databases_in_scope": ["DB_A", "DB_B"],
+        "object_count": 8,
+        "counts_by_type": {"TABLE": 8},
+        "inventory": [],
+        "extraction_notes": [],
+    }
+    base.update(over)
+    return base
+
+
+def test_a_database_that_could_not_be_read_is_marked_in_the_scope_line():
+    md = render_inventory(_inv(extraction_notes=[
+        "database DB_B: 002043 (02000): SQL compilation error"]))
+    scope = next(l for l in md.splitlines() if l.startswith("Databases in scope"))
+    assert "DB_B (**NOT READ**)" in scope, scope
+    assert "DB_A (**NOT READ**)" not in scope
+
+
+def test_the_count_says_it_does_not_cover_the_refused_database():
+    md = render_inventory(_inv(extraction_notes=[
+        "database DB_B: 002043 (02000): SQL compilation error"]))
+    assert "could not be read at all" in md
+    assert "privilege result, not an empty database" in md
+
+
+def test_a_fully_readable_estate_gets_no_such_warning():
+    md = render_inventory(_inv())
+    assert "NOT READ" not in md
+    assert "could not be read at all" not in md
+
+
+def test_an_object_level_note_is_not_mistaken_for_a_refused_database():
+    """The extractor writes both kinds of note into the same list."""
+    md = render_inventory(_inv(extraction_notes=[
+        "DB_A.PUBLIC.V1: GET_DDL failed: 002043 (02000)"]))
+    assert "NOT READ" not in md
+
+
+def test_the_role_line_names_the_secondary_roles_that_served_the_reads():
+    md = render_inventory(_inv(session={
+        "A": "ACC", "R": "REG", "ROLE": "LIMITED",
+        "SECONDARY_ROLES": '{"roles":"ACCOUNTADMIN","value":"ALL"}'}))
+    role_line = next(l for l in md.splitlines() if l.startswith("Probed"))
+    assert "ACCOUNTADMIN" in role_line, role_line
+    assert "secondary" in role_line.lower()
+
+
+def test_no_secondary_roles_leaves_the_role_line_as_it_was():
+    md = render_inventory(_inv(session={
+        "A": "ACC", "R": "REG", "ROLE": "LIMITED",
+        "SECONDARY_ROLES": '{"roles":"","value":""}'}))
+    role_line = next(l for l in md.splitlines() if l.startswith("Probed"))
+    assert "secondary" not in role_line.lower()
+    assert "`LIMITED`" in role_line

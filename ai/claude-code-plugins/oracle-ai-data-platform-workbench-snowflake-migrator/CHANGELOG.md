@@ -604,6 +604,42 @@ on its first colon, which is how the file passed before.
   always read and reports the distinction as *not distinguishable*, never as
   none. Every new read is a `SHOW` or a `SELECT`; the transport is unchanged.
 
+### Fixed — "as visible to role X" was not true when secondary roles were on
+
+- Live 2026-09-23. A session connected as `role=SNOWMIG_LIMITED`, a role
+  holding `USAGE` on exactly one database, read the whole account:
+
+      current_role()            SNOWMIG_LIMITED
+      current_secondary_roles() {"roles":"ORGADMIN,ACCOUNTADMIN","value":"ALL"}
+
+  Snowflake activates every role granted to the user by default. The same
+  `assess` against the same two databases counted **24 objects** with
+  secondary roles on and **10** with them off — same role name, same
+  command, 2.4x the estate.
+- Every count in `CENSUS.md`, `SECURITY.md` and the `INVENTORY.md` header is
+  attributed to `CURRENT_ROLE()`, so the attribution named an authority the
+  numbers were not produced under — and it erred in the unsafe direction,
+  making a restricted role look sufficient when the run had leaned on
+  `ACCOUNTADMIN`. `CURRENT_SECONDARY_ROLES()` is read now and every sentence
+  that names a role names them too.
+- **`--only-primary-role`** drops them for the session, so a run sees exactly
+  what `--role` can see. That is what a migration rehearsal needs: proving a
+  least-privilege role is sufficient BEFORE cutover, rather than finding out
+  at cutover that every read had been served by something else. Asked for,
+  never assumed, and said on the console when it happens.
+
+### Fixed — an inventory headline that disagreed with the inventory
+
+- Same run: `Databases in scope: SNOWMIG_COVERAGE, SNOWMIG_COV_B` above
+  `**16 objects**`, where `SNOWMIG_COV_B` had been refused outright and
+  contributed nothing. The refusal was disclosed thirty-five lines lower
+  under *Extraction notes*, which is not where a reader who has taken the
+  headline goes.
+- A database in scope that could not be read is marked `(**NOT READ**)` in
+  the scope line, and a note under the count says the count does not cover
+  it and that this is a privilege result rather than an empty database. An
+  object-level extraction note is not mistaken for a refused database.
+
 ### Fixed — the four items raised on the review PR
 
 - **Required before merge: census readability was global, not per database.**

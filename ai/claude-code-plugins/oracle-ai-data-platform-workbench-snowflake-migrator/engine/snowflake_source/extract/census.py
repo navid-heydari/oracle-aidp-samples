@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import collections
 import datetime
+import json
 from typing import Callable
 
 from ..dialect import lexer
@@ -425,13 +426,27 @@ def _read_show(run_sql, db: str | None, spec: dict) -> list[dict]:
     return run_sql(f'show {spec["relation"]} in database {lexer.qualify(db)}')
 
 
-def _role_text(role: str | None) -> str:
-    return f"role `{role}`" if role else "the current role"
+def _role_text(role: str | None, secondary: list[str] | None = None) -> str:
+    """How to name the authority a count was produced under.
+
+    Naming only the primary role is wrong whenever secondary roles are
+    active: the read had their privileges too, so a reader who takes the
+    sentence at face value concludes a restricted role is sufficient when it
+    is not.
+    """
+    base = f"role `{role}`" if role else "the current role"
+    if secondary:
+        return (base + " **plus secondary role(s) "
+                + ", ".join(f"`{r}`" for r in secondary)
+                + "**, whose privileges these reads also had")
+    return base
 
 
-def _visibility_note(role: str | None) -> str:
+def _visibility_note(role: str | None,
+                     secondary: list[str] | None = None) -> str:
     lines = [
-        f"**Counted as visible to {_role_text(role)}.** Snowflake's SHOW and "
+        f"**Counted as visible to {_role_text(role, secondary)}.** "
+        "Snowflake's SHOW and "
         "INFORMATION_SCHEMA return only the objects the current role holds a "
         "privilege on, and a statement that returns nothing still succeeds -- "
         "so every count below is a lower bound, and a zero means *none "
@@ -443,7 +458,7 @@ def _visibility_note(role: str | None) -> str:
 
 def _summary(count: int, readable: bool, scope: str, note: str,
              role: str | None, *, denied: list[str] | None = None,
-             answered: int = 0) -> dict:
+             answered: int = 0, secondary: list[str] | None = None) -> dict:
     """One row of the counts table.
 
     `count` is None only when NOBODY looked. Where some databases answered
@@ -460,11 +475,12 @@ def _summary(count: int, readable: bool, scope: str, note: str,
             "denied_databases": denied,
             "scope": scope,
             "note": (f"{count} found in the database(s) that answered; "
-                     f"not visible to {_role_text(role)} in "
+                     f"not visible to {_role_text(role, secondary)} in "
                      f'{", ".join(denied)}, so this is a lower bound'),
         }
     if readable and not count:
-        note = f"0 visible to {_role_text(role)}; a lower bound, not a total"
+        note = (f"0 visible to {_role_text(role, secondary)}; a lower "
+                f"bound, not a total")
     return {"count": count if readable else None,
             "readable": readable,
             "unread": None if readable else "denied",
@@ -482,12 +498,35 @@ def _not_distinguishable(parent: str, scope: str) -> dict:
                      f"distinguishable rather than none")}
 
 
+def secondary_roles_active(value) -> list[str]:
+    """The roles in effect BESIDES the current one, from
+    `CURRENT_SECONDARY_ROLES()`.
+
+    Snowflake returns a JSON object: `{"roles":"A,B","value":"ALL"}` when
+    secondary roles are active, and an empty `roles` when they are not. Any
+    shape this cannot read yields no roles rather than a guess -- an empty
+    list here means "none named", and the caller must not read it as "none
+    active" when the field was missing entirely.
+    """
+    if not value:
+        return []
+    text = str(value)
+    if text.strip().startswith("{"):
+        try:
+            text = json.loads(text).get("roles", "")
+        except (ValueError, AttributeError):
+            return []
+    return [r.strip() for r in str(text).split(",") if r.strip()]
+
+
 def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
                  include_definitions: bool = False,
-                 role: str | None = None) -> dict:
+                 role: str | None = None,
+                 secondary_roles: list[str] | None = None) -> dict:
     notes: list[str] = []
     kinds: dict[str, dict] = {}
     objects: list[dict] = []
+    secondary = list(secondary_roles or [])
 
     for spec in KINDS:
         kind = spec["kind"]
@@ -525,7 +564,8 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
                 tally[entry["kind"]] = tally.get(entry["kind"], 0) + 1
         readable = not denied
         kinds[kind] = _summary(tally[kind], readable, scope, note, role,
-                               denied=denied, answered=answered)
+                               denied=denied, answered=answered,
+                               secondary=secondary)
         if readable and degraded:
             kinds[kind]["note"] += (
                 f"; the detail columns were not readable, so every row is "
@@ -538,7 +578,8 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
             kinds[sub] = (
                 _not_distinguishable(kind, scope) if readable and degraded
                 else _summary(tally[sub], readable, scope, note, role,
-                              denied=denied, answered=answered))
+                              denied=denied, answered=answered,
+                              secondary=secondary))
 
     by_language = collections.Counter(
         o["language"] for o in objects if o.get("language"))
@@ -557,9 +598,10 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
         "by_effort": dict(by_effort),
         "unreadable": notes,
         "role": role,
+        "secondary_roles": secondary,
         "completeness": "visible-to-role",
-        "visibility_note": _visibility_note(role),
-        "scope_statement": _scope_statement(len(objects), by_kind, kinds, role),
+        "visibility_note": _visibility_note(role, secondary),
+        "scope_statement": _scope_statement(len(objects), by_kind, kinds, role, secondary),
     }
 
 
@@ -627,10 +669,11 @@ def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
 
 
 def _scope_statement(total: int, by_kind, kinds: dict,
-                     role: str | None = None) -> str:
+                     role: str | None = None,
+                     secondary: list[str] | None = None) -> str:
     denied = [k for k, v in kinds.items() if v.get("unread") == "denied"]
     indistinct = [k for k, v in kinds.items() if v.get("unread") == "degraded"]
-    who = _role_text(role)
+    who = _role_text(role, secondary)
     if total == 0 and not denied:
         # Every statement succeeded and returned nothing. With a minimal
         # read-only role that is the EXPECTED result on an estate full of

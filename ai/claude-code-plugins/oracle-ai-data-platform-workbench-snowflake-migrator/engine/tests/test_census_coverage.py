@@ -518,3 +518,68 @@ def test_the_report_marks_a_partial_count_rather_than_calling_it_denied():
     assert "not visible to this role" not in row, row
     assert "1" in row
     assert "partial" in row.lower(), row
+
+
+# ------------------- the role a count is attributed to may not be the whole
+#                     authority it was produced under
+#
+# Live 2026-09-23. A session connected as `role=SNOWMIG_LIMITED`, which holds
+# USAGE on exactly one database, read the whole account:
+#
+#     current_role()            SNOWMIG_LIMITED
+#     current_secondary_roles() {"roles":"ORGADMIN,ACCOUNTADMIN","value":"ALL"}
+#
+# `USE SECONDARY ROLES NONE` on the same session turned the same read into
+# "Database 'SNOWMIG_COV_B' does not exist or not authorized". Every count in
+# CENSUS.md is attributed to CURRENT_ROLE(), so where secondary roles are
+# active the report names an authority the numbers were not produced under --
+# and it errs in the unsafe direction, making a restricted role look
+# sufficient when the run leaned on ACCOUNTADMIN.
+
+def test_secondary_roles_are_parsed_from_snowflakes_json():
+    from snowflake_source.extract.census import secondary_roles_active
+    assert secondary_roles_active(
+        '{"roles":"ORGADMIN,ACCOUNTADMIN","value":"ALL"}') == [
+            "ORGADMIN", "ACCOUNTADMIN"]
+
+
+def test_no_secondary_roles_reads_as_none():
+    from snowflake_source.extract.census import secondary_roles_active
+    assert secondary_roles_active('{"roles":"","value":""}') == []
+    assert secondary_roles_active(None) == []
+    assert secondary_roles_active("") == []
+
+
+def test_an_unreadable_shape_yields_no_roles_rather_than_a_guess():
+    from snowflake_source.extract.census import secondary_roles_active
+    assert secondary_roles_active("{not json") == []
+    assert secondary_roles_active("{}") == []
+
+
+def test_a_bare_comma_list_is_accepted_too():
+    from snowflake_source.extract.census import secondary_roles_active
+    assert secondary_roles_active("A, B") == ["A", "B"]
+
+
+def test_the_census_names_the_secondary_roles_the_reads_also_had():
+    census = build_census(FakeSql(_responses()), ["DB"], role="LIMITED",
+                          secondary_roles=["ACCOUNTADMIN"])
+    note = census["visibility_note"] + census["scope_statement"]
+    assert "ACCOUNTADMIN" in note, \
+        "a count produced with ACCOUNTADMIN may not be attributed to LIMITED alone"
+    assert "secondary" in note.lower()
+
+
+def test_without_secondary_roles_the_sentence_is_unchanged():
+    census = build_census(FakeSql(_responses()), ["DB"], role="LIMITED",
+                          secondary_roles=[])
+    note = census["visibility_note"] + census["scope_statement"]
+    assert "secondary" not in note.lower()
+    assert "LIMITED" in note
+
+
+def test_the_per_kind_note_carries_the_same_attribution():
+    census = build_census(FakeSql(_responses()), ["DB"], role="LIMITED",
+                          secondary_roles=["ACCOUNTADMIN"])
+    zero = census["kinds"]["PIPE"]            # nothing visible
+    assert "ACCOUNTADMIN" in zero["note"], zero["note"]

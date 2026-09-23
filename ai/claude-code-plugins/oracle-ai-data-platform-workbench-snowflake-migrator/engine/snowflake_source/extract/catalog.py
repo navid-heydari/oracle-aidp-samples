@@ -127,7 +127,12 @@ def build_inventory(run_sql: Callable[..., list[dict]],
     notes: list[str] = []
     session = run_sql(
         "select current_user() U, current_account() A, current_region() R, "
-        "current_role() ROLE, current_warehouse() WH, current_version() V")[0]
+        "current_role() ROLE, current_warehouse() WH, current_version() V, "
+        # CURRENT_ROLE alone is not the authority a read ran under: with
+        # secondary roles active every role granted to the user is in
+        # effect, so a count attributed to a restricted role can have been
+        # produced with ACCOUNTADMIN. Live-verified 2026-09-23.
+        "current_secondary_roles() SECONDARY_ROLES")[0]
 
     if not databases:
         databases = [r["name"] for r in _show_all(run_sql, "show databases")
