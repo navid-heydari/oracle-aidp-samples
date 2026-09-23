@@ -38,6 +38,31 @@ class ManifestShapeError(ValueError):
     """The manifest is not the shape `00_discover_snowflake.py` writes."""
 
 
+# The fields a manifest must carry beyond type and nullability, because the
+# planning stages report on them. A manifest that carries none of them was
+# written by an older discovery, which is a different fact from a column
+# that genuinely has no default -- see `facts_recorded` below.
+FACT_KEYS = ("column_default", "identity_start", "identity_increment",
+             "comment")
+
+
+def manifest_records_column_facts(manifest: dict) -> bool:
+    """Did the discovery that wrote this manifest read the fact columns?
+
+    True when any column carries any of them, or when discovery said so
+    outright with `facts_recorded`. False means UNKNOWN, never "none".
+    """
+    for schema in manifest.get("schemas") or []:
+        for key in ("tables", "views"):
+            for obj in schema.get(key) or []:
+                for col in obj.get("columns") or []:
+                    if col.get("facts_recorded"):
+                        return True
+                    if any(col.get(k) is not None for k in FACT_KEYS):
+                        return True
+    return False
+
+
 def _column_record(col: dict, *, semi_structured: str, geospatial: str,
                    timestamp_ntz: str) -> tuple[dict, object]:
     """One column, mapped. Returns (enriched column, mapping verdict)."""
@@ -63,6 +88,13 @@ def _column_record(col: dict, *, semi_structured: str, geospatial: str,
         "NUMERIC_SCALE": col.get("numeric_scale"),
         "CHARACTER_MAXIMUM_LENGTH": col.get("character_maximum_length"),
         "IS_NULLABLE": "YES" if col.get("nullable", True) else "NO",
+        # Reported on by R22/R23 and carried into the CREATE TABLE. Absent
+        # from an older manifest, which the caller records as unknown rather
+        # than letting it read as "no default".
+        "COLUMN_DEFAULT": col.get("column_default"),
+        "IDENTITY_START": col.get("identity_start"),
+        "IDENTITY_INCREMENT": col.get("identity_increment"),
+        "COMMENT": col.get("comment"),
         "target_type": m.spark_type,
     }
     return enriched, m
@@ -175,6 +207,20 @@ def inventory_from_manifest(manifest: dict, *, database: str,
     notes: list[str] = []
     inventory: list[dict] = []
 
+    # A manifest from an older discovery carries no DEFAULT, IDENTITY or
+    # COMMENT at all. Rendering that as "this column has no default" is the
+    # same false negative the census rule exists to prevent, and it is the
+    # quiet kind: the plan simply omits the warning.
+    facts_known = manifest_records_column_facts(manifest)
+    if not facts_known:
+        notes.append(
+            "column DEFAULT, IDENTITY and COMMENT are UNKNOWN for every "
+            "object here, not absent: this manifest was written by a "
+            "discovery that did not read them. R22/R23 cannot fire and no "
+            "column comment can travel. Re-run "
+            "00_discover_snowflake.py to capture them, or plan these "
+            "objects from a live `assess`.")
+
     for schema in manifest.get("schemas") or []:
         sname = schema.get("name")
         if not sname:
@@ -187,10 +233,13 @@ def inventory_from_manifest(manifest: dict, *, database: str,
                     notes.append(f"{sname}: an object entry carries no name "
                                  f"and was skipped rather than guessed")
                     continue
-                inventory.append(_record(
+                record = _record(
                     database, sname, kind, obj,
                     semi_structured=semi_structured, geospatial=geospatial,
-                    timestamp_ntz=timestamp_ntz, notes=notes))
+                    timestamp_ntz=timestamp_ntz, notes=notes)
+                if not facts_known:
+                    record["column_facts_unknown"] = True
+                inventory.append(record)
         # Discovery's own per-schema errors are extraction notes here: an
         # object it could not read is absent from the inventory, and absence
         # must never read as "it does not exist".

@@ -604,6 +604,26 @@ on its first colon, which is how the file passed before.
   always read and reports the distinction as *not distinguishable*, never as
   none. Every new read is a `SHOW` or a `SELECT`; the transport is unchanged.
 
+### Fixed — the in-AIDP planning path dropped the column facts
+
+- Live 2026-09-23, the same estate planned both ways and compared column by
+  column: **71 columns, identical types, identical verdicts — and six facts
+  present from a live `assess` and absent from a manifest.** Three column
+  `DEFAULT`s, an `IDENTITY` start and increment, and a column `COMMENT`.
+- Those are exactly what `R22`, `R23` and the column-comment fidelity work
+  report on. So an estate planned through runbook S6/S7 — the path that
+  exists *because* the estate is too large for the laptop path — got a DDL
+  plan with no warning that its defaults and identity columns stop working
+  at cutover, while the same estate planned from a laptop warned about both.
+  Neither plan said it differed from the other.
+- Discovery now selects `COLUMN_DEFAULT`, `IDENTITY_START`,
+  `IDENTITY_INCREMENT` and `COMMENT`; the bridge carries them; and the two
+  paths were re-compared live afterwards: **0 differences over 71 columns.**
+- A manifest written by an older discovery carries none of them, and that is
+  recorded as UNKNOWN for every object rather than rendered as "this column
+  has no default" — the same false negative the census rule exists to
+  prevent, and the quiet kind, because the plan simply omits the warning.
+
 ### Fixed — "as visible to role X" was not true when secondary roles were on
 
 - Live 2026-09-23. A session connected as `role=SNOWMIG_LIMITED`, a role
