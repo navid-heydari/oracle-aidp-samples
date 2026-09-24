@@ -604,6 +604,32 @@ on its first colon, which is how the file passed before.
   always read and reports the distinction as *not distinguishable*, never as
   none. Every new read is a `SHOW` or a `SELECT`; the transport is unchanged.
 
+### Fixed — a target key longer than the destination can hold
+
+- Measured live 2026-09-24, not taken from a document. The limit is **not**
+  on the object name: it is **255 characters on the whole key**
+  `catalog.schema.name`.
+
+  | catalog + schema | prefix | accepted | refused |
+  |---|---:|---:|---:|
+  | `snowmig_coverage_v2` + `snowmig_coverage_edge` | 42 | 213 | 214 |
+  | `snowmig_coverage_v2` + `default` | 28 | 227 | 228 |
+
+  The second boundary was predicted from the first and hit exactly, so it
+  is the key that is bounded and nothing else.
+- This matters more than a name limit would, because the migrator chooses
+  two thirds of the key: `--bronze-catalog-prefix`, and the `db_schema`
+  style that concatenates database + `_` + schema. Both eat the budget the
+  table name has left, and an operator told only "the name is too long"
+  would shorten the one part they cannot change.
+- The failure mode is the bad one: `202 Accepted`, the object never
+  appears, and the name is then burned in that schema. So it is refused at
+  plan time, with the key, its length, the overage, and how many characters
+  the catalog and schema have left for the name.
+- Also measured, and needing no change: a reserved word is a perfectly good
+  object name here. `select`, `table`, `from`, `order`, `group`, `index`
+  and `int` were each created and read back.
+
 ### Fixed — the in-AIDP planning path dropped the column facts
 
 - Live 2026-09-23, the same estate planned both ways and compared column by

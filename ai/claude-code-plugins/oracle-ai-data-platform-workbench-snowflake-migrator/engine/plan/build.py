@@ -39,9 +39,9 @@ from target.ddl import (
     uncarried_column_facts,
 )
 
-from .medallion import (TARGET_NAME_RULE_TEXT, bronze_target,
+from .medallion import (TARGET_KEY_MAX, TARGET_NAME_RULE_TEXT, bronze_target,
                         detect_target_collisions, layer_jobs,
-                        unacceptable_target_names)
+                        target_key_overage, unacceptable_target_names)
 from .restrictions import apply_restrictions
 from .waves import compute_waves
 
@@ -264,6 +264,31 @@ def build_plan(inventory: dict, dependencies: dict, *,
         # A name the destination will refuse is refused here, not at the
         # create. Planning it means generating DDL for it, attempting it, and
         # burning the name on a 400 -- which is how it was found.
+        # A key the destination cannot hold, refused here rather than at
+        # the create -- where it returns 202, never appears, and burns the
+        # name in that schema.
+        over = target_key_overage(targets[ident])
+        if over:
+            target = targets[ident]
+            catalog, schema, _, = (target.split(".", 2) + ["", ""])[:3]
+            cannot.append({
+                "source_identifier": ident,
+                "object_type": rec.get("object_type"),
+                "category": "target_key_too_long",
+                "reason": (
+                    f"the target key {target!r} is {len(target)} characters; "
+                    f"the destination stores at most {TARGET_KEY_MAX} and "
+                    f"answers a longer one with 202 Accepted, creates "
+                    f"nothing, and burns the name. It is over by {over}. "
+                    f"The limit is on the WHOLE key: catalog {catalog!r} "
+                    f"({len(catalog)}) + schema {schema!r} ({len(schema)}) "
+                    f"leave {max(0, TARGET_KEY_MAX - len(catalog) - len(schema) - 2)} "
+                    f"characters for the object name. Shorten "
+                    f"--bronze-catalog-prefix, or use "
+                    f"--bronze-schema-style db, before renaming anything in "
+                    f"Snowflake.")})
+            continue
+
         bad = unacceptable_target_names(targets[ident])
         if bad:
             cannot.append({

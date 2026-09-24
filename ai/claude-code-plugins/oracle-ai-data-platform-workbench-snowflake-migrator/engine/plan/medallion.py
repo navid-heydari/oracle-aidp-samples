@@ -55,6 +55,23 @@ TARGET_NAME_RULE_TEXT = (
     "underscores, starting with a letter")
 
 
+# Measured against a live DataLake on 2026-09-24, not taken from a doc: a
+# `catalog.schema.name` key of 255 characters is created, 256 returns 202
+# Accepted and never appears. Confirmed twice, under schema names of two
+# different lengths, so it is the key that is bounded and not the name.
+TARGET_KEY_MAX = 255
+
+
+def target_key_overage(target_fqn: str) -> int:
+    """How many characters the whole target key is over the limit, or 0.
+
+    The key is the three-part name the catalog API stores, so a long
+    catalog or schema leaves a short table name no room -- which is why the
+    caller reports the parts and not just the object name.
+    """
+    return max(0, len(str(target_fqn)) - TARGET_KEY_MAX)
+
+
 def unacceptable_target_names(target_fqn: str) -> list[str]:
     """The parts of a planned FQN the destination will refuse, if any.
 
