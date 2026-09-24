@@ -10,6 +10,18 @@ schema, table -> table, view -> view). Silver and Gold are requirement-driven, s
 this module emits disabled job stubs for them rather than inventing
 transformation logic nobody specified.
 
+SHOW TABLES lists dynamic, external, Iceberg, event and hybrid tables next to
+standard ones, and the extractor keeps the is_* flags. None of those is a table
+this plugin can copy: each lands in `cannot_migrate` with a reason specific to
+its kind, so the plan agrees with CENSUS.md instead of contradicting it.
+TRANSIENT and TEMPORARY tables do migrate, as permanent Delta tables, and the
+plan carries a warning per object saying so, which PLANNED_OBJECTS.md lists and
+SUMMARY.md scores MEDIUM.
+
+An object that depends on one that is not migrating cannot migrate either --
+a view over a blocked or excluded table would be created over nothing. The
+cascade follows the dependency edges transitively and names the missing object.
+
 A target-name collision raises: two source objects merging into one target table
 is a data-loss defect, not something to resolve by picking a winner.
 """
@@ -17,16 +29,48 @@ from __future__ import annotations
 
 import collections
 import datetime
+import json
 
 from snowflake_source.dialect.views import (
     detect_unsupported_constructs, extract_view_body,
 )
+from target.ddl import (
+    DEFERRED_EQUIVALENT_PROPERTIES, SCRUBBED_PROPERTIES,
+    uncarried_column_facts,
+)
 
-from .medallion import bronze_target, detect_target_collisions, layer_jobs
+from .medallion import (TARGET_NAME_RULE_TEXT, bronze_target,
+                        detect_target_collisions, layer_jobs,
+                        unacceptable_target_names)
 from .restrictions import apply_restrictions
 from .waves import compute_waves
 
 __all__ = ["build_plan", "TargetCollision"]
+
+# Values that mean "this property is not set"; the same list ddl.py skips.
+_UNSET = (None, "", "false", "FALSE", "N", "OFF", "null", "NULL")
+
+
+def _maintenance_facts(rec: dict) -> tuple[list[dict], list[str]]:
+    """(deferred_properties, omitted_properties), as `ddl` will report them.
+
+    SUMMARY.md scores risk from the plan entry alone, and it once saw only
+    the object type and the row count -- so a clustered table whose DDL plan
+    listed cluster_by, change_tracking and retention_time as deferred read
+    LOW with "no properties dropped". The tables are ddl.py's own, so the
+    two reports name the same settings.
+    """
+    deferred: list[dict] = []
+    omitted: list[str] = []
+    for prop, value in (rec.get("source_metadata") or {}).items():
+        if value in _UNSET:
+            continue
+        if prop in DEFERRED_EQUIVALENT_PROPERTIES:
+            deferred.append({"property": prop, "value": value,
+                             "aidp_equivalent": DEFERRED_EQUIVALENT_PROPERTIES[prop]})
+        elif prop in SCRUBBED_PROPERTIES:
+            omitted.append(f"{prop}={value}")
+    return deferred, omitted
 
 
 class TargetCollision(RuntimeError):
@@ -35,17 +79,77 @@ class TargetCollision(RuntimeError):
     def __init__(self, collisions: dict[str, list[str]]):
         self.collisions = collisions
         detail = "; ".join(f"{t} <- {sorted(s)}" for t, s in collisions.items())
-        super().__init__(f"target name collision, refusing to guess: {detail}")
+        remedy = ""
+        if collisions:
+            # The one in-tool remedy, in the form the restrictions JSON takes:
+            # a quoted part of an exclude_objects entry matches case-sensitively.
+            twin = sorted(next(iter(collisions.values())))[-1]
+            example = json.dumps(".".join(f'"{p}"' for p in twin.split(".")))
+            remedy = (" -- to migrate one twin now, list the other in "
+                      "exclude_objects with its exact double-quoted spelling, "
+                      f'e.g. "exclude_objects": [{example}]')
+        super().__init__(f"target name collision, refusing to guess: {detail}{remedy}")
+
+
+def _is_set(value) -> bool:
+    return str(value if value is not None else "").strip().lower() in (
+        "true", "y", "yes", "1")
+
+
+# SHOW TABLES flag -> why a plain Delta copy is not that object. First match
+# wins; a table carrying several flags is still one refusal.
+_TABLE_KIND_BLOCKS = (
+    ("is_dynamic", "Snowflake dynamic table: refreshed by Snowflake from its "
+                   "defining query; the census lists them; no equivalent is "
+                   "generated -- a copy would be a snapshot that never refreshes"),
+    ("is_external", "Snowflake external table: its data lives in the stage's "
+                    "object storage, not in Snowflake; point AIDP at that "
+                    "location rather than copying a materialisation of it"),
+    ("is_iceberg", "Snowflake Iceberg table: already open-format in object "
+                   "storage; register that Iceberg location in AIDP rather "
+                   "than copying it into Delta"),
+    ("is_event", "Snowflake event table: a log and trace sink written by "
+                 "Snowflake itself; AIDP has no equivalent object"),
+    ("is_hybrid", "Snowflake hybrid (Unistore) table: row-store OLTP "
+                  "semantics do not carry to Delta"),
+)
+
+# SHOW TABLES `kind` values that migrate, as permanent tables, with a warning.
+_TABLE_KIND_WARNINGS = {
+    "TRANSIENT": "TRANSIENT table in Snowflake (no Fail-safe, short Time "
+                 "Travel); it is planned as a permanent Delta table, so confirm "
+                 "it is meant to persist",
+    "TEMPORARY": "TEMPORARY table in Snowflake (session-scoped, dropped when "
+                 "the session ends); it is planned as a permanent Delta table, "
+                 "so confirm it is meant to persist at all",
+}
+
+
+def _table_verdict(rec: dict) -> tuple[bool, str, str]:
+    """(can_migrate, category, reason) for one table, from its SHOW flags."""
+    meta = rec.get("source_metadata") or {}
+    for flag, reason in _TABLE_KIND_BLOCKS:
+        if _is_set(meta.get(flag)):
+            return False, "unsupported_object", reason
+    return True, "", ""
+
+
+def _table_kind_warning(rec: dict) -> dict | None:
+    kind = str((rec.get("source_metadata") or {}).get("kind") or "").upper()
+    if kind in _TABLE_KIND_WARNINGS:
+        return {"source_identifier": rec["source_identifier"], "kind": kind,
+                "warning": _TABLE_KIND_WARNINGS[kind]}
+    return None
 
 
 def _view_verdict(rec: dict) -> tuple[bool, str, str]:
     """(can_migrate, category, reason) for one view."""
     meta = rec.get("source_metadata") or {}
-    if str(meta.get("is_secure", "")).lower() in ("true", "y", "yes"):
+    if _is_set(meta.get("is_secure")):
         return False, "unsupported_object", (
             "Snowflake secure view: its definition and row-visibility rules have "
             "no Delta equivalent")
-    if str(meta.get("is_materialized", "")).lower() in ("true", "y", "yes"):
+    if _is_set(meta.get("is_materialized")):
         return False, "unsupported_object", (
             "Snowflake materialized view: no AIDP equivalent; rebuild as a table "
             "plus a refresh job")
@@ -62,6 +166,73 @@ def _view_verdict(rec: dict) -> tuple[bool, str, str]:
         return False, "snowflake_only_sql", "uses " + "; ".join(
             f'{u["construct"]} ({u["reason"]})' for u in unsupported)
     return True, "", ""
+
+
+def _cascade_dependency_exclusions(can: list[dict], cannot: list[dict],
+                                   edges: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Move every dependent of a `cannot` object into `cannot`, transitively.
+
+    Without this only the planned ids reached compute_waves, which drops an
+    edge whose other end is not in the set: the view lost its only edge, sat
+    at indegree 0, sorted first (rows=None -> size 0) and got a CREATE VIEW
+    over a table that will never exist, under a report line promising that
+    views follow their base tables.
+    """
+    can_ids = {c["source_identifier"] for c in can}
+    kinds = {c["source_identifier"]: c["object_type"] for c in can}
+    dependents: dict[str, set[str]] = collections.defaultdict(set)
+    for edge in edges:
+        if edge["from"] != edge["to"]:
+            dependents[edge["to"]].add(edge["from"])
+
+    why = {c["source_identifier"]: c for c in cannot}
+    queue = collections.deque(sorted(why))
+    while queue:
+        missing = queue.popleft()
+        for dependent in sorted(dependents.get(missing, ())):
+            if dependent not in can_ids:
+                continue
+            can_ids.discard(dependent)
+            state = ("excluded" if why[missing]["category"] == "restriction"
+                     else "blocked")
+            entry = {"source_identifier": dependent,
+                     "object_type": kinds[dependent],
+                     "category": "dependency_not_migrated",
+                     "reason": f"depends on {missing}, which is {state} "
+                               f'({why[missing]["category"]})'}
+            cannot.append(entry)
+            why[dependent] = entry
+            queue.append(dependent)
+    return [c for c in can if c["source_identifier"] in can_ids], cannot
+
+
+def _target_catalog_note(catalogs: list[str], prefix: str | None,
+                         style: str) -> str:
+    """Say whose catalog name the Target column carries.
+
+    The in-AIDP structure job (01_create_structure) creates
+    <--target-catalog>.<source schema>.<name> and never reads the plan's
+    target_fqn; the plan's catalog part is the source database mirrored, or
+    the prefix. Reviewers were approving names the job does not create.
+    """
+    job = ("The in-AIDP structure job (01_create_structure) does not read this "
+           "column: it creates <--target-catalog>.<schema>.<table> under the "
+           "catalog passed to `provision --target-catalog`, keeping the source "
+           "schema and table names.")
+    if prefix is None:
+        mirrored = ", ".join(catalogs) or "the source database"
+        return (f"The catalog part of the Target column is the source database "
+                f"name mirrored 1:1 ({mirrored}); no --bronze-catalog-prefix was "
+                f"given. {job} Read the Target column with that "
+                f"catalog in place of {mirrored}. In the runbook the catalog "
+                f"named after the source database is the read-only EXTERNAL "
+                f"pointer at Snowflake, not the target -- the job refuses "
+                f"source == target.")
+    return (f"The catalog part of the Target column is the --bronze-catalog-prefix "
+            f"{prefix!r}, with the schema part in the {style!r} style. {job} "
+            f"Pass {prefix!r} to `provision --target-catalog` for the catalogs to "
+            f"agree; the schema part the job creates is the source schema, not "
+            f"the {style!r} form shown here.")
 
 
 def build_plan(inventory: dict, dependencies: dict, *,
@@ -82,12 +253,34 @@ def build_plan(inventory: dict, dependencies: dict, *,
         for e in restricted]
 
     targets: dict[str, str] = {}
+    kind_warnings: list[dict] = []
     for rec in kept:
         ident = rec["source_identifier"]
         db, schema, name = ident.split(".", 2)
         targets[ident] = bronze_target(db, schema, name,
                                        catalog_prefix=bronze_catalog_prefix,
                                        schema_style=bronze_schema_style)
+
+        # A name the destination will refuse is refused here, not at the
+        # create. Planning it means generating DDL for it, attempting it, and
+        # burning the name on a 400 -- which is how it was found.
+        bad = unacceptable_target_names(targets[ident])
+        if bad:
+            cannot.append({
+                "source_identifier": ident,
+                "object_type": rec.get("object_type"),
+                "category": "unacceptable_target_name",
+                "reason": (
+                    f'the target name {targets[ident]!r} is not one the '
+                    f'destination accepts: '
+                    + ", ".join(repr(b) for b in bad)
+                    + f' -- {TARGET_NAME_RULE_TEXT}. Snowflake allows it '
+                      f'because the source name is double-quoted. Rename it '
+                      f'in Snowflake, or exclude it, and re-run: this plugin '
+                      f'does not rewrite an object name, because a renamed '
+                      f'table is a different table to everything that reads '
+                      f'it.')})
+            continue
 
         if rec.get("compatibility_status") == "blocked":
             cannot.append({
@@ -97,19 +290,57 @@ def build_plan(inventory: dict, dependencies: dict, *,
                           + "; ".join(rec.get("blocked_reasons") or ["unspecified"])})
             continue
 
-        if rec.get("object_type") == "VIEW":
-            ok, category, reason = _view_verdict(rec)
-            if not ok:
-                cannot.append({
-                    "source_identifier": ident, "object_type": "VIEW",
-                    "category": category, "reason": reason})
-                continue
+        verdict = _view_verdict if rec.get("object_type") == "VIEW" else _table_verdict
+        ok, category, reason = verdict(rec)
+        if not ok:
+            cannot.append({
+                "source_identifier": ident, "object_type": rec.get("object_type"),
+                "category": category, "reason": reason})
+            continue
+        warning = _table_kind_warning(rec)
+        if warning:
+            kind_warnings.append(warning)
 
+        # ddl reports maintenance settings for tables only (build_create_view
+        # reads is_secure/is_materialized alone); the plan mirrors that split
+        # so SUMMARY.md and DDL_PLAN.md name the same settings.
+        deferred, omitted = (([], []) if rec.get("object_type") == "VIEW"
+                             else _maintenance_facts(rec))
+        # A column DEFAULT or an IDENTITY that does not travel changes what
+        # an INSERT DOES after cutover -- NULL, or a failure, where Snowflake
+        # supplied a value -- so it goes in `warnings`, which assess_risk
+        # counts and PLANNED_OBJECTS.md prints. The sentences come from
+        # target.ddl so this and DDL_PLAN.md cannot say different things.
+        column_facts = ([] if rec.get("object_type") == "VIEW"
+                        else uncarried_column_facts(rec))
+        # Constraints are kept OUT of `warnings` on purpose: PK/UNIQUE/FK are
+        # unenforced metadata on BOTH sides, so nothing behaves differently
+        # after cutover, and raising every table with a primary key to MEDIUM
+        # would drown the settings that do change behaviour. They are carried
+        # as a fact per object instead, and named in DDL_PLAN.md (R20).
+        constraints = ([] if rec.get("object_type") == "VIEW"
+                       else list(rec.get("constraints") or []))
         can.append({"source_identifier": ident,
                     "object_type": rec.get("object_type"),
                     "target": targets[ident],
                     "rows": rec.get("row_count_exact"),
-                    "columns": len(rec.get("columns") or [])})
+                    "columns": len(rec.get("columns") or []),
+                    # The facts assess_risk reads. Column warnings (timezone,
+                    # semi-structured-as-string, declared lengths) come from
+                    # the type mapper; the maintenance settings from SHOW;
+                    # the DEFAULT/IDENTITY sentences from target.ddl.
+                    "warnings": list(rec.get("warnings") or []) + column_facts,
+                    # Declared on the source, created on neither target path.
+                    "constraints_not_created": constraints,
+                    # Kept apart from the column warnings: assess_risk counts
+                    # those, but a TRANSIENT/TEMPORARY table planned as a
+                    # permanent one is a sentence about the object itself.
+                    "kind_warning": warning["warning"] if warning else None,
+                    "deferred_properties": deferred,
+                    "omitted_properties": omitted})
+
+    can, cannot = _cascade_dependency_exclusions(
+        can, cannot, dependencies.get("edges", []))
 
     collisions = detect_target_collisions(
         {c["source_identifier"]: targets[c["source_identifier"]] for c in can})
@@ -120,8 +351,18 @@ def build_plan(inventory: dict, dependencies: dict, *,
     migratable = [r for r in kept if r["source_identifier"] in can_ids]
     sizes = {r["source_identifier"]: (r.get("row_count_exact") or 0)
              for r in migratable}
-    waved = compute_waves(sorted(can_ids), dependencies.get("edges", []),
+    edges = dependencies.get("edges", [])
+    waved = compute_waves(sorted(can_ids), edges,
                           sort_key=lambda n: (sizes.get(n, 0), n))
+    # A planned view with no edge from either source sits at indegree 0 and
+    # sorts by size, so it can land ahead of its base table. Derived from the
+    # planned views against the edges rather than from the producer's label,
+    # so account_usage_empty, account_usage+parsed_ddl, parsed_ddl (ACCOUNT_
+    # USAGE denied) and not_extracted are all covered alike.
+    ordered = {e["from"] for e in edges}
+    unordered_views = sorted(c["source_identifier"] for c in can
+                             if c["object_type"] == "VIEW"
+                             and c["source_identifier"] not in ordered)
 
     catalogs = sorted({targets[i].split(".", 1)[0] for i in can_ids})
     schemas = sorted({tuple(targets[i].split(".")[:2]) for i in can_ids})
@@ -134,18 +375,30 @@ def build_plan(inventory: dict, dependencies: dict, *,
         "bronze_schema_style": bronze_schema_style,
         "bronze_mapping": ("Snowflake database -> AIDP Standard Catalog, "
                            "schema -> schema, table -> table, view -> view"),
+        "target_catalog_note": _target_catalog_note(
+            catalogs, bronze_catalog_prefix, bronze_schema_style),
         "waves": waved["waves"],
         "cycles": waved["cycles"],
         "target_names": targets,
         "clone_targets": sorted(can_ids),
         "can_migrate": sorted(can, key=lambda c: c["source_identifier"]),
         "cannot_migrate": sorted(cannot, key=lambda c: c["source_identifier"]),
+        # Planned, but not as what they were: TRANSIENT/TEMPORARY tables
+        # become permanent Delta tables. One entry per affected object.
+        "table_kind_warnings": sorted(
+            (w for w in kind_warnings
+             if w["source_identifier"] in {c["source_identifier"] for c in can}),
+            key=lambda w: w["source_identifier"]),
         "restrictions_applied": restrictions or {},
         "catalogs_to_create": catalogs,
         "schemas_to_create": [list(s) for s in schemas],
         "silver_gold_jobs": layer_jobs(scopes),
         "dependency_source": dependencies.get("source_used"),
         "dependency_coverage_note": dependencies.get("coverage_note"),
+        "dependency_warning": dependencies.get("warning"),
+        "dependency_edge_count": len(edges),
+        # Ordered by size only; NOT guaranteed to follow their base tables.
+        "views_without_dependency_edge": unordered_views,
         # Carried so every report can state the architecture decision. None means
         # undecided, which the reports say out loud rather than defaulting.
         "architecture_choice": architecture_choice,

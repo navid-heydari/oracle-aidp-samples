@@ -40,15 +40,40 @@ def test_externalbrowser_sets_the_authenticator():
 
 def test_pat_reads_the_token_from_a_file(tmp_path):
     f = tmp_path / "pat"
-    f.write_text("  tok-abc123  \n")
+    f.write_text("  tok-abc123  \n", encoding="utf-8")
     kw = build_connect_kwargs("pat", account=ACC, user="u", pat_path=str(f))
     assert kw["authenticator"] == "PROGRAMMATIC_ACCESS_TOKEN"
-    assert kw["password"] == "tok-abc123", "token must be stripped"
+    # The connector's PAT authenticator reads `token`, never `password`. A PAT
+    # handed over as `password` reaches the wire as `TOKEN: null`.
+    assert kw["token"] == "tok-abc123", "token must be stripped"
+    assert "password" not in kw
+
+
+def test_pat_lands_where_the_connector_actually_reads_it(tmp_path):
+    # Pins the plugin's kwargs to the connector's own consumption, so a rename
+    # on either side cannot silently regress PAT login again. No socket: this
+    # runs the connector's kwarg mapping and its PAT auth class, nothing else.
+    connection = pytest.importorskip("snowflake.connector.connection")
+    from snowflake.connector.auth.pat import AuthByPAT
+    f = tmp_path / "pat"
+    f.write_text("tok-abc123\n", encoding="utf-8")
+    kw = build_connect_kwargs("pat", account=ACC, user="u", pat_path=str(f))
+
+    c = connection.SnowflakeConnection.__new__(connection.SnowflakeConnection)
+    for name, (value, _type) in connection.DEFAULT_CONFIGURATION.items():
+        setattr(c, "_" + name, value)          # what __init__ does before __config
+    c._SnowflakeConnection__config(**kw)
+    assert c._authenticator == "PROGRAMMATIC_ACCESS_TOKEN"
+    assert c._token == "tok-abc123"
+
+    body = {"data": {}}
+    AuthByPAT(c._token).update_body(body)      # what connect() puts in the login body
+    assert body["data"]["TOKEN"] == "tok-abc123"
 
 
 def test_password_read_from_file_not_taken_inline(tmp_path):
     f = tmp_path / "pw"
-    f.write_text("s3cret\n")
+    f.write_text("s3cret\n", encoding="utf-8")
     kw = build_connect_kwargs("password", account=ACC, user="u", password_path=str(f))
     assert kw["password"] == "s3cret"
 
@@ -73,3 +98,19 @@ def test_missing_secret_file_is_a_clear_error(tmp_path):
     with pytest.raises(AuthError, match="not readable"):
         build_connect_kwargs("pat", account=ACC, user="u",
                              pat_path=str(tmp_path / "nope"))
+
+
+
+# --- host: the laptop connects where the catalog registration points -------
+
+def test_host_is_passed_to_the_driver_when_set():
+    kw = build_connect_kwargs("externalbrowser", account=ACC,
+                              host=" x.us-east-2.aws.snowflakecomputing.com ")
+    assert kw["host"] == "x.us-east-2.aws.snowflakecomputing.com"
+
+
+def test_host_is_omitted_when_absent_so_the_driver_derives_it():
+    kw = build_connect_kwargs("externalbrowser", account=ACC)
+    assert "host" not in kw
+    kw = build_connect_kwargs("externalbrowser", account=ACC, host="")
+    assert "host" not in kw

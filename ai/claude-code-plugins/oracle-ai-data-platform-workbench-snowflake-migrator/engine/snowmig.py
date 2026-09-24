@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """snowmig -- Snowflake -> AIDP migrator CLI.
 
-Five subcommands, one per pipeline stage. Each reads the previous stage's JSON
-and writes its own plus a markdown report, so any stage can be re-run alone.
+One subcommand per pipeline stage (`--help` lists them all). Each reads the
+previous stage's JSON and writes its own plus a markdown report, so any stage
+can be re-run alone. The main ones:
 
   assess  -> inventory.json      + INVENTORY.md            (needs Snowflake)
   deps    -> dependencies.json                              (needs Snowflake)
@@ -14,7 +15,8 @@ and writes its own plus a markdown report, so any stage can be re-run alone.
                                                              --execute needs AIDP)
   compute -> compute.json        + COMPUTE_PROPOSAL.md      (needs Snowflake)
   smoke   -> smoke.json          + SMOKE_TEST.md            (source; dest if given)
-  notebook-> <nb>.ipynb          + NOTEBOOK.md              (offline; --upload writes)
+  notebook-> <nb>.ipynb          + NOTEBOOK.md              (offline; --upload is
+                                                             refused, see GAPS 13)
   summary -> SUMMARY.md                                     (offline)
   data-options -> data_options.json + DATA_MOVEMENT_OPTIONS.md  (offline; PROPOSAL
                   ONLY -- this plugin moves no bytes and implements no transfer)
@@ -35,6 +37,7 @@ Exit codes: 0 ok | 1 error | 3 HALT (identifier-case or target-name collision)
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import json
 import os
@@ -47,7 +50,7 @@ from plan.medallion import SCHEMA_STYLES
 from plan.restrictions import InvalidRestriction
 from plan.data_movement import OPTIONS as DATA_OPTIONS
 from plan.data_movement import options_for, record_choice
-from plan.smoke import run_smoke
+from plan.smoke import run_smoke, smoke_verdict
 from target.notebook import build_notebook, notebook_workspace_path
 from report.stages import build_stage_board
 from report.render import (
@@ -69,7 +72,7 @@ from snowflake_source.extract.maintenance import build_maintenance
 from snowflake_source.extract.census import build_census
 from snowflake_source.extract.security import build_security
 from snowflake_source.dialect.types import (
-    GEOSPATIAL_MODES, SEMI_STRUCTURED_MODES, TIMESTAMP_NTZ_MODES)
+    GEOSPATIAL_MODES, SEMI_STRUCTURED_MODES, TIMESTAMP_NTZ_MODES, map_type)
 from snowflake_source.extract.dependencies import extract_dependencies
 from snowflake_source.extract.warehouses import extract_warehouses
 from sizing.warehouse_map import propose_all
@@ -83,17 +86,16 @@ from target.catalog_provision import ensure_catalog
 from target.catalog_provision import RefusedToExecute as CatalogRefused
 from target.snowflake_catalog_connection import (
     ConnectionConfigError, build_snowflake_connection_details,
-    load_connection_config,
 )
 from migration_config import (
     CONFIG_NAMES, TEMPLATE_NAME, ConfigError, aidp_block, discover_config,
-    load_config, redact, resolve_secret, snowflake_block, write_template,
+    load_config, resolve_secret, snowflake_block, write_template,
 )
 from target.deploy import RefusedToExecute, deploy
 from target.jobs import JobRunCollision
 from target.provisioning import ProvisionTransportError
 from target.executor import (
-    NoBackendAvailable, build_command, detect_backend,
+    NoBackendAvailable, detect_backend,
 )
 # Aliased: snowflake_source.conn also exports make_run_sql, and the
 # unqualified import shadowed it.
@@ -113,16 +115,56 @@ def _read(out_dir: pathlib.Path, name: str) -> dict:
     if not path.is_file():
         raise FileNotFoundError(
             f"{name} not found in {out_dir}. Run the earlier stage first.")
-    return json.loads(path.read_text())
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        # Name the file: the decoder's own message says where in the text
+        # the problem is, not which artifact holds it.
+        raise ValueError(
+            f"{path} is not valid JSON ({exc}); delete it and re-run the "
+            f"stage that produces it") from exc
 
 
 def _write(out_dir: pathlib.Path, name: str, payload) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     if isinstance(payload, str):
-        (out_dir / name).write_text(payload)
+        (out_dir / name).write_text(payload, encoding="utf-8")
     else:
-        (out_dir / name).write_text(json.dumps(payload, indent=2, default=str))
+        (out_dir / name).write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     print(f"  -> {out_dir / name}")
+
+
+def _executed_record_exists(out_dir: pathlib.Path, name: str) -> bool:
+    """Does `name` in `out_dir` record an EXECUTED run (`dry_run: false`)?
+
+    A missing, unreadable or hand-edited file is "no executed record": the
+    guard exists to protect evidence, and a file that is not evidence is
+    not protected by it.
+    """
+    path = out_dir / name
+    if not path.is_file():
+        return False
+    try:
+        prev = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(prev, dict) and prev.get("dry_run") is False
+
+
+def _refuse_dry_run_overwrite(out_dir: pathlib.Path, name: str,
+                              stage: str) -> int:
+    """The write stages default to a dry run, and a dry run writes the same
+    artifact an executed run does. Re-running `deploy` to re-read
+    PREFLIGHT.md, or forgetting --execute, therefore replaced the only local
+    record of what was created, verified and burned with a dry-run record --
+    and the stage board then said nothing had been created. The artifact is
+    the evidence; it is not overwritten by a rehearsal."""
+    print(f"error: {out_dir / name} records an EXECUTED {stage} run "
+          f"(dry_run: false). A dry run would overwrite the only local "
+          f"evidence of what was created and verified, so it was not written. "
+          f"Re-run with --execute to continue that run, or pass a different "
+          f"--out-dir for a rehearsal.", file=sys.stderr)
+    return 1
 
 
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -170,11 +212,133 @@ def _aidp_from_config(args) -> dict:
     taken = {k: v for k, v in block.items()
              if not getattr(args, k.replace("-", "_"), None)}
     if taken:
-        shown = ", ".join(f"{k}={v}" for k, v in sorted(taken.items())
-                          if k != "oci_profile")
+        # `oci_profile` has its own line (see _oci_profile). `subnet_id` is
+        # accepted so a typo is still reported, but no stage reads it from
+        # the file yet -- said here rather than left to be assumed.
+        shown = ", ".join(
+            f"{k}={v}" + (" (not used by any stage yet)"
+                          if k == "subnet_id" else "")
+            for k, v in sorted(taken.items()) if k != "oci_profile")
         if shown:
             print(f"  destination from the config file: {shown}")
     return block
+
+
+def _oci_profile(args) -> str | None:
+    """`aidp.oci_profile` from the config, announced once.
+
+    It reaches the `oci` CLI as `--profile`, a documented flag. The `aidp`
+    CLI's flag set is unverified, so its argv is left alone and the line
+    says so -- an operator on a non-default profile then knows which calls
+    the file covered.
+    """
+    cached = getattr(args, "_oci_profile", None)
+    if cached is not None:
+        return cached or None
+    profile = str(aidp_block(_load_migration_config(args))
+                  .get("oci_profile") or "").strip()
+    args._oci_profile = profile  # "" when absent, so this runs once
+    if profile:
+        print(f"  oci profile from the config file: {profile} (passed to "
+              f"every `oci` and `aidp` call)")
+    return profile or None
+
+
+# A child CLI is another Python program with its own interpreter and its own
+# site-packages. These variables retarget that interpreter, and a virtual
+# environment built from Microsoft Store Python exports PYTHONUSERBASE
+# unconditionally -- which made `oci` die with "No module named
+# 'cryptography'", reported as a failed API call rather than a broken
+# environment. Nothing the plugin needs travels in them, so they are dropped.
+_INHERITED_PYTHON_VARS = (
+    "PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE", "PYTHONNOUSERSITE",
+    "PYTHONSTARTUP", "PYTHONEXECUTABLE", "PYTHONSAFEPATH",
+)
+
+
+def cli_environment(environ: dict | None = None) -> dict:
+    """The environment a spawned CLI should see: ours, minus the variables
+    that would repoint its interpreter."""
+    env = dict(os.environ if environ is None else environ)
+    for name in _INHERITED_PYTHON_VARS:
+        env.pop(name, None)
+    return env
+
+
+def _oci_auth_mode(args) -> str | None:
+    """`aidp.oci_auth`, or the mode the chosen profile implies.
+
+    A profile carrying `security_token_file` is a session profile: both CLIs
+    need `--auth security_token`, and without it the call is a 401 that reads
+    as a permissions problem. `oci` defaults to api_key and `aidp` defaults to
+    security_token, so neither default is safe to rely on -- the mode is
+    always stated.
+    """
+    cached = getattr(args, "_oci_auth", None)
+    if cached is not None:
+        return cached or None
+    block = aidp_block(_load_migration_config(args))
+    mode = str(block.get("oci_auth") or "").strip()
+    if not mode:
+        mode = _profile_auth_mode(str(block.get("oci_profile") or "").strip()
+                                  or "DEFAULT")
+    args._oci_auth = mode
+    if mode:
+        print(f"  oci auth mode: {mode} (passed as --auth to the `oci` and "
+              f"`aidp` CLIs)")
+    return mode or None
+
+
+def _profile_auth_mode(profile: str) -> str:
+    """security_token when that profile names a token file, else api_key.
+
+    Read-only, and it reads only the section headers and key NAMES -- never a
+    value, so no credential is loaded to decide this.
+    """
+    path = pathlib.Path(os.environ.get("OCI_CONFIG_FILE")
+                        or (pathlib.Path.home() / ".oci" / "config"))
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    current, found = None, False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current = stripped[1:-1].strip()
+            continue
+        if current == profile and stripped.split("=", 1)[0].strip() == \
+                "security_token_file":
+            found = True
+    return "security_token" if found else "api_key"
+
+
+def _oci_runner(args):
+    """The `run_process` every transport uses.
+
+    It states the profile and the auth mode on both CLIs -- `oci` takes
+    `--profile`, `aidp` takes `-p`, and both take `--auth` -- and hands the
+    child an environment that cannot repoint its interpreter.
+    """
+    import subprocess
+
+    profile = _oci_profile(args)
+    mode = _oci_auth_mode(args)
+
+    def run(cmd):
+        argv = list(cmd)
+        if argv and argv[0] in ("oci", "aidp"):
+            if profile and "--profile" not in argv and "-p" not in argv:
+                argv[1:1] = ["--profile", profile]
+            if mode:
+                if "--auth" in argv:
+                    argv[argv.index("--auth") + 1] = mode
+                else:
+                    argv[1:1] = ["--auth", mode]
+        return subprocess.run(argv, capture_output=True, text=True,
+                              check=False, encoding="utf-8", errors="replace",
+                              env=cli_environment())
+    return run
 
 
 def _snowflake_coords(args) -> dict:
@@ -200,7 +364,8 @@ def _snowflake_coords(args) -> dict:
         auth = str(config["auth"])
 
     return {"auth": auth or "keypair",
-            "account": pick("account"), "user": pick("user"),
+            "account": pick("account"), "host": pick("host"),
+            "user": pick("user"),
             "role": pick("role"), "warehouse": pick("warehouse"),
             "key_path": pick("key_path"),
             # A secret may be inline now, so it is resolved rather than
@@ -209,11 +374,18 @@ def _snowflake_coords(args) -> dict:
                          if config else None),
             "private_key": (resolve_secret(config, "private_key", "key_path")
                             if config and config.get("private_key") else None),
-            "key_passphrase": (
-                getattr(args, "key_passphrase", None)
-                or (resolve_secret(config, "key_passphrase",
-                                   "key_passphrase_path")
-                    if config else None)),
+            # From the config only (inline, or a file it names): there is no
+            # flag for it, because a passphrase in argv lands in shell
+            # history and the process table.
+            "key_passphrase": (resolve_secret(config, "key_passphrase",
+                                              "key_passphrase_path")
+                               if config else None),
+            # A PAT may be inline (`token:`) or a path (`pat_path:`),
+            # the same as password and private_key. The config already
+            # treats `token` as a secret; it was validated and redacted and
+            # then never read at connect time.
+            "token": (resolve_secret(config, "token", "pat_path")
+                      if config and config.get("token") else None),
             "pat_path": pick("pat_path"),
             "password_path": pick("password_path"),
             "database": pick("database")}
@@ -235,7 +407,7 @@ def _run_sql_from_args(args):
         if existing or not value:
             return existing
         fd, path = tempfile.mkstemp(prefix="snowmig_secret_")
-        with os.fdopen(fd, "w") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(value)
         spooled.append(path)
         return path
@@ -243,10 +415,11 @@ def _run_sql_from_args(args):
     try:
         kwargs = build_connect_kwargs(
             coords["auth"], account=coords["account"], user=coords["user"],
+            host=coords.get("host"),
             role=coords["role"], warehouse=coords["warehouse"],
             key_path=as_path(coords.get("private_key"), coords["key_path"]),
             key_passphrase=coords["key_passphrase"],
-            pat_path=coords["pat_path"],
+            pat_path=as_path(coords.get("token"), coords["pat_path"]),
             password_path=as_path(coords.get("password"),
                                   coords["password_path"]))
         return make_run_sql(connect(**kwargs))
@@ -279,7 +452,8 @@ def _assess_inventory(args) -> dict:
     if not getattr(args, "no_census", False):
         inv["census"] = build_census(
             run_sql, inv["databases_in_scope"],
-            include_definitions=getattr(args, "capture_definitions", False))
+            include_definitions=getattr(args, "capture_definitions", False),
+            role=(inv.get("session") or {}).get("ROLE"))
     return inv
 
 
@@ -331,7 +505,7 @@ def cmd_ingest(args) -> int:
             f"workspace by the discovery workflow (runbook S6); download it "
             f"from backup-snowflake-migration/reports/ first.")
 
-    manifest = json.loads(manifest_path.read_text())
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     inv = inventory_from_manifest(
         manifest, database=args.database_name,
         semi_structured=args.semi_structured, geospatial=args.geospatial,
@@ -387,7 +561,9 @@ def cmd_deps(args) -> int:
     out = pathlib.Path(args.out_dir)
     deps = extract_dependencies(_run_sql_from_args(args), _read(out, "inventory.json"))
     _write(out, "dependencies.json", deps)
-    print(f'  lineage source: {deps["source_used"]}')
+    print(f'  lineage source: {deps["source_used"]}, {len(deps["edges"])} edge(s)')
+    if deps.get("warning"):
+        print(f'  {deps["warning"]}', file=sys.stderr)
     return 0
 
 
@@ -450,7 +626,8 @@ def cmd_catalogs(args) -> int:
     target = resolve_target(**coords, require=("datalake_ocid",))
     backend = args.backend or detect_backend()
     print(f"  backend: {backend}")
-    payload = make_call(target, backend=backend)("list_catalogs")
+    payload = make_call(target, backend=backend,
+                        run_process=_oci_runner(args))("list_catalogs")
     cats = [{"name": i.get("displayName"), "key": i.get("key"),
              "catalog_type": i.get("catalogType"),
              "source_type": i.get("sourceType")}
@@ -551,6 +728,34 @@ def cmd_security(args) -> int:
         return 0
     extra = len(sec["secure_views"])
     print(f'  {count} policy exposure(s), {extra} secure view(s) losing SECURE')
+    unattached = sec.get("policies_defined_without_attachment") or 0
+    policies = sec.get("policies") or {}
+    if unattached:
+        # SECURITY.md and the stage board already say UNCONFIRMED; the one
+        # line the operator reads on the console has to say it too.
+        print(f'  {unattached} policy object(s) defined but no attachment '
+              'visible (ACCOUNT_USAGE.POLICY_REFERENCES lags ~2 h) - '
+              'exposure UNCONFIRMED, re-run before relying on 0',
+              file=sys.stderr)
+    elif any(not (policies.get(k) or {}).get("readable", True)
+             for k in ("masking", "row_access")):
+        print('  policy objects could not be enumerated - the empty '
+              'attachment list is UNCORROBORATED, see SECURITY.md',
+              file=sys.stderr)
+    live = sec.get("live_attachments") or {}
+    if live.get("attempted") and live.get("failed"):
+        # A per-object read that skipped objects has not answered for them,
+        # and the count above is not a verdict about those objects.
+        print(f'  {len(live["failed"])} object(s) could not be read directly '
+              f'({live["probed"]} of {live["objects"]} read) - the count above '
+              f'does not speak for them, see SECURITY.md', file=sys.stderr)
+    elif live.get("attempted") and not live.get("reason"):
+        print(f'  read per object from INFORMATION_SCHEMA '
+              f'({live["objects"]} object(s)), so this is current rather than '
+              f'subject to the ~2 h ACCOUNT_USAGE lag')
+    elif live.get("reason"):
+        print(f'  attachments NOT read per object: {live["reason"]}',
+              file=sys.stderr)
     if count or extra:
         print("  these objects are created WITHOUT their protection - see "
               "SECURITY.md", file=sys.stderr)
@@ -561,8 +766,21 @@ def cmd_plan(args) -> int:
     out = pathlib.Path(args.out_dir)
     inv = _read(out, "inventory.json")
     deps = _read(out, "dependencies.json")
-    restrictions = (json.loads(pathlib.Path(args.restrictions).read_text())
-                    if args.restrictions else None)
+    restrictions = None
+    if args.restrictions:
+        rpath = pathlib.Path(args.restrictions)
+        try:
+            restrictions = json.loads(rpath.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise InvalidRestriction(
+                f"{rpath}: not valid JSON: {exc}") from exc
+        # The validator iterates a mapping; anything else is a shape error to
+        # report by name, not an AttributeError from inside it.
+        if not isinstance(restrictions, dict):
+            raise InvalidRestriction(
+                f"{rpath}: a restrictions file must be a JSON object mapping "
+                f"restriction names to values, got "
+                f"{type(restrictions).__name__}")
     # A recorded architecture choice, if the data-options stage has been run.
     choice = None
     if (out / "data_options.json").is_file():
@@ -599,11 +817,70 @@ def cmd_plan(args) -> int:
     return 0
 
 
+def _remap_timestamp_ntz(inv: dict, mode: str) -> tuple[dict, list[str]]:
+    """Re-map every TIMESTAMP_NTZ column of `inv` under `mode`, offline.
+
+    Snowflake's default TIMESTAMP is TIMESTAMP_NTZ, the default mapping
+    preserves it, and the AIDP metastore refuses it at CREATE TABLE -- so
+    almost every real estate halts at `ddl`. The mapping is a decision, not
+    an observation, and flipping it must not cost a Snowflake re-read: this
+    applies the same mapper `assess`/`ingest` call, so the type and the
+    timezone caveat come out identical. A deep copy is returned; the
+    inventory on disk is the record of what was observed and stays as it is.
+    """
+    out = copy.deepcopy(inv)
+    changed: list[str] = []
+    for rec in out.get("inventory") or []:
+        for col in rec.get("columns") or []:
+            if str(col.get("DATA_TYPE") or "").strip().upper() != "TIMESTAMP_NTZ":
+                continue
+            mapped = map_type("TIMESTAMP_NTZ", timestamp_ntz=mode)
+            if col.get("target_type") == mapped.spark_type:
+                continue
+            col["target_type"] = mapped.spark_type
+            if mapped.warning:
+                # build_create_table lifts "COL: ..." warnings onto the
+                # statement, which is how the caveat reaches DDL_PLAN.md.
+                caveat = f'{col["COLUMN_NAME"]}: {mapped.warning}'
+                rec.setdefault("warnings", []).append(caveat)
+            changed.append(f'{rec["source_identifier"]}.{col["COLUMN_NAME"]}')
+    out["timestamp_ntz_mode"] = mode
+    return out, changed
+
+
 def cmd_ddl(args) -> int:
     out = pathlib.Path(args.out_dir)
     inv = _read(out, "inventory.json")
     built = _read(out, "plan.json")
+
+    # The TIMESTAMP_NTZ decision can be taken (or re-taken) here, offline.
+    # Only the downgrade is applied: `preserve` on an inventory already
+    # recorded as `timestamp` is a no-op, because the target refuses NTZ
+    # whichever way it was recorded, and re-upgrading would only rebuild
+    # the halt.
+    remapped: list[str] | None = None
+    mode = getattr(args, "timestamp_ntz", None)
+    recorded = inv.get("timestamp_ntz_mode")
+    if mode == "timestamp" and recorded != "timestamp":
+        inv, remapped = _remap_timestamp_ntz(inv, "timestamp")
+        print(f"  re-mapped {len(remapped)} TIMESTAMP_NTZ column(s) to "
+              f"TIMESTAMP offline (inventory.json and INVENTORY.md are "
+              f"untouched and still show the preserved type)")
+    elif mode == "timestamp":
+        remapped = []
+    elif mode == "preserve":
+        remapped = []
+        if recorded == "timestamp":
+            print("  note: inventory.json was recorded with --timestamp-ntz "
+                  "timestamp; `preserve` does not re-upgrade it here. The "
+                  "target refuses TIMESTAMP_NTZ either way -- not "
+                  "re-upgraded.", file=sys.stderr)
+
     payload = build_ddl_payload(inv, built)
+    if remapped is not None:
+        payload["timestamp_ntz_mode"] = (
+            "timestamp" if mode == "timestamp" else recorded)
+        payload["remapped_columns"] = remapped
     _write(out, "ddl_plan.json", payload)
     _write(out, "DDL_PLAN.md", render_ddl_plan(payload))
 
@@ -624,8 +901,9 @@ def cmd_ddl(args) -> int:
                   file=sys.stderr)
         for remedy in dict.fromkeys(r["remedy"] for r in rejected):
             print(f"  {remedy}", file=sys.stderr)
-        print("  Nothing was created. Fix the INPUT and re-run `ddl` -- do "
-              "not hand this plan to the structure workflow.", file=sys.stderr)
+        print("  Nothing was created. Re-run `ddl --timestamp-ntz timestamp` "
+              "(offline), or fix the INPUT and re-run `ddl` -- do not hand "
+              "this plan to the structure workflow.", file=sys.stderr)
         return 3
     return 0
 
@@ -656,21 +934,38 @@ def cmd_deploy(args) -> int:
         print(f"  {line}" if line else "")
     print()
 
+    # After the pre-flight, so re-reading PREFLIGHT.md still works; before
+    # the result is built, so nothing below can replace the executed record.
+    if not args.execute and _executed_record_exists(out, "deploy_result.json"):
+        return _refuse_dry_run_overwrite(out, "deploy_result.json", "deploy")
+
     if args.transport == "catalog_api":
         # The working transport. `POST .../sql/execute` returns 404, and a
         # structure-only clone needs no Spark cluster anyway.
-        call = (make_call(target, backend=args.backend or detect_backend())
+        call = (make_call(target, backend=args.backend or detect_backend(),
+                          run_process=_oci_runner(args))
                 if args.execute else None)
         result = deploy_catalog(ddl_plan, target=target,
                                 execute=args.execute, call=call,
                                 diagnose=not args.no_diagnose)
     else:
-        run_sql = (make_aidp_run_sql(target, backend=args.backend or detect_backend())
+        run_sql = (make_aidp_run_sql(target,
+                                     backend=args.backend or detect_backend(),
+                                     run_process=_oci_runner(args))
                    if args.execute else None)
         result = deploy(ddl_plan, target=target, execute=args.execute,
                         run_sql=run_sql, chunk_size=args.chunk_size)
     _write(out, "deploy_result.json", result)
     _write(out, "SOFT_CLONE_SUMMARY.md", render_soft_clone_summary(built, result))
+    if result.get("matched_nothing"):
+        print(f'  NOTHING MATCHED: all '
+              f'{result.get("out_of_scope_count", 0)} planned object(s) '
+              f'target '
+              + ", ".join(result.get("out_of_scope_catalogs") or [])
+              + f', not `{result.get("catalog_in_scope")}`. Nothing was '
+                f'created. Point --catalog at the catalog the plan targets, '
+                f'or re-plan with --bronze-catalog-prefix.', file=sys.stderr)
+        return 1
     return 1 if result.get("failed") or result.get("chunk_errors") \
         or result.get("mismatched_targets") else 0
 
@@ -718,9 +1013,10 @@ def cmd_run(args) -> int:
             "ignore " + ", ".join(sorted(parameters)) + " and execute "
             "whatever the notebook's PARAMS cell already holds.\n"
             "Set stage parameters where they are actually read:\n"
-            "  * re-run `provision --execute --reuse-existing` with the "
-            "coordinate flags -- it rewrites each stage notebook's PARAMS "
-            "cell and uploads it, or\n"
+            "  * re-run `provision --execute --reuse-existing "
+            "--refresh-notebooks` with the coordinate flags -- it rewrites "
+            "each stage notebook's PARAMS cell and uploads it (console edits "
+            "to that cell are lost), or\n"
             "  * edit the PARAMS cell of "
             "backup-snowflake-migration/scripts/<stage>.ipynb in the "
             "console.\n"
@@ -728,7 +1024,7 @@ def cmd_run(args) -> int:
             "make it cover less.")
 
 
-    call = make_provision_call(ocid)
+    call = make_provision_call(ocid, run_process=_oci_runner(args))
 
     job_key = args.job_key
     if not job_key:
@@ -783,6 +1079,26 @@ def cmd_run(args) -> int:
     _write(out, f"RUN_{slug}.md", _render_run(result))
 
     if not result["terminal"]:
+        if result.get("unrecognised"):
+            # Neither a verdict nor "still going": a status this plugin does
+            # not classify. Saying STILL RUNNING here would round it up.
+            print(f'  {slug}: UNRECOGNISED STATE {result["status"]} after '
+                  f'{result.get("polls")} poll(s) — not a status this plugin '
+                  f'knows, so neither done nor still running. Check the run '
+                  f'in the console and report the status so it can be '
+                  f'classified.')
+            return 1
+        if result.get("cancel_unconfirmed"):
+            # The watchdog fired but the cancel never reached a terminal
+            # state, so nothing was resubmitted: the slot is still held by a
+            # run the cluster may never pick up. That is not "still running"
+            # in the healthy sense, and not a verdict either.
+            print(f'  {slug}: cold start suspected; cancel unconfirmed after '
+                  f'{args.max_polls} poll(s). Run {result["run_key"]} was '
+                  f'never confirmed cancelled, so nothing was resubmitted. '
+                  f'Cancel it by hand (`aidp workflow cancel-job-run '
+                  f'{args.workspace} {result["run_key"]}`), then re-run.')
+            return 1
         print(f"  {slug}: STILL RUNNING after {args.max_polls} poll(s) — "
               f"not failed, not done. Re-check with the run key above.")
         return 0
@@ -793,10 +1109,25 @@ def cmd_run(args) -> int:
 
 def _render_run(result: dict) -> str:
     """The workflow run as evidence: what ran, what it returned, its log."""
-    if not result.get("terminal"):
-        verdict = ("**STILL RUNNING** — the poll budget ran out with the job "
-                   "still going. This is neither success nor failure; "
-                   "re-check the run key.")
+    polls = result.get("polls", "?")
+    if not result.get("terminal") and result.get("unrecognised"):
+        verdict = (f'**UNRECOGNISED STATE `{result.get("status")}`** — after '
+                   f'{polls} poll(s) the run reports a status this plugin '
+                   f'classifies as neither running nor ended. This is neither '
+                   f'success nor failure; check the run in the console.')
+    elif not result.get("terminal") and result.get("cancel_unconfirmed"):
+        verdict = (f"**STILL RUNNING — cold start suspected; cancel "
+                   f"unconfirmed.** The cluster had not picked up run "
+                   f"`{result.get('run_key')}`, the cancel did not reach a "
+                   f"terminal state (see below), so nothing was resubmitted "
+                   f"and the poll budget ({polls} poll(s)) ran out with it "
+                   f"still `{result.get('status')}`. Cancel it by hand and "
+                   f"re-run; this is neither success nor failure.")
+    elif not result.get("terminal"):
+        verdict = (f"**STILL RUNNING** — the poll budget ({polls} poll(s)) "
+                   f"ran out with the job still `{result.get('status')}`. "
+                   f"This is neither success nor failure; re-check the run "
+                   f"key.")
     elif result.get("ok"):
         verdict = "**SUCCESS**"
     else:
@@ -827,18 +1158,27 @@ def _render_run(result: dict) -> str:
             "## Cold-start restarts",
             "",
             "The cluster did not pick up the run(s) below — the job run sat "
-            "at `RUNNING` with its task never started. Each was cancelled "
-            "and resubmitted. **The output below belongs to the last run "
-            "key, not the first.**",
+            "at `RUNNING` with its task never started. A run whose cancel "
+            "reached a terminal state was resubmitted, and **the output "
+            "below then belongs to the last run key, not the first.** A "
+            "run whose cancel did NOT (it raised, or never left CANCELING) "
+            "was kept: resubmitting into a slot that is still held gets "
+            "the new run accepted and discarded.",
             "",
-            "| Abandoned run | Cancelled to | Waited | Resubmitted as |",
+            "| Run | Cancelled to | Waited | Outcome |",
             "|---|---|---|---|",
         ]
-        lines += [
-            f'| `{r.get("abandoned_run")}` | `{r.get("cancel_state")}` | '
-            f'{r.get("after_seconds"):.0f}s | `{r.get("new_run")}` |'
-            for r in result["restarts"]
-        ]
+        for r in result["restarts"]:
+            if r.get("new_run"):
+                outcome = f'resubmitted as `{r.get("new_run")}`'
+                run = r.get("abandoned_run")
+            else:
+                outcome = ("kept — cancel unconfirmed"
+                           + (f': {r.get("cancel_error")}'
+                              if r.get("cancel_error") else ""))
+                run = r.get("kept_run")
+            lines.append(f'| `{run}` | `{r.get("cancel_state")}` | '
+                         f'{r.get("after_seconds"):.0f}s | {outcome} |')
         lines.append("")
     lines += ["## Output", "", "```", (result.get("output") or "(none)").strip(),
               "```", ""]
@@ -848,7 +1188,8 @@ def _render_run(result: dict) -> str:
 def cmd_catalog(args) -> int:
     """Register the target catalog. EXTERNAL/SNOWFLAKE by default.
 
-    STANDARD is allowed and is step S3 of the runbook. Creating the catalog
+    STANDARD is allowed and is step S4 of the runbook (S3 registers the
+    EXTERNAL source). Creating the catalog
     is not the same as creating its tables: the catalog is ONE control-plane
     object, while a table create through the same API can return 202 Accepted
     and silently create nothing. So the container is made here and the tables
@@ -883,30 +1224,52 @@ def cmd_catalog(args) -> int:
                   f'EXTERNAL catalog registers the whole database '
                   f'({block.get("database")}). It scopes the source side.')
 
+    # The name to register, resolved ONCE and keyed strictly by catalog type:
+    # `aidp.external_catalog` is the Snowflake source's EXTERNAL catalog,
+    # `aidp.catalog` the INTERNAL target. Neither stands in for the other --
+    # ensure_catalog reuses ANY catalog carrying the name, whatever its type,
+    # so registering the source under the target's name would make the later
+    # `--catalog-type standard` step silently "reuse" the EXTERNAL one.
+    coords = _target_coords(args)
+    aidp = aidp_block(_load_migration_config(args)) if config_path else {}
+    key = "external_catalog" if catalog_type == "EXTERNAL" else "catalog"
+    name = args.catalog or aidp.get(key)
+    if not name or not str(name).strip():
+        raise MissingTarget(
+            f"catalog name not supplied: pass --catalog <name> or set "
+            f"`aidp.{key}:` in {config_path or 'the migration config'}")
+    name = str(name).strip()
+
     if not args.execute:
-        result = {"dry_run": True, "catalog": args.catalog,
+        if _executed_record_exists(out, "catalog_result.json"):
+            return _refuse_dry_run_overwrite(out, "catalog_result.json",
+                                             "catalog")
+        result = {"dry_run": True, "catalog": name,
                   "catalog_type": catalog_type,
                   "source_type": args.source_type.upper(),
                   "connection_config": (str(config_path) if config_path
                                         else None),
                   "connection_fields": sorted(connection or {})}
     else:
-        target = resolve_target(**_target_coords(args))
+        # The Target carries the name being registered, not the config's
+        # INTERNAL `catalog:`, which need not exist yet at this step.
+        target = resolve_target(**{**coords, "catalog": name})
         backend = args.backend or detect_backend()
         print(f"  backend: {backend}")
         result = ensure_catalog(
-            display_name=args.catalog,
-            call=make_call(target, backend=backend),
+            display_name=name,
+            call=make_call(target, backend=backend,
+                           run_process=_oci_runner(args)),
             catalog_type=catalog_type, source_type=args.source_type.upper(),
             connection=connection,
             description=args.description or
-            f"Snowflake {args.catalog}, registered by the snowflake-migrator")
+            f"Snowflake {name}, registered by the snowflake-migrator")
         result["dry_run"] = False
         result["source_type"] = args.source_type.upper()
 
     # Validation as a COMMAND, not a suggestion: the documented
-    # POST /actions/testConnection, polled through /asyncOperations. Both
-    # contracts live-verified 2026-09-16.
+    # POST /actions/testConnection (live-verified 2026-09-16), then the
+    # async operation it names polled through /asyncOperations to a verdict.
     if args.test_connection and not args.execute:
         print("  test-connection: skipped — it needs an existing catalog "
               "(the API resolves RBAC on the key), so it only runs with "
@@ -917,46 +1280,38 @@ def cmd_catalog(args) -> int:
                 "--test-connection needs --connection-config: the API "
                 "requires the connection details inline, not just the "
                 "catalog key")
-        ocid = _target_coords(args)["datalake_ocid"]
+        ocid = coords["datalake_ocid"]
         if not ocid:
             raise MissingTarget(
                 "--test-connection needs the aiDataPlatform OCID: put it "
                 "under `aidp:` in the config, or pass --datalake-ocid")
         from target.provision_api import build_test_connection_body
-        from target.provisioning import make_provision_call
-        import time as _time
-        pcall = make_provision_call(ocid)
+        from target.provisioning import (make_provision_call,
+                                         connection_test_outcome)
+        pcall = make_provision_call(ocid, run_process=_oci_runner(args))
         # The API resolves the catalog KEY (RBAC DESCCATALOG), which is what
         # ensure_catalog reported back -- not necessarily the display name.
         probe = pcall("test_connection",
                       body=build_test_connection_body(
-                          str(result.get("key") or args.catalog),
+                          str(result.get("key") or name),
                           source_type=args.source_type.upper(),
                           connection_properties=connection,
-                          display_name=args.catalog))
-        # The response body is empty; the async key rides in a header the
-        # raw-request JSON parser does not surface, so when it is absent the
-        # result is reported PENDING, never assumed. When present, poll.
-        outcome = {"requested": True, "status": "PENDING",
-                   "note": "test requested; result not yet readable"}
-        op_key = probe.get("aidp-async-operation-key") or probe.get("key")
-        if op_key:
-            for delay in (5, 10, 15, 20, 30):
-                _time.sleep(delay)
-                op = pcall("get_async_operation", key=op_key)
-                outcome["status"] = str(op.get("status") or "PENDING")
-                if outcome["status"] in ("SUCCEEDED", "FAILED", "CANCELED"):
-                    outcome["error"] = (f'{op.get("errorCode")}: '
-                                        f'{op.get("errorMessage")}'
-                                        if op.get("errorCode") else None)
-                    break
+                          display_name=name))
+        # The response body is empty and the async key rides in a response
+        # HEADER, which the transport keeps under `_headers`;
+        # connection_test_outcome reads it from wherever the envelope put it
+        # and polls /asyncOperations/{key} to a verdict. PENDING means the
+        # budget ran out, never "not looked"; a missing key is said to be
+        # missing.
+        outcome = connection_test_outcome(pcall, probe)
         result["test_connection"] = outcome
         print(f'  test-connection: {outcome["status"]}'
-              + (f' — {outcome.get("error")}' if outcome.get("error") else ""))
+              + (f' — {outcome.get("error")}' if outcome.get("error") else "")
+              + (f' — {outcome.get("note")}' if outcome.get("note") else ""))
 
     _write(out, "catalog_result.json", result)
     _write(out, "CATALOG.md", render_catalog(result))
-    print(f'  catalog {args.catalog}: '
+    print(f'  catalog {name}: '
           f'{"dry run — nothing created" if not args.execute else result["action"]}')
     return 0
 
@@ -1011,15 +1366,41 @@ def cmd_smoke(args) -> int:
         print(f"  destination backend: {backend}")
         # The catalog API, not SQL: `POST .../sql/execute` returns 404, so a
         # SQL-based check reported FAIL against a working destination.
-        dest_call = make_call(target, backend=backend)
+        dest_call = make_call(target, backend=backend,
+                              run_process=_oci_runner(args))
+    # The probe WRITES (one schema, created and removed), so it is gated
+    # like every other write: `--write-probe` alone is a dry run that says
+    # what it would create; `--write-probe --execute` creates it.
+    write_probe = bool(args.write_probe and args.execute)
+    if args.write_probe and not args.execute:
+        if target is not None:
+            print(f"  dry run: --write-probe would create and remove one "
+                  f"schema named snowmig_permission_probe_<hex> in "
+                  f"{target.catalog} on {target.datalake_ocid} "
+                  f"(workspace {target.workspace}); add --execute to run it. "
+                  f"Nothing was created.")
+        else:
+            print("  dry run: --write-probe needs the four AIDP coordinates "
+                  "and --execute; nothing was created.")
     result = run_smoke(source_run_sql=_run_sql_from_args(args), target=target,
-                       dest_call=dest_call, write_probe=args.write_probe,
+                       dest_call=dest_call, write_probe=write_probe,
                        database=(args.database or [None])[0]
                        if getattr(args, "database", None) else None)
+    if args.write_probe and not args.execute \
+            and not result["destination"].get("skipped"):
+        result["destination"]["write_note"] = (
+            "not attempted: --write-probe was given without --execute, so "
+            "this was a dry run. Re-run with --write-probe --execute to "
+            "create one probe schema and remove it again.")
     _write(out, "smoke.json", result)
     _write(out, "SMOKE_TEST.md", render_smoke(result))
-    print(f'  verdict: {"PASS" if result["ok"] else "FAIL"}')
-    return 0 if result["ok"] else 1
+    verdict = smoke_verdict(result)
+    if verdict == "PARTIAL":
+        print("  verdict: PARTIAL — Snowflake was checked; the AIDP destination "
+              f'was NOT ({result["destination"].get("reason", "")}). Not a pass.')
+    else:
+        print(f"  verdict: {verdict}")
+    return 0 if verdict == "PASS" else 1
 
 
 def cmd_notebook(args) -> int:
@@ -1061,10 +1442,12 @@ def cmd_notebook(args) -> int:
              "verifies each object individually at the end.", ""]
 
     if not args.upload:
-        lines += ["Not uploaded. Re-run with `--upload` plus the AIDP target "
-                  "coordinates to place it in the workspace.", ""]
+        lines += ["Not uploaded. The structure it describes is created on AIDP "
+                  "compute by the `provision` + `run` workflow (runbook S10); "
+                  "`--upload` is a dry run without `--execute`, and is refused "
+                  "with it (see below).", ""]
         _write(out, "NOTEBOOK.md", "\n".join(lines))
-        print("  generated only; pass --upload to place it in AIDP")
+        print("  generated only; the structure workflow is `provision` + `run`")
         return 0
 
     target = _optional_target(args)
@@ -1072,28 +1455,41 @@ def cmd_notebook(args) -> int:
         raise MissingTarget(
             "--upload needs all four AIDP coordinates: --datalake-ocid, "
             "--workspace, --cluster-id, --catalog. Ask the user for them.")
-    backend = args.backend or detect_backend()
-    cmd = build_command(backend, "upload_notebook", target,
-                        workspace_path=ws_path, local_path=str(local))
-    print(f"  backend: {backend}")
-    print(f'  command: {" ".join(cmd)}')
-    if args.dry_run:
-        lines += ["Upload was a **dry run**. The command above was not executed.",
-                  ""]
+
+    # An upload is a write, so it is a dry run without --execute like every
+    # other write. And WITH --execute it is refused: the only transport this
+    # command has is the Jupyter contents API, which the validated build
+    # answers with a 200 and then cannot read the file back (GAPS.md 13).
+    # Reporting "uploaded" on that 200 was a false success; the verified
+    # upload surface is the one `provision` drives for the stage notebooks.
+    remedy = (f"The notebook is at {local}. Upload it from the workspace UI, "
+              f"or create the structure through the verified path: `snowmig "
+              f"provision --execute` places the stage notebooks in the "
+              f"workspace and `snowmig run --job snowmig_01_structure` "
+              f"executes the structure stage from ddl_plan.json.")
+    if not args.execute:
+        print(f"  dry run: --upload would place {local.name} at {ws_path} in "
+              f"workspace {target.workspace} on {target.datalake_ocid}; "
+              f"nothing was sent. Add --execute to attempt it -- which is "
+              f"currently refused: the upload transport is known-bad "
+              f"(GAPS.md 13). {remedy}")
+        lines += [f"Upload was a **dry run**: nothing was sent to `{ws_path}`. "
+                  f"With `--execute` the upload is refused because its "
+                  f"transport is known-bad (GAPS.md 13). {remedy}", ""]
         _write(out, "NOTEBOOK.md", "\n".join(lines))
         return 0
 
-    import subprocess
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        print(f"error: upload failed: {(proc.stderr or '')[:400]}", file=sys.stderr)
-        return 1
-    lines += [f"Uploaded to `{ws_path}`.", "",
-              "**Ask the user before executing it.** Then run it from the AIDP "
-              "workspace, or via `aidp notebook run`.", ""]
+    lines += [f"**Upload refused.** Nothing was sent to `{ws_path}`: the "
+              f"transport this command has (the Jupyter contents API) returns "
+              f"200 and the file cannot be read back on the validated build "
+              f"(GAPS.md 13), so a success here would be a false one. "
+              f"{remedy}", ""]
     _write(out, "NOTEBOOK.md", "\n".join(lines))
-    print(f"  uploaded to {ws_path}")
-    return 0
+    print(f"error: notebook --upload is refused: its transport is known-bad "
+          f"(GAPS.md 13 -- the PUT returns 200 and the file cannot be read "
+          f"back), so an upload could not be reported honestly. {remedy}",
+          file=sys.stderr)
+    return 1
 
 
 def cmd_summary(args) -> int:
@@ -1129,7 +1525,7 @@ def cmd_data_options(args) -> int:
             custom = {
                 "name": args.custom_name,
                 "description": pathlib.Path(
-                    args.custom_description_file).read_text().strip()}
+                    args.custom_description_file).read_text(encoding="utf-8").strip()}
         payload["choice"] = record_choice(
             args.choose, chosen_by=args.chosen_by, rationale=args.rationale,
             custom_architecture=custom)
@@ -1199,7 +1595,8 @@ def cmd_preflight(args) -> int:
             workspace=coords["workspace"] or "unused",
             cluster_id=coords["cluster_id"] or "unused",
             catalog=catalog)
-        call = make_call(target, backend=args.backend or detect_backend())
+        call = make_call(target, backend=args.backend or detect_backend(),
+                         run_process=_oci_runner(args))
 
     result = run_preflight(config, run_sql=run_sql, call=call,
                            catalog=catalog)
@@ -1275,33 +1672,56 @@ def cmd_provision(args) -> int:
         if not source_config.is_file():
             raise FileNotFoundError(
                 f"--source-config {source_config} not found")
-        plan_files.append(source_config)
+        # Not appended to plan_files: provision() derives the `snowflake:`
+        # block and uploads that; the operator's file itself never travels.
 
     requirements = None
     if not args.skip_libraries:
         requirements = (pathlib.Path(args.requirements) if args.requirements
                         else scripts_dir / "requirements-aidp.txt")
 
+    # The catalogs baked into the jobs' PARAMS defaults may come from the
+    # config's `aidp:` block (announced by _aidp_from_config like every
+    # other config-derived value); a flag still wins. Read for the dry run
+    # too, so PROVISION.md previews the defaults --execute will bake in.
+    aidp = _aidp_from_config(args)
+    external_catalog = args.external_catalog or aidp.get("external_catalog")
+    target_catalog = args.target_catalog or aidp.get("target_catalog")
+
     call = None
     if args.execute:
-        ocid = _target_coords(args)["datalake_ocid"]
+        ocid = args.datalake_ocid or aidp.get("datalake_ocid")
         if not ocid:
             raise MissingTarget(
                 "--execute needs the aiDataPlatform OCID: put it under "
                 "`aidp:` in the config, or pass --datalake-ocid.")
-        call = make_provision_call(ocid)
+        call = make_provision_call(ocid, run_process=_oci_runner(args))
+    elif _executed_record_exists(out, "provision_result.json"):
+        return _refuse_dry_run_overwrite(out, "provision_result.json",
+                                         "provision")
 
     res = provision(
         call=call, workspace_name=args.workspace_name,
         cluster_name=args.cluster_name, scripts=list(scripts),
         plan_files=plan_files, requirements=requirements,
-        maven=args.maven or [], external_catalog=args.external_catalog,
-        target_catalog=args.target_catalog, source_mode=args.source_mode,
+        maven=args.maven or [], external_catalog=external_catalog,
+        target_catalog=target_catalog, source_mode=args.source_mode,
         source_config=source_config,
         warehouse_clusters=warehouse_clusters, execute=args.execute,
-        subnet_id=args.subnet_id, reuse_existing=args.reuse_existing)
+        subnet_id=args.subnet_id, reuse_existing=args.reuse_existing,
+        refresh_notebooks=args.refresh_notebooks)
     _write(out, "provision_result.json", res)
     _write(out, "PROVISION.md", render_provision(res))
+
+    for obj in res.get("credential_objects") or []:
+        # Said out loud, dry run or not: this is the one object this plugin
+        # places anywhere that holds a secret.
+        print(f"  CREDENTIAL ON THE WORKSPACE MOUNT: {obj} "
+              f"{'would hold' if res['dry_run'] else 'holds'} the Snowflake "
+              f"connection block, credential included -- readable by every "
+              f"member of workspace {res['workspace']['name']} and every "
+              f"cluster in it via /Workspace. Remove it when the migration "
+              f"is done.", file=sys.stderr)
 
     failed = [s for s in res["steps"] if s["verified"] is False]
     if res["dry_run"]:
@@ -1362,15 +1782,16 @@ def _add_snowflake_args(p) -> None:
     p.add_argument("--auth", default="keypair",
                    choices=["keypair", "pat", "password", "externalbrowser"])
     p.add_argument("--key-path")
-    p.add_argument("--key-passphrase")
+    # No --key-passphrase: every secret is a path or lives in the config.
+    # main() refuses the old spelling by name (see _REMOVED_SECRET_FLAGS).
     p.add_argument("--pat-path")
     p.add_argument("--password-path")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    # --out-dir lives on a parent parser so it is accepted AFTER the subcommand,
-    # which is how every caller writes it: `snowmig plan --out-dir ...`.
-    common = argparse.ArgumentParser(add_help=False)
+def _out_dir_parent(default) -> argparse.ArgumentParser:
+    """A parent parser carrying `--out-dir`, with the default the caller asks
+    for. Built twice: see `build_parser`."""
+    parent = argparse.ArgumentParser(add_help=False)
     # ONE artifact directory, and it explains itself. `snowmig_out` was the
     # right idea with the wrong presentation: an unexplained directory of
     # JSON appearing beside the plugin reads as a bug rather than as output.
@@ -1379,15 +1800,28 @@ def build_parser() -> argparse.ArgumentParser:
     # reads the `inventory.json` that `assess` wrote -- so it cannot be
     # temporary scratch. What it CAN be is obvious: a name that says what it
     # holds, a README inside it, and a permanent ignore rule.
-    common.add_argument(
-        "--out-dir", default=None,
+    parent.add_argument(
+        "--out-dir", default=default,
         help=f"where run artifacts go. Default: the plugin's "
              f"{ARTIFACTS_DIRNAME}/ — one clearly-named directory that "
              f"explains itself in a README, is gitignored permanently, and "
              f"is removed by `snowmig clean`")
+    return parent
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # --out-dir is accepted on BOTH sides of the subcommand: after it, which
+    # is how every caller writes it (`snowmig plan --out-dir ...`), and
+    # before it, which is what the top-level usage line advertises. The two
+    # copies need different defaults: argparse applies the chosen
+    # subparser's defaults over the root namespace, so a `None` default on
+    # the subparser copy silently discarded a root-level value -- and
+    # `snowmig --out-dir X clean` then deleted the default directory the
+    # operator had not named. SUPPRESS leaves the root value alone.
+    common = _out_dir_parent(argparse.SUPPRESS)
 
     ap = argparse.ArgumentParser(prog="snowmig", description=__doc__,
-                                 parents=[common])
+                                 parents=[_out_dir_parent(None)])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     st = sub.add_parser("stages", parents=[common],
@@ -1530,6 +1964,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_plan)
 
     g = sub.add_parser("ddl", parents=[common], help="generate target DDL (offline)")
+    g.add_argument("--timestamp-ntz", choices=list(TIMESTAMP_NTZ_MODES),
+                   default=None,
+                   help="re-map Snowflake TIMESTAMP_NTZ offline, from "
+                        "inventory.json, without re-reading Snowflake. "
+                        "timestamp: downgrade to Spark TIMESTAMP (the only "
+                        "form the AIDP metastore accepts) and record the "
+                        "timezone caveat on every affected column. Default: "
+                        "keep whatever `assess`/`ingest` recorded")
     g.set_defaults(func=cmd_ddl)
 
     dep = sub.add_parser("deploy", parents=[common], help="dry-run by default")
@@ -1635,6 +2077,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "default: a migration creates its own environment "
                          "so its blast radius is knowable, and a taken name "
                          "is a collision to resolve, not a shortcut")
+    pv.add_argument("--refresh-notebooks", action="store_true",
+                    help="with --reuse-existing, regenerate the stage "
+                         "notebooks from this run's flags even where they "
+                         "already exist. OFF by default: a notebook already "
+                         "on the workspace is kept, because its PARAMS cell "
+                         "(schema, mode, verify) is edited in the console and "
+                         "an overwrite would discard that silently")
     pv.set_defaults(func=cmd_provision)
 
     rn = sub.add_parser("run", parents=[common],
@@ -1672,7 +2121,7 @@ def build_parser() -> argparse.ArgumentParser:
                      default="external",
                      help="external (default): register a read-only pointer at "
                           "the live Snowflake source, copying nothing. standard "
-                          "(runbook S3): create the managed target catalog as a "
+                          "(runbook S4): create the managed target catalog as a "
                           "CONTAINER -- its schemas and tables are created on "
                           "AIDP compute by the structure workflow (S10), never "
                           "through the control-plane CRUD API")
@@ -1712,16 +2161,29 @@ def build_parser() -> argparse.ArgumentParser:
                          "probe schema and removing it again; if cleanup fails, "
                          "the report names what was left. Skipped with a note "
                          "when the target catalog is EXTERNAL, which is "
-                         "read-only by design")
+                         "read-only by design. A dry run without --execute")
+    sm.add_argument("--execute", action="store_true",
+                    help="actually run --write-probe; without it the probe is "
+                         "a dry run that prints what it would create")
     sm.set_defaults(func=cmd_smoke)
 
     nb = sub.add_parser("notebook", parents=[common],
-                        help="generate the shallow-clone notebook; --upload places "
-                             "it in the AIDP workspace")
+                        help="generate the shallow-clone notebook (offline). "
+                             "--upload is a dry run without --execute, and "
+                             "refused with it: its transport is known-bad "
+                             "(GAPS.md 13); the structure workflow is "
+                             "`provision` + `run`")
     _add_target_args(nb)
-    nb.add_argument("--upload", action="store_true")
+    nb.add_argument("--upload", action="store_true",
+                    help="say where the notebook would be placed in the AIDP "
+                         "workspace (dry run). With --execute the upload is "
+                         "refused -- see GAPS.md 13")
+    nb.add_argument("--execute", action="store_true",
+                    help="with --upload, attempt the upload instead of the "
+                         "dry run; currently refused (GAPS.md 13)")
     nb.add_argument("--dry-run", action="store_true",
-                    help="with --upload, print the command without running it")
+                    help="accepted for compatibility: the upload is a dry run "
+                         "unless --execute is given")
     nb.set_defaults(func=cmd_notebook)
 
     su = sub.add_parser("summary", parents=[common],
@@ -1816,11 +2278,14 @@ def prepare_out_dir(path: str | pathlib.Path) -> pathlib.Path:
     committed even if it is copied out of this repo.
     """
     out = pathlib.Path(path)
+    if out.exists() and not out.is_dir():
+        raise ValueError(
+            f"--out-dir {out} is an existing file, not a directory")
     out.mkdir(parents=True, exist_ok=True)
     if out.resolve() == default_out_dir().resolve():
         readme = out / "README.md"
         if not readme.exists():
-            readme.write_text(_ARTIFACTS_README)
+            readme.write_text(_ARTIFACTS_README, encoding="utf-8")
         ignore = out / ".gitignore"
         if not ignore.exists():
             # Ignore everything here, including this rule: the contents name
@@ -1828,11 +2293,52 @@ def prepare_out_dir(path: str | pathlib.Path) -> pathlib.Path:
             ignore.write_text(
                 "# Generated migrator output: never committed.\n"
                 "# Contents name a real Snowflake estate.\n"
-                "*\n")
+                "*\n", encoding="utf-8")
     return out
 
 
+def _utf8_streams() -> None:
+    """Reports use → — · and friends. On Windows a piped stdout is cp1252 and
+    print() would raise UnicodeEncodeError half-way through a stage; artifacts
+    are written with an explicit encoding, so the streams get the same."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+#: Flags that once took a secret VALUE on the command line. They are refused
+#: by name before argparse sees them, so the answer names where the secret
+#: belongs instead of "unrecognized arguments" -- and never echoes the value.
+_REMOVED_SECRET_FLAGS = {
+    "--key-passphrase": ("key_passphrase", "key_passphrase_path"),
+}
+
+
+def _refuse_inline_secret(argv: list[str]) -> str | None:
+    for arg in argv:
+        flag = arg.split("=", 1)[0]
+        if flag in _REMOVED_SECRET_FLAGS:
+            inline, path_field = _REMOVED_SECRET_FLAGS[flag]
+            return (f"{flag} is not accepted: a secret on the command line "
+                    f"reaches shell history and the process table. Put it in "
+                    f"the migration config instead, as `{inline}:` (inline; "
+                    f"the file is gitignored) or `{path_field}:` (a file "
+                    f"holding it).")
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
+    _utf8_streams()
+    refused = _refuse_inline_secret(
+        list(sys.argv[1:] if argv is None else argv))
+    if refused:
+        print(f"error: {refused}", file=sys.stderr)
+        return 1
     args = build_parser().parse_args(argv)
     if getattr(args, "out_dir", None) is None:
         args.out_dir = str(default_out_dir())
@@ -1842,12 +2348,16 @@ def main(argv: list[str] | None = None) -> int:
     # be absurd.
     if args.func is not cmd_clean:
         print(f"  artifacts: {args.out_dir}")
-        prepare_out_dir(args.out_dir)
     try:
+        if args.func is not cmd_clean:
+            # Inside the try: an --out-dir that cannot be created (an
+            # existing file, a permission) is the operator's input, and it
+            # gets the same one-line `error:` as every other bad input.
+            prepare_out_dir(args.out_dir)
         return args.func(args)
     except (AuthError, MissingTarget, RefusedToExecute, CatalogRefused,
             DeployRefused, ProvisionTransportError, JobRunCollision,
-            ConnectionConfigError, ConfigError, FileNotFoundError,
+            ConnectionConfigError, ConfigError, FileNotFoundError, OSError,
             InvalidRestriction, NoBackendAvailable, BackendError,
             ExecutorBackendError,
             SourceWriteRefused, ValueError) as exc:

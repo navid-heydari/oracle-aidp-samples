@@ -358,3 +358,354 @@ def test_the_census_report_says_nothing_is_migratable():
 def test_a_task_gets_the_cutover_warning():
     md = render_census(_CENSUS)
     assert "stops being populated" in md or "stops being" in md
+
+
+# --------------------------------------------------------------------------
+# SECURITY.md: a policy object that exists while POLICY_REFERENCES (up to
+# ~2 h stale) shows no attachment must not be rendered as an all-clear.
+# --------------------------------------------------------------------------
+
+def _security(**over):
+    base = {"statement": "s", "exposures": [], "exposure_count": 0,
+            "secure_views": [], "unreadable": [],
+            "policy_references_readable": True,
+            "policies": {"masking": {"count": 1, "readable": True, "note": ""},
+                         "row_access": {"count": 0, "readable": True, "note": ""},
+                         "tags": {"count": 0, "readable": True, "note": ""}},
+            "grants": {"measured": False}}
+    base.update(over)
+    return base
+
+
+def test_security_report_flags_a_defined_but_unattached_policy():
+    from report.render import render_security
+    md = render_security(_security(policies_defined_without_attachment=1))
+    assert "Defined is not the same as attached" not in md, \
+        "that sentence tells the reader to disregard the only contradicting signal"
+    assert "not seen attached" in md and "all-clear" in md
+
+
+def test_security_report_keeps_the_plain_sentence_when_attachments_are_accounted_for():
+    from report.render import render_security
+    md = render_security(_security(policies_defined_without_attachment=0))
+    assert "Defined is not the same as attached" in md
+    assert "all-clear" not in md
+
+
+def test_planned_objects_with_an_empty_census_carries_the_visibility_caveat():
+    # The scope statement travels into PLANNED_OBJECTS.md and SUMMARY.md, so
+    # the "whole estate" claim would travel with it.
+    from fake_sql import FakeSql
+    from snowflake_source.extract.census import build_census
+    empty = {"information_schema.procedures": [], "information_schema.functions": [],
+             "information_schema.sequences": [], "information_schema.stages": [],
+             "information_schema.file_formats": [], "information_schema.pipes": [],
+             "show tasks": [], "show streams": [], "show materialized views": [],
+             "show dynamic tables": [], "show alerts": [], "show secrets": [],
+             "show network rules": [], "show streamlits": [],
+             "show notebooks": [], "show services": [], "show shares": [],
+             "show roles": [], "show network policies": [],
+             "show applications": [], "show compute pools": []}
+    plan = dict(PLAN)
+    plan["census"] = build_census(FakeSql(empty), ["DB"], role="R")
+    md = render_planned_objects(plan)
+    assert "whole estate" not in md.lower()
+    assert "visible" in md.lower()
+
+
+def test_dependency_not_migrated_has_a_title_not_a_raw_key():
+    plan = dict(PLAN)
+    plan["cannot_migrate"] = PLAN["cannot_migrate"] + [
+        {"source_identifier": "D.PUBLIC.J_VW", "object_type": "VIEW",
+         "category": "dependency_not_migrated",
+         "reason": "depends on D.PUBLIC.J, which is blocked (unmapped_type)"}]
+    md = render_planned_objects(plan)
+    assert "### Depends on an object that is not migrating" in md
+    assert "depends on D.PUBLIC.J, which is blocked" in md
+
+
+# plan.json may carry `target_catalog_note` (how the target catalog comes to
+# exist: a container at S4, structure at S10). It is the approval artifact's
+# business to show it, and an older plan.json without it must still render.
+# --------------------------------------------------------------------------
+
+def test_planned_objects_renders_the_target_catalog_note_when_present():
+    note = ("The target catalog is created as a CONTAINER at S4 by "
+            "`catalog --catalog-type standard --execute`; its schemas and "
+            "tables are created at S10 on AIDP compute.")
+    md = render_planned_objects(dict(PLAN, target_catalog_note=note))
+    assert note in md
+    structure = md.split("## Target structure to exist first", 1)[1]
+    assert note in structure.split("\n## ", 1)[0], \
+        "the note belongs with the target-structure section"
+
+
+def test_planned_objects_without_the_note_still_renders():
+    plan = {k: v for k, v in PLAN.items() if k != "target_catalog_note"}
+    md = render_planned_objects(plan)
+    assert "Target structure to exist first" in md
+    assert "None" not in md.split("## Target structure to exist first", 1)[1].split("\n## ", 1)[0]
+
+
+# --------------------------------------------------------------------------
+# plan.json carries `table_kind_warnings` (TRANSIENT/TEMPORARY tables planned
+# as permanent Delta tables). The sign-off artifact must show them; a warning
+# nobody renders is not a warning.
+# --------------------------------------------------------------------------
+
+_KIND_WARNING = {"source_identifier": "D.PUBLIC.SCRATCH", "kind": "TRANSIENT",
+                 "warning": "TRANSIENT table in Snowflake (no Fail-safe, short "
+                            "Time Travel); it is planned as a permanent Delta "
+                            "table, so confirm it is meant to persist"}
+
+
+def test_planned_objects_lists_tables_planned_as_something_else():
+    md = render_planned_objects(dict(PLAN, table_kind_warnings=[_KIND_WARNING]))
+    assert "## Planned, but not as what they were" in md
+    section = md.split("## Planned, but not as what they were", 1)[1].split("\n## ", 1)[0]
+    assert "`D.PUBLIC.SCRATCH`" in section and "TRANSIENT" in section
+    assert "permanent" in section
+
+
+def test_planned_objects_has_no_kind_section_when_nothing_changes_kind():
+    assert "Planned, but not as what they were" not in render_planned_objects(PLAN)
+    assert "Planned, but not as what they were" not in render_planned_objects(
+        dict(PLAN, table_kind_warnings=[]))
+
+
+# --------------------------------------------------------------------------
+# "Dependencies land before their dependents, so views follow their base
+# tables" is only true of views that HAVE an edge. A view with no edge from
+# either source sorts by size and can land before its base table; the plan
+# must say so instead of asserting an order it does not have.
+# --------------------------------------------------------------------------
+
+def _order_section(md):
+    return md.split("## Order of creation", 1)[1].split("\n## ", 1)[0]
+
+
+def test_order_of_creation_names_views_with_no_dependency_edge():
+    warning = ("1 view(s) have no ACCOUNT_USAGE lineage edge (the view lags "
+               "DDL by up to ~3 h); their DDL was parsed instead. 1 still have "
+               "no edge from either source and are ordered by size only: "
+               "D.PUBLIC.ORDERS_VW. Re-run `deps` after the lag before relying "
+               "on the wave order.")
+    md = render_planned_objects(dict(
+        PLAN, dependency_source="account_usage_empty",
+        views_without_dependency_edge=["D.PUBLIC.ORDERS_VW"],
+        dependency_warning=warning, dependency_edge_count=0))
+    section = _order_section(md)
+    assert "so views follow their base tables" not in md
+    assert "`D.PUBLIC.ORDERS_VW`" in section
+    assert "size only" in section
+    assert "NOT guaranteed" in section
+    assert warning in md
+
+
+def test_order_of_creation_flags_unordered_views_even_without_a_producer_warning():
+    # ACCOUNT_USAGE denied -> parsed_ddl with warning None, and a view whose
+    # only reference lies outside the inventory still has no edge.
+    md = render_planned_objects(dict(
+        PLAN, dependency_source="parsed_ddl",
+        views_without_dependency_edge=["D.PUBLIC.ORDERS_VW"],
+        dependency_warning=None))
+    assert "so views follow their base tables" not in md
+    assert "`D.PUBLIC.ORDERS_VW`" in _order_section(md)
+    assert "None" not in _order_section(md)
+
+
+def test_order_of_creation_keeps_the_plain_sentence_when_every_view_has_an_edge():
+    assert "so views follow their base tables" in render_planned_objects(PLAN)
+    assert "so views follow their base tables" in render_planned_objects(
+        dict(PLAN, views_without_dependency_edge=[], dependency_warning=None))
+
+
+# --------------------------------------------------------------------------
+# "## Target structure to exist first" must not tell the reader, in three
+# consecutive lines, to create catalog `d`, that `d` is the EXTERNAL pointer
+# and not the target, and that the clone creates `d.public` -- a schema the
+# structure job never creates. The lines are labelled per path.
+# --------------------------------------------------------------------------
+
+_DEFAULT_NOTE = ("The catalog part of the Target column is the source database "
+                 "name mirrored 1:1 (d); no --bronze-catalog-prefix was given. "
+                 "The in-AIDP structure job (01_create_structure) does not read "
+                 "this column: it creates <--target-catalog>.<schema>.<table> "
+                 "under the catalog passed to `provision --target-catalog`. In "
+                 "the runbook the catalog named after the source database is "
+                 "the read-only EXTERNAL pointer at Snowflake, not the target "
+                 "-- the job refuses source == target.")
+_PREFIX_NOTE = ("The catalog part of the Target column is the "
+                "--bronze-catalog-prefix 'lake', with the schema part in the "
+                "'db_schema' style. The in-AIDP structure job "
+                "(01_create_structure) does not read this column: it creates "
+                "<--target-catalog>.<schema>.<table> under the catalog passed to "
+                "`provision --target-catalog`. Pass 'lake' to `provision "
+                "--target-catalog` for the catalogs to agree; the schema part "
+                "the job creates is the source schema, not the 'db_schema' form "
+                "shown here.")
+
+
+def _structure_section(md):
+    return md.split("## Target structure to exist first", 1)[1].split("\n## ", 1)[0]
+
+
+def test_default_mode_target_structure_does_not_ask_for_the_mirrored_catalog():
+    md = render_planned_objects(dict(PLAN, target_catalog_note=_DEFAULT_NOTE,
+                                     catalogs_to_create=["d"],
+                                     schemas_to_create=[["d", "public"]]))
+    section = _structure_section(md)
+    assert "create these" not in section, section
+    assert "Catalogs" in section, "the word test :94 pins must survive"
+    assert "not a catalog to create" in section
+    assert "`provision --target-catalog`" in section
+    assert _DEFAULT_NOTE in section
+    structure_line = next(l for l in section.splitlines()
+                          if l.startswith("Schemas the structure job"))
+    assert "`public`" in structure_line and "d.public" not in structure_line
+    assert "Older `deploy`/`notebook` path only: `d.public`" in section
+    assert "exist as INTERNAL" in section
+    assert "Schemas the clone will create" not in section
+
+
+def test_prefix_mode_target_structure_names_the_catalog_to_create_and_the_source_schema():
+    md = render_planned_objects(dict(PLAN, bronze_catalog_prefix="lake",
+                                     target_catalog_note=_PREFIX_NOTE,
+                                     catalogs_to_create=["lake"],
+                                     schemas_to_create=[["lake", "d_public"]]))
+    section = _structure_section(md)
+    assert "create these" in section and "`lake`" in section
+    assert _PREFIX_NOTE in section
+    structure_line = next(l for l in section.splitlines()
+                          if l.startswith("Schemas the structure job"))
+    assert "`public`" in structure_line and "d_public" not in structure_line
+    assert "Older `deploy`/`notebook` path only: `lake.d_public`" in section
+    assert "Schemas the clone will create" not in section
+
+
+def test_a_plan_without_the_note_keeps_the_legacy_two_lines():
+    plan = {k: v for k, v in PLAN.items() if k != "target_catalog_note"}
+    section = _structure_section(render_planned_objects(plan))
+    assert "create these" in section
+    assert "Schemas the clone will create: `D.PUBLIC`" in section
+
+
+# --------------------------------------------------------------------------
+# SECURITY.md: the policy-object table, tag attachments and grant classes.
+# I3 again -- a kind nobody asked for and a kind the role cannot see are two
+# different cells, and neither of them is a zero.
+# --------------------------------------------------------------------------
+
+def _all_kinds(**over):
+    base = {"masking": {"count": 0, "readable": True, "note": ""},
+            "row_access": {"count": 0, "readable": True, "note": ""},
+            "aggregation": {"count": 0, "readable": True, "note": ""},
+            "projection": {"count": 0, "readable": True, "note": ""},
+            "tags": {"count": 0, "readable": True, "note": ""}}
+    base.update(over)
+    return base
+
+
+def test_security_report_lists_aggregation_and_projection_policy_objects():
+    from report.render import render_security
+    md = render_security(_security(policies=_all_kinds(
+        projection={"count": 2, "readable": True, "note": ""})))
+    assert "| Aggregation |" in md
+    assert "| Projection | 2" in md
+
+
+def test_security_report_shows_a_denied_kind_as_not_visible_not_zero():
+    from report.render import render_security
+    md = render_security(_security(policies=_all_kinds(
+        aggregation={"count": None, "readable": False, "note": "denied"})))
+    assert "not visible to this role" in md
+    assert "| Aggregation | 0" not in md
+
+
+def test_security_report_says_when_a_kind_was_never_enumerated():
+    # _security()'s payload predates aggregation/projection enumeration, so
+    # the report must say those kinds were never asked for rather than
+    # leaving the reader to assume they were covered.
+    from report.render import render_security
+    md = render_security(_security())
+    assert "not enumerated" in md
+    assert "never asked for" in md
+
+
+def test_security_report_lists_tag_attachments():
+    from report.render import render_security
+    md = render_security(_security(tag_references={
+        "measured": True, "count": 1, "out_of_scope": 0, "carried_over": False,
+        "source": "SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES (lags up to ~2 "
+                  "hours behind DDL)",
+        "attachments": [{"object": "DB.SC.CUSTOMERS", "column": "EMAIL",
+                         "domain": "COLUMN", "tag": "DB.SC.PII",
+                         "value": "HIGH",
+                         "consequence": "the tag does not travel",
+                         "aidp_path": "ontology sensitivity classification"}]}))
+    assert "Tag attachments" in md
+    assert "DB.SC.PII" in md and "DB.SC.CUSTOMERS" in md
+    assert "lags up to ~2 hours" in md
+
+
+def test_security_report_never_reports_zero_tag_attachments_when_unreadable():
+    from report.render import render_security
+    md = render_security(_security(tag_references={
+        "measured": False, "count": None, "attachments": [],
+        "out_of_scope": 0, "carried_over": False,
+        "source": "SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES",
+        "note": "Insufficient privileges"}))
+    assert "Tag attachments" in md
+    assert "Not measured" in md
+    assert "0 tag attachment" not in md
+
+
+def test_security_report_names_the_grant_classes_it_covered():
+    from report.render import render_security
+    md = render_security(_security(grants={
+        "measured": True, "by_object": {}, "carried_over": False,
+        "classes_requested": ["TABLE", "VIEW", "SCHEMA", "WAREHOUSE"],
+        "by_class": {"SCHEMA": {"grants": 2, "roles": ["LOADER"],
+                                "objects": 1}},
+        "out_of_scope": 0, "note": "0 in-scope object(s)"}))
+    assert "SCHEMA" in md and "WAREHOUSE" in md
+    assert "No grant is replayed" in md
+
+
+# --- the deploy report says what the deploy result records ---------------
+# catalog_deploy records a NOT NULL the catalog API cannot carry and a
+# COMMENT the target dropped; the summary used to print neither, so the
+# operator read "verified" and nothing else.
+
+_DEPLOYED = {"dry_run": False, "statement_count": 1, "executed": 1, "verified": 1,
+             "failed": [], "chunk_errors": [], "blocked_count": 0,
+             "catalog_in_scope": "D", "out_of_scope_count": 0,
+             "out_of_scope_catalogs": []}
+
+
+def test_soft_clone_summary_names_the_properties_the_api_cannot_carry():
+    md = render_soft_clone_summary(PLAN, {
+        **_DEPLOYED,
+        "properties_not_applied": [{
+            "source_identifier": "D.PUBLIC.ORDERS", "target_fqn": "d.public.orders",
+            "property": "NOT NULL", "columns": ["ORDER_ID"],
+            "reason": "ORDER_ID are NOT NULL in the reviewed plan and are "
+                      "created NULLABLE here: the field entry has no nullability key"}]})
+    assert "## Properties this transport cannot carry" in md
+    assert "`d.public.orders` — NOT NULL:" in md and "R21" in md
+
+
+def test_soft_clone_summary_names_a_dropped_description():
+    md = render_soft_clone_summary(PLAN, {
+        **_DEPLOYED,
+        "description_drift": [{
+            "source_identifier": "D.PUBLIC.ORDERS", "target_fqn": "d.public.orders",
+            "reason": "created with the planned columns, but table COMMENT: "
+                      "planned 'orders' found ''."}]})
+    assert "## Descriptions the target dropped" in md
+    assert "`d.public.orders`" in md and "table COMMENT" in md
+
+
+def test_soft_clone_summary_is_silent_when_nothing_was_dropped():
+    md = render_soft_clone_summary(PLAN, dict(_DEPLOYED))
+    assert "cannot carry" not in md and "Descriptions the target dropped" not in md

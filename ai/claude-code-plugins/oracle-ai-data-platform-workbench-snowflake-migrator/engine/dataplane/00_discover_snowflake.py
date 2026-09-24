@@ -25,6 +25,11 @@ written anywhere except --reports-dir.
 
 External-catalog mode is resumable per schema (each is flushed immediately);
 connector mode returns the estate whole, so there is nothing to resume.
+
+`--schemas` is pushed into the INFORMATION_SCHEMA queries as a predicate, not
+applied after the fetch, and a scoped run MERGES into the manifest: the named
+schemas are refreshed and every other schema is kept. `--force` alone (no
+`--schemas`) re-discovers the whole estate from an empty manifest.
 """
 from __future__ import annotations
 
@@ -37,7 +42,8 @@ import traceback
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from snowmig_source import (  # noqa: E402
-    SOURCE_MODES, SnowflakeSource, SourceConfigError, load_source_config, q)
+    SOURCE_MODES, SnowflakeSource, SourceConfigError, _sql_literal,
+    load_source_config, q)
 
 # /Workspace is the live-verified mount of the workspace tree on cluster
 # filesystems (probed 2026-09-16 on a real cluster).
@@ -47,15 +53,32 @@ MANIFEST_NAME = "discovery_manifest.json"
 # Snowflake's own system schema: never a migration target.
 _SYSTEM_SCHEMAS = {"information_schema"}
 
+# `{where}` is the --schemas predicate, or nothing.
 _TABLES_SQL = (
     "select TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, ROW_COUNT, BYTES "
-    "from INFORMATION_SCHEMA.TABLES order by TABLE_SCHEMA, TABLE_NAME")
+    "from INFORMATION_SCHEMA.TABLES{where} order by TABLE_SCHEMA, TABLE_NAME")
 
 _COLUMNS_SQL = (
     "select TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, "
     "DATA_TYPE, IS_NULLABLE, NUMERIC_PRECISION, NUMERIC_SCALE, "
-    "CHARACTER_MAXIMUM_LENGTH from INFORMATION_SCHEMA.COLUMNS "
+    "CHARACTER_MAXIMUM_LENGTH from INFORMATION_SCHEMA.COLUMNS{where} "
     "order by TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION")
+
+
+def _schema_predicate(wanted: list[str] | None) -> str:
+    """` where TABLE_SCHEMA in (...)` for --schemas, or an empty string.
+
+    Pushed into the query rather than applied after the fetch. An unfiltered
+    read over a large database's INFORMATION_SCHEMA can exceed Snowflake's
+    result cap ("Information schema query returned too much data"), and a
+    --schemas scope that only filtered client-side could do nothing about
+    it. TABLE_SCHEMA is compared as a string value, so the names are
+    literals, not identifiers.
+    """
+    if not wanted:
+        return ""
+    names = ", ".join(f"'{_sql_literal(s)}'" for s in wanted)
+    return f" where TABLE_SCHEMA in ({names})"
 
 
 def log(msg: str) -> None:
@@ -129,15 +152,18 @@ def _snowflake_type(col: dict) -> str:
 def discover_via_connector(source: SnowflakeSource, *,
                            wanted: list[str] | None,
                            exclude: set[str]) -> list[dict]:
-    """Every schema/table/column of the database, in two queries."""
+    """Every schema/table/column of the database (or of `wanted`), in two
+    queries."""
     # INFORMATION_SCHEMA is per-database. The connector's `schema` option
     # must name a REAL schema (it rejects INFORMATION_SCHEMA itself with
     # DATA_ACCESS_LAYER_0031); the SQL below then reads INFORMATION_SCHEMA
     # relative to the database. Both established live.
-    tables = _rows(source.pushdown(_TABLES_SQL))
-    columns = _rows(source.pushdown(_COLUMNS_SQL))
+    where = _schema_predicate(wanted)
+    tables = _rows(source.pushdown(_TABLES_SQL.format(where=where)))
+    columns = _rows(source.pushdown(_COLUMNS_SQL.format(where=where)))
     log(f"INFORMATION_SCHEMA: {len(tables)} relation(s), "
-        f"{len(columns)} column(s), in 2 queries")
+        f"{len(columns)} column(s), in 2 queries"
+        + (f" scoped to {len(wanted)} schema(s)" if wanted else ""))
 
     by_object: dict[tuple[str, str], list[dict]] = {}
     for col in columns:
@@ -244,7 +270,8 @@ def render_summary(manifest: dict) -> str:
                      f'| {cols} | {len(s["errors"])}{mark} |')
     lines += ["",
               "A schema with errors is INCOMPLETE, not empty — re-run with "
-              "`--force --schemas <name>` after fixing the cause.", ""]
+              "`--schemas <name>` (add `--force` in external-catalog mode) after "
+              "fixing the cause; the other schemas are kept.", ""]
     return "\n".join(lines)
 
 
@@ -268,11 +295,16 @@ def main(argv: list[str] | None = None) -> int:
                          "config). The connector refuses INFORMATION_SCHEMA "
                          "here, so one real schema name is required")
     ap.add_argument("--schemas", nargs="*", default=None,
-                    help="only these schemas (default: all)")
+                    help="only these schemas (default: all). Pushed into the "
+                         "INFORMATION_SCHEMA queries as a predicate, and "
+                         "merged into the existing manifest: the other "
+                         "schemas are kept")
     ap.add_argument("--exclude-schemas", nargs="*", default=[])
     ap.add_argument("--reports-dir", default=DEFAULT_REPORTS_DIR)
     ap.add_argument("--force", action="store_true",
-                    help="rediscover schemas the manifest already carries")
+                    help="rediscover the named --schemas even if the manifest "
+                         "already carries them (the others are kept); without "
+                         "--schemas, rediscover the whole estate")
     args = ap.parse_args(argv)
 
     from pyspark.sql import SparkSession
@@ -294,13 +326,18 @@ def main(argv: list[str] | None = None) -> int:
                 == "external-catalog" else source.database())
 
     manifest = {"schemas": []}
-    if manifest_path.exists() and not args.force:
-        existing = json.loads(manifest_path.read_text())
+    if manifest_path.exists():
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        # The identity guard holds under --force too: a --force against a
+        # manifest written for another database must not overwrite it.
         if existing.get("source_identity") not in (None, identity):
             return fail(f"error: {manifest_path} describes "
                   f"{existing.get('source_identity')!r}, not {identity!r}. "
                   f"Use a fresh --reports-dir.")
-        manifest = existing
+        if args.force and not args.schemas:
+            log("--force without --schemas: rediscovering the whole estate")
+        else:
+            manifest = existing
 
     manifest.update(source=source.describe(), source_identity=identity,
                     generated_at=datetime.datetime.now(
@@ -312,11 +349,23 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.source_mode == "connector":
         try:
-            manifest["schemas"] = discover_via_connector(
+            fresh = discover_via_connector(
                 source, wanted=args.schemas, exclude=exclude)
         except Exception:
             failures += 1
             log(f"DISCOVERY FAILED:\n{traceback.format_exc(limit=3)}")
+        else:
+            if args.schemas:
+                # A scoped run MERGES. Assigning the filtered result over the
+                # loaded manifest used to drop every other schema -- exactly
+                # what DISCOVERY.md's own "re-run with --schemas <name>"
+                # advice then did to a finished discovery. An unscoped run is
+                # the whole estate and stays authoritative.
+                requested = set(args.schemas)
+                fresh = sorted(
+                    [s for s in manifest["schemas"] if s["name"] not in requested]
+                    + fresh, key=lambda s: s["name"])
+            manifest["schemas"] = fresh
     else:
         done = {s["name"] for s in manifest["schemas"]}
         listed = [str(_first_key(r, "namespace", "databaseName",
@@ -343,12 +392,12 @@ def main(argv: list[str] | None = None) -> int:
                 [s for s in manifest["schemas"] if s["name"] != schema]
                 + [record], key=lambda s: s["name"])
             # Flush after EVERY schema: a large estate resumes, not restarts.
-            manifest_path.write_text(json.dumps(manifest, indent=2))
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             log(f"{schema}: {len(record['tables'])} table(s), "
                 f"{len(record['views'])} view(s)")
 
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    (reports / "DISCOVERY.md").write_text(render_summary(manifest))
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (reports / "DISCOVERY.md").write_text(render_summary(manifest), encoding="utf-8")
     total = sum(len(s["tables"]) for s in manifest["schemas"])
     log(f"{len(manifest['schemas'])} schema(s), {total} table(s) "
         f"-> {manifest_path}")
@@ -358,7 +407,8 @@ def main(argv: list[str] | None = None) -> int:
         log("ZERO schemas discovered. In external-catalog mode that usually "
             "means the catalog never crawled successfully (check its refresh "
             "status and the crawler's network path to Snowflake); in "
-            "connector mode it means these credentials see nothing. Either "
+            "connector mode it means these credentials see nothing, or "
+            "DISCOVERY FAILED above (read that traceback first). Either "
             "way it is a FINDING, not a success.")
         return 1
     return 1 if failures else 0

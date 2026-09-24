@@ -1,9 +1,12 @@
 """Per-object migration status and migration risk. Pure, zero I/O.
 
 The status vocabulary is deliberately closed, and two of its values --
-DATA_CLONE and DONE -- are UNREACHABLE in this version. The plugin moves no data,
-so no code path may report that it did. They exist so the vocabulary does not
-have to change when a data phase is added.
+DATA_CLONE and DONE -- are never produced here. This module sees only the
+control-plane deploy result, which copies no data; whether rows were copied
+by the in-AIDP job snowmig_02_copy_schema is known to snowmig_03_reconcile
+(MIGRATION_REPORT.md), not to this module, so claiming either value would be
+a report of something it cannot see. They exist so the vocabulary does not
+have to change if that result is ever ingested.
 """
 from __future__ import annotations
 
@@ -15,6 +18,14 @@ RISK_LEVELS = ("LOW", "MEDIUM", "HIGH")
 
 # Above this, the later data phase needs a wave/staging plan of its own.
 _LARGE_ROWS = 100_000_000
+
+_RISK_ORDER = {level: i for i, level in enumerate(RISK_LEVELS)}
+
+
+def _raise(level: str, to: str) -> str:
+    """Risk only ever goes up. A VIEW is HIGH; a column warning on the same
+    view is a lesser fact and used to overwrite it down to MEDIUM."""
+    return to if _RISK_ORDER[to] > _RISK_ORDER[level] else level
 
 
 def migration_status(identifier: str, *, deployed: dict | None,
@@ -29,8 +40,9 @@ def migration_status(identifier: str, *, deployed: dict | None,
         # BLOCKED, not cloned: something else owns that name.
         return "BLOCKED"
     if identifier in set(deployed.get("verified_targets") or []):
-        # Structure only. DATA_CLONE/DONE are never returned here: this plugin
-        # copies no rows, and claiming otherwise would be a false report.
+        # Structure only. DATA_CLONE/DONE are never returned here: the deploy
+        # result says nothing about rows (the copy job's outcome lives in
+        # 03_reconcile), and claiming otherwise would be a false report.
         return "SHALLOW_CLONE"
     if identifier in set(deployed.get("derived_type_drift_targets") or []):
         # The view exists and is ours; the target derived some column types
@@ -67,13 +79,13 @@ def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
 
     omitted = obj.get("omitted_properties") or []
     if omitted:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append("source properties dropped with no AIDP equivalent: "
                      + ", ".join(omitted))
 
     deferred = obj.get("deferred_properties") or []
     if deferred:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append(
             "source maintenance/layout settings not applied on the target: "
             + ", ".join(f'{d["property"]}={d["value"]}' for d in deferred))
@@ -81,16 +93,24 @@ def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
     warnings = obj.get("warnings") or []
     tz = [w for w in warnings if "timezone" in w.lower()]
     if tz:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append("timezone semantics differ for one or more columns")
     other = [w for w in warnings if w not in tz]
     if other:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append(f"{len(other)} column warning(s) recorded")
+
+    kind_warning = obj.get("kind_warning")
+    if kind_warning:
+        # A TRANSIENT/TEMPORARY table planned as a permanent Delta table. The
+        # sentence itself travels, not a count: the row must say what to
+        # confirm.
+        level = _raise(level, "MEDIUM")
+        notes.append(kind_warning)
 
     rows = obj.get("rows")
     if rows is not None and rows >= _LARGE_ROWS:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append(f"{rows:,} rows: the later data phase will need its own "
                      "staging and wave plan")
 

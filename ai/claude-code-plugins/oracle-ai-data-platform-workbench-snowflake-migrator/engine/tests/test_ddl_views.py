@@ -66,6 +66,9 @@ def test_portable_view_has_no_unsupported_constructs():
     ("select system$current_user() from t", "SYSTEM$"),
     ("select * from t at(timestamp => x)", "Time Travel"),
     ("select j:field from t", "VARIANT path"),
+    ('select j:"Field Name" from t', "VARIANT path"),
+    ("select datediff(day, a, b) from t", "DATEDIFF / TIMESTAMPDIFF"),
+    ("select timestampadd(day, 1, ts) from t", "TIMESTAMPADD / TIMEADD"),
 ])
 def test_snowflake_only_constructs_detected(sql, construct):
     found = [c["construct"] for c in detect_unsupported_constructs(sql)]
@@ -103,7 +106,7 @@ def test_a_view_using_only_translatable_sql_migrates():
     res = build_create_view(view_record(ddl=ddl), "D.S.V")
     assert res.blocked is False
     assert "IF(a > 1, 'y', 'n')" in res.sql and "IFF(" not in res.sql
-    assert "CAST(b AS int)" in res.sql
+    assert "CAST(b AS DECIMAL(38,0))" in res.sql, "INT is NUMBER(38,0) in Snowflake"
     assert any(r.rule_id == "R43_VIEW_DIALECT_TRANSLATED" for r in res.rules_applied)
     assert any(r.rule_id == "T01_IFF" for r in res.rules_applied)
 
@@ -268,3 +271,271 @@ def test_trailing_semicolon_and_whitespace_are_stripped():
 def test_unterminated_literal_in_the_ddl_is_reported():
     with pytest.raises(ValueError):
         extract_view_body("create view v as select 'oops")
+
+
+# --------------------------------------------------------------------------
+# A backslash-escaped quote inside a cast operand used to raise out of the
+# translator and abort the whole ddl stage with no view named.
+# --------------------------------------------------------------------------
+
+def test_build_create_view_with_escaped_quote_in_cast():
+    ddl = "create view V_BAD as select 'don\\'t'::string as w, a from DB.SC.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V_BAD")
+    assert res.blocked is False, res.blocked_reason
+    assert "CAST('don\\'t' AS" in res.sql
+    assert "::" not in res.sql
+
+
+def test_translator_value_error_blocks_the_view_not_the_payload(monkeypatch):
+    import target.ddl as ddl_mod
+
+    def raise_value_error(body):
+        raise ValueError("translator could not read this body")
+
+    monkeypatch.setattr(ddl_mod, "translate_view_body", raise_value_error)
+    res = build_create_view(view_record(), "D.S.V")
+    assert res.blocked is True
+    assert "translator could not read this body" in res.blocked_reason
+
+
+# --- `::` casts go through the type mapper ---------------------------------
+
+def test_view_with_variant_cast_is_blocked_with_the_mapper_reason():
+    ddl = "create view V as select p::VARIANT as v from D.S.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is True
+    assert "VARIANT" in res.blocked_reason
+
+
+def test_view_cast_warnings_reach_the_rewrite_result():
+    ddl = "create view V as select d::TIMESTAMP as ts from D.S.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is False
+    assert any("timezone" in w for w in res.warnings), res.warnings
+
+
+# --- DATEADD is exact only for DATE operands, and only in its simple form ---
+
+def test_a_view_with_dateadd_is_not_labelled_exact():
+    ddl = "create view V as select DATEADD(day, 1, created_ts) as due_ts from D.S.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is False
+    r43 = [r for r in res.rules_applied if r.rule_id == "R43_VIEW_DIALECT_TRANSLATED"]
+    assert r43 and "every one is an exact rewrite" not in r43[0].detail, r43
+    assert any("TIMESTAMP" in w for w in res.warnings), res.warnings
+
+
+def test_a_view_with_dateadd_column_hours_is_blocked_with_the_construct_named():
+    ddl = "create view V as select DATEADD(hour, n_hours, ts) as x from D.S.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is True
+    assert "DATEADD" in res.blocked_reason
+
+
+def test_a_view_with_a_nested_dateadd_is_blocked_not_stamped_portable():
+    ddl = ("create view V as select * from D.S.EVENTS "
+           "where ts >= DATEADD(day, -30, CURRENT_DATE())")
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is True
+    assert "DATEADD" in res.blocked_reason
+    assert not any(r.rule_id in ("R42_VIEW_PORTABLE_SQL", "R43_VIEW_DIALECT_TRANSLATED")
+                   for r in res.rules_applied)
+
+
+# --- the constructs table is derived from the rules, not hand-maintained ---
+
+def test_unsupported_constructs_table_is_derived_from_rules():
+    from snowflake_source.dialect.translate import RULES
+    assert set(UNSUPPORTED_CONSTRUCTS) == {
+        r.construct for r in RULES if r.status == "declared"}
+
+
+def test_datediff_view_is_blocked_end_to_end():
+    from plan.build import _view_verdict
+    ddl = ("create view V as select DATEDIFF(dd, order_date, ship_date) as d "
+           "from D.S.T")
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is True
+    assert "DATEDIFF" in res.blocked_reason
+    ok, category, reason = _view_verdict(view_record(ddl=ddl))
+    assert ok is False and category == "snowflake_only_sql"
+    assert "DATEDIFF" in reason
+
+
+# --- "portable" means only that no known construct matched -----------------
+
+def test_r42_wording_does_not_claim_a_clean_check():
+    # GREATEST/LEAST parse on Spark with different NULL handling and SPLIT's
+    # separator is a regex there; neither is in the rule table, so the body
+    # ships verbatim. The rule text must say that, not "no construct present".
+    ddl = "create view V as select GREATEST(a, b) as g, SPLIT(p, '.')[0] as r from D.S.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is False
+    r42 = [r for r in res.rules_applied if r.rule_id == "R42_VIEW_PORTABLE_SQL"]
+    assert r42, res.rules_applied
+    assert "no known Snowflake-only construct matched" in r42[0].detail
+    assert "carried verbatim" in r42[0].detail
+    assert "no Snowflake-only construct present" not in r42[0].detail
+    assert any("not in the rule table" in w for w in res.warnings), res.warnings
+
+
+# --- quoted identifiers, string escapes and $$ strings in view bodies -------
+
+def test_view_with_quoted_identifiers_is_backticked_and_its_body_survives():
+    from target import ddl as ddl_mod
+    ddl = 'create view V as select "Order ID", "we""ird" from DB.SC."Orders"'
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is False, res.blocked_reason
+    assert "`Order ID`" in res.sql and "DB.SC.`Orders`" in res.sql
+    assert '"Order ID"' not in res.sql
+    ids = {r.rule_id for r in res.rules_applied}
+    assert "T07_QUOTED_IDENTIFIER" in ids and "R43_VIEW_DIALECT_TRANSLATED" in ids
+    assert "R42_VIEW_PORTABLE_SQL" not in ids
+    # The catalog API takes the body separately; it is re-lexed from the
+    # emitted statement and must survive the `we"ird` identifier.
+    body = ddl_mod._view_text(res.sql)
+    assert body == 'select `Order ID`, `we"ird` from DB.SC.`Orders`'
+
+
+def test_view_with_a_doubled_quote_literal_is_escaped_for_spark():
+    ddl = "create view V as select * from D.S.CUST where last_name = 'O''Brien'"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is False
+    assert "'O\\'Brien'" in res.sql
+    assert "''Brien" not in res.sql
+    ids = {r.rule_id for r in res.rules_applied}
+    assert "R43_VIEW_DIALECT_TRANSLATED" in ids and "R42_VIEW_PORTABLE_SQL" not in ids
+
+
+def test_view_with_a_dollar_quoted_string_is_blocked_naming_it():
+    ddl = "create view V as select $$it's$$ as note, id from D.S.T"
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is True
+    assert "dollar" in res.blocked_reason.lower()
+
+
+@pytest.mark.parametrize("body", [
+    'select "Order ID" from DB.SC."Orders"',
+    'select IFF(a, 1, 2) as "F", "we""ird" from t',
+    "select 'O''Brien' as who from t",
+    'select "c"::int from t',
+])
+def test_no_double_quoted_identifier_survives_into_emitted_spark_sql(body):
+    from snowflake_source.dialect import lexer
+    res = build_create_view(view_record(ddl=f"create view V as {body}"), "D.S.V")
+    assert res.blocked is False, res.blocked_reason
+    emitted = extract_view_body(res.sql)
+    assert not any(kind == "ident" and text.startswith('"')
+                   for kind, text in lexer.segments(emitted)), emitted
+
+
+# --------------------------------------------------------------------------
+# R41 object-reference rewrite. It used to be a plain re.sub over the whole
+# body: it mutated string literals (data, not SQL), missed a reference whose
+# parts GET_DDL had quoted, hit a longer sibling name as a substring, and the
+# plan then reported a rewrite that had not happened.
+# --------------------------------------------------------------------------
+
+PREFIX_MAP = {"MY-DATA-DB.SALES.ORDERS": "lake.my-data-db_sales.orders"}
+
+
+def _rules(res):
+    return {r.rule_id: r.detail for r in res.rules_applied}
+
+
+def test_string_literal_containing_a_name_is_not_rewritten():
+    ddl = ("create view V as select CREATED_AT as D, "
+           "'from MY-DATA-DB.SALES.ORDERS' as LBL from \"MY-DATA-DB\".SALES.ORDERS")
+    res = build_create_view(view_record(ddl=ddl, source_database="MY-DATA-DB"),
+                            "lake.my-data-db_analytics.v", name_map=PREFIX_MAP)
+    assert res.blocked is False, res.blocked_reason
+    assert "'from MY-DATA-DB.SALES.ORDERS'" in res.sql, "the literal is data"
+    assert res.sql.count("lake.`my-data-db_sales`.orders") == 1, res.sql
+    assert "R41_VIEW_REFS_REWRITTEN" in _rules(res)
+
+
+def test_double_quoted_reference_is_rewritten_and_backticked():
+    ddl = 'create view V as select o.x from "DB"."S"."ORDERS" o'
+    res = build_create_view(view_record(ddl=ddl), "lake.db_s.v",
+                            name_map={"DB.S.ORDERS": "lake.db_s.orders"})
+    assert res.blocked is False
+    assert '"DB"' not in res.sql and "`DB`" not in res.sql
+    assert "from lake.db_s.orders o" in res.sql, res.sql
+    assert "R41_VIEW_REFS_REWRITTEN" in _rules(res)
+
+
+def test_quoted_part_matches_exact_case_only():
+    # "db" is a different object from DB in Snowflake, so it is not rewritten.
+    ddl = 'create view V as select o.x from "db"."S"."ORDERS" o'
+    res = build_create_view(view_record(ddl=ddl), "lake.db_s.v",
+                            name_map={"DB.S.ORDERS": "lake.db_s.orders"})
+    assert "`db`.`S`.`ORDERS`" in res.sql, res.sql
+    assert "R41_VIEW_REFS_REWRITTEN" not in _rules(res)
+
+
+def test_unquoted_reference_still_matches_case_insensitively():
+    ddl = "create view V as select o.x from db.s.orders o"
+    res = build_create_view(view_record(ddl=ddl), "lake.db_s.v",
+                            name_map={"DB.S.ORDERS": "lake.db_s.orders"})
+    assert "from lake.db_s.orders o" in res.sql, res.sql
+
+
+def test_longer_sibling_is_not_a_substring_hit():
+    ddl = "create view V as select a.x from DB.S.ORDERS_ARCHIVE a"
+    res = build_create_view(
+        view_record(ddl=ddl), "lake.db_s.v",
+        name_map={"DB.S.ORDERS": "lake.db_s.orders",
+                  "DB.S.ORDERS_ARCHIVE": "lake.db_s.orders_archive"})
+    assert "lake.db_s.orders_archive" in res.sql, res.sql
+    assert "orders_ARCHIVE" not in res.sql
+    assert _rules(res)["R41_VIEW_REFS_REWRITTEN"] == (
+        "rewrote object references: DB.S.ORDERS_ARCHIVE -> lake.db_s.orders_archive")
+
+
+def test_sibling_not_in_the_map_is_left_whole_and_no_rewrite_is_reported():
+    ddl = "create view V as select a.x from DB.S.ORDERS_ARCHIVE a"
+    res = build_create_view(view_record(ddl=ddl), "lake.db_s.v",
+                            name_map={"DB.S.ORDERS": "lake.db_s.orders"})
+    assert "from DB.S.ORDERS_ARCHIVE a" in res.sql, res.sql
+    assert "R41_VIEW_REFS_REWRITTEN" not in _rules(res)
+    assert "R40_VIEW_REFS_IDENTITY" in _rules(res)
+
+
+def test_comment_mentioning_a_name_is_untouched():
+    ddl = "create view V as select a.x from DB.S.ORDERS a -- see DB.S.ORDERS\n"
+    res = build_create_view(view_record(ddl=ddl), "lake.db_s.v",
+                            name_map={"DB.S.ORDERS": "lake.db_s.orders"})
+    assert "-- see DB.S.ORDERS" in res.sql, res.sql
+    assert "from lake.db_s.orders a" in res.sql
+
+
+def test_r41_lists_only_the_references_that_were_rewritten():
+    ddl = "create view V as select a.x from DB.S.ORDERS a"
+    res = build_create_view(
+        view_record(ddl=ddl), "lake.db_s.v",
+        name_map={"DB.S.ORDERS": "lake.db_s.orders",
+                  "DB.S.CUSTOMERS": "lake.db_s.customers"})
+    assert _rules(res)["R41_VIEW_REFS_REWRITTEN"] == (
+        "rewrote object references: DB.S.ORDERS -> lake.db_s.orders")
+
+
+def test_rewritten_target_with_a_hyphen_is_backticked_and_parses():
+    sqlglot = pytest.importorskip("sqlglot")
+    ddl = 'create view V as select o.x from "MY-DATA-DB".SALES.ORDERS o'
+    res = build_create_view(view_record(ddl=ddl, source_database="MY-DATA-DB"),
+                            "lake.my-data-db_sales.v", name_map=PREFIX_MAP)
+    tree = sqlglot.parse_one(res.sql, dialect="spark")
+    tables = {t.sql(dialect="spark").split(" AS ")[0]
+              for t in tree.find_all(sqlglot.exp.Table)}
+    assert "lake.`my-data-db_sales`.orders" in tables, tables
+
+
+def test_view_with_a_quoted_field_variant_path_is_blocked_not_quoted():
+    # T16 used to want an identifier character after the colon, so the quoted
+    # field slipped past it; T07 then turned "Field Name" into a backtick
+    # identifier and the view was stamped an exact rewrite with a colon path
+    # still in the body. The construct is refused, named.
+    ddl = 'create view V as select payload:"Field Name" as f from t'
+    res = build_create_view(view_record(ddl=ddl), "D.S.V")
+    assert res.blocked is True and res.sql is None
+    assert "VARIANT path" in res.blocked_reason

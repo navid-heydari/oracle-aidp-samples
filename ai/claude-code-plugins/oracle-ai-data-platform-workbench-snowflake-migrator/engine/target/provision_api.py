@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 
 from .coords import region_from_ocid
+from .executor import paged_uri
 
 __all__ = ["PROVISION_API_VERSION", "ProvisionBackendUnsupported",
            "build_provision_command",
@@ -252,9 +253,12 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
     base = _base(platform_ocid)
 
     def raw(method: str, uri: str, body: dict | None = None,
-            body_file: str | None = None) -> list[str]:
+            body_file: str | None = None,
+            page: str | None = None) -> list[str]:
+        # `page` is the `opc-next-page` token of the previous list response;
+        # None leaves the URI exactly as it was.
         cmd = ["oci", "raw-request", "--http-method", method,
-               "--target-uri", uri]
+               "--target-uri", paged_uri(uri, page)]
         if body_file:
             cmd += ["--request-body", f"file://{body_file}"]
         elif body is not None:
@@ -262,16 +266,17 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
         return cmd
 
     ws = kwargs.get("workspace")
+    page = kwargs.get("page")
 
     if operation == "list_workspaces":
-        return raw("GET", f"{base}/workspaces")
+        return raw("GET", f"{base}/workspaces", page=page)
     if operation == "create_workspace":
         return raw("POST", f"{base}/workspaces", kwargs["body"])
     if operation == "get_async_operation":
         return raw("GET", f'{base}/asyncOperations/{kwargs["key"]}')
 
     if operation == "list_clusters":
-        return raw("GET", f"{base}/workspaces/{ws}/clusters")
+        return raw("GET", f"{base}/workspaces/{ws}/clusters", page=page)
     if operation == "create_cluster":
         return raw("POST", f"{base}/workspaces/{ws}/clusters", kwargs["body"])
     if operation in ("start_cluster", "stop_cluster", "restart_cluster"):
@@ -280,7 +285,7 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
                            f'{kwargs["cluster"]}/actions/{action}', {})
     if operation == "list_libraries":
         return raw("GET", f"{base}/workspaces/{ws}/clusters/"
-                          f'{kwargs["cluster"]}/libraries')
+                          f'{kwargs["cluster"]}/libraries', page=page)
     if operation == "install_libraries":
         return raw("PATCH", f"{base}/workspaces/{ws}/clusters/"
                             f'{kwargs["cluster"]}/libraries', kwargs["body"])
@@ -313,7 +318,7 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
                         "--path", kwargs["path"])
 
     if operation == "list_jobs":
-        return raw("GET", f"{base}/workspaces/{ws}/jobs")
+        return raw("GET", f"{base}/workspaces/{ws}/jobs", page=page)
     if operation == "create_job":
         return raw("POST", f"{base}/workspaces/{ws}/jobs", kwargs["body"])
     if operation == "run_job":
@@ -326,7 +331,8 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
         # `startTime` is rejected as a sort key even though it is a field on
         # every run. `timeCreated` works.
         return raw("GET", f'{base}/workspaces/{ws}/jobRuns'
-                          f'?jobKey={kwargs["job_key"]}&sortBy=timeCreated')
+                          f'?jobKey={kwargs["job_key"]}&sortBy=timeCreated',
+                   page=page)
     if operation == "cancel_job_run":
         # Live-verified (2026-09-19): answers 202, and the run reads CANCELED
         # on the next poll. Used by the cold-start watchdog in jobs.py to let
@@ -337,13 +343,16 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
         # null" (live).
         return raw("GET", f"{base}/workspaces/{ws}/taskRuns"
                           f'?jobRunKey={kwargs["run_key"]}'
-                          f"&sortBy=timeCreated")
+                          f"&sortBy=timeCreated", page=page)
     if operation == "fetch_task_output":
         return raw("POST", f"{base}/workspaces/{ws}/taskRuns/"
                            f'{kwargs["task_run_key"]}/actions/fetchOutput',
                    {})
 
     if operation == "test_connection":
-        return raw("POST", f"{base}/actions/testConnection", kwargs["body"])
+        # The body carries the Snowflake credential; the transport spools it
+        # and passes `body_file`, which `raw()` prefers over the inline body.
+        return raw("POST", f"{base}/actions/testConnection",
+                   kwargs.get("body"), body_file=kwargs.get("body_file"))
 
     raise ValueError(f"unknown provisioning operation {operation!r}")

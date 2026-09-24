@@ -73,9 +73,9 @@ def _write(out: pathlib.Path, name: str, payload) -> pathlib.Path:
     out.mkdir(parents=True, exist_ok=True)
     path = out / name
     if isinstance(payload, str):
-        path.write_text(payload)
+        path.write_text(payload, encoding="utf-8")
     else:
-        path.write_text(json.dumps(payload, indent=2, default=str))
+        path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     return path
 
 
@@ -302,8 +302,10 @@ def run_demo(out_dir) -> dict:
         f"Generated: `{out / nb_name}`",
         f"Intended AIDP path: `{notebook_workspace_path(DEMO_STANDARD_CATALOG)}`",
         "",
-        "Not uploaded: this is the demo. In production, `notebook --upload` "
-        "places it in the workspace and the USER decides whether to run it.",
+        "Not uploaded: this is the demo. In production the structure is "
+        "created by `provision --execute` and then `run --job "
+        "snowmig_01_structure`; `notebook --upload` is a dry run, and is "
+        "refused with `--execute` (GAPS.md 13).",
         ""]))
     stage("notebook: the Standard-catalog path generated as a script that "
           "runs on AIDP compute, where Spark reports real errors — the "

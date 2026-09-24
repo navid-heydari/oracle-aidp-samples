@@ -21,10 +21,74 @@ INV = {
 
 
 def test_inventory_lists_objects_with_exact_row_counts():
-    md = render_inventory(INV)
+    # Exact mode, stated as such: the fixture says how the numbers were got.
+    exact = {**INV, "row_count_mode": "exact",
+             "inventory": [{**r, "row_count_source": "count_query"}
+                           for r in INV["inventory"]]}
+    md = render_inventory(exact)
     assert "MYDB.PUBLIC.ORDERS" in md
     assert "100" in md
-    assert "exact" in md.lower(), "must label counts as exact, not estimated"
+    assert "Rows (exact)" in md, "must label counts as exact, not estimated"
+    assert "count(*)" in md.lower()
+
+
+def _row(md: str, ident: str) -> str:
+    return next(l for l in md.splitlines() if f"`{ident}`" in l)
+
+
+def test_inventory_metadata_mode_never_claims_exact():
+    # The default mode. The numbers are SHOW estimates and the views were
+    # deliberately not counted; neither is an error and neither is exact.
+    inv = {**INV, "row_count_mode": "metadata", "inventory": [
+        {**INV["inventory"][0], "row_count_source": "show_metadata"},
+        {**INV["inventory"][1], "row_count_exact": None,
+         "row_count_source": "not_counted",
+         "row_count_note": "not counted: a view has no stored row count, so "
+                           "counting it means executing the view"}]}
+    md = render_inventory(inv)
+    header = md.split("| Object |", 1)[0].lower()
+    assert "are **exact**" not in header and "in-session" not in header
+    assert "not" in header and "verified" in header, \
+        "must say plainly that a metadata count is not a verified one"
+    assert "Rows (metadata)" in md
+    assert "ERROR" not in md
+    assert "not counted" in _row(md, "MYDB.PUBLIC.ORDERS_VW")
+    assert md.count("counting it means executing the view") == 1
+
+
+def test_inventory_none_mode_labels_not_requested():
+    inv = {**INV, "row_count_mode": "none", "inventory": [
+        {**r, "row_count_exact": None, "row_count_source": "not_counted",
+         "row_count_note": "row counts were not requested"}
+        for r in INV["inventory"]]}
+    md = render_inventory(inv)
+    assert "ERROR" not in md
+    assert "not requested" in md
+    header = md.split("| Object |", 1)[0].lower()
+    assert "are **exact**" not in header and "in-session" not in header
+
+
+def test_inventory_count_error_is_the_only_thing_called_error():
+    inv = {**INV, "row_count_mode": "exact", "inventory": [
+        {**INV["inventory"][0], "row_count_source": "count_query"},
+        {**INV["inventory"][1], "row_count_exact": None,
+         "row_count_source": "error",
+         "row_count_note": "No active warehouse selected"}]}
+    md = render_inventory(inv)
+    assert "ERROR" in _row(md, "MYDB.PUBLIC.ORDERS_VW")
+    assert "ERROR" not in _row(md, "MYDB.PUBLIC.ORDERS")
+    assert "No active warehouse selected" in md
+
+
+def test_inventory_record_without_provenance_renders_dash():
+    # An inventory.json written before row_count_source existed: a blank is
+    # a blank, not a named error.
+    inv = {**INV, "inventory": [
+        {**INV["inventory"][1], "row_count_exact": None}]}
+    md = render_inventory(inv)
+    row = _row(md, "MYDB.PUBLIC.ORDERS_VW")
+    assert "ERROR" not in row
+    assert "| - |" in row
 
 
 def test_inventory_shows_the_type_breakdown():

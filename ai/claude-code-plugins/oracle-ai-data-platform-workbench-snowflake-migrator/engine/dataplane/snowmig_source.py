@@ -43,6 +43,114 @@ SOURCE_MODES = ("connector", "external-catalog")
 AIDP_FORMAT = "aidataplatform"
 
 
+# The verbs this transport may send. Deliberately narrower than the
+# control-plane transport's list: WITH is absent, because following a CTE to
+# the statement it prefixes needs the engine's lexer, which does not exist on
+# a cluster. A read that needs a CTE can be written as a subquery.
+PUSHDOWN_READ_VERBS = ("SELECT", "SHOW", "DESCRIBE", "DESC", "EXPLAIN")
+
+
+class SourceWriteRefused(PermissionError):
+    """A statement that is not a read was handed to the pushdown transport."""
+
+
+def _code_only(sql: str) -> str:
+    """`sql` with string literals and comments blanked, length preserved.
+
+    A `;` inside a literal is data, not a statement boundary, and `--` inside
+    one is not a comment. Blanking rather than deleting keeps offsets, so the
+    scan cannot be confused about where anything starts.
+    """
+    out = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        two = sql[i:i + 2]
+        if c in ("'", '"'):
+            out.append(" ")
+            i += 1
+            while i < n:
+                if sql[i] == "\\" and i + 1 < n:      # escaped char
+                    out.append("  ")
+                    i += 2
+                    continue
+                if sql[i] == c:
+                    if sql[i:i + 2] == c * 2:           # doubled = literal
+                        out.append("  ")
+                        i += 2
+                        continue
+                    out.append(" ")
+                    i += 1
+                    break
+                out.append("\n" if sql[i] == "\n" else " ")
+                i += 1
+            continue
+        if two == "$$":
+            out.append("  ")
+            i += 2
+            while i < n and sql[i:i + 2] != "$$":
+                out.append("\n" if sql[i] == "\n" else " ")
+                i += 1
+            out.append("  ")
+            i += 2
+            continue
+        if two == "--":
+            while i < n and sql[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if two == "/*":
+            depth, i = 1, i + 2
+            out.append("  ")
+            while i < n and depth:
+                if sql[i:i + 2] == "/*":
+                    depth += 1
+                    out.append("  ")
+                    i += 2
+                elif sql[i:i + 2] == "*/":
+                    depth -= 1
+                    out.append("  ")
+                    i += 2
+                else:
+                    out.append("\n" if sql[i] == "\n" else " ")
+                    i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def assert_pushdown_read_only(sql: str) -> None:
+    """Refuse anything that is not a single read. Fails closed.
+
+    The cluster-side counterpart of the control plane's `assert_read_only`:
+    the credential the notebook holds may well be able to write, and the
+    only thing standing between a migration and a modified SOURCE is this
+    check.
+    """
+    code = _code_only(sql or "")
+    statements = [s for s in code.split(";") if s.strip()]
+    if not statements:
+        raise SourceWriteRefused(
+            f"empty statement refused; this transport is read-only against "
+            f"Snowflake (allowed: {', '.join(PUSHDOWN_READ_VERBS)})")
+    if len(statements) > 1:
+        raise SourceWriteRefused(
+            f"{len(statements)} statements in one pushdown; refused. A "
+            f"second statement is how a write rides along behind a read.")
+    verb = statements[0].split()[0].upper() if statements[0].split() else ""
+    if verb == "WITH":
+        raise SourceWriteRefused(
+            "a CTE is refused by this transport: deciding whether `WITH ... "
+            "INSERT` is a read needs the engine's scanner, which does not "
+            "run on the cluster. Write the CTE as a subquery.")
+    if verb not in PUSHDOWN_READ_VERBS:
+        raise SourceWriteRefused(
+            f"{verb or 'unrecognised statement'} refused: this transport is "
+            f"read-only against Snowflake, whatever the credential allows "
+            f"(allowed: {', '.join(PUSHDOWN_READ_VERBS)}).")
+
+
 class SourceConfigError(ValueError):
     """The source config is missing, unreadable or incomplete."""
 
@@ -66,7 +174,7 @@ def load_source_config(path: str | pathlib.Path) -> dict:
     """Read the Snowflake connection config (JSON) from the workspace."""
     p = pathlib.Path(path).expanduser()
     try:
-        text = p.read_text()
+        text = p.read_text(encoding="utf-8")
     except OSError as exc:
         raise SourceConfigError(
             f"source config not readable at {p}: {exc.strerror}") from exc
@@ -84,12 +192,12 @@ def load_source_config(path: str | pathlib.Path) -> dict:
         raise SourceConfigError(f"{p}: expected a mapping at the top level")
     # THE MIGRATION CONFIG IS ONE FILE FOR BOTH ENDS: the Snowflake connection
     # nested under `snowflake:`, the AIDP coordinates under `aidp:`. That is
-    # the file `provision --source-config` uploads, and it uploads it
-    # verbatim -- so the shape that actually reaches the mount is the nested
-    # one, and reading the top level for `account` found nothing but the two
-    # envelope keys. The failure surfaced on the cluster, as every required
-    # field missing at once, which reads like a broken credential rather than
-    # a config one level too deep.
+    # the file `provision --source-config` reads, and it uploads the
+    # `snowflake:` block as JSON (`plan/<stem>.json`) -- so the shape that
+    # reaches the mount is the nested one, and reading the top level for
+    # `account` found nothing but the envelope key. The failure surfaced on
+    # the cluster, as every required field missing at once, which reads
+    # like a broken credential rather than a config one level too deep.
     nested = data.get("snowflake")
     if isinstance(nested, dict):
         return dict(nested)
@@ -160,7 +268,7 @@ class SnowflakeSource:
                 return str(cfg[inline])
             if cfg.get(path_field):
                 return pathlib.Path(
-                    str(cfg[path_field])).expanduser().read_text().strip()
+                    str(cfg[path_field])).expanduser().read_text(encoding="utf-8").strip()
             return None
 
         auth = str(cfg["auth"]).strip().lower()
@@ -196,11 +304,17 @@ class SnowflakeSource:
     def pushdown(self, sql: str, *, schema: str | None = None):
         """Run `sql` IN SNOWFLAKE and return a DataFrame.
 
+        Refuses anything that is not a single read statement, whatever the
+        credential allows -- see `assert_pushdown_read_only`.
+
         Connector mode only. The `schema` option must name a REAL schema:
         the connector rejects INFORMATION_SCHEMA there with
         DATA_ACCESS_LAYER_0031, while a query scoped to a real schema may
         reference INFORMATION_SCHEMA freely. Both established live.
         """
+        # Before the mode check and before anything reaches Spark: the
+        # refusal must not depend on configuration being right.
+        assert_pushdown_read_only(sql)
         if self.mode != "connector":
             raise SourceConfigError(
                 "pushdown is connector-mode only; external-catalog mode has "

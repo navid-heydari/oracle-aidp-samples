@@ -5,14 +5,25 @@ Runs on AIDP compute. Per table:
 
   1. read the source count;
   2. move the rows —
-       skip-existing (default): only into a table with 0 rows;
+       skip-existing (default): only into a table with 0 rows; a table that
+                                already holds rows is `skipped_nonempty`
+                                when its count equals the source's and
+                                `count_mismatch` when it does not -- a
+                                re-run never softens a recorded failure;
        append:                  INSERT INTO ... SELECT *;
        overwrite:               INSERT OVERWRITE ... SELECT * (rewrites ROWS,
                                 never drops the table);
   3. VERIFY: target count == source count (both read AFTER the copy), and
-     with --verify counts+sums an exact SUM over every DECIMAL column,
-     cast to DECIMAL(38,s) on both sides. Floats are never summed for
-     equality — float tolerance is wrong for money.
+     with --verify counts+sums an exact SUM over every DECIMAL column OF
+     THE SOURCE, cast to DECIMAL(38,s) with the SOURCE's scale on both
+     sides. Floats are never summed for equality — float tolerance is
+     wrong for money.
+
+Before any row moves, and in both verify modes, the source's DECIMAL
+columns are checked against the target's types: a target column that is not
+DECIMAL, or a DECIMAL with fewer integer digits or a smaller scale, would be
+rounded or truncated by the INSERT with the row count intact. That table is
+recorded `type_drift` and NOT copied.
 
 The copy's claim is the verification, not the INSERT returning: exactly the
 discipline the control-plane deploy learned from live AIDP (a 2xx is not the
@@ -49,6 +60,10 @@ MANIFEST_NAME = "discovery_manifest.json"
 
 _DECIMAL = re.compile(r"^decimal\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
 
+# Copy statuses that mean the table is NOT verified. A later run that copies
+# nothing (skip-existing over a table with rows) never softens one of these.
+_COPY_FAILURES = ("count_mismatch", "sum_mismatch", "type_drift", "failed")
+
 
 def q(identifier: str) -> str:
     return "`" + str(identifier).replace("`", "``") + "`"
@@ -77,17 +92,49 @@ def _count(spark, fqn: str) -> int:
     return spark.sql(f"SELECT COUNT(*) AS n FROM {fqn}").collect()[0]["n"]
 
 
-def _decimal_columns(spark, fqn: str) -> list[tuple[str, int]]:
-    """[(column, scale)] for every DECIMAL column of `fqn`."""
-    out = []
+def _column_types(spark, fqn: str) -> dict[str, str]:
+    """{column: data_type} from DESCRIBE, in column order; lower-cased types.
+
+    Columns end at the first blank or `#` row (Delta's metadata section).
+    """
+    out: dict[str, str] = {}
     for row in spark.sql(f"DESCRIBE {fqn}").collect():
         name = str(row["col_name"] or "").strip()
         if not name or name.startswith("#"):
             break
-        m = _DECIMAL.match(str(row["data_type"] or "").strip())
-        if m:
-            out.append((name, int(m.group(2))))
+        out[name] = str(row["data_type"] or "").strip().lower()
     return out
+
+
+def _decimal_columns(types: dict[str, str]) -> list[tuple[str, int, int]]:
+    """[(column, precision, scale)] for every DECIMAL column in `types`."""
+    out = []
+    for name, data_type in types.items():
+        m = _DECIMAL.match(data_type)
+        if m:
+            out.append((name, int(m.group(1)), int(m.group(2))))
+    return out
+
+
+def _type_drift(src_types: dict[str, str], tgt_types: dict[str, str]) -> dict:
+    """Source DECIMAL columns the target cannot hold without silent loss.
+
+    Keyed off the SOURCE: a source decimal whose target column is not a
+    decimal, or a decimal with fewer integer digits (precision - scale) or a
+    smaller scale, would be rounded, truncated or overflowed by the INSERT's
+    store-assignment cast -- with the row count intact. A wider target is
+    fine. Non-decimal columns are the structure stage's business.
+    """
+    by_lower = {k.lower(): v for k, v in tgt_types.items()}
+    drift = {}
+    for name, precision, scale in _decimal_columns(src_types):
+        target = by_lower.get(name.lower())
+        m = _DECIMAL.match(target or "")
+        if not m or int(m.group(2)) < scale or \
+                int(m.group(1)) - int(m.group(2)) < precision - scale:
+            drift[name] = {"source": src_types[name],
+                           "target": target or "<missing>"}
+    return drift
 
 
 def _decimal_sums(spark, fqn: str, columns: list[tuple[str, int]]) -> dict:
@@ -145,8 +192,30 @@ def _copy(spark, src: str, tgt: str, *, mode: str, verify: str,
     if source_count is None:
         source_count = _count(spark, src)
 
+    # Pre-flight, before anything is written and in both verify modes:
+    # metadata only (DESCRIBE on the registered source and on the target).
+    src_types = _column_types(spark, src)
+    tgt_types = _column_types(spark, tgt)
+    drift = _type_drift(src_types, tgt_types)
+    if drift:
+        return {"status": "type_drift", "type_drift": drift,
+                "source_count": source_count, "started_at": started,
+                "reason": f"{len(drift)} DECIMAL column(s) are narrower or "
+                          f"not DECIMAL on the target; an INSERT would round "
+                          f"or truncate them silently. NOT copied. Recreate "
+                          f"the table from the approved plan."}
+
     target_rows = _count(spark, tgt)
     if mode == "skip-existing" and target_rows > 0:
+        # A verification, not a bypass: a target that holds rows but not the
+        # source's count is a mismatch whether or not this run wrote it.
+        if target_rows != source_count:
+            return {"status": "count_mismatch", "source_count": source_count,
+                    "target_count": target_rows, "started_at": started,
+                    "reason": f"target already holds {target_rows} row(s) "
+                              f"but the source has {source_count}; nothing "
+                              f"was copied. Use --mode overwrite to rewrite "
+                              f"it. NOT verified."}
         return {"status": "skipped_nonempty", "source_count": source_count,
                 "target_count": target_rows, "started_at": started,
                 "reason": f"target already holds {target_rows} row(s); use "
@@ -175,7 +244,22 @@ def _copy(spark, src: str, tgt: str, *, mode: str, verify: str,
            "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
            "mode": mode}
 
-    # The verification IS the claim.
+    # The verification IS the claim. The rows have landed by now, so a
+    # failure from here on must say so: a `failed` record that looked like a
+    # failed INSERT would invite an `append` re-run that duplicates every row.
+    try:
+        return _verify(spark, src, tgt, out, verify=verify,
+                       source_count=source_count, src_types=src_types)
+    except Exception as exc:
+        out.update(status="failed", insert_completed=True,
+                   reason=f"the INSERT completed but the verification raised: "
+                          f"{str(exc)[:300]}. NOT verified; re-copy with "
+                          f"--mode overwrite, not append")
+        return out
+
+
+def _verify(spark, src: str, tgt: str, out: dict, *, verify: str,
+            source_count: int, src_types: dict[str, str]) -> dict:
     src_after = _count(spark, src)
     tgt_after = _count(spark, tgt)
     out.update(source_count=src_after, target_count=tgt_after)
@@ -190,16 +274,23 @@ def _copy(spark, src: str, tgt: str, *, mode: str, verify: str,
         return out
 
     if verify == "counts+sums":
-        columns = _decimal_columns(spark, tgt)
+        # The SOURCE's decimal columns, cast to the SOURCE's scale on both
+        # sides: the target is at least as wide (the pre-flight in _copy
+        # refused it otherwise), so the comparison is exact rather than
+        # rounded to whatever the target happens to be.
+        columns = [(c, s) for c, _p, s in _decimal_columns(src_types)]
         src_sums = _decimal_sums(spark, src, columns)
         tgt_sums = _decimal_sums(spark, tgt, columns)
-        drift = {c: {"source": src_sums[c], "target": tgt_sums[c]}
-                 for c, _ in columns if src_sums[c] != tgt_sums[c]}
+        sum_drift = {c: {"source": src_sums[c], "target": tgt_sums[c]}
+                     for c, _ in columns if src_sums[c] != tgt_sums[c]}
         out["decimal_columns_checked"] = [c for c, _ in columns]
-        if drift:
+        if not columns:
+            out["decimal_columns_note"] = ("the source has no DECIMAL "
+                                           "columns; counts are the whole check")
+        if sum_drift:
             out["status"] = "sum_mismatch"
-            out["sum_drift"] = drift
-            out["reason"] = (f"{len(drift)} decimal column(s) do not sum "
+            out["sum_drift"] = sum_drift
+            out["reason"] = (f"{len(sum_drift)} decimal column(s) do not sum "
                              f"equal. NOT verified.")
             return out
 
@@ -232,15 +323,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--reports-dir", default=DEFAULT_REPORTS_DIR)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true",
-                    help="re-copy tables already recorded as verified")
+                    help="re-copy tables already recorded as verified; needs "
+                         "--mode overwrite or append, since skip-existing "
+                         "cannot re-copy a table that holds rows")
     args = ap.parse_args(argv)
 
     if args.source_catalog and \
             args.source_catalog.lower() == args.target_catalog.lower():
         return fail("error: source and target catalog are the same.")
+    if args.force and args.mode == "skip-existing":
+        # Under the default mode --force copied nothing (skip-existing never
+        # writes into a table with rows) and overwrote a `verified` record
+        # with `skipped_nonempty`. Refuse rather than guess at overwrite.
+        return fail("error: --force re-copies tables already recorded as "
+                    "verified, which --mode skip-existing cannot do; pass "
+                    "--mode overwrite (rewrites rows) or --mode append")
 
     reports = pathlib.Path(args.reports_dir)
-    manifest = json.loads((reports / MANIFEST_NAME).read_text())
+    manifest = json.loads((reports / MANIFEST_NAME).read_text(encoding="utf-8"))
     record = next((s for s in manifest["schemas"] if s["name"] == args.schema),
                   None)
     if record is None:
@@ -251,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
     target = f"{args.target_catalog}.{target_schema}"
     report = {"schema": args.schema, "tables": {}, "target": target}
     if path.exists():
-        prior = json.loads(path.read_text())
+        prior = json.loads(path.read_text(encoding="utf-8"))
         # Resumability is keyed by SOURCE schema, so a report written against
         # a DIFFERENT target must not let this run skip copies as already
         # verified (the same trap the structure script hit live).
@@ -260,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"{target} — starting a fresh record for this target")
             path.with_suffix(
                 f".{prior['target'].replace('.', '_')}.json").write_text(
-                    json.dumps(prior, indent=2))
+                    json.dumps(prior, indent=2), encoding="utf-8")
         else:
             report = prior
             report["target"] = target
@@ -282,23 +382,62 @@ def main(argv: list[str] | None = None) -> int:
     else:
         # Default to what the structure step created for THIS target, when it
         # left a report: the manifest is the whole estate, and copying into
-        # tables nobody approved is not a default worth having.
+        # tables nobody approved is not a default worth having. A table it
+        # found already there WITH the planned layout counts; one it recorded
+        # as `type_drift` never does -- the copy below is a positional INSERT
+        # INTO ... SELECT *, and that layout is not the plan's.
         structure_path = reports / f"structure_report_{args.schema.lower()}.json"
         created = []
+        objects = None
         if structure_path.is_file():
-            prior = json.loads(structure_path.read_text())
+            prior = json.loads(structure_path.read_text(encoding="utf-8"))
             if prior.get("target") in (None, target):
-                created = [n for n, rec in (prior.get("objects") or {}).items()
-                           if rec.get("status") == "created"]
+                objects = prior.get("objects") or {}
+                created = [n for n, rec in objects.items()
+                           if rec.get("status") in ("created", "already_existed")]
         if created:
             names = created
             log(f"scope: {len(names)} table(s) the structure step created for "
                 f"{target} (the manifest lists "
                 f'{len(record["tables"])} for this schema)')
         else:
-            names = [t["name"] for t in record["tables"]]
+            # The `created` filter above never runs when nothing was created,
+            # and that is exactly the all-drift schema: a re-plan over tables
+            # that all pre-exist with the old layout records every one of
+            # them `type_drift`. They are excluded here too, or the fallback
+            # copies into the very layout the structure step refused.
+            drifted = {n for n, r in (objects or {}).items()
+                       if r.get("status") == "type_drift"}
+            names = [t["name"] for t in record["tables"]
+                     if t["name"] not in drifted]
+            if objects is None:
+                why = f"no structure report for {target} was found"
+            else:
+                # The report IS there; saying it was not pointed the operator
+                # away from the real cause (a plan that never covered this
+                # schema). Tables it created nothing for will come back
+                # `target_missing` below.
+                nip = sum(1 for r in objects.values()
+                          if r.get("status") == "not_in_plan")
+                why = (f"the structure report for {target} records 0 created "
+                       f"table(s) ({nip} not_in_plan, {len(drifted)} "
+                       f"type_drift, {len(objects) - nip - len(drifted)} "
+                       f"other) -- re-run 01_create_structure with the right "
+                       f"ddl_plan.json, or pass --tables")
+                if drifted:
+                    why += (f"; {len(drifted)} type_drift table(s) excluded "
+                            f"-- recreate them from the approved plan")
+                if drifted and not names:
+                    # Zero iterations below would be exit 0: a copy job that
+                    # did nothing, reported as a success.
+                    return fail(
+                        f"error: every table the manifest lists for "
+                        f"{args.schema} is recorded type_drift in the "
+                        f"structure report for {target}; nothing to copy. "
+                        f"Recreate them from the approved plan "
+                        f"(01_create_structure) or pass --tables to override")
             log(f"scope: all {len(names)} table(s) the manifest lists for "
-                f"this schema; no structure report for {target} was found")
+                f"this schema; {why}")
 
     todo = [n for n in names
             if args.force
@@ -329,16 +468,33 @@ def main(argv: list[str] | None = None) -> int:
                 f"source={args.source_mode})")
             continue
         log(f"{args.schema}.{name}: copying ({args.mode})")
-        result = copy_table(source, args.schema, name, tgt, mode=args.mode,
-                            verify=args.verify,
-                            source_count=source_counts.get(name))
+        started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        try:
+            result = copy_table(source, args.schema, name, tgt, mode=args.mode,
+                                verify=args.verify,
+                                source_count=source_counts.get(name))
+        except Exception as exc:
+            # A failure is a finding, not the end of the run: live, one
+            # connector login timeout would otherwise end the schema with
+            # the failing table unrecorded and the rest never attempted.
+            result = {"status": "failed", "started_at": started,
+                      "reason": str(exc)[:400]}
+            log(f"{args.schema}.{name}: FAILED — {str(exc)[:200]}")
+        if result["status"] == "skipped_nonempty" and \
+                prior.get("status") in _COPY_FAILURES:
+            # Nothing was copied, so nothing was re-verified: a recorded
+            # failure stands until a real re-copy verifies the table.
+            result = dict(prior, reason=(
+                f"{prior.get('reason') or prior['status']} (a re-run in "
+                f"skip-existing mode left the target untouched; use --mode "
+                f"overwrite to re-copy and re-verify it)"))
         if result["status"] not in ("verified", "skipped_nonempty",
                                     "target_missing"):
             failures += 1
         report["tables"][name] = result
         report["updated_at"] = datetime.datetime.now(
             datetime.timezone.utc).isoformat()
-        path.write_text(json.dumps(report, indent=2))
+        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         log(f"{args.schema}.{name}: {result['status']} "
             f"({result.get('target_count', '?')} row(s))")
 

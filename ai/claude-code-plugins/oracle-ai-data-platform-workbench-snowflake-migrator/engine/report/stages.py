@@ -10,13 +10,17 @@ Two rules it holds to, both learned the hard way elsewhere in this plugin:
     exposures" and "we could not read the policy references" are opposite
     findings and must not render the same.
   * Three stages write to AIDP -- `provision`, `catalog` and `deploy` -- and
-    the board says which. (`smoke --write-probe` and `notebook --upload` can
-    write too, narrowly and opt-in, and say so in their own reports.)
+    the board says which. The one further write is `smoke --write-probe
+    --execute`: one probe schema, created and removed; `--write-probe` alone
+    is a dry run. `notebook --upload` sends nothing -- a dry run without
+    `--execute`, refused with it (GAPS.md 13).
 """
 from __future__ import annotations
 
 import json
 import pathlib
+
+from plan.smoke import smoke_verdict
 
 __all__ = ["STAGES", "build_stage_board"]
 
@@ -39,8 +43,9 @@ STAGES: tuple[dict, ...] = (
      "purpose": "clustering, retention and churn — who inherits OPTIMIZE/VACUUM"},
     {"stage": "security", "needs": "Snowflake", "writes": False,
      "artifact": "security.json",
-     "purpose": "masking/row-access policies, secure views, grants — what "
-                "arrives unprotected"},
+     "purpose": "masking/row-access/aggregation/projection policies, tag "
+                "attachments, secure views, grants — what arrives "
+                "unprotected"},
     {"stage": "compute", "needs": "Snowflake", "writes": False,
      "artifact": "compute.json",
      "purpose": "warehouse-to-cluster sizing proposal"},
@@ -93,7 +98,7 @@ def _load(out_dir: pathlib.Path, name: str):
     if path.suffix != ".json":
         return {"_exists": True}
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {"_unreadable": True}
 
@@ -118,8 +123,41 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
         return (text, False)
 
     if stage == "deps":
-        return (f'lineage from {data.get("source_used", _UNKNOWN)}',
-                bool(data.get("cycles")))
+        # `cycles` lives in plan.json, never here. What dependencies.json
+        # does say is WHERE the graph came from: account_usage is the full
+        # graph; parsed_ddl is partial (view DDL only); account_usage_empty
+        # and account_usage+parsed_ddl mean ACCOUNT_USAGE was readable but
+        # lagged behind the DDL for some or all views, whose DDL was parsed
+        # instead; not_extracted is "did not look" and must not read as
+        # clean. A value the board does not know is flagged, not guessed at.
+        source = data.get("source_used")
+        edges = len(data.get("edges") or [])
+        if not source:
+            # Both producers write the key. Without it, how the graph was got
+            # is unknown, and "view DDL only" would be a guess about it.
+            return (f'lineage source not recorded; {edges} edge(s) -- '
+                    '**completeness unknown**', True)
+        text = f'lineage from {source}; {edges} edge(s)'
+        if source == "not_extracted":
+            return (text + " -- **NOT extracted; view order unchecked**", True)
+        unresolved = len(data.get("unresolved_references") or [])
+        tail = f', {unresolved} unresolved reference(s)' if unresolved else ''
+        if source == "account_usage":
+            return (text, False)
+        if source == "parsed_ddl":
+            return (text + " -- **partial graph (view DDL only)**" + tail, True)
+        if source in ("account_usage+parsed_ddl", "account_usage_empty"):
+            # The producer writes a per-run warning naming the lagged views
+            # and the ones still unordered; surface it rather than restate
+            # a weaker version.
+            missing = len(data.get("views_without_account_usage_edge") or [])
+            note = data.get("warning") or (
+                f"{missing} view(s) had no ACCOUNT_USAGE edge; their DDL was "
+                "parsed (OBJECT_DEPENDENCIES lags DDL up to ~3 h) -- re-run "
+                "deps before relying on the wave order")
+            return (text + f" -- **{note}**" + tail, True)
+        return (text + " -- **provenance not recognised; completeness unknown**",
+                True)
 
     if stage == "maintenance":
         flagged = data.get("objects_with_signals")
@@ -137,11 +175,40 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
             return ("**policy attachments unreadable — exposure UNKNOWN, "
                     "not zero**", True)
         text = f'{count} policy exposure(s), {secure} secure view(s)'
+        # A policy object that exists while POLICY_REFERENCES (which lags
+        # ~2 h) lists no attachment is UNCONFIRMED, not zero; and an empty
+        # attachment list is uncorroborated when SHOW MASKING/ROW ACCESS
+        # POLICIES was denied. `readable` defaults to True so an artefact
+        # written before the `policies` block existed stays unflagged.
+        unattached = data.get("policies_defined_without_attachment") or 0
+        if unattached:
+            return (text + f'; **{unattached} policy object(s) defined, '
+                    'attachment UNCONFIRMED (ACCOUNT_USAGE.POLICY_REFERENCES '
+                    'lags ~2 h)**', True)
+        pol = data.get("policies") or {}
+        denied = [k for k in ("masking", "row_access", "aggregation",
+                              "projection")
+                  if not (pol.get(k) or {}).get("readable", True)]
+        if denied:
+            return (text + f'; **{", ".join(denied)} policy objects could not '
+                    'be enumerated — empty attachment list uncorroborated**',
+                    True)
+        # Tag attachments are a separate ACCOUNT_USAGE view with the same
+        # failure mode: unreadable is UNKNOWN, never "no tags attached".
+        tags = data.get("tag_references")
+        if tags is not None and not tags.get("measured", True):
+            return (text + '; **tag attachments unreadable — classification '
+                    'UNKNOWN, not zero**', True)
         return (text, bool(count or secure))
 
     if stage == "compute":
-        return (f'{len(data.get("proposals") or data.get("warehouses") or [])} '
-                f'warehouse(s) sized', False)
+        # compute.json is what propose_all writes: `proposals` and `blocked`.
+        # A warehouse with no proposal is a decision still owed, not clean.
+        blocked = len(data.get("blocked") or [])
+        text = f'{len(data.get("proposals") or [])} warehouse(s) sized'
+        if blocked:
+            return (text + f', **{blocked} blocked (no shape proposed)**', True)
+        return (text, False)
 
     if stage == "plan":
         s = data.get("summary") or {}
@@ -155,8 +222,12 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
                 f'{blocked} blocked', bool(blocked))
 
     if stage == "smoke":
-        ok = data.get("ok")
-        return ("PASS" if ok else "**FAIL**", not ok)
+        verdict = smoke_verdict(data)
+        if verdict == "PASS":
+            return ("PASS", False)
+        if verdict == "PARTIAL":
+            return ("**PARTIAL** — destination not checked", True)
+        return ("**FAIL**", True)
 
     if stage == "preflight":
         cfg = data.get("config") or {}
@@ -172,11 +243,17 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
             return ("DRY RUN — nothing was provisioned", False)
         steps = data.get("steps") or []
         bad = [s for s in steps if s.get("verified") is False]
+        # None in execute mode is "not confirmed, not assumed" (a library
+        # install awaiting the restart, a folder create that may have hit
+        # an existing one). Pending is pending; it does not read as clean.
+        pending = [s for s in steps if s.get("verified") is None]
         text = (f'{len(steps)} step(s); workspace '
                 f'{(data.get("workspace") or {}).get("name", "?")}')
         if bad:
-            return (text + f' — **{len(bad)} failed/unverified**', True)
-        return (text, False)
+            text += f' — **{len(bad)} failed/unverified**'
+        if pending:
+            text += f' — **{len(pending)} not confirmed**'
+        return (text, bool(bad or pending))
 
     if stage == "catalog":
         if data.get("dry_run"):
@@ -198,10 +275,27 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
                     f'would be created; nothing was', False)
         verified = data.get("verified", 0)
         total = data.get("statement_count", 0)
+        # Every outcome the deploy buckets, so the row adds up to the
+        # statement count. The default transport (catalog_api) is the one
+        # that produces "exists but its structure could not be read" and
+        # derived type drift; neither was counted, so a board could read
+        # "verified 4/7" with no warning and three tables unverified.
         bad = (len(data.get("failed") or [])
                + len(data.get("mismatched_targets") or []))
-        return (f'**verified {verified}/{total}**'
-                + (f', {bad} not verified' if bad else ''), bool(bad))
+        unverified = len(data.get("unverified_structure_targets") or [])
+        drift = len(data.get("derived_type_drift_targets") or [])
+        errors = (len(data.get("errors") or [])
+                  + len(data.get("chunk_errors") or []))
+        text = f'**verified {verified}/{total}**'
+        if bad:
+            text += f', {bad} failed/mismatched'
+        if unverified:
+            text += f', {unverified} structure not verified'
+        if drift:
+            text += f', {drift} created with derived type drift'
+        if errors:
+            text += f', {errors} error(s)'
+        return (text, bool(bad or unverified or drift or errors))
 
     if stage == "data-options":
         choice = data.get("choice")

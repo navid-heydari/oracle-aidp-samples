@@ -2,10 +2,12 @@
 
 An EXTERNAL catalog is a read-only pointer at the live Snowflake source and
 copies nothing. A STANDARD catalog is managed storage, so it is created only
-when asked for by name, and only ever as the CONTAINER (runbook S3): its
+when asked for by name, and only ever as the CONTAINER (runbook S4): its
 tables belong on AIDP compute, where a failure is visible in the cluster's own
 output instead of somewhere inside a series of control-plane HTTP calls.
 """
+import pathlib
+
 import pytest
 
 from target.catalog_api import InvalidCatalogSpec, build_catalog_body
@@ -131,8 +133,11 @@ def test_standard_creates_the_container_and_says_so():
     assert res["action"] == "created"
     # The container existing must never read as the tables existing.
     assert res["container_only"] is True
-    # The note has to name where the structure path actually is.
-    assert "notebook" in res["note"]
+    # The note has to route the operator to where the structure path
+    # actually is: the S10 workflow, not the refused notebook upload.
+    assert "snowmig_01_structure" in res["note"]
+    assert "Generate the structure script" not in res["note"]
+    assert "--upload" in res["note"] and "GAPS 13" in res["note"]
 
 
 def test_standard_never_carries_the_source_credential():
@@ -235,3 +240,36 @@ def test_an_unreadable_listing_before_create_raises_rather_than_creating():
     with pytest.raises(RuntimeError, match="401"):
         ensure_catalog(display_name="sales_db", call=call,
                        connection=CONNECTION, verify_delays=())
+
+
+# ------------------------------------------------- runbook step labels
+#
+# The overview skill numbers the runbook: S3 registers the EXTERNAL source,
+# S4 creates the INTERNAL target catalog. This module and the CLI both called
+# the INTERNAL create S3, so the CLI's own output contradicted the commands
+# at the very step they drive.
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def test_runbook_step_labels_agree_in_catalog_provision():
+    text = (ROOT / "target" / "catalog_provision.py").read_text(encoding="utf-8")
+    assert "runbook S3" not in text
+    assert "runbook S4" in text
+
+
+def test_runbook_step_labels_agree_in_the_cli():
+    import argparse
+
+    import snowmig
+
+    doc = snowmig.cmd_catalog.__doc__
+    assert "step S3" not in doc and "step S4" in doc, doc
+    parser = snowmig.build_parser()
+    subs = next(a for a in parser._actions
+                if isinstance(a, argparse._SubParsersAction))
+    catalog = subs.choices["catalog"]
+    action = next(a for a in catalog._actions
+                  if "--catalog-type" in a.option_strings)
+    # `databases` is legitimately S3; only the INTERNAL create is checked.
+    assert "runbook S3" not in action.help and "runbook S4" in action.help

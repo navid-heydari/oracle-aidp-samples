@@ -3,6 +3,8 @@ import json
 import types
 import pytest
 
+OCID = "ocid1.aidataplatform.oc1.iad.amaaaaaaaifake"
+
 from target.coords import resolve_target
 from target.runner import make_call, BackendError, make_run_sql
 
@@ -166,7 +168,7 @@ def test_the_spooled_body_file_is_removed_after_the_call():
         path = next(a[len("file://"):] for a in cmd if a.startswith("file://"))
         seen["path"] = path
         assert os.path.exists(path), "the file must exist while the CLI runs"
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             assert _SECRET in fh.read(), "the CLI reads the real body"
         return types.SimpleNamespace(
             returncode=0, stdout=json.dumps({"data": {"key": "k"}}), stderr="")
@@ -226,3 +228,191 @@ def test_run_refuses_a_param_it_cannot_deliver():
     assert "schema" in msg
     assert "PARAMS" in msg
     assert "provision" in msg
+
+
+# --------------------------------------------------------------------------
+# A list operation follows `opc-next-page` until the server stops sending
+# one. Reading page one only made every object past it "absent": a table
+# read back after its create "never appeared", a schema was re-POSTed.
+# --------------------------------------------------------------------------
+
+def _envelope(items, next_page=None):
+    env = {"data": {"items": items}, "status": "200 OK"}
+    if next_page:
+        env["headers"] = {"opc-next-page": next_page}
+    return json.dumps(env)
+
+
+def _paged_server(pages):
+    """`pages` maps a page token (None for the first page) to
+    (items, next_token). Records every URI asked."""
+    asked = []
+
+    def fake(cmd):
+        uri = cmd[cmd.index("--target-uri") + 1]
+        asked.append(uri)
+        token = None
+        if "page=" in uri:
+            token = uri.rsplit("page=", 1)[1]
+        items, nxt = pages[token]
+        return types.SimpleNamespace(returncode=0, stderr="",
+                                     stdout=_envelope(items, nxt))
+
+    return fake, asked
+
+
+def test_a_list_operation_follows_opc_next_page():
+    fake, asked = _paged_server({None: ([{"key": "c.s.t1"}], "P2"),
+                                 "P2": ([{"key": "c.s.t2"}], None)})
+    call = make_call(_target(), backend="oci_raw", run_process=fake)
+    out = call("list_tables_in", catalog="c", schema="s")
+    assert [i["key"] for i in out["items"]] == ["c.s.t1", "c.s.t2"]
+    assert len(asked) == 2
+    assert "page=" not in asked[0]
+    assert asked[1].endswith("&page=P2")
+
+
+def test_a_list_without_a_token_makes_one_request():
+    fake, asked = _paged_server({None: ([{"key": "c.s.t1"}], None)})
+    call = make_call(_target(), backend="oci_raw", run_process=fake)
+    assert call("list_schemas", catalog="c")["items"] == [{"key": "c.s.t1"}]
+    assert len(asked) == 1
+
+
+def test_a_repeating_page_token_raises_instead_of_looping():
+    fake, asked = _paged_server({None: ([{"key": "a"}], "P2"),
+                                 "P2": ([{"key": "b"}], "P2")})
+    call = make_call(_target(), backend="oci_raw", run_process=fake)
+    with pytest.raises(RuntimeError, match="list_catalogs"):
+        call("list_catalogs")
+    assert len(asked) <= 3
+
+
+def test_create_and_get_operations_are_not_paginated():
+    asked = []
+
+    def fake(cmd):
+        asked.append(cmd)
+        return types.SimpleNamespace(
+            returncode=0, stderr="",
+            stdout=json.dumps({"data": {"key": "lake.s.t"},
+                               "headers": {"opc-next-page": "P2"}}))
+
+    call = make_call(_target(), backend="oci_raw", run_process=fake)
+    assert call("get_table", catalog="lake", schema="s",
+                table="t")["key"] == "lake.s.t"
+    assert len(asked) == 1
+
+
+def test_the_aidp_cli_backend_refuses_a_truncated_listing():
+    """The CLI's paging flags are undocumented, so a second page cannot be
+    asked for. Returning page one as the whole would make every object past
+    it absent; refusing says why."""
+    def fake(cmd):
+        return types.SimpleNamespace(
+            returncode=0, stderr="",
+            stdout="Response:\n" + _envelope([{"key": "lake.a"}], "P2"))
+
+    call = make_call(_target(), backend="aidp_cli", run_process=fake)
+    with pytest.raises(RuntimeError, match="page"):
+        call("list_schemas", catalog="lake")
+
+
+def test_read_back_finds_an_object_created_past_page_one():
+    """deploy_catalog through the real transport against a server that pages
+    every list at ONE item: both tables must verify, and nothing may be
+    diagnosed as burned."""
+    from target.catalog_deploy import deploy_catalog
+
+    state = {"schemas": {}, "tables": {}}
+
+    def page(items, token):
+        # One item per page, tokens are 1-based offsets.
+        start = int(token or 0)
+        chunk = items[start:start + 1]
+        nxt = str(start + 1) if start + 1 < len(items) else None
+        return _envelope(chunk, nxt)
+
+    def fake(cmd):
+        method = cmd[cmd.index("--http-method") + 1]
+        uri = cmd[cmd.index("--target-uri") + 1]
+        token = uri.rsplit("page=", 1)[1] if "page=" in uri else None
+        path = uri.split("?", 1)[0]
+        body = (json.loads(cmd[cmd.index("--request-body") + 1])
+                if "--request-body" in cmd else {})
+        if method == "GET" and path.endswith("/catalogs"):
+            return types.SimpleNamespace(returncode=0, stderr="", stdout=page(
+                [{"displayName": "lake", "catalogType": "STANDARD"}], token))
+        if method == "GET" and path.endswith("/schemas"):
+            return types.SimpleNamespace(returncode=0, stderr="", stdout=page(
+                [{"key": k, "lifecycleState": "ACTIVE"}
+                 for k in state["schemas"]], token))
+        if method == "POST" and path.endswith("/schemas"):
+            key = f'{body["catalogKey"]}.{body["displayName"]}'.lower()
+            state["schemas"][key] = True
+            return types.SimpleNamespace(returncode=0, stderr="",
+                                         stdout=json.dumps({"data": {"key": key}}))
+        if method == "POST" and path.endswith("/tables"):
+            key = f'{body["schemaKey"]}.{body["displayName"]}'.lower()
+            state["tables"][key] = body["tableFields"]
+            return types.SimpleNamespace(returncode=0, stderr="",
+                                         stdout=json.dumps({"data": {"key": key}}))
+        if method == "GET" and path.endswith("/tables"):
+            return types.SimpleNamespace(returncode=0, stderr="", stdout=page(
+                [{"key": k} for k in sorted(state["tables"])], token))
+        if method == "GET" and "/tables/" in path:
+            key = path.rsplit("/tables/", 1)[1].lower()
+            return types.SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+                {"data": {"key": key, "tableFields": state["tables"][key]}}))
+        raise AssertionError((method, uri))
+
+    plan = {"statements": [
+        {"source_identifier": f"DB.PUBLIC.T{i}", "object_type": "TABLE",
+         "target_fqn": f"lake.DB.T{i}", "sql": "",
+         "expected_columns": [{"name": "A", "type": "STRING"}]}
+        for i in range(3)], "blocked": []}
+    call = make_call(_target(), backend="oci_raw", run_process=fake)
+    out = deploy_catalog(plan, target=_target(), execute=True, call=call,
+                         retry_delays=(), verify_delays=(), schema_wait=())
+    assert out["verified"] == 3, out["failed"]
+    assert out["failed_targets"] == []
+    assert out["poisoned_names"] == [] and out["diagnosis_probes"] == []
+
+
+# --- an expired OCI session profile is named, not pasted --------------------
+# Live 2026-09-22: `oci` answers an expired session by PROMPTING on stdout and
+# exiting 1 with "Abort:" on stderr, which the transport truncated into
+# "failed (exit 1): Abort:".
+
+def _expired_proc(cmd):
+    import types
+    return types.SimpleNamespace(
+        returncode=1,
+        stdout=("ERROR: This CLI session has expired, so it cannot currently "
+                "be used to run commands\nDo you want to re-authenticate your "
+                "CLI session profile? [Y/n]: "),
+        stderr="Abort: \n")
+
+
+def test_an_expired_session_names_the_command_that_fixes_it():
+    from target.coords import Target
+    from target.runner import make_call
+    target = Target(datalake_ocid=OCID, workspace="w", cluster_id="c",
+                    catalog="cat")
+    with pytest.raises(RuntimeError) as err:
+        make_call(target, backend="oci_raw",
+                  run_process=_expired_proc)("list_catalogs")
+    message = str(err.value)
+    assert "session" in message and "expired" in message
+    assert "oci session authenticate" in message
+    assert "us-ashburn-1" in message
+    assert "Abort:" not in message, "the abort text says nothing on its own"
+
+
+def test_the_provisioning_transport_says_the_same_thing():
+    from target.provisioning import (ProvisionTransportError,
+                                     make_provision_call)
+    with pytest.raises(ProvisionTransportError) as err:
+        make_provision_call(OCID, run_process=_expired_proc)("list_workspaces")
+    message = str(err.value)
+    assert "oci session authenticate" in message and "expired" in message

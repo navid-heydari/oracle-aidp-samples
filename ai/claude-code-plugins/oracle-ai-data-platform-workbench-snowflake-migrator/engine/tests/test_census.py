@@ -28,6 +28,18 @@ def _responses(**over):
         "show streams": [],
         "show materialized views": [],
         "show dynamic tables": [],
+        "show alerts": [],
+        "show secrets": [],
+        "show network rules": [],
+        "show streamlits": [],
+        "show notebooks": [],
+        "show services": [],
+        # Account-scoped: read once for the account, not once per database.
+        "show shares": [],
+        "show roles": [],
+        "show network policies": [],
+        "show applications": [],
+        "show compute pools": [],
     }
     empty.update(over)
     return empty
@@ -88,8 +100,13 @@ def test_nothing_in_the_census_is_ever_marked_migratable():
 
 
 def test_every_declared_kind_appears_in_the_summary_even_at_zero():
+    # Including the sub-kinds a single read splits into: a UDTF and an
+    # external function come out of the FUNCTIONS read, and a kind that is
+    # only ever reported inside another one is a kind nobody can count.
     c = build_census(FakeSql(_responses()), ["DB"])
-    assert set(c["kinds"]) == {k["kind"] for k in KINDS}
+    declared = {k["kind"] for k in KINDS}
+    declared |= {s for k in KINDS for s in (k.get("sub_kinds") or ())}
+    assert set(c["kinds"]) == declared
 
 
 # ------------------------------------------------------------ language triage
@@ -174,6 +191,52 @@ def test_the_scope_statement_names_what_was_examined():
     assert "cannot" in s.lower() or "not migrat" in s.lower()
 
 
-def test_a_clean_estate_says_so_in_the_scope_statement():
+def test_an_all_empty_census_never_claims_the_whole_estate():
+    # SHOW and INFORMATION_SCHEMA return only objects the role holds a
+    # privilege on. A read-only role with USAGE + SELECT sees no task, stream,
+    # procedure or pipe at all, and every statement still succeeds -- so a
+    # zero here is "none visible", not "none exist", and must not be turned
+    # into "the migratable count is the whole estate".
+    c = build_census(FakeSql(_responses()), ["DB"], role="MIGRATION_READER_ROLE")
+    s = c["scope_statement"]
+    assert "whole estate" not in s.lower()
+    assert "MIGRATION_READER_ROLE" in s
+    assert "visible" in s.lower() and "lower bound" in s.lower()
+    assert c["role"] == "MIGRATION_READER_ROLE"
+    assert c["completeness"] == "visible-to-role"
+
+
+def test_zero_count_is_distinguished_from_denied():
+    from report.render import render_census
+    c = build_census(FakeSql(_responses()), ["DB"], role="R")
+    task = c["kinds"]["TASK"]
+    assert task["count"] == 0 and task["readable"] is True, "unchanged: we looked"
+    assert "visible" in task["note"] and "lower bound" in task["note"]
+    row = next(line for line in render_census(c).splitlines()
+               if line.startswith("| Task |"))
+    assert "| 0 | yes |" not in row, row
+    assert "lower bound" in row
+
+
+def test_a_populated_census_still_says_the_count_is_a_lower_bound():
+    c = build_census(FakeSql(_responses(**{
+        "information_schema.procedures": [_proc()]})), ["DB"], role="R")
+    assert "lower bound" in c["scope_statement"].lower()
+    assert "role `R`" in c["scope_statement"]
+
+
+def test_scope_statement_without_a_role_falls_back_to_current_role_wording():
     c = build_census(FakeSql(_responses()), ["DB"])
-    assert "only tables and views" in c["scope_statement"].lower()
+    assert "current role" in c["scope_statement"]
+    assert "None" not in c["scope_statement"]
+
+
+def test_the_census_header_lists_the_grants_a_complete_census_needs():
+    from report.render import render_census
+    c = build_census(FakeSql(_responses()), ["DB"], role="R")
+    note = c["visibility_note"]
+    for grant in ("OPERATE", "MONITOR", "USAGE", "SELECT", "IMPORTED PRIVILEGES"):
+        assert grant in note, grant
+    md = render_census(c)
+    assert note in md, "the grants list is in CENSUS.md's header"
+    assert md.index(note) < md.index("## Counts by kind")

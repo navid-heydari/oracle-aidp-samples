@@ -76,10 +76,10 @@ cluster. So `--source-mode connector` is the default and
 | Database | **Catalog (INTERNAL)** | plan mirrors 1:1; created via structure clone | AIDP lower-cases identifiers; case collisions HALT the plan |
 | Schema | Schema | structure clone | |
 | Table | **Managed Delta table** | from the approved `ddl_plan` (engine-translated types, default), or CTAS `WHERE 1=0` through the source | `NUMBER(p,s)`→`DECIMAL(p,s)` exact; `VARIANT/GEOGRAPHY` **blocked** unless the operator opts into string; `TIMESTAMP_NTZ` needs an explicit downgrade decision |
-| View | View | 6 exact dialect rewrites (`IFF`, `::`, `DATEADD`, `LISTAGG`…); 12 constructs (`QUALIFY`, `LATERAL FLATTEN`, …) **refused and named** for a human | target re-derives column types — drift is reported, narrowing flagged |
+| View | View | 8 dialect rewrites (`IFF`, `::` via the type mapper, `DATEADD` — exact for DATE operands only, caveat recorded on the plan — `LISTAGG`, quoted identifiers, `''` escapes…); 12 constructs (`QUALIFY`, `LATERAL FLATTEN`, …) **refused and named** for a human | target re-derives column types — drift is reported, narrowing flagged |
 | Warehouse | **Compute cluster** | `provision` creates `migration_assets`; per-warehouse clusters proposed by `compute` with sizing left as a decision | same-name clusters, default config, per request |
 | Table data | Delta rows | `02_copy_schema.ipynb` per schema: INSERT-SELECT through the connector (or the external catalog), verified by counts (+ exact decimal sums) | per-table snapshots — see §6 consistency |
-| Task / Stream / Pipe / Dynamic table | **AIDP Job** (to be rewritten) | census inventories them with effort bands; **not auto-translated** | the blast-radius risk: a task that fed a migrated table stops feeding it after cutover |
+| Task / Stream / Pipe / Dynamic table | **AIDP Job** (to be rewritten) | census inventories them with effort bands; **not auto-translated**. A dynamic, external, Iceberg, event or hybrid table that `SHOW TABLES` flags is blocked by `plan` with the reason named (`PLANNED_OBJECTS.md`, "Object kinds with no AIDP equivalent") | the blast-radius risk: a task that fed a migrated table stops feeding it after cutover |
 | Procedure / UDF | Job or Spark UDF (rewrite) | census + language verdict (SQL/JS/Python/Java/Scala) | code is rewritten by humans/AI with review, never mechanically |
 | Masking / row-access policy | — no equivalent API | security stage reports every exposure | data arrives **unprotected**; restricted views + classification is a design task |
 | Secure view | — | blocked, named | guarantees do not survive |
@@ -98,20 +98,27 @@ marked emulated.
 
 **Prod mode** is the same pipeline with credentials and `--execute` gates:
 
-See `README.md` for the runnable form of this table.
+See `README.md` for the runnable form of this table, and
+`skills/snowflake-migrator-overview/SKILL.md` for the twelve-step order
+(S1–S12) it follows; the `S` labels below are that runbook's.
 
 | # | Step | Command | Writes |
 |---|---|---|---|
 | 0 | **Confirm the connection config with the user, field by field**, and test both ends | `preflight` | no |
-| 1 | Inventory the estate (objects, census, lineage, security, maintenance, warehouses) | `assess` `deps` `security` `maintenance` `compute` | no |
-| 2 | Plan + generate DDL, get sign-off | `plan` `ddl` | no |
-| 3 | Prove both ends | `smoke` | opt-in probe |
-| 4 | Provision the AIDP environment: workspace (named after the source account), `migration_assets` cluster, **one cluster per Snowflake warehouse**, `backup-snowflake-migration/` (scripts + plan), 4 unscheduled jobs | `provision --execute` | yes |
-| 5 | Register Snowflake as an EXTERNAL catalog | `catalog --execute` | yes |
-| 6 | Create structure (INTERNAL catalog): control-plane deploy or the notebook on compute | `deploy --execute` / `notebook` | yes |
-| 6b | Confirm the environment from inside AIDP | `diagnose_environment.ipynb` | no |
-| 7 | Run the jobs inside AIDP: discover → structure → **copy, schema by schema** → reconcile | AIDP jobs (driver notebooks) | yes (target only) |
-| 8 | Read `MIGRATION_REPORT.md`: per table — structure, copy, live existence, verdict, why | `03_reconcile` | no |
+| 1 | Preview the estate from the laptop (objects, census, lineage, security, maintenance, warehouses) — optional; the migration's own discovery is step 6 | `assess` `deps` `security` `maintenance` `compute` | no |
+| 2 | Plan + generate DDL, get sign-off (S7–S9) | `plan` `ddl` | no |
+| 3 | Prove both ends | `smoke` | only with `--write-probe --execute`: one probe schema, removed again |
+| 4 | Provision the AIDP environment: workspace (named after the source account), `migration_assets` cluster, **one cluster per Snowflake warehouse**, `backup-snowflake-migration/` (scripts + plan), 4 unscheduled jobs (S1, S2, S5). Copy `workspace.key` and `cluster.key` from `provision_result.json` into the config's `aidp:` block — `PROVISION.md` shows display names, not keys | `provision --execute` | yes |
+| 5 | Register Snowflake as an EXTERNAL catalog (S3), then create the INTERNAL target catalog as a container (S4) | `catalog --execute`, then `catalog --catalog-type standard --execute` | yes |
+| 5b | Confirm the environment from inside AIDP | `diagnose_environment.ipynb` | no |
+| 6 | Discover the estate as a workflow inside AIDP; back up the manifest (S6) | `run --job snowmig_00_discover` | yes (workspace files) |
+| 7 | Create the structure in the INTERNAL catalog on AIDP compute, from the approved plan, one workflow per schema (S10) | `run --job snowmig_01_structure` | yes |
+| 8 | Later, on the customer's decision: **copy, schema by schema**, then reconcile | `snowmig_02_copy_schema`, `snowmig_03_reconcile` | yes (target only) |
+| 9 | Read `MIGRATION_REPORT.md`: per table — structure, copy, live existence, verdict, why | `03_reconcile` | no |
+
+`deploy` — control-plane CRUD straight into a Standard catalog — is not in
+this table: it is live-proven but a `202 Accepted` can create nothing, so it
+is reached for only when the user asks for it by name (see `ARCHITECTURE.md`).
 
 Every write stage is a dry run until `--execute`; every create is read back
 before it is called done; a 2xx is never the claim.
@@ -121,7 +128,7 @@ before it is called done; a 2xx is never the claim.
 | Work | Who |
 |---|---|
 | Discovery, inventory, census, lineage, sizing inputs | scripts (batched SQL, paginated) |
-| Type mapping, DDL, the 6 exact SQL rewrites | scripts — refuse rather than guess |
+| Type mapping, DDL, the 8 SQL rewrites (7 exact; `DATEADD` exact for DATE operands only, and the plan says so) | scripts — refuse rather than guess |
 | Environment provisioning, uploads, job wiring | scripts, with per-step read-back |
 | Data copy + verification (counts, exact decimal sums) | scripts, resumable per schema |
 | Plan-vs-reality reconciliation | script, consulting the live catalog |
@@ -146,10 +153,16 @@ before it is called done; a 2xx is never the claim.
   failure modes (async 202s, name poisoning, case folding, derived view
   types); the EXTERNAL registration contract; provisioning end to end
   (workspace, cluster, folders, uploads, jobs); the connector read and
-  pushdown from the cluster; discovery of 11 schemas / 1000 tables in two
-  queries; and structure creation from the approved `ddl_plan`. Still
-  unproven: anything at real scale (the largest run was one schema), the
-  external catalog's crawl, and the cluster-library item shape.
+  pushdown from the cluster. For the data plane the register is `GAPS.md` →
+  "What is actually proven"; its sentence: **What has run live:** the
+  discovery job (`snowmig_00_discover`) ran to SUCCESS on a migration
+  cluster, reading 1065 relations and 9935 columns in two
+  `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
+  ran on a cluster from the approved plan, a healthy 23-minute run left alone
+  by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
+  and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
+  authors**. Still unproven: anything at real scale (the largest run was one
+  schema), the external catalog's crawl, and the cluster-library item shape.
 - **Job startup dominates small work** — ~5–6 minutes per run, measured. The
   operating unit is a schema; per-table runs are the wrong shape.
 - **A failed create can permanently burn its name** in that schema (observed

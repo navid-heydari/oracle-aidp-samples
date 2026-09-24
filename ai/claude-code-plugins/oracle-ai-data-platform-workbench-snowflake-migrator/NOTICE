@@ -3,8 +3,11 @@ Claude Code plugin
 
 Copyright (c) 2026 Oracle Corporation. Licensed under the MIT License — see the LICENSE file.
 
-This plugin assesses a Snowflake estate and migrates its STRUCTURE onto Oracle
-AI Data Platform. It copies no data.
+This plugin assesses a Snowflake estate and migrates its structure onto Oracle
+AI Data Platform through the control plane, which copies no data. Table rows
+are copied only by the in-AIDP job snowmig_02_copy_schema (INSERT-SELECT,
+verified by row count and decimal sums), one schema per run, when the operator
+runs it.
 
 Oracle and Snowflake are trademarks of their respective owners. This plugin is
 not affiliated with or endorsed by Snowflake Inc.

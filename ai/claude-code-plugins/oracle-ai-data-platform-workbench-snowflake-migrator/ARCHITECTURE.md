@@ -58,10 +58,10 @@ change the destination.
 | 6 | `data-options` | offline | — | `data_options.json`, `DATA_MOVEMENT_OPTIONS.md` | no |
 | 7 | `plan` | offline | `inventory.json`, `dependencies.json`, *(`data_options.json`)* | `plan.json`, `PLANNED_OBJECTS.md` | no |
 | 8 | `ddl` | offline | `inventory.json`, `plan.json` | `ddl_plan.json`, `DDL_PLAN.md` | no |
-| 9 | `smoke` | Snowflake + AIDP | — | `smoke.json`, `SMOKE_TEST.md` | **only with `--write-probe`** |
+| 9 | `smoke` | Snowflake + AIDP | — | `smoke.json`, `SMOKE_TEST.md` | **only with `--write-probe --execute`** |
 | 10 | `catalog` | AIDP | — | `catalog_result.json`, `CATALOG.md` | **yes, with `--execute`** |
 | 11 | `deploy` | AIDP | `ddl_plan.json`, `plan.json`, `inventory.json` | `PREFLIGHT.md`, `deploy_result.json`, `SOFT_CLONE_SUMMARY.md` | **yes, with `--execute`** |
-| 12 | `notebook` | offline *(AIDP with `--upload`)* | `ddl_plan.json`, `plan.json`, `inventory.json` | `*.ipynb`, `NOTEBOOK.md` | **only with `--upload`** |
+| 12 | `notebook` | offline | `ddl_plan.json`, `plan.json`, `inventory.json` | `*.ipynb`, `NOTEBOOK.md` | no — `--upload` is a dry run, refused with `--execute` **[GAP 13]** |
 | 13 | `summary` | offline | `plan.json`, `inventory.json`, *(`deploy_result.json`)* | `SUMMARY.md` | no |
 | 14 | `provision` | AIDP | the scripts + whatever plan artifacts exist | `provision_result.json`, `PROVISION.md`, and the AIDP-side folder, drivers and jobs | **yes, with `--execute`** |
 | — | `stages` | offline | everything present | `STAGES.md` | no |
@@ -75,7 +75,7 @@ reconcile), and their reports land in the workspace, not in `--out-dir`.
 `stages` is not a pipeline step; it is the read-out of one.
 
 **Three stages write — `provision`, `catalog` and `deploy` — plus, narrowly
-and opt-in, `smoke --write-probe` and `notebook --upload`.** The stage board
+and opt-in, `smoke --write-probe --execute`.** The stage board
 says exactly that, lists `provision` and `catalog` in their dependency
 positions, and reads their artifacts (a `create_requested` that never became
 visible is flagged as pending, not success).
@@ -115,15 +115,15 @@ visible is flagged as pending, not success).
         ┌─────────┴──────────────────────────────┐
         ▼  DEFAULT                               ▼  ON EXPLICIT REQUEST ONLY
   ┌──────────────┐                        ┌──────────────┐
-  │   catalog    │  EXTERNAL/SNOWFLAKE    │   catalog    │  STANDARD → REFUSED here
+  │   catalog    │  EXTERNAL/SNOWFLAKE    │   catalog    │  STANDARD → CONTAINER only
   │  --execute   │  read-only pointer     │  (standard)  │
   └──────┬───────┘  copies nothing        └──────┬───────┘
          │                                       ▼
          │                                ┌──────────────┐
-         │                                │   notebook   │  script → Shared/
+         │                                │   notebook   │  local .ipynb only
          │                                └──────┬───────┘
          │                                       ▼
-         │                                run on AIDP compute
+         │                                run --job snowmig_01_structure
          │                                (Spark reports real errors;
          │                                 the CRUD API returns 202 and
          │                                 can silently create nothing)
@@ -175,10 +175,32 @@ the field list. "The planned columns are there" is the claim. `ensure_catalog`
 polls the same way; a listing that fails mid-poll counts as "not visible yet",
 because it is not evidence either way.
 
+**I3a — ask the source that can answer, not the one that is convenient.**
+Two sources answer "what is attached to this object": the account-wide
+`ACCOUNT_USAGE` views, one statement for the estate but up to ~2 hours stale
+and gated behind `IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE`; and the
+`INFORMATION_SCHEMA` table functions, one round trip per object, current, and
+needing no extra grant. A hedge about staleness is not a substitute for the
+read that is not stale. Both are read and UNIONed, each attachment says which
+source saw it, and a row only the stale one has is marked for confirmation
+rather than believed or dropped. Where the per-object read cannot run --
+denied, or an estate over the budget for one round trip per object -- the
+older verdict and its hedge stand, and the report says which case produced
+the number.
+
 **I3 — "Could not look" never renders as zero.** An unreadable `ACCOUNT_USAGE`
 reports `measured: false` with null counts, because *0 reclustering credits*
 and *we could not check* lead to opposite decisions. Same for unreadable
-scopes in the census and unresolvable policy references.
+scopes in the census and unresolvable policy references. The rule has a
+second half: a verdict may not name a kind that was never enumerated. A
+sentence like "no aggregation policy is attached" is only true if
+`SHOW AGGREGATION POLICIES` was issued and answered; the security report
+builds its clean sentence from the kinds that actually answered and names
+the rest as not enumerated. And there is a third state between counted
+and unreadable: *not distinguishable*, when rows were read and counted
+under their parent kind but the column that tells a UDTF from a UDF, or
+an external stage from an internal one, could not be read. That is
+reported as such, never folded into either neighbour.
 
 **I4 — Refuse rather than guess.** An unmappable type, an unknown OCI region,
 a `LISTAGG … WITHIN GROUP`, a `::` cast over an expression: all raise. A
@@ -212,9 +234,9 @@ A gate is a point where the run stops and does not proceed on its own.
 | **Unmappable type** | `ddl` | `VARIANT`/`OBJECT`/`ARRAY`/`GEOGRAPHY` block their table unless the operator opts into `string`, which defers rather than solves |
 | **`timestamp_ntz`** | `ddl` | The catalog API silently rejects it. Blocked by default; `--timestamp-ntz timestamp` accepts the timezone-semantics change and records the caveat on the field |
 | **Connectivity** | `smoke` | Both ends reachable with the permissions the next stage needs. The write probe is skipped, with a note, against an EXTERNAL catalog — read-only by design is not a FAIL |
-| **`--execute`** | `catalog`, `deploy` | Dry run otherwise. Nothing reaches AIDP without it |
+| **`--execute`** | `catalog`, `deploy`, `provision`, `smoke --write-probe`, `notebook --upload` | Dry run otherwise. Nothing reaches AIDP without it (and `notebook --upload --execute` is then refused — **[GAP 13]**) |
 | **EXTERNAL target** | `deploy` | The target's `catalogType` is resolved before the first create; EXTERNAL, absent, or unreadable → **refused** |
-| **Managed catalog** | `catalog` | `--catalog-type standard` creates the CONTAINER only (as `INTERNAL`; `STANDARD` is an alias the API rejects) and returns `container_only`. Its **tables** are still refused here, with a pointer to the notebook path |
+| **Managed catalog** | `catalog` | `--catalog-type standard` creates the CONTAINER only (as `INTERNAL`; `STANDARD` is an alias the API rejects) and returns `container_only`. Its **tables** are still refused here, with a pointer to the structure workflow (`run --job snowmig_01_structure`, S10) |
 | **Explicit request** | skill layer | A Standard catalog requires the user to have asked, in words |
 
 ### Failure semantics
@@ -264,8 +286,8 @@ python3 $E catalog --out-dir $OUT --catalog MYCAT \
                    --config ./snowmig-config.yaml \
                    --datalake-ocid ... --workspace ... --cluster-id ...
 #   dry run first — prints the fields, never the secrets
-python3 $E catalog ... --execute
-#   then: aidp catalog test-connection    ← the shape is inferred, not verified
+python3 $E catalog ... --execute --test-connection
+#   --test-connection only runs with --execute (RBAC resolves on an existing catalog)
 
 python3 $E summary --out-dir $OUT
 python3 $E stages  --out-dir $OUT        # where does this run stand?

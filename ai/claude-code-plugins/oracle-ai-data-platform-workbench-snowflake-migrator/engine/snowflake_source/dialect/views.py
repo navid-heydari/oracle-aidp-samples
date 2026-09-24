@@ -7,51 +7,29 @@ here: both the planner (deciding what can migrate) and the DDL generator
 A Snowflake-only construct is DETECTED AND REPORTED, never rewritten on a
 guess. A view that ships with a subtly wrong translation is worse than one
 reported as needing manual work, because the wrong one returns numbers.
+
+Quoting is normalised on the way through (see translate.py): "quoted
+identifiers" become `backticked`, `''` inside a literal becomes `\\'`, and a
+$$...$$ string is refused. Spark reads "..." as a string literal and `''` as
+two adjacent literals, so a body carried verbatim returned wrong data.
 """
 from __future__ import annotations
 
 import re
 
 from . import lexer
-from .translate import translate_sql
+from .translate import RULES, translate_sql
 
 __all__ = ["UNSUPPORTED_CONSTRUCTS", "detect_unsupported_constructs",
            "extract_view_body", "translate_view_body"]
 
-# construct -> (regex, brief reason)
+# construct -> (regex, brief reason). Derived from the translator's declared
+# rules, so this table cannot disagree with what detection actually does. A
+# hand-maintained copy did: it listed DATEDIFF as blocking while no rule
+# detected it, and listed IFF as blocking long after IFF was translated.
 UNSUPPORTED_CONSTRUCTS: dict[str, tuple[str, str]] = {
-    "QUALIFY": (
-        r"\bQUALIFY\b",
-        "no Spark equivalent; must be rewritten as a subquery with WHERE on the "
-        "window result"),
-    "LATERAL FLATTEN": (
-        r"\bLATERAL\s+FLATTEN\b|\bFLATTEN\s*\(",
-        "semi-structured expansion; maps to explode / LATERAL VIEW but the "
-        "mapping depends on the VARIANT shape"),
-    "IFF": (r"\bIFF\s*\(", "Spark uses IF(); a rename is safe but is not applied "
-                              "automatically in MVP-1"),
-    "DECODE": (r"\bDECODE\s*\(", "must become a CASE expression"),
-    "NVL2": (r"\bNVL2\s*\(", "no Spark equivalent; must become CASE"),
-    ":: CAST SHORTHAND": (
-        r"::\s*[A-Za-z]", "Snowflake cast shorthand; Spark requires CAST(x AS t)"),
-    "LISTAGG": (r"\bLISTAGG\s*\(",
-                "no Spark equivalent; becomes collect_list + concat_ws"),
-    "GENERATOR": (r"\bGENERATOR\s*\(|\bSEQ[48]\s*\(",
-                  "row generation; Spark uses range()"),
-    "ARRAY_CONSTRUCT": (r"\bARRAY_CONSTRUCT\s*\(", "Spark uses array()"),
-    "OBJECT_CONSTRUCT": (r"\bOBJECT_CONSTRUCT\s*\(",
-                         "Spark uses named_struct() or map()"),
-    "SYSTEM$ FUNCTION": (r"\bSYSTEM\$", "Snowflake-internal function with no target"),
-    "TIME TRAVEL": (r"\bAT\s*\(\s*(?:TIMESTAMP|OFFSET|STATEMENT)\b|\bBEFORE\s*\(",
-                    "Snowflake Time Travel has no Delta equivalent in this form"),
-    "VARIANT PATH": (r"[A-Za-z_][A-Za-z0-9_]*\s*:\s*[A-Za-z_]",
-                     "Snowflake VARIANT path access; needs an explicit struct design"),
-    "DATEADD/DATEDIFF": (
-        r"\bDATE(?:ADD|DIFF)\s*\(",
-        "argument order and unit strings differ from Spark's date functions; a "
-        "signature mapping is required, not a rename"),
-    "PIVOT/UNPIVOT": (r"\b(?:UN)?PIVOT\s*\(", "Spark syntax differs materially"),
-}
+    r.construct: (r.detect, r.detail or r.description)
+    for r in RULES if r.status == "declared"}
 
 # The header is located by SCANNING, not by regex. Two failures drove that:
 #

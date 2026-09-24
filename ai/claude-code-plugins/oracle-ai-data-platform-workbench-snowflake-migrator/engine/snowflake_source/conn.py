@@ -15,7 +15,6 @@ Auth modes:
 from __future__ import annotations
 
 import pathlib
-import re
 from typing import Any, Callable
 
 from .dialect import lexer
@@ -25,7 +24,9 @@ __all__ = ["AuthError", "SourceWriteRefused", "READ_ONLY_VERBS",
            "make_run_sql"]
 
 # The ONLY statements this plugin may send to Snowflake. Default deny: an
-# unrecognised verb is refused rather than assumed safe.
+# unrecognised verb is refused rather than assumed safe. WITH is on the list
+# for the CTE-SELECT and only for it: assert_read_only looks past the CTE
+# list, because `WITH x AS (...) INSERT ...` leads with WITH too.
 #
 # This is enforced at the transport, not by convention, so it holds even when the
 # credential has write privileges and even if a future skill, agent or prompt
@@ -56,6 +57,10 @@ def assert_read_only(sql: str) -> None:
       * a statement whose first content is a literal has no verb at all and is
         refused rather than having a word read out of the literal
 
+    A leading WITH is a read only when the statement after the CTE list is a
+    SELECT: `WITH x AS (...) INSERT ...` is refused, naming INSERT, and so is
+    a CTE whose body the walker cannot identify (a parenthesised body).
+
     Fails closed: SQL the scanner cannot make sense of is refused.
     """
     try:
@@ -84,12 +89,22 @@ def assert_read_only(sql: str) -> None:
                 f"read-only against Snowflake and never writes to or drops "
                 f"from the source, regardless of what the credential permits. "
                 f"Allowed: {', '.join(READ_ONLY_VERBS)}.")
+        if verb == "WITH":
+            body = lexer.cte_body_verb(part)
+            if body != "SELECT":
+                raise SourceWriteRefused(
+                    f"WITH ... {body or '<no keyword>'}: a common table "
+                    f"expression is only a read when the statement after the "
+                    f"CTE list is a SELECT; refused. This plugin is strictly "
+                    f"read-only against Snowflake and never writes to or drops "
+                    f"from the source, regardless of what the credential "
+                    f"permits. Allowed: {', '.join(READ_ONLY_VERBS)}.")
 
 
 def _read_secret_file(path: str, label: str) -> str:
     p = pathlib.Path(path).expanduser()
     try:
-        return p.read_text().strip()
+        return p.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise AuthError(f"{label} not readable at {path}: {exc.strerror}") from exc
 
@@ -114,7 +129,8 @@ def build_connect_kwargs(auth: str, *, account: str, user: str | None = None,
                          database: str | None = None, key_path: str | None = None,
                          key_passphrase: str | None = None,
                          pat_path: str | None = None,
-                         password_path: str | None = None) -> dict[str, Any]:
+                         password_path: str | None = None,
+                         host: str | None = None) -> dict[str, Any]:
     if auth not in _MODES:
         raise AuthError(f"unknown auth mode {auth!r}; expected one of {sorted(_MODES)}")
     if not account:
@@ -123,6 +139,13 @@ def build_connect_kwargs(auth: str, *, account: str, user: str | None = None,
         raise AuthError(f"user is required for auth mode {auth!r}")
 
     kw: dict[str, Any] = {"account": account, "client_session_keep_alive": False}
+    # An explicit host (locator form, PrivateLink) is what the EXTERNAL
+    # catalog registers; without it the driver derives
+    # <account>.snowflakecomputing.com, which is right only for an
+    # org-account identifier. Passed through so preflight tests the same
+    # endpoint AIDP will use.
+    if host and host.strip():
+        kw["host"] = host.strip()
     if user:
         kw["user"] = user
     for value, key in ((role, "role"), (warehouse, "warehouse"), (database, "database")):
@@ -139,7 +162,9 @@ def build_connect_kwargs(auth: str, *, account: str, user: str | None = None,
         if not pat_path:
             raise AuthError("pat auth requires pat_path")
         kw["authenticator"] = "PROGRAMMATIC_ACCESS_TOKEN"
-        kw["password"] = _read_secret_file(pat_path, "PAT file")
+        # The connector builds its PAT authenticator from `token`. A PAT
+        # handed over as `password` goes to the wire as TOKEN: null.
+        kw["token"] = _read_secret_file(pat_path, "PAT file")
     elif auth == "password":
         if not password_path:
             raise AuthError("password auth requires password_path")

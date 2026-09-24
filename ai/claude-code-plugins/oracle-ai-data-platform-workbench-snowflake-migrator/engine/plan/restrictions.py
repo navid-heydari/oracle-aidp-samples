@@ -7,13 +7,34 @@ cannot be migrated and why -- an object that silently vanished from the plan is
 indistinguishable from one that was never there.
 
 An unrecognised restriction key is an ERROR, not an ignored line. A typo'd key
-would apply nothing while appearing to succeed.
+would apply nothing while appearing to succeed. The same goes for values: an
+empty list, a blank pattern, a non-string entry, a negative cap, a JSON boolean
+where an integer belongs, or an object type outside TABLE/VIEW is rejected
+rather than applied as a no-op that the report then lists as "in force".
+
+A cap that cannot be evaluated excludes the object, with that as the reason.
+A table whose count was never captured (`--row-counts none`, a count that
+errored, a view under the default metadata mode, a manifest without sizes) is
+not known to be under `max_rows`, and keeping it would be a guess; the
+exclusion is listed in PLANNED_OBJECTS.md like any other, so the operator can
+drop the cap or count exactly and re-plan.
+
+`include_objects` / `exclude_objects` entries follow Snowflake's own case rule:
+an unquoted part folds to upper (`d.s.orders` is D.S.ORDERS), a double-quoted
+part is case-sensitive (`"D"."S"."orders"` is only the lower-case object). That
+is what lets a restriction resolve an identifier-case collision -- the plan
+HALTs on ORDERS vs "orders" rather than guessing, and the operator defers one
+twin by spelling it exactly. An unquoted entry matches every case-variant, as
+it always did; its exclusion reason names the entry and says the match was
+case-insensitive, and only a quoted, exact hit is reported as the operator's
+explicit choice, so the report never blames a twin the operator did not name
+on the operator.
 """
 from __future__ import annotations
 
 import re
 
-__all__ = ["InvalidRestriction", "SCHEMA", "apply_restrictions",
+__all__ = ["InvalidRestriction", "OBJECT_TYPES", "SCHEMA", "apply_restrictions",
            "validate_restrictions"]
 
 
@@ -37,6 +58,9 @@ SCHEMA: dict[str, type] = {
     "max_bytes": int,
 }
 
+# The only kinds the inventory produces and the plan decides on.
+OBJECT_TYPES = ("TABLE", "VIEW")
+
 
 def validate_restrictions(restrictions: dict | None) -> dict:
     if not restrictions:
@@ -46,12 +70,34 @@ def validate_restrictions(restrictions: dict | None) -> dict:
             raise InvalidRestriction(
                 f"unknown restriction {key!r}; expected one of {sorted(SCHEMA)}")
         expected = SCHEMA[key]
-        if expected is list and not isinstance(value, list):
-            raise InvalidRestriction(f"{key!r} must be a list, got "
-                                     f"{type(value).__name__}")
-        if expected is int and not isinstance(value, int):
-            raise InvalidRestriction(f"{key!r} must be an integer, got "
-                                     f"{type(value).__name__}")
+        if expected is list:
+            if not isinstance(value, list):
+                raise InvalidRestriction(f"{key!r} must be a list, got "
+                                         f"{type(value).__name__}")
+            if not value:
+                what = ("an empty allowlist admits nothing or everything -- "
+                        "say which" if key.startswith("include_")
+                        else "an empty denylist excludes nothing")
+                raise InvalidRestriction(f"{key!r} is an empty list; {what}. "
+                                         "Omit the key or list entries")
+            for entry in value:
+                if not isinstance(entry, str) or not entry.strip():
+                    raise InvalidRestriction(f"{key!r} entries must be non-empty "
+                                             f"strings, got {entry!r}")
+        if expected is int:
+            # bool is an int subclass, so JSON true would otherwise pass and
+            # then compare as 1.
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise InvalidRestriction(f"{key!r} must be an integer, got "
+                                         f"{type(value).__name__}")
+            if value < 0:
+                raise InvalidRestriction(f"{key!r} must be >= 0, got {value}")
+    for key in ("include_object_types", "exclude_object_types"):
+        for entry in restrictions.get(key) or []:
+            if entry.upper() not in OBJECT_TYPES:
+                raise InvalidRestriction(
+                    f"{key} entry {entry!r} is not an object type this plan "
+                    f"knows; expected one of {list(OBJECT_TYPES)}")
     for key in ("include_name_patterns", "exclude_name_patterns"):
         for pattern in restrictions.get(key) or []:
             try:
@@ -64,6 +110,61 @@ def validate_restrictions(restrictions: dict | None) -> dict:
 
 def _upper(values) -> set[str]:
     return {str(v).upper() for v in values or []}
+
+
+def _split_quoted(entry: str) -> list[tuple[str, bool]]:
+    """`d.s."Orders"` -> [("d", False), ("s", False), ("Orders", True)].
+
+    A doubled quote inside a quoted part is not unescaped: assert_safe_identifier
+    forbids `"` in a name, so no inventory object needs one.
+    """
+    parts: list[tuple[str, bool]] = []
+    buf: list[str] = []
+    in_quotes = was_quoted = False
+    for ch in entry:
+        if ch == '"':
+            in_quotes = not in_quotes
+            was_quoted = True
+        elif ch == "." and not in_quotes:
+            parts.append(("".join(buf), was_quoted))
+            buf, was_quoted = [], False
+        else:
+            buf.append(ch)
+    parts.append(("".join(buf), was_quoted))
+    return parts
+
+
+def _object_matcher(entries):
+    """Build ident -> (entry, how) | None for include_objects/exclude_objects.
+
+    An entry with no double quote is folded to upper on both sides, as before.
+    An entry with quotes is compared part by part: a quoted part must match
+    exactly, an unquoted part folds. `how` is the word the exclusion reason
+    uses, so a case-insensitive hit on a collision twin is never reported as
+    the operator's explicit choice.
+    """
+    folded: dict[str, str] = {}
+    quoted: list[tuple[str, list[tuple[str, bool]]]] = []
+    for entry in entries or []:
+        text = str(entry)
+        if '"' in text:
+            quoted.append((text, _split_quoted(text)))
+        else:
+            folded[text.upper()] = text
+
+    def match(ident: str):
+        hit = folded.get(ident.upper())
+        if hit is not None:
+            return hit, "case-insensitively"
+        parts = ident.split(".")
+        for text, spec in quoted:
+            if len(spec) == len(parts) and all(
+                    (have == want) if exact else (have.upper() == want.upper())
+                    for (want, exact), have in zip(spec, parts)):
+                return text, "exactly"
+        return None
+
+    return match
 
 
 def _exclusion(rec: dict, restriction: str, reason: str) -> dict:
@@ -82,9 +183,17 @@ def apply_restrictions(records: list[dict],
     inc_db, exc_db = _upper(r.get("include_databases")), _upper(r.get("exclude_databases"))
     inc_sc, exc_sc = _upper(r.get("include_schemas")), _upper(r.get("exclude_schemas"))
     inc_ty, exc_ty = _upper(r.get("include_object_types")), _upper(r.get("exclude_object_types"))
-    inc_ob, exc_ob = _upper(r.get("include_objects")), _upper(r.get("exclude_objects"))
-    inc_pat = [re.compile(p) for p in r.get("include_name_patterns") or []]
-    exc_pat = [re.compile(p) for p in r.get("exclude_name_patterns") or []]
+    match_inc = _object_matcher(r.get("include_objects"))
+    match_exc = _object_matcher(r.get("exclude_objects"))
+    has_inc_ob = bool(r.get("include_objects"))
+    # Case-insensitive, like every sibling restriction. Snowflake
+    # upper-cases every unquoted identifier, so `^tmp_` written by hand
+    # matched nothing at all in a real estate -- the one restriction that
+    # could look right and silently do nothing.
+    inc_pat = [re.compile(p, re.IGNORECASE)
+               for p in r.get("include_name_patterns") or []]
+    exc_pat = [re.compile(p, re.IGNORECASE)
+               for p in r.get("exclude_name_patterns") or []]
     max_rows, max_bytes = r.get("max_rows"), r.get("max_bytes")
 
     kept, excluded = [], []
@@ -95,11 +204,18 @@ def apply_restrictions(records: list[dict],
         kind = str(rec.get("object_type", "")).upper()
         name = ident.rsplit(".", 1)[-1]
 
-        if exc_ob and ident.upper() in exc_ob:
-            excluded.append(_exclusion(rec, "exclude_objects",
-                                       "explicitly excluded by the user"))
+        hit = match_exc(ident)
+        if hit:
+            entry, how = hit
+            # Only a quoted, exact hit is the operator's explicit choice; a
+            # folded hit may be a case twin the operator never named.
+            reason = (f"explicitly excluded by the user (exclude_objects entry "
+                      f"{entry!r})" if how == "exactly" else
+                      f"excluded by exclude_objects entry {entry!r}, which "
+                      f"matched case-insensitively")
+            excluded.append(_exclusion(rec, "exclude_objects", reason))
             continue
-        if inc_ob and ident.upper() not in inc_ob:
+        if has_inc_ob and not match_inc(ident):
             excluded.append(_exclusion(rec, "include_objects",
                                        "not in the user's include_objects list"))
             continue
@@ -138,16 +254,33 @@ def apply_restrictions(records: list[dict],
                                        "name matches no include pattern"))
             continue
 
-        rows = rec.get("row_count_exact")
-        if max_rows is not None and rows is not None and rows > max_rows:
-            excluded.append(_exclusion(rec, "max_rows",
-                                       f"{rows} rows exceeds max_rows {max_rows}"))
-            continue
-        byts = (rec.get("source_metadata") or {}).get("bytes")
-        if max_bytes is not None and byts is not None and byts > max_bytes:
-            excluded.append(_exclusion(rec, "max_bytes",
-                                       f"{byts} bytes exceeds max_bytes {max_bytes}"))
-            continue
+        if max_rows is not None:
+            rows = rec.get("row_count_exact")
+            if rows is None:
+                note = rec.get("row_count_note")
+                excluded.append(_exclusion(
+                    rec, "max_rows",
+                    "row count unknown; max_rows cannot be evaluated"
+                    + (f" ({note})" if note else "")))
+                continue
+            if rows > max_rows:
+                excluded.append(_exclusion(
+                    rec, "max_rows", f"{rows} rows exceeds max_rows {max_rows}"))
+                continue
+        if max_bytes is not None:
+            # The in-AIDP discovery bridge writes the key upper-case.
+            meta = rec.get("source_metadata") or {}
+            byts = meta.get("bytes", meta.get("BYTES"))
+            if byts is None:
+                excluded.append(_exclusion(
+                    rec, "max_bytes",
+                    "byte size unknown; max_bytes cannot be evaluated"))
+                continue
+            if byts > max_bytes:
+                excluded.append(_exclusion(
+                    rec, "max_bytes",
+                    f"{byts} bytes exceeds max_bytes {max_bytes}"))
+                continue
 
         kept.append(rec)
     return kept, excluded

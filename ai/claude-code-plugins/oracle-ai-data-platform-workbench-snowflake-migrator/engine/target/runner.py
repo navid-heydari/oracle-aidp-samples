@@ -16,11 +16,48 @@ import subprocess
 import tempfile
 from typing import Callable
 
+from .coords import region_from_ocid
 from .executor import build_command, parse_cli_json
 
-__all__ = ["BackendError", "make_run_sql"]
+__all__ = ["BackendError", "make_run_sql", "spool_body"]
 
 _MAX_STDERR = 500
+
+
+# The `oci` CLI answers an expired session profile by PROMPTING on stdout
+# ("Do you want to re-authenticate your CLI session profile? [Y/n]:") and,
+# with no tty, exiting 1 with "Abort:" on stderr. Truncated into a transport
+# error that reads "failed (exit 1): Abort:", which says nothing. The state
+# is ordinary and the remedy is one command, so it is named.
+_EXPIRED_SESSION = "this cli session has expired"
+
+
+def _session_expired(*streams: str | None) -> bool:
+    return any(_EXPIRED_SESSION in (s or "").lower() for s in streams)
+
+
+def expired_session_message(profile: str | None, region: str | None) -> str:
+    who = f" --profile {profile}" if profile else ""
+    where = f" --region {region}" if region else ""
+    return ("the OCI CLI session profile has expired; nothing was sent. "
+            f"Refresh it with `oci session authenticate{who}{where}` and "
+            "re-run this stage.")
+
+
+def spool_body(body: dict, *, prefix: str) -> str:
+    """Write a credential-bearing request body to a private temp file.
+
+    In argv a body is visible to every user on the host via `ps`, and
+    process-creation auditing records it permanently. So a body that carries
+    `connectionDetails` travels by file -- created 0600 where the OS has mode
+    bits -- and the command references the path. The caller unlinks it after
+    the call, success or failure. One helper for every transport, so the
+    `create_catalog` and `testConnection` paths cannot drift apart again.
+    """
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(body, fh)
+    return path
 
 
 class BackendError(RuntimeError):
@@ -28,7 +65,7 @@ class BackendError(RuntimeError):
 
 
 def _default_run_process(cmd: list[str]):
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+    return subprocess.run(cmd, capture_output=True, text=True, check=False, encoding="utf-8", errors="replace")
 
 
 def make_run_sql(target, *, backend: str,
@@ -85,11 +122,13 @@ def make_call(target, *, backend: str, run_process=None):
     Separate from `make_run_sql` because the catalog API is not SQL: it takes
     an operation plus a JSON body and returns one object, not rows.
     """
-    from .executor import build_command, parse_cli_json
+    from .executor import build_command, collect_pages, parse_cli_envelope
 
     runner = run_process or _default_run_process
 
-    def call(operation: str, **kwargs) -> dict:
+    def _once(operation: str, kwargs: dict) -> tuple[list[dict], str | None]:
+        """One request: its rows, and the next-page token if the server sent
+        one in `opc-next-page`."""
         body = kwargs.get("body")
         spooled = None
         # A create_catalog body carries the credential. In argv it is visible
@@ -97,32 +136,56 @@ def make_call(target, *, backend: str, run_process=None):
         # removed after the call) and the command references the path.
         if operation == "create_catalog" and isinstance(body, dict) \
                 and "connectionDetails" in body:
-            fd, spooled = tempfile.mkstemp(prefix="snowmig_catalog_",
-                                           suffix=".json")
-            with os.fdopen(fd, "w") as fh:
-                json.dump(body, fh)
+            spooled = spool_body(body, prefix="snowmig_catalog_")
             kwargs = {**kwargs, "body_file": spooled}
         try:
             cmd = build_command(backend, operation, target, **kwargs)
             print("  $ " + " ".join(_printable(c) for c in cmd))
             proc = runner(cmd)
             if proc.returncode != 0:
+                if _session_expired(proc.stdout, proc.stderr):
+                    raise RuntimeError(
+                        f"{operation}: "
+                        + expired_session_message(
+                            getattr(target, "oci_profile", None),
+                            region_from_ocid(target.datalake_ocid)))
                 raise RuntimeError(
                     f"{operation} failed (exit {proc.returncode}): "
                     f"{(proc.stderr or proc.stdout or '')[:300]}")
-            rows = parse_cli_json(proc.stdout)
+            rows, headers = parse_cli_envelope(proc.stdout)
         finally:
             if spooled:
                 try:
                     os.unlink(spooled)
                 except OSError:
                     pass
+        next_page = headers.get("opc-next-page")
+        if next_page and cmd[0] == "aidp":
+            # The CLI's paging flags are undocumented, so the rest cannot be
+            # asked for. Page one handed back as the whole collection would
+            # make every object past it "absent"; say so instead.
+            raise RuntimeError(
+                f"{operation}: the aidp CLI answered with a next-page token "
+                f"({str(next_page)[:40]!r}), so this listing is only its "
+                f"first page and the rest cannot be requested through that "
+                f"CLI. Use the oci CLI (backend oci_raw), which follows "
+                f"opc-next-page.")
+        return rows, next_page
+
+    def call(operation: str, **kwargs) -> dict:
         # A list operation returns a COLLECTION; a create/get returns ONE
         # object. Collapsing both to rows[0] made key resolution see a single
         # schema instead of the list, so every read-back failed while the
-        # objects had in fact been created.
+        # objects had in fact been created. A collection may also span
+        # PAGES: `opc-next-page` is followed until the server stops sending
+        # one, so an object past page one is not read as absent either.
         if operation.startswith("list_"):
-            return {"items": rows}
+            items = collect_pages(
+                lambda page: _once(operation, {**kwargs, "page": page}
+                                   if page else kwargs),
+                operation)
+            return {"items": items}
+        rows, _ = _once(operation, kwargs)
         return rows[0] if rows else {}
 
     return call

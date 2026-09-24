@@ -1,6 +1,6 @@
 ---
 name: snowflake-medallion-clone
-description: Create the medallion architecture on Oracle AI Data Platform - registering an EXTERNAL catalog of source type SNOWFLAKE by default, and generating Spark SQL for schemas, tables and views from an approved Snowflake plan only when the user has explicitly asked for a Standard catalog. Structure only; copies no data. Use when the user asks to create the medallion structure, soft clone, shallow clone, create the target catalog, or deploy the target schema.
+description: Create the medallion architecture on Oracle AI Data Platform - registering an EXTERNAL catalog of source type SNOWFLAKE by default, and generating Spark SQL for schemas, tables and views from an approved Snowflake plan only when the user has explicitly asked for a Standard catalog. This stage copies no data - rows are copied only by the snowmig_02_copy_schema job, when the operator runs it. Use when the user asks to create the medallion structure, soft clone, shallow clone, create the target catalog, or deploy the target schema.
 ---
 
 # Catalogs — runbook S3 and S4
@@ -38,7 +38,10 @@ CRUD API, and that refusal still stands.
 
 ## Phase A — register the EXTERNAL catalog (the default path)
 
-**Ask the user for these now. They are stored nowhere and there is no default:**
+**Take these from the `aidp:` block of `snowmig-config.yaml` when present
+(see `snowmig-config.example.yaml`); a flag on the command line wins, and the
+CLI prints whatever it took from the file before acting. Ask the user only
+for what is missing, and ask in this turn:**
 
 - DataLake OCID
 - workspace
@@ -48,8 +51,18 @@ CRUD API, and that refusal still stands.
 
 The Snowflake account, warehouse, database, user and credential come from a
 config **file**, never from inline arguments — see
-`snowmig-config.example.yaml`. The credential itself is a *path*
-inside that config, so the config carries no secret.
+`snowmig-config.example.yaml`. The password or private key lives **inline in
+that file** (`password:` / `private_key: |`; a `*_path` variant is an opt-in
+alternative), so the file holds a live credential in plain text. The rules
+that go with that are the bootstrap skill's, and they apply here too:
+
+- **Ask the user before reading the config**, and say why you need it.
+- **Never print, echo, quote or summarise a secret value** — not in chat, not
+  in a report, not in a commit. Render the config only through
+  `${CLAUDE_PLUGIN_ROOT}/bin/snowmig preflight`, which uses
+  `migration_config.redact()`.
+- **Never ask the user to paste a secret into the conversation.** If one
+  lands in the chat anyway, say so and tell them to rotate it.
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig catalog \
@@ -60,9 +73,11 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig catalog \
 Without `--execute` this is a dry run: it validates the config, reports which
 connection fields were built, and creates nothing. Show `CATALOG.md`.
 
-Then validate the connection with `aidp catalog test-connection` before
-claiming the catalog is usable — a registered catalog that cannot reach
-Snowflake reads as created and returns nothing.
+Then validate the connection with `--test-connection` on the same command
+(`${CLAUDE_PLUGIN_ROOT}/bin/snowmig catalog ... --execute --test-connection`;
+it only runs with `--execute`, because the API resolves RBAC on an existing
+catalog) before claiming the catalog is usable — a registered catalog that
+cannot reach Snowflake reads as created and returns nothing.
 
 ## Phase B — generate the DDL (offline, safe; needed only for Phase C)
 

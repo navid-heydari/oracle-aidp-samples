@@ -46,7 +46,7 @@ every statement these notebooks issue against the source is a SELECT.
 |---|---|---|---|---|
 | — | `diagnose_environment.ipynb` | everything | nothing | **run this first**: mount, egress, credentials, catalog |
 | 0 | `00_discover_snowflake.ipynb` | Snowflake | reports dir | inventory every schema/table/column into `discovery_manifest.json` |
-| 1 | `01_create_structure.ipynb` | `ddl_plan.json` (or source) | target catalog | create target schemas + empty Delta tables |
+| 1 | `01_create_structure.ipynb` | `ddl_plan.json` (or source) | target catalog | create target schemas + empty Delta tables, read back against the plan (views listed, not created) |
 | 2 | `02_copy_schema.ipynb` | Snowflake | target catalog + reports | copy ONE schema's tables, verify counts (and exact decimal sums) |
 | 3 | `03_reconcile.ipynb` | reports + target catalog | reports dir | plan-vs-reality report: what landed, what did not, and why |
 
@@ -89,9 +89,74 @@ route spends a long while discovering that it does not scale. Start with
 
 | Mode | Types come from | Cost |
 |---|---|---|
-| `ddl-plan` *(default)* | `plan/ddl_plan.json` — the migrator's own mapper, which refuses what it cannot map exactly, reviewed and signed off before the run | no source read; a table absent from the plan is reported `not_in_plan` and NOT created |
+| `ddl-plan` *(default)* | `plan/ddl_plan.json` — the migrator's own mapper, which refuses what it cannot map exactly, reviewed and signed off before the run | no source read; a table absent from the plan is reported `not_in_plan` and NOT created, and a run in which **every** table is `not_in_plan` exits 1 — the plan and the requested schema do not overlap |
 | `ctas` | Spark, derived through the connector | one Snowflake round trip per table — measured slow, and the mapping is the connector's, not an audited one |
 | `manifest` | `discovery_manifest.json` verbatim | only valid for an external-catalog manifest (Spark types); a connector manifest carries Snowflake types and is refused rather than mistranslated |
+
+In every mode the CREATE returning is not the claim: the table is `DESCRIBE`d
+afterwards and compared with the plan, column by column and in order.
+`CREATE TABLE IF NOT EXISTS` is a silent no-op on a table that is already
+there, so without the read-back a stale layout would be certified as created
+from the plan — and the copy is a positional `INSERT ... SELECT *`.
+
+## Statuses and verdicts
+
+What each report records per table. Anything under **problem** exits 1 in
+the stage that records it and is a problem verdict in `MIGRATION_REPORT.md`.
+
+**`structure_report_<schema>.json`** (`objects`, one per table)
+
+| Status | Meaning | Problem? |
+|---|---|---|
+| `created` | not there before; reads back as planned | no |
+| `already_existed` | there before, and it matches the plan (in `ctas` mode there is no plan: the layout is NOT compared, and the record's reason says so) | no |
+| `type_drift` | there before with a layout the plan did not produce; left as found, differing columns listed; excluded from the copy's default scope | **yes** |
+| `not_in_plan` | the approved plan carries no columns for it; NOT created | no (but a run of nothing else exits 1) |
+| `failed` | the CREATE raised; the error is the reason | **yes** |
+| `dry_run` | `--dry-run`; nothing was issued | no |
+
+Views sit under a separate `views` key, every one `not_created_by_this_path`
+(with `in_plan` when the plan was read): these jobs create **tables only**;
+create views with `snowmig deploy --execute` and verify them against the
+source. They are listed so a view the plan promised is never absent from
+every report with exit 0.
+
+**`copy_report_<schema>.json`** (`tables`, one per table)
+
+| Status | Meaning | Problem? |
+|---|---|---|
+| `verified` | counts equal after the copy (and decimal sums, with `counts+sums`) | no |
+| `skipped_nonempty` | `skip-existing` found rows already there, **equal** to the source count; not re-verified | no |
+| `count_mismatch` | counts differ — after a copy, or on a `skip-existing` target that already held a different number of rows (nothing copied) | **yes** |
+| `sum_mismatch` | counts equal, a decimal column does not sum equal | **yes** |
+| `type_drift` | a source DECIMAL column is not DECIMAL, or narrower, on the target; NOT copied — an INSERT would round or truncate with the count intact | **yes** |
+| `failed` | the copy raised; `insert_completed: true` means the rows landed before verification failed, so re-copy with `--mode overwrite`, never `append` | **yes** |
+| `target_missing` | no table to copy into (usually `not_in_plan` upstream) | no |
+
+A re-run never softens a recorded failure: `count_mismatch`, `sum_mismatch`,
+`type_drift` and `failed` stand until a real re-copy verifies the table.
+`--force` re-copies verified tables and needs `--mode overwrite` or
+`append` — `skip-existing` cannot re-copy a table that holds rows.
+
+**`MIGRATION_REPORT.md` verdicts** (per table, from the two reports plus the
+live catalog)
+
+| Verdict | Meaning | Problem? |
+|---|---|---|
+| `MIGRATED_VERIFIED` | copy verified, table present (and, with `--counts`, still at the verified row count) | no |
+| `PRESENT_NOT_REVERIFIED` | rows were already there at the source's count; sums not re-checked | no |
+| `STRUCTURE_ONLY` | table present, no copy yet | no |
+| `NOT_MIGRATED` | never attempted, or intentionally not in the plan | no |
+| `VIEW_NOT_CREATED_BY_THIS_PATH` | a manifest view; the job path creates tables only | no |
+| `MISSING_DESPITE_REPORT` | a report says created or verified; the catalog lacks it | **yes** |
+| `STRUCTURE_FAILED` | the CREATE raised | **yes** |
+| `STRUCTURE_TYPE_DRIFT` | the table's layout is not the plan's — outranks a verified copy, since counts match when rows land in the wrong columns | **yes** |
+| `STRUCTURE_ONLY_COPY_FAILED` | the copy ended in a mismatch, drift or failure | **yes** |
+| `COUNT_DRIFT` | `--counts` only: verified at N rows, the target now holds a different number — changed since the copy, not by it | **yes** |
+| `TARGET_UNREADABLE` | `SHOW TABLES` failed; not the same as empty | **yes** |
+
+A report written for a **different target catalog** is ignored by reconcile
+(and named in the report), never applied to this one.
 
 ## The intended run, per schema
 
@@ -107,7 +172,7 @@ To run one by hand, open it in the console and edit the `PARAMS` cell:
 # ── PARAMETERS ──
 PARAMS = {
     'source-mode': 'connector',
-    'source-config': '/Workspace/backup-snowflake-migration/plan/snowmig-config.yaml',
+    'source-config': '/Workspace/backup-snowflake-migration/plan/snowmig-config.json',
     'target-catalog': 'snowdemo',   # REQUIRED
     'schema': 'SALES',              # REQUIRED for 02_copy_schema
     'verify': 'counts+sums',
@@ -137,8 +202,9 @@ that:
   per table for the sums, which is why it is opt-in.
 
 Every script is **resumable**: re-running skips work its report already
-records as done (`--force` overrides), because a 200k-table estate will not
-finish in one sitting and must never restart from zero.
+records as done (`--force` overrides; for the copy it needs `--mode overwrite`
+or `append`), because a 200k-table estate will not finish in one sitting and
+must never restart from zero. A re-run never softens a recorded failure.
 
 ## Safety properties (hold for all four)
 
@@ -146,12 +212,16 @@ finish in one sitting and must never restart from zero.
   external catalog's), and by the read-only grant on the service user.
 - Nothing is dropped, ever. `--mode overwrite` rewrites a table's **rows**
   (`INSERT OVERWRITE`); it never drops the table, and the default mode
-  (`skip-existing`) touches nothing that already has rows.
+  (`skip-existing`) touches nothing that already has rows — it compares
+  their count with the source's and records `count_mismatch` when they differ.
 - A per-table failure is recorded and the run continues; the report — not the
   exit code alone — is the deliverable.
 - Verification is explicit: row counts by default, `counts+sums` adds an
-  exact `SUM` over every decimal column (cast to `DECIMAL(38,s)`); float
-  tolerance is wrong for money, so floats are never summed for equality.
+  exact `SUM` over every decimal column **of the source** (cast to
+  `DECIMAL(38,s)` with the source's scale on both sides); float tolerance is
+  wrong for money, so floats are never summed for equality. A target column
+  that cannot hold a source decimal without loss stops the copy as
+  `type_drift` before any row moves, in both verify modes.
 
 ## Consistency warning — read before a production cutover
 
@@ -172,19 +242,30 @@ cluster-libraries API (`PATCH .../clusters/{key}/libraries`, types `PYPI` /
 
 ## What is proven, and what is not
 
-**Live-verified** (2026-09-16, a real DataLake and a real Snowflake account):
-the connector read and pushdown; discovery of 11 schemas / 1000 tables via two
-queries; structure creation in `ddl-plan` mode, including its refusal of
-tables absent from the approved plan; **the copy, with five tables verified
-row-for-row (87, 88, 89, 90, 91) and exact decimal sums**; the
-upload/job/run/output loop; and the `/Workspace` mount these paths assume.
+Canonical per-stage status: `../GAPS.md` → "What is actually proven". Its
+sentence, repeated here so this file cannot drift from it:
 
-That first copy also failed once, usefully: it died on the sixth table
-because the approved plan covered five and the manifest listed a hundred. Two
-rules came out of it — a table with no target is recorded as
+**What has run live:** the discovery job (`snowmig_00_discover`) ran to
+SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in
+two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
+ran on a cluster from the approved plan, a healthy 23-minute run left alone
+by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
+and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
+authors**.
+
+Also live-verified (2026-09-16, a real DataLake and a real Snowflake
+account): the connector read and pushdown; the structure step's refusal of
+tables absent from the approved plan; the upload/job/run/output loop; and the
+`/Workspace` mount these paths assume.
+
+An earlier version of this file described a five-table copy verified
+row-for-row with exact decimal sums; the 0.25.0 changelog, three days later,
+said the copy had not executed. Until the person who ran the cluster jobs
+confirms which is right, the copy is unproven here. Two rules did come out
+of an early copy attempt — a table with no target is recorded as
 `target_missing` and skipped rather than ending the run, and the copy's
 default scope is **what the structure step created for this target**, not the
-whole manifest.
+whole manifest — and they are pinned by tests regardless.
 
 **Not yet proven at scale**: the largest run was one schema. Before a real
 estate, run `diagnose_environment.ipynb`, then one small schema end to end,

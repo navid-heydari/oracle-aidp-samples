@@ -9,7 +9,7 @@ Delta tables, which is real storage with real blast radius, so it is created
 only when a caller asks for it by name -- never by default.
 
 What a STANDARD catalog gets here is the CONTAINER and nothing else (runbook
-S3). Its schemas and tables are created on AIDP compute by the structure
+S4). Its schemas and tables are created on AIDP compute by the structure
 workflow (S10), never through the control-plane CRUD API: that POST returns
 202 Accepted and can create nothing at all, so a table "created" that way is
 unverifiable. That narrower refusal is the one that still stands.
@@ -33,9 +33,12 @@ _STANDARD_CONTAINER_ONLY = (
     "the STANDARD catalog CONTAINER was created, and nothing inside it. Its "
     "schemas and tables belong on AIDP compute (a Spark cluster), not the "
     "control-plane catalog CRUD API -- that POST returns 202 Accepted and can "
-    "create nothing, so a table created that way cannot be verified. Generate "
-    "the structure script with `snowmig.py notebook` and run it on the cluster "
-    "-- see the `snowflake-clone-notebook` skill.")
+    "create nothing, so a table created that way cannot be verified. Create "
+    "the structure at runbook S10 with `snowmig.py run --job "
+    "snowmig_01_structure` (one workflow per schema, from the approved "
+    "ddl_plan.json placed on the workspace by `snowmig.py provision "
+    "--execute`). Do not use `notebook --upload`: its transport is known-bad "
+    "(GAPS 13) and the upload is refused.")
 
 
 def _find_catalog(call, display_name: str) -> dict | None:
@@ -91,7 +94,7 @@ def ensure_catalog(*, display_name: str, call: Callable[..., dict],
 
     EXTERNAL registers a read-only pointer at the source. INTERNAL -- which the
     runbook calls STANDARD, and which is accepted as an alias -- creates the
-    managed CONTAINER only (runbook S3) and reports `container_only`, so a
+    managed CONTAINER only (runbook S4) and reports `container_only`, so a
     caller can never read it as "the tables exist"; those are made on compute
     by the structure workflow. Any other shape is refused.
     """

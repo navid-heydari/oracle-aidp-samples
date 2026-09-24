@@ -20,7 +20,7 @@ die() { printf 'snowmig-test: %s\n' "$1" >&2; exit 1; }
 can_test() { "$1" -c 'import pytest, yaml, snowflake.connector' >/dev/null 2>&1; }
 
 PY=""
-for candidate in "${SNOWMIG_PYTHON:-}" python3 python3.13 python3.12 python3.11; do
+for candidate in "${SNOWMIG_PYTHON:-}" python3 python3.13 python3.12 python3.11 python; do
   [ -n "${candidate}" ] || continue
   command -v "${candidate}" >/dev/null 2>&1 || continue
   if can_test "${candidate}"; then PY="${candidate}"; break; fi
@@ -28,7 +28,7 @@ done
 
 if [ -z "${PY}" ]; then
   base=""
-  for candidate in python3.13 python3.12 python3.11 python3; do
+  for candidate in python3.13 python3.12 python3.11 python3 python; do
     command -v "${candidate}" >/dev/null 2>&1 || continue
     if "${candidate}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
       base="${candidate}"; break
@@ -41,6 +41,8 @@ if [ -z "${PY}" ]; then
   printf 'snowmig-test: building a throwaway environment (removed on exit)\n' >&2
   "${base}" -m venv "${SCRATCH}/venv" >/dev/null 2>&1 || die "could not create a temporary venv"
   PY="${SCRATCH}/venv/bin/python"
+  # A venv on Windows (Git Bash) puts the interpreter under Scripts/.
+  [ -x "${PY}" ] || PY="${SCRATCH}/venv/Scripts/python.exe"
   "${PY}" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
   for req in "${REQUIREMENTS}" "${DEV_REQUIREMENTS}"; do
     [ -f "${req}" ] || continue

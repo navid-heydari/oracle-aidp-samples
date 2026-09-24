@@ -63,8 +63,11 @@ live, it needs no extra cluster library, and it does not wait on the external
 catalog's crawler — which on at least one deployment fails
 (`CONNECTOR_0067, Login has timed out`) with credentials the connector
 accepts. It needs `--source-config` so the credential reaches the workspace
-mount; that file carries a secret, so it is uploaded only when passed
-explicitly.
+mount: its `snowflake:` block is uploaded as JSON to
+`plan/<config stem>.json` (the `aidp:` block is not copied), and because that
+block carries a secret it is uploaded only when passed explicitly. A `*_path`
+secret is refused before anything is uploaded — the path is not on the
+cluster.
 
 `--source-mode external-catalog` uses three-part names instead, and needs a
 catalog whose crawl has actually succeeded. Check that first — an empty
@@ -80,6 +83,12 @@ not the same as an empty database.
   API accepted and the object never became visible in the poll budget — say
   it is pending and point at the console. `name_taken` is neither: it means
   something of that name was already there and this run did **not** adopt it.
+- **Hand-off.** After `--execute`, read `workspace.key` and `cluster.key`
+  from `provision_result.json` and have the user put them under `aidp:` in
+  `snowmig-config.yaml` (`aidp.workspace`, `aidp.cluster_id`) before
+  `/snowflake-catalog`. `PROVISION.md` shows the display names, which are
+  not the keys; the catalog step needs the keys, and `provision` does not
+  write them back.
 - **Never reuse, never "ensure".** Do not list existing workspaces or
   clusters and offer the user a choice among them. The only question is *may
   I create this*.

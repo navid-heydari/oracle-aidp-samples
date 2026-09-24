@@ -109,6 +109,12 @@ first.
   run, poll to terminal, fetch task output — reachable from no CLI stage. It
   is now the `run` stage, and it reports a spent poll budget as STILL
   RUNNING rather than rounding it to a verdict.
+- **A dependent of an object that is not migrating is not migrating either.**
+  `plan` files a view whose base table or view is blocked or excluded under
+  `dependency_not_migrated`, naming the missing object, instead of waving it
+  into a wave it cannot run in. And a table that `SHOW TABLES` flags as
+  dynamic, external, Iceberg, event or hybrid is `unsupported_object` with
+  the reason named, rather than being planned as a plain Delta copy.
 
 ---
 
@@ -118,6 +124,18 @@ Worth stating first, because "verified" now means something specific here.
 Updated after the 2026-09-16 live validation campaign: a trial Snowflake
 account (1002 objects, 11 schemas) and a shared AIDP DataLake. Coordinates
 live in the gitignored config files, never here.
+
+This table is the **one home** for per-stage live status; README,
+ASSUMPTIONS, MIGRATION-ARCHITECTURE, the data-plane README and the overview
+skill repeat the sentence below and point here rather than keeping their own.
+
+**What has run live:** the discovery job (`snowmig_00_discover`) ran to
+SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in
+two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
+ran on a cluster from the approved plan, a healthy 23-minute run left alone
+by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
+and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
+authors**.
 
 | Surface | Status |
 |---|---|
@@ -133,7 +151,11 @@ live in the gitignored config files, never here.
 | **EXTERNAL catalog registration** | **Executed and created.** The API itself enumerated the real contract (`connectionDetails.connectionProperties`, `SNOWFLAKE_*` keys, auth enum `Basic\|KeyPair`) — see B2a. The connection **values** remain unproven: the crawler/testConnection fail with "Login has timed out", and every pre-existing external catalog in that DataLake is Oracle-network ATP/ADW, so crawler egress to the public internet is the suspect, not the body |
 | Provisioning (workspace/cluster reuse, folder tree, uploads, jobs) | **Live-verified end to end, exit 0** — via the `workspace-object` surface; the Jupyter contents API on that build 200s on PUT and then 404/500s on read-back, and cannot create directories |
 | Jobs | **Live-verified**: creation, run and output fetch for NOTEBOOK_TASK (driver notebooks). PYTHON_TASK is accepted at creation and fails every run resolving the file; job `parameters` reach the notebook neither as argv nor env — hence the generated drivers with inline args. `/Workspace` mount on cluster FS probed and confirmed |
-| Data movement scripts | **Live-verified**: discovery (11 schemas / 1000 tables / 9935 columns in two `INFORMATION_SCHEMA` queries) and structure creation from the approved `ddl_plan` both ran SUCCESS inside AIDP. Copy + reconcile were exercised on one schema |
+| Data plane: `00_discover` | **Live-verified** — ran to SUCCESS as a job on a migration cluster: 11 schemas / 1065 relations / 9935 columns in two `INFORMATION_SCHEMA` queries |
+| Data plane: `01_create_structure` | **Live-verified** in `ddl-plan` mode from the approved plan (2026-09-19, a healthy 23-minute run); `ctas` mode is not scale-tested (14a) |
+| Data plane: `02_copy_schema` | **Not yet confirmed by the authors.** The data-plane README described a five-table copy verified by counts and decimal sums (2026-09-16); the 0.25.0 changelog (2026-09-19) says the copy had not executed. Until the person who ran the cluster jobs states which is right, treat the copy as unproven and canary one small schema first |
+| Data plane: `03_reconcile` | **Not yet confirmed by the authors.** No run outcome (PASS/FAIL) is recorded anywhere in the repository |
+| Not yet proven | Anything at full-estate scale (the largest run was one schema); the EXTERNAL catalog crawler (B16); the cluster-library item shape (B12); `NUMBER(p,s)` through a Parquet/Delta round trip |
 | **AIDP Snowflake connector** as the source | **Live-verified** — read a table and ran pushdown from the cluster with no extra library. Now the DEFAULT source mode |
 | EXTERNAL catalog **crawler** | **Fails on the validated deployment** — `CONNECTOR_0067, Login has timed out`, with credentials the connector accepts. Not an FQDN form (both host forms resolve identically and both fail). Suspect: the crawler's network path, which is not the cluster's. Raised as B16 |
 
@@ -370,7 +392,14 @@ conversation until the phase that needs them arrives.
 
 ## Known limits, stated rather than hidden
 
-- **No data is moved.** By design; `DATA_CLONE` and `DONE` are unreachable.
+- **Data moves by one path only.** The control plane copies no data; rows
+  move solely through the in-AIDP job `snowmig_02_copy_schema`
+  (INSERT-SELECT over the EXTERNAL catalog, one schema per run, verified by
+  row count and decimal sums), and only when the operator runs it. The CLI
+  summary still tops out at `SHALLOW_CLONE`: `summary` reads the
+  control-plane deploy result and never `reconciliation.json`, so copy
+  status is reported by `snowmig_03_reconcile` in `MIGRATION_REPORT.md`,
+  not by `SUMMARY.md`.
 - **Scale is untested.** Validated on 7 objects. Pagination, per-schema column
   reads and metadata row counts are all in place, but nothing has run against
   a large estate.

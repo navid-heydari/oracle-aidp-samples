@@ -285,6 +285,50 @@ def test_show_results_are_paginated_so_a_large_estate_is_not_truncated():
     assert "T99999" in names
 
 
+def test_pagination_cursor_is_a_plain_name_not_a_like_pattern(monkeypatch):
+    # `SHOW ... LIMIT n FROM '<name>'` takes a NAME STRING, and SHOW resumes
+    # strictly after it. `_` and `%` are literal there, not wildcards, so a
+    # LIKE-escaped cursor (`ORDER\_ITEMS`) names an object that does not
+    # exist and the walk resumes in the wrong place: pages repeat and the
+    # tail of the schema never enters the inventory. Nearly every real name
+    # contains an underscore, so the 10k-name test above cannot see this.
+    import re
+    from snowflake_source.extract import catalog as catalog_module
+
+    all_names = sorted(["ACCOUNTS_2019", "O'BRIEN_T", "ORDER_ITEMS_FACT",
+                        "ORDER_ITEMS_STG", "ORDER_LINES", "PCT%DONE",
+                        "ZZ_LAST"])
+    monkeypatch.setattr(catalog_module, "SHOW_PAGE_SIZE", 2)
+
+    class Seeking(FakeSql):
+        """Emulates the live-verified FROM semantics: resume after the
+        literal name given, exclusive; an unknown name seeks to wherever it
+        would sort."""
+        def __call__(self, sql, params=None):
+            flat = " ".join(sql.split())
+            if flat.lower().startswith("show tables in schema"):
+                self.calls.append(sql)
+                m = re.search(r" from '((?:[^']|'')*)'$", flat)
+                after = m.group(1).replace("''", "'") if m else None
+                names = [n for n in all_names if after is None or n > after]
+                return [{"name": n, "rows": 0} for n in names[:2]]
+            return super().__call__(sql, params)
+
+    fake = Seeking(_base_responses(tables=[], columns=[]))
+    inv = build_inventory(fake, row_counts="none")
+    names = [r["source_identifier"].rsplit(".", 1)[1] for r in inv["inventory"]]
+    assert names == all_names, "every object exactly once: no repeat, no loss"
+
+    resumes = [c for c in fake.calls if " from '" in c]
+    assert len(resumes) == 3
+    assert not any("\\" in c for c in resumes), \
+        "the cursor is a plain name; LIKE escaping does not belong here"
+    assert resumes[0].endswith("from 'O''BRIEN_T'"), \
+        "only the quote is doubled, so a name with ' cannot break the literal"
+    assert resumes[1].endswith("from 'ORDER_ITEMS_STG'")
+    assert resumes[2].endswith("from 'PCT%DONE'")
+
+
 def test_columns_are_read_per_schema_so_one_query_cannot_be_unbounded():
     fake = FakeSql(_base_responses(tables=[{"name": "T", "rows": 0}],
                                   columns=[_col("T")]))
@@ -323,3 +367,21 @@ def test_maintenance_columns_are_captured_from_show_output():
                 "search_optimization", "search_optimization_bytes",
                 "retention_time"):
         assert key in meta, f"{key} not captured from SHOW"
+
+
+def test_show_tables_kind_and_flags_reach_the_plan():
+    # SHOW TABLES says which rows are dynamic, and whether a table is
+    # TRANSIENT/TEMPORARY. Both must survive extraction so the plan can act:
+    # a dynamic table cannot migrate; a transient one migrates with a warning.
+    from plan.build import build_plan
+    fake = FakeSql(_base_responses(
+        tables=[{"name": "DT", "rows": 1, "is_dynamic": "Y", "kind": "TABLE"},
+                {"name": "TT", "rows": 1, "is_dynamic": "N", "kind": "TRANSIENT"}],
+        columns=[_col("DT"), _col("TT")]))
+    inv = build_inventory(fake, row_counts="none")
+    meta = {r["source_identifier"]: r["source_metadata"] for r in inv["inventory"]}
+    assert meta["DB.PUBLIC.TT"]["kind"] == "TRANSIENT"
+    plan = build_plan(inv, {"edges": []})
+    assert [c["source_identifier"] for c in plan["cannot_migrate"]] == ["DB.PUBLIC.DT"]
+    assert plan["cannot_migrate"][0]["category"] == "unsupported_object"
+    assert [w["source_identifier"] for w in plan["table_kind_warnings"]] == ["DB.PUBLIC.TT"]

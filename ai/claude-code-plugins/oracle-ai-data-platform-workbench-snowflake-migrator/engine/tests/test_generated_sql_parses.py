@@ -73,8 +73,18 @@ def test_awkward_identifiers_still_parse():
     "select a::varchar as v from t",
     "select LISTAGG(name, ', ') from t",
     "select DATEADD(day, 1, d) as d2 from t",
+    "select DATEADD(week, n, d) as d2 from t",
+    "select DATEADD(year, n, d) as d3 from t",
+    "select DATEADD(hour, -1, ts) as d4 from t",
+    "select DATEADD(day, -30, CURRENT_DATE()) as cutoff from t",
+    "select DATEADD('day', 1, d) as d2 from t",
+    "select DATEADD(day, abs(n), d) as d2 from t",
+    "select DATEADD(day, 1, d) as d1, DATEADD(day, -30, CURRENT_DATE()) as c from t",
     "select ARRAY_CONSTRUCT(1, 2) as arr",
     "select OBJECT_CONSTRUCT('k', v) as o from t",
+    'select "Order ID", "Amount" from DB.SC."Orders"',
+    "select 'O''Brien' as who, 'it''s' as note from t",
+    "select $$it's$$ as note from t",
 ])
 def test_translated_view_bodies_parse_as_spark(body):
     """Each implemented rule's output must be valid Spark SQL.
@@ -96,3 +106,47 @@ def test_translated_view_bodies_parse_as_spark(body):
     for banned in ("IFF(", "::", "LISTAGG(", "DATEADD(", "ARRAY_CONSTRUCT(",
                    "OBJECT_CONSTRUCT("):
         assert banned not in translated, f"{banned} survived translation"
+
+
+def test_cast_targets_are_spark_types_not_snowflake_names():
+    """The parse gate is lenient: sqlglot accepts CAST(x AS NUMBER(18,2)) and
+    CAST(x AS TEXT) in its spark dialect, so parsing alone cannot catch a type
+    name copied over verbatim. Check the CAST targets themselves."""
+    record = {"source_identifier": "DB.SC.V", "object_type": "VIEW",
+              "view_ddl_get_ddl": ("create view V as select a::NUMBER(18,2) as n, "
+                                   "b::FLOAT as f, c::INT as i from t"),
+              "source_metadata": {}, "columns": []}
+    res = build_create_view(record, "CAT.SC.V", {})
+    assert res.blocked is False, res.blocked_reason
+    tree = _parse(res.sql)
+    targets = sorted(c.to.sql(dialect="spark") for c in tree.find_all(sqlglot.exp.Cast))
+    assert targets == sorted(["DECIMAL(18, 2)", "DOUBLE", "DECIMAL(38, 0)"]), targets
+
+
+def _view(body):
+    record = {"source_identifier": "DB.SC.V", "object_type": "VIEW",
+              "view_ddl_get_ddl": f"create view V as {body}",
+              "source_metadata": {}, "columns": []}
+    return build_create_view(record, "CAT.SC.V", {})
+
+
+def test_doubled_quote_literal_is_one_literal_on_spark_not_a_concat():
+    """A parse-only check passes on the CONCAT form: Spark reads 'O''Brien' as
+    two adjacent literals. The assertion that catches the bug is that the
+    tree holds exactly one string literal, and it is O'Brien."""
+    res = _view("select 'O''Brien' as who, 'it''s' as note from t")
+    assert res.blocked is False, res.blocked_reason
+    tree = _parse(res.sql)
+    literals = sorted(lit.this for lit in tree.find_all(sqlglot.exp.Literal)
+                      if lit.is_string)
+    assert literals == ["O'Brien", "it's"], literals
+    assert not list(tree.find_all(sqlglot.exp.Concat))
+
+
+def test_quoted_identifier_is_a_column_on_spark_not_a_string():
+    res = _view('select "Order ID", "Amount" from t')
+    assert res.blocked is False, res.blocked_reason
+    tree = _parse(res.sql)
+    names = sorted(c.name for c in tree.find_all(sqlglot.exp.Column))
+    assert names == ["Amount", "Order ID"], names
+    assert not [lit for lit in tree.find_all(sqlglot.exp.Literal) if lit.is_string]

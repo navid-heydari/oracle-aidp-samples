@@ -1,6 +1,6 @@
 ---
 name: snowflake-assess-estate
-description: Read-only PREVIEW of a Snowflake environment from the operator's machine - inventory of tables and views with row counts, byte sizes and column types, plus the census of objects that are not tables or views, table-maintenance state and security posture. Use ONLY when the user wants to look at an account without migrating it - answering what is in there, how big the tables are, what the security posture looks like. This is NOT the discovery step of a migration: a migration discovers inside AIDP as a workflow (runbook S6), because a laptop-side read leaves no log and no evidence on the platform. If the user asked to migrate, route to snowflake-migrator-overview and follow S1 through S12.
+description: "Read-only PREVIEW of a Snowflake environment from the operator's machine - inventory of tables and views with row counts, byte sizes and column types, plus the census of objects that are not tables or views, table-maintenance state and security posture. Use ONLY when the user wants to look at an account without migrating it - answering what is in there, how big the tables are, what the security posture looks like. This is NOT the discovery step of a migration: a migration discovers inside AIDP as a workflow (runbook S6), because a laptop-side read leaves no log and no evidence on the platform. If the user asked to migrate, route to snowflake-migrator-overview and follow S1 through S12."
 ---
 
 # Preview the estate — from the operator's machine
@@ -100,9 +100,13 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig security \
 
 `assess` used to look at tables and views only, so "N of N objects can move"
 was true of what had been examined and overstated the estate. `CENSUS.md` now
-counts procedures, UDFs, tasks, streams, materialized and dynamic tables,
-stages, pipes, sequences and file formats. **None of them migrate**, and no
-equivalent is generated.
+counts procedures, UDFs and UDTFs, external functions, tasks, streams, alerts,
+materialized and dynamic tables, internal and external stages, pipes,
+sequences, file formats, secrets, network rules, Streamlit apps, notebooks
+and container services, plus the account's shares, roles, network policies,
+applications and compute pools. **None of them migrate**, and no equivalent
+is generated. An outbound share is a live contract with another account:
+read that row first.
 
 Two things to carry to the user:
 

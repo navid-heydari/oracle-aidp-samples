@@ -16,7 +16,7 @@ from target.snowflake_catalog_connection import (
 
 def _config(tmp_path, **overrides):
     key = tmp_path / "rsa.p8"
-    key.write_text("-----BEGIN PRIVATE KEY-----\nabc\n")
+    key.write_text("-----BEGIN PRIVATE KEY-----\nabc\n", encoding="utf-8")
     base = {"account": "ORG-ACC", "warehouse": "WH", "database": "SALES_DB",
             "user": "SVC", "auth": "keypair", "key_path": str(key)}
     base.update(overrides)
@@ -25,14 +25,14 @@ def _config(tmp_path, **overrides):
 
 def test_json_config_loads_without_pyyaml(tmp_path):
     path = tmp_path / "conn.json"
-    path.write_text(json.dumps({"account": "A"}))
+    path.write_text(json.dumps({"account": "A"}), encoding="utf-8")
     assert load_connection_config(path) == {"account": "A"}
 
 
 def test_yaml_config_loads(tmp_path):
     pytest.importorskip("yaml")
     path = tmp_path / "conn.yaml"
-    path.write_text("account: A\nwarehouse: WH\n")
+    path.write_text("account: A\nwarehouse: WH\n", encoding="utf-8")
     assert load_connection_config(path)["warehouse"] == "WH"
 
 
@@ -113,7 +113,7 @@ def test_keypair_with_neither_inline_nor_path_is_refused(tmp_path):
 
 def test_password_auth_reads_the_password_file(tmp_path):
     secret = tmp_path / "pw"
-    secret.write_text("hunter2\n")
+    secret.write_text("hunter2\n", encoding="utf-8")
     details = build_snowflake_connection_details(
         _config(tmp_path, auth="password", password_path=str(secret)))
     assert details["SNOWFLAKE_AUTHENTICATION_METHOD"] == "Basic"

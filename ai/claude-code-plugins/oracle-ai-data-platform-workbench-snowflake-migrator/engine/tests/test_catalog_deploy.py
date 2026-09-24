@@ -738,3 +738,448 @@ def test_a_dry_run_never_asks_for_the_catalog_type():
                          retry_delays=(), verify_delays=())
     assert rec.ops == []
     assert out["catalog_type"] is None
+
+
+# ==========================================================================
+# A listing that FAILS is not a listing that came back empty.
+#
+# `_find_schema` and `_resolve_object` used to swallow every exception from
+# the list call and return None, so a 403 on list_schemas read as "absent"
+# and the schema was re-POSTed -- the exact write the module docstring says
+# drops the table creates that follow -- while a 403 on list_tables_in made
+# every table that WAS created report "never appeared", burned 33 s of
+# polling per table, and left a diagnosis probe behind in the customer's
+# schema because its own read-back was blind too. None of it recorded the
+# 403 anywhere.
+# ==========================================================================
+
+class DeniedList(Folding):
+    """A principal that may create but not list. `deny` names the operations
+    that raise, the way `oci raw-request` does on a 403."""
+
+    def __init__(self, *deny, **kw):
+        super().__init__(**kw)
+        self.deny = set(deny)
+
+    def __call__(self, operation, **kw):
+        if operation in self.deny:
+            self.ops.append((operation, kw))
+            raise RuntimeError(
+                f"{operation} failed (exit 1): 403 NotAuthorizedOrNotFound")
+        return super().__call__(operation, **kw)
+
+
+def test_a_failed_schema_listing_refuses_before_any_write():
+    call = DeniedList("list_schemas")
+    with pytest.raises(RefusedToExecute, match="could not list"):
+        deploy_catalog(_plan(2), target=TARGET, execute=True, call=call,
+                       retry_delays=(), verify_delays=())
+    assert not any(op in ("create_schema", "create_table", "create_view")
+                   for op, _ in call.ops), "nothing may be written blind"
+
+
+def test_an_existing_schema_is_never_re_posted_when_listing_fails():
+    call = DeniedList("list_schemas")
+    call.schemas["lake.db"] = "lake.db"     # it is already there
+    with pytest.raises(RefusedToExecute):
+        deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
+                       retry_delays=(), verify_delays=())
+    assert [op for op, _ in call.ops].count("create_schema") == 0, \
+        "a schema that cannot be listed is not known to be absent"
+
+
+def test_a_failed_table_listing_is_reported_as_unknown_not_never_appeared():
+    call = DeniedList("list_tables_in", "list_views_in")
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
+                         retry_delays=(), verify_delays=())
+    assert out["failed_targets"] == ["DB.PUBLIC.T0"]
+    reason = out["failed"][0]["reason"]
+    assert "could not be read back" in reason and "403" in reason
+    assert "never appeared" not in reason
+    assert "unsupported field type" not in reason
+    # No probe: the schema cannot even be listed, so a probe would be
+    # created blind and judged blind.
+    assert not any(op == "create_table"
+                   and str(kw.get("table", "")).startswith("snowmig_probe_")
+                   for op, kw in call.ops)
+    assert out["diagnosis_probes"] == []
+    assert any("403" in e for e in out["errors"]), \
+        "the actual error must be on the record"
+
+
+def test_a_permission_error_on_listing_does_not_poll(monkeypatch):
+    from target import catalog_deploy
+    slept = []
+    monkeypatch.setattr(catalog_deploy.time, "sleep", slept.append)
+    call = DeniedList("list_tables_in")
+    deploy_catalog(_plan(3), target=TARGET, execute=True, call=call,
+                   retry_delays=(), verify_delays=(3, 5, 10, 15))
+    assert [op for op, _ in call.ops].count("list_tables_in") == 3, \
+        "one look per table: a 403 reads the same on every attempt"
+    assert sum(slept) == 0
+
+
+def test_a_transient_listing_error_is_polled_like_a_slow_create(monkeypatch):
+    from target import catalog_deploy
+    slept = []
+    monkeypatch.setattr(catalog_deploy.time, "sleep", slept.append)
+
+    class Flaky(Folding):
+        def __init__(self):
+            super().__init__()
+            self.failures_left = 2
+
+        def __call__(self, operation, **kw):
+            if operation == "list_tables_in" and self.failures_left:
+                self.failures_left -= 1
+                self.ops.append((operation, kw))
+                raise RuntimeError("backend returned 503 Service Unavailable")
+            return super().__call__(operation, **kw)
+
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=Flaky(),
+                         retry_delays=(), verify_delays=(3, 5, 10, 15))
+    assert out["verified_targets"] == ["DB.PUBLIC.T0"]
+    assert slept == [3, 5]
+
+
+def test_a_schema_listing_that_fails_mid_poll_is_recorded_not_read_as_absent():
+    class BlindAfterCreate(Folding):
+        def __call__(self, operation, **kw):
+            if operation == "list_schemas" and self.schemas:
+                self.ops.append((operation, kw))
+                raise RuntimeError("list_schemas failed (exit 1): 403 denied")
+            return super().__call__(operation, **kw)
+
+    call = BlindAfterCreate()
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
+                         retry_delays=(), verify_delays=(), schema_wait=())
+    assert out["schemas_created"] == ["lake.DB"]
+    assert any("403" in e and "list" in e.lower() for e in out["errors"])
+
+
+def test_diagnosis_probe_is_deleted_when_its_listing_fails():
+    from target.catalog_deploy import _diagnose_never_appeared
+
+    class ProbeBlind(Folding):
+        def __call__(self, operation, **kw):
+            if operation in ("list_tables_in", "list_views_in"):
+                self.ops.append((operation, kw))
+                raise RuntimeError("503 service unavailable")
+            if operation == "delete_table":
+                self.ops.append((operation, kw))
+                return {}
+            return super().__call__(operation, **kw)
+
+    call = ProbeBlind()
+    probes = []
+    assert _diagnose_never_appeared(call, "lake", "lake.db", probes) is None
+    deleted = [kw["table"] for op, kw in call.ops if op == "delete_table"]
+    assert deleted == [probes[0]["name"]], \
+        "never leave the probe behind because we could not look"
+    assert probes[0]["created"] is None
+    assert "503" in probes[0]["list_error"]
+
+
+# ------------------------------------------- an execute that matches nothing
+#
+# Live 2026-09-22: `deploy --execute --catalog snowmig_coverage_internal` on a
+# plan whose every object targets catalog `snowmig_coverage` created nothing,
+# recorded `executed: 0, errors: []`, and exited 0. The report's only trace
+# was the ordinary "Not deployed in this run" note. A caller reading the exit
+# code would have called that a successful structural clone of 11 objects.
+
+def _elsewhere(n=2):
+    return {"statements": [
+        {"source_identifier": f"DB.PUBLIC.T{i}", "object_type": "TABLE",
+         "target_fqn": f"other_catalog.DB.T{i}", "sql": "CREATE TABLE ...",
+         "expected_columns": [{"name": "A", "type": "STRING"}]}
+        for i in range(n)], "blocked": []}
+
+
+def test_a_plan_that_matches_no_statement_is_not_a_clean_empty_deploy():
+    out = deploy_catalog(_elsewhere(2), target=TARGET, execute=True,
+                         call=Recorder(), retry_delays=(), verify_delays=())
+    assert out["matched_nothing"] is True
+    assert out["out_of_scope_count"] == 2
+    assert out["executed"] == 0
+
+
+def test_an_empty_plan_is_not_a_run_that_matched_nothing():
+    """Nothing to do and nothing matching are different facts: only the
+    second means the operator named a catalog the plan never mentions."""
+    out = deploy_catalog({"statements": [], "blocked": []}, target=TARGET,
+                         execute=True, call=Recorder(), retry_delays=(),
+                         verify_delays=())
+    assert out["matched_nothing"] is False
+
+
+def test_a_partial_match_is_not_a_run_that_matched_nothing():
+    plan = _plan(1)
+    plan["statements"] += _elsewhere(1)["statements"]
+    out = deploy_catalog(plan, target=TARGET, execute=True, call=Recorder(),
+                         retry_delays=(), verify_delays=())
+    assert out["matched_nothing"] is False
+    assert out["out_of_scope_count"] == 1
+
+
+def test_the_report_says_the_catalog_name_is_what_did_not_match():
+    from report.render import render_soft_clone_summary
+    md = render_soft_clone_summary(
+        {"can_migrate": [], "blocked": []},
+        {"dry_run": False, "executed": 0, "verified": 0, "statements": [],
+         "statement_count": 0, "blocked_count": 0, "errors": [],
+         "catalog_in_scope": "wrong_name", "matched_nothing": True,
+         "out_of_scope_count": 11,
+         "out_of_scope_catalogs": ["snowmig_coverage"]})
+    assert "wrong_name" in md
+    assert "snowmig_coverage" in md
+    assert "nothing was created" in md.lower()
+
+
+# ------------------------- no property gap for an object that was not created
+#
+# Live 2026-09-22: `v_customer_totals` failed to create (the backend returned
+# 500) and the run still reported its two NOT NULL columns as "created
+# NULLABLE here". The gap is recorded before the create on purpose, because
+# it is a property of this transport rather than a discovery -- but it may
+# not survive into the artifact for an object that does not exist.
+
+def _plan_not_null(fqn="lake.DB.T0", ident="DB.PUBLIC.T0"):
+    return {"statements": [
+        {"source_identifier": ident, "object_type": "TABLE",
+         "target_fqn": fqn, "sql": "CREATE TABLE ...",
+         "expected_columns": [{"name": "A", "type": "STRING",
+                               "nullable": False}]}], "blocked": []}
+
+
+def test_a_not_null_gap_is_reported_for_an_object_that_was_created():
+    out = deploy_catalog(_plan_not_null(), target=TARGET, execute=True,
+                         call=Recorder(), retry_delays=(), verify_delays=())
+    assert out["verified"] == 1
+    assert [p["property"] for p in out["properties_not_applied"]] == ["NOT NULL"]
+
+
+def test_no_not_null_gap_is_reported_for_an_object_that_failed_to_create():
+    out = deploy_catalog(_plan_not_null(), target=TARGET, execute=True,
+                         call=Recorder(fail_on=("T0",)), retry_delays=(),
+                         verify_delays=())
+    assert out["failed"], "the create must have failed for this to mean anything"
+    assert out["properties_not_applied"] == []
+    assert out["properties_not_applied_targets"] == []
+
+
+# ----------------------------------- a refused create is not a burned name
+#
+# Live 2026-09-22: AIDP answered one create with 400 `Invalid name` and four
+# with 500 `InternalError`. Every one of them was then reported as "the
+# create returned 202 Accepted ... a NOVEL name was created successfully, so
+# the schema and your request are both fine and this NAME IS BURNED ... Retry
+# into a FRESH SCHEMA". The create had raised, not returned 202; the request
+# was demonstrably not fine, the target had said so; and a fresh schema
+# would have produced the same 400 and the same 500.
+
+class Refusing(Recorder):
+    """A backend that rejects one create outright, as a real one does."""
+
+    def __init__(self, *, refuse=(), message="400 Bad Request: Invalid name",
+                 **kw):
+        super().__init__(**kw)
+        self.refuse = set(refuse)
+        self.message = message
+
+    def __call__(self, operation, **kw):
+        name = kw.get("table") or kw.get("view") or kw.get("schema")
+        if operation in ("create_table", "create_view") and name in self.refuse:
+            raise RuntimeError(self.message)
+        return super().__call__(operation, **kw)
+
+
+def test_a_refused_create_reports_what_the_target_said():
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True,
+                         call=Refusing(refuse=("T0",)), retry_delays=(),
+                         verify_delays=())
+    reason = out["failed"][0]["reason"]
+    assert "REFUSED" in reason
+    assert "Invalid name" in reason, "the target's own answer has to be in it"
+    assert "202" not in reason, "the create raised; it did not return 202"
+
+
+def test_a_refused_create_is_not_called_a_burned_name():
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True,
+                         call=Refusing(refuse=("T0",)), retry_delays=(),
+                         verify_delays=())
+    reason = out["failed"][0]["reason"].lower()
+    assert "burned" not in reason or "not burned" in reason
+    assert "fresh schema" not in reason or "would not help" in reason
+    assert out["poisoned_names"] == []
+
+
+def test_a_refused_create_does_not_claim_the_request_was_fine():
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True,
+                         call=Refusing(refuse=("T0",),
+                                       message="500 Server Error: InternalError"),
+                         retry_delays=(), verify_delays=())
+    reason = out["failed"][0]["reason"].lower()
+    assert "your request are both fine" not in reason
+    assert "internalerror" in reason
+
+
+def test_a_refused_create_runs_no_diagnosis_probe():
+    """The probe exists to tell a burned name from a bad request. The target
+    already answered that question for this object, so the probe is a write
+    to the customer's catalog for nothing."""
+    rec = Refusing(refuse=("T0",))
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=rec,
+                         retry_delays=(), verify_delays=())
+    assert out["diagnosis_probes"] == []
+    assert not [op for op, kw in rec.ops
+                if op == "create_table"
+                and str(kw.get("table", "")).startswith("snowmig_probe")]
+
+
+def test_an_accepted_create_that_vanishes_is_still_a_burned_name():
+    """The inference is sound where it belongs: the target took the create,
+    reported nothing, and the object never appeared."""
+    class Vanishing(Recorder):
+        def __call__(self, operation, **kw):
+            name = kw.get("table") or kw.get("view")
+            if operation == "create_table" and name == "T0":
+                return {"key": "accepted"}      # 202, and nothing created
+            return super().__call__(operation, **kw)
+
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True,
+                         call=Vanishing(), retry_delays=(), verify_delays=())
+    reason = out["failed"][0]["reason"]
+    assert "202 Accepted" in reason
+    assert "BURNED" in reason
+    assert out["poisoned_names"] == ["lake.DB.T0"]
+
+
+# ------------------------------- the diagnosis probe must be of the kind
+#                                 that failed
+#
+# Live 2026-09-22: four `create view` calls failed on a DataLake where every
+# view create returned 500. The probe created a TABLE, it landed, and the
+# verdict "a NOVEL name in this schema was created successfully, so the
+# schema and your request are both fine" was applied to the views. A table
+# landing says nothing about whether a view can be created here.
+
+class ViewsVanish(Recorder):
+    """Tables work. Views are accepted and never appear -- including the
+    probe, which is what a catalog that cannot make views looks like."""
+
+    def __call__(self, operation, **kw):
+        if operation in ("create_view", "list_views_in", "delete_view"):
+            self.ops.append((operation, kw))    # record, like the base does
+            return {"items": []} if operation == "list_views_in" else {
+                "key": "accepted"}
+        return super().__call__(operation, **kw)
+
+
+def _one_view_plan():
+    return {"statements": [
+        {"source_identifier": "DB.PUBLIC.V0", "object_type": "VIEW",
+         "target_fqn": "lake.DB.V0", "sql": "CREATE VIEW ...",
+         "view_text": "select 1 as a",
+         "expected_columns": [{"name": "A", "type": "STRING"}]}],
+        "blocked": []}
+
+
+def test_a_failed_view_is_probed_with_a_view():
+    rec = ViewsVanish()
+    deploy_catalog(_one_view_plan(), target=TARGET, execute=True, call=rec,
+                   retry_delays=(), verify_delays=())
+    probes = [kw for op, kw in rec.ops if op == "create_view"
+              and str(kw.get("view", "")).startswith("snowmig_probe")]
+    assert probes, "the probe for a failed view has to be a view"
+    assert not [kw for op, kw in rec.ops if op == "create_table"
+                and str(kw.get("table", "")).startswith("snowmig_probe")]
+
+
+def test_a_catalog_that_cannot_make_views_is_not_a_burned_name():
+    out = deploy_catalog(_one_view_plan(), target=TARGET, execute=True,
+                         call=ViewsVanish(), retry_delays=(), verify_delays=())
+    reason = out["failed"][0]["reason"]
+    assert "BURNED" not in reason, reason
+    assert "novel view name" in reason.lower()
+    assert out["poisoned_names"] == []
+
+
+def test_the_probe_records_which_kind_it_was():
+    out = deploy_catalog(_one_view_plan(), target=TARGET, execute=True,
+                         call=ViewsVanish(), retry_delays=(), verify_delays=())
+    assert out["diagnosis_probes"][0]["kind"] == "VIEW"
+
+
+def test_a_failed_table_is_still_probed_with_a_table():
+    class TablesVanish(Recorder):
+        def __call__(self, operation, **kw):
+            if operation == "create_table" and kw.get("table") == "T0":
+                return {"key": "accepted"}
+            return super().__call__(operation, **kw)
+
+    rec = TablesVanish()
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=rec,
+                         retry_delays=(), verify_delays=())
+    assert out["diagnosis_probes"][0]["kind"] == "TABLE"
+    assert "BURNED" in out["failed"][0]["reason"]
+    assert out["poisoned_names"] == ["lake.DB.T0"]
+
+
+# ------------------------- a 4xx explains itself; a 5xx needs the probe
+#
+# Live 2026-09-22: `create table mixed case table` returned 400 with the rule
+# it broke -- nothing to investigate. Four `create view` calls returned 500
+# `InternalError` with no detail, where the operator's next move depends
+# entirely on something the message does not say: was THIS view rejected, or
+# can this catalog not create a view at all? On that DataLake it was the
+# second, and the answer changes the plan from "fix the SQL" to "create the
+# structure on compute instead".
+
+def test_a_client_error_is_taken_at_its_word_and_costs_no_probe():
+    rec = Refusing(refuse=("T0",),
+                   message="400 Bad Request: Invalid name: mixed case table")
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=rec,
+                         retry_delays=(), verify_delays=())
+    assert out["diagnosis_probes"] == []
+    reason = out["failed"][0]["reason"]
+    assert "Invalid name" in reason
+    assert "named what was wrong" in reason
+
+
+def test_a_server_error_is_probed_because_it_explains_nothing():
+    rec = Refusing(refuse=("T0",), message="500 Server Error: InternalError")
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=rec,
+                         retry_delays=(), verify_delays=())
+    assert out["diagnosis_probes"], "a 5xx leaves the real question open"
+    assert out["diagnosis_probes"][0]["kind"] == "TABLE"
+
+
+def test_a_server_error_with_a_working_probe_points_at_this_object():
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True,
+                         call=Refusing(refuse=("T0",),
+                                       message="500 Server Error: InternalError"),
+                         retry_delays=(), verify_delays=())
+    reason = out["failed"][0]["reason"]
+    assert "about THIS object" in reason
+    assert "not burned" in reason
+
+
+def test_a_catalog_that_refuses_every_view_says_so_and_names_the_way_round():
+    """The live case. Every create_view returns 500, including the probe."""
+    class NoViewsAtAll(Recorder):
+        def __call__(self, operation, **kw):
+            if operation == "create_view":
+                raise RuntimeError("500 Server Error: InternalError")
+            if operation == "list_views_in":
+                return {"items": []}
+            return super().__call__(operation, **kw)
+
+    out = deploy_catalog(_one_view_plan(), target=TARGET, execute=True,
+                         call=NoViewsAtAll(), retry_delays=(),
+                         verify_delays=())
+    reason = out["failed"][0]["reason"]
+    assert "cannot create a view through the catalog API at all" in reason
+    assert "provision" in reason and "run" in reason
+    assert "fresh schema" in reason.lower()
+    assert out["poisoned_names"] == []

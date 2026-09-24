@@ -43,8 +43,9 @@ Categories:
 |---|---|
 | `restriction` | The user's own restriction excluded it. Name which one |
 | `unmapped_type` | A column type has no Delta equivalent, e.g. `VARIANT`, `GEOGRAPHY` |
-| `snowflake_only_sql` | A view uses `QUALIFY`, `LATERAL FLATTEN`, `IFF`, `::`, … |
-| `unsupported_object` | Secure view, materialized view |
+| `snowflake_only_sql` | A view uses a construct the translator recognises but has no exact rewrite for — `QUALIFY`, `LATERAL FLATTEN`, `DATEDIFF`/`TIMESTAMPDIFF`, `TIMESTAMPADD`/`TIMEADD`, `$$…$$`, `DECODE`, `NVL2`, a `::` cast over an expression or to `VARIANT`, a `DATEADD` whose amount is an expression or whose unit is quoted or a nested call. The reason names the construct and why. `IFF`, `x::TYPE` on a bare column or literal, `LISTAGG(x, sep)`, `DATEADD(unit, n, col)` and `"quoted identifiers"` are translated, not blocked. Full rule table: [references/dialect-translation.md](../../references/dialect-translation.md) |
+| `unsupported_object` | Secure view, materialized view; dynamic, external, Iceberg, event or hybrid table (`SHOW TABLES` flags) — see also `CENSUS.md` |
+| `dependency_not_migrated` | Depends on an object that is not migrating (a blocked or excluded base table or view); the reason names it |
 | `no_definition` / `unparseable_sql` | The view SQL could not be read or parsed |
 
 ## Restrictions — ask for them, do not invent them

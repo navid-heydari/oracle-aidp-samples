@@ -144,6 +144,61 @@ def test_leading_verb_does_not_read_a_verb_out_of_a_literal():
     assert lexer.leading_verb("'drop table t'") is None
 
 
+# --------------------------------------------------------- cte_body_verb
+
+@pytest.mark.parametrize("sql", [
+    "with x as (select 1) select * from x",
+    "with a as (select 1), b as (select 2) select * from a, b",
+    "WITH RECURSIVE r (n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<3) "
+    "SELECT * FROM r",
+    'with "Weird Name" as (select 1) select 1',
+    "with x (a, b) as (select 1, 2) select a from x",
+    "with x as (select 1) /* c */ select * from x",
+    "with x /* c */ as (select 1) -- c\n select * from x",
+    "with x as (select (1)) select ((1)) from x",
+])
+def test_cte_body_verb_finds_the_select_after_the_cte_list(sql):
+    assert lexer.cte_body_verb(sql) == "SELECT"
+
+
+@pytest.mark.parametrize("sql, verb", [
+    ("with x as (select 1 a) insert into t select a from x", "INSERT"),
+    ("with x as (select 1) delete from t", "DELETE"),
+    ("with x as (select 1) update t set a = 1", "UPDATE"),
+    ("with x as (select 1) merge into t using x on 1=1 when matched then delete",
+     "MERGE"),
+    ("WITH src AS (SELECT * FROM s) INSERT INTO d.s.t SELECT * FROM src", "INSERT"),
+])
+def test_cte_body_verb_reports_the_write_after_the_cte_list(sql, verb):
+    assert lexer.cte_body_verb(sql) == verb
+
+
+def test_cte_body_verb_does_not_read_the_verb_out_of_a_literal():
+    # `insert` and `;` inside the CTE body are data, and so is a quoted
+    # identifier. The body verb is the first keyword at depth 0 after the list.
+    assert lexer.cte_body_verb(
+        "with x as (select 'insert; delete' as w) select w from x") == "SELECT"
+    assert lexer.cte_body_verb(
+        'with x as (select 1 as "insert") select * from x') == "SELECT"
+    assert lexer.cte_body_verb(
+        "with x as (select $$ insert $$ as w) select w from x") == "SELECT"
+
+
+def test_cte_body_verb_is_none_when_no_keyword_follows_the_cte_list():
+    # A parenthesised body is a legitimate read the walker does not follow.
+    # None means "could not identify", never "harmless": the guard refuses.
+    assert lexer.cte_body_verb("with x as (select 1) (select * from x)") is None
+    assert lexer.cte_body_verb("with x as (select 1)") is None
+    assert lexer.cte_body_verb("with x as (select 1) 'text'") is None
+    assert lexer.cte_body_verb('with x as (select 1) "q"') is None
+
+
+def test_cte_body_verb_of_a_statement_that_is_not_a_cte_is_none():
+    assert lexer.cte_body_verb("select 1") is None
+    assert lexer.cte_body_verb("insert into t values (1)") is None
+    assert lexer.cte_body_verb("") is None
+
+
 # ----------------------------------------------------------- quote_ident
 
 def test_quote_ident_wraps_and_doubles_embedded_double_quotes():
@@ -253,3 +308,24 @@ def test_sub_code_anchor_group_accepts_a_literal_at_the_span_start():
                             sql, anchor_group="op")
     assert out == "select CAST('x' AS int)"
     assert n == 1
+
+
+# ------------------------------------------------------- backtick identifiers
+
+def test_backtick_quoted_identifier_is_its_own_segment():
+    # The translator emits Spark backtick identifiers and the DDL generator
+    # re-lexes the emitted statement to hand the catalog API its body. While a
+    # backtick was code, a `"` inside it opened a phantom identifier and the
+    # re-lex raised -- and the catalog API would have received an empty body.
+    assert lexer.segments('select `a"b` from t') == [
+        ("code", "select "), ("ident", '`a"b`'), ("code", " from t")]
+
+
+def test_doubled_backtick_inside_identifier_does_not_end_it():
+    assert lexer.segments("select `we``ird`") == [
+        ("code", "select "), ("ident", "`we``ird`")]
+
+
+def test_unterminated_backtick_identifier_is_reported():
+    with pytest.raises(lexer.UnterminatedLiteral, match="identifier"):
+        lexer.segments("select `oops from t")

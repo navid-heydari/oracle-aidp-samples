@@ -29,7 +29,29 @@ import re
 __all__ = ["UnmappableFieldType", "InvalidCatalogSpec", "field_from_spark_type",
            "build_schema_body", "build_table_body", "build_view_body",
            "build_catalog_body", "MANAGED_FORMAT", "CATALOG_TYPES",
-           "normalize_catalog_type"]
+           "normalize_catalog_type", "PROPERTIES_THIS_BODY_CANNOT_CARRY"]
+
+# What this transport CANNOT express, named once so every caller reports the
+# same thing rather than silently sending less than the plan.
+#
+# A field entry is `fieldName` / `fieldType` (+ `fieldPrecision` /
+# `fieldScale` for decimal) / `fieldDescription`. There is no nullability
+# field: the shape was read off a real table in the target environment, and
+# inventing a key here would be a guess posted to a create that returns 202
+# and then fails silently. So `NOT NULL` -- which IS in the reviewed SQL and
+# IS applied by the in-AIDP structure notebook -- does not travel on this
+# path, and that is reported per object instead of dropped.
+PROPERTIES_THIS_BODY_CANNOT_CARRY = {
+    "not_null": (
+        "the catalog API table body has no nullability field (a field is "
+        "fieldName/fieldType/fieldPrecision/fieldScale/fieldDescription), so "
+        "columns the plan declares NOT NULL are created NULLABLE on this "
+        "transport. Nothing was guessed: an invented key would be accepted "
+        "with 202 and then fail silently. Create the table with the in-AIDP "
+        "structure notebook (`snowmig provision` + 01_create_structure), "
+        "which emits the reviewed CREATE TABLE verbatim, if the constraint "
+        "has to hold."),
+}
 
 # What AIDP calls its two catalog shapes, LIVE-VERIFIED 2026-09-18 by reading
 # the catalogType of every catalog on a real DataLake: INTERNAL and EXTERNAL,
