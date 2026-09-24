@@ -104,7 +104,7 @@ from target.executor import (
 # for HTTP errors carried in the body); both must be caught or a live 400
 # prints as a traceback instead of a message -- observed live.
 from target.executor import BackendError as ExecutorBackendError
-from target.runner import BackendError
+from target.runner import DEFAULT_CLI_TIMEOUT, BackendError
 from target.runner import make_call
 from target.runner import make_run_sql as make_aidp_run_sql
 
@@ -338,7 +338,8 @@ def _oci_runner(args):
                     argv[1:1] = ["--auth", mode]
         return subprocess.run(argv, capture_output=True, text=True,
                               check=False, encoding="utf-8", errors="replace",
-                              env=cli_environment())
+                              env=cli_environment(),
+                              timeout=DEFAULT_CLI_TIMEOUT)
     return run
 
 

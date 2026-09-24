@@ -64,8 +64,35 @@ class BackendError(RuntimeError):
     """The aidp/oci CLI exited non-zero."""
 
 
-def _default_run_process(cmd: list[str]):
-    return subprocess.run(cmd, capture_output=True, text=True, check=False, encoding="utf-8", errors="replace")
+class CliTimeout(RuntimeError):
+    """A CLI child did not return inside its budget."""
+
+
+# Generous, because a cluster create legitimately takes minutes -- but
+# finite, because the alternative is what happened live: a single child
+# that never returned held the stage for 107 minutes while a cluster
+# billed, with nothing on the console to say so.
+DEFAULT_CLI_TIMEOUT = 900
+
+
+def run_cli(cmd: list[str], *, run_process=None,
+            timeout: int = DEFAULT_CLI_TIMEOUT):
+    """Run a CLI command, bounded. Raises CliTimeout rather than hanging."""
+    proc = run_process or _default_run_process
+    try:
+        return proc(cmd, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise CliTimeout(
+            f"`{' '.join(cmd[:3])}` timed out after {timeout}s and was "
+            f"killed. Nothing here can tell a slow call from a stuck one, "
+            f"so the wait is bounded: re-run, and if it recurs check the "
+            f"network path to the endpoint before raising the budget.")
+
+
+def _default_run_process(cmd: list[str], timeout: int | None = None):
+    return subprocess.run(cmd, capture_output=True, text=True, check=False,
+                          encoding="utf-8", errors="replace",
+                          timeout=timeout)
 
 
 def make_run_sql(target, *, backend: str,

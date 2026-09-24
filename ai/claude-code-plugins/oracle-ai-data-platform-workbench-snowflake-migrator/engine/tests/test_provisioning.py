@@ -1227,3 +1227,59 @@ def test_no_transport_puts_connection_details_on_argv(transport, operation,
     transport(fake)(operation, body=body)
     assert not any("connectionDetails" in a for a in seen["cmd"]), seen["cmd"]
     assert _SECRET not in " ".join(seen["cmd"])
+
+
+# ------------------------------- a CLI call that never returns, live 2026-09-24
+#
+# `provision --execute` hung for one hour and forty-seven minutes. A single
+# `oci` child process, started two minutes into the run, never exited; the
+# parent sat in subprocess.run() waiting for it with no timeout, printed
+# nothing, and wrote no result. A Spark cluster billed for the whole of it.
+# Killing the child by hand let the parent continue immediately.
+#
+# None of the three subprocess.run() call sites passed `timeout=`. A hung
+# CLI is not exotic -- a stalled TLS handshake or a proxy black hole does
+# it -- and the cost of not bounding it is measured in cluster-hours.
+
+def test_every_subprocess_call_site_bounds_its_wait():
+    """Read the sources: no subprocess.run without a timeout."""
+    import re
+    root = pathlib.Path(__file__).resolve().parents[1]
+    offenders = []
+    for src in root.rglob("*.py"):
+        if "tests" in src.parts:
+            continue
+        text = src.read_text(encoding="utf-8")
+        for m in re.finditer(r"subprocess\.run\(", text):
+            # the call's argument list, to its balancing paren
+            i, depth = m.end(), 1
+            while i < len(text) and depth:
+                depth += (text[i] == "(") - (text[i] == ")")
+                i += 1
+            if "timeout=" not in text[m.end():i]:
+                line = text[:m.start()].count("\n") + 1
+                offenders.append(f"{src.relative_to(root)}:{line}")
+    assert not offenders, (
+        "subprocess.run without timeout=: " + ", ".join(offenders))
+
+
+def test_a_timed_out_cli_call_is_reported_not_raised():
+    """The operator gets a named failure, not a traceback and not a hang."""
+    import subprocess
+    from target.runner import run_cli, CliTimeout
+
+    def hang(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, kw.get("timeout", 1))
+
+    with pytest.raises(CliTimeout) as e:
+        run_cli(["oci", "raw-request", "--target-uri", "https://x"],
+                run_process=hang, timeout=1)
+    msg = str(e.value)
+    assert "1" in msg and "timed out" in msg.lower()
+    assert "oci" in msg
+
+
+def test_the_timeout_is_long_enough_for_a_real_call():
+    """Bounded, not impatient: a cluster create legitimately takes minutes."""
+    from target.runner import DEFAULT_CLI_TIMEOUT
+    assert DEFAULT_CLI_TIMEOUT >= 300

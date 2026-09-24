@@ -384,6 +384,40 @@ def columns_from_ddl_plan(ddl_plan: dict) -> dict[tuple[str, str], list[dict]]:
     return out
 
 
+def targets_from_ddl_plan(ddl_plan: dict
+                          ) -> dict[tuple[str, str], tuple[str, str]]:
+    """{(source_schema, table): (target_schema, target_name)} from the plan.
+
+    The plan's `target_fqn` IS the approved name. Deriving it again from the
+    source schema silently discards `--bronze-catalog-prefix` and
+    `--bronze-schema-style`, and creates an object the reviewer never saw.
+
+    A statement without a three-part `target_fqn` contributes nothing: this
+    map is only ever used to place an object the plan actually named.
+    """
+    out: dict[tuple[str, str], tuple[str, str]] = {}
+    for stmt in ddl_plan.get("statements") or []:
+        source = str(stmt.get("source_identifier") or "").split(".")
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(source) != 3 or len(target) != 3:
+            continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue
+        out[(source[1], source[2])] = (target[1], target[2])
+    return out
+
+
+def catalogs_from_ddl_plan(ddl_plan: dict) -> set:
+    """Every catalog the plan targets. More than one, or one that is not
+    the catalog this run was given, is the operator's to see."""
+    out = set()
+    for stmt in ddl_plan.get("statements") or []:
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(target) == 3:
+            out.add(target[0])
+    return out
+
+
 def descriptions_from_ddl_plan(ddl_plan: dict) -> dict[tuple[str, str], str]:
     """{(source_schema, table): table COMMENT} from the engine's ddl_plan.
 
@@ -471,6 +505,7 @@ def main(argv: list[str] | None = None) -> int:
     planned_columns: dict = {}
     planned_descriptions: dict = {}
     planned_views: set | None = None
+    planned_targets: dict = {}
     if args.mode == "ddl-plan":
         ddl_path = (pathlib.Path(args.ddl_plan) if args.ddl_plan
                     else reports.parent / "plan" / "ddl_plan.json")
@@ -482,6 +517,22 @@ def main(argv: list[str] | None = None) -> int:
         planned_columns = columns_from_ddl_plan(ddl_plan)
         planned_descriptions = descriptions_from_ddl_plan(ddl_plan)
         planned_views = views_from_ddl_plan(ddl_plan)
+        planned_targets = targets_from_ddl_plan(ddl_plan)
+        # A plan for another catalog is a different migration. Creating its
+        # tables here under this run's catalog would be the same silent
+        # substitution this map exists to stop.
+        plan_catalogs = catalogs_from_ddl_plan(ddl_plan)
+        stray = {c for c in plan_catalogs
+                 if c.lower() != str(args.target_catalog).lower()}
+        if stray:
+            return fail(
+                f"error: the approved plan targets catalog(s) "
+                f"{', '.join(sorted(stray))}, and this run was given "
+                f"--target-catalog {args.target_catalog}. Creating the "
+                f"plan's tables somewhere it does not name would be exactly "
+                f"the substitution the plan exists to prevent. Re-run `ddl` "
+                f"for this catalog, or point this run at the one the plan "
+                f"names.")
         log(f"ddl plan: {len(planned_columns)} table(s) with engine-"
             f"translated types, from {ddl_path}"
             + (f"; {len(planned_views)} view(s) it carries are NOT created "
@@ -508,7 +559,31 @@ def main(argv: list[str] | None = None) -> int:
         if record is None:
             return fail(f"error: schema {schema!r} is not in the manifest; run "
                   f"00_discover first")
-        target_schema = args.target_schema or schema
+        # The approved plan decides the target namespace. Only where the
+        # plan is silent (ctas/manifest mode, or a table it does not carry)
+        # does the source schema name stand in.
+        planned_for_schema = {
+            tgt_schema for (src_schema, _t), (tgt_schema, _n)
+            in planned_targets.items() if src_schema == schema}
+        if args.target_schema:
+            target_schema = args.target_schema
+            if planned_for_schema and target_schema not in planned_for_schema:
+                return fail(
+                    f"error: --target-schema {target_schema!r} contradicts "
+                    f"the approved plan, which puts {schema} in "
+                    f"{', '.join(sorted(planned_for_schema))}. The plan is "
+                    f"the reviewed artifact; change it, or drop the flag.")
+        elif len(planned_for_schema) == 1:
+            target_schema = next(iter(planned_for_schema))
+        elif len(planned_for_schema) > 1:
+            return fail(
+                f"error: the approved plan puts source schema {schema} in "
+                f"more than one target schema "
+                f"({', '.join(sorted(planned_for_schema))}); this stage "
+                f"creates one schema per run. Pass --target-schema to say "
+                f"which.")
+        else:
+            target_schema = schema
         path = _report_path(reports, schema)
         target = f"{args.target_catalog}.{target_schema}"
         report = _load_report(path, schema, target)

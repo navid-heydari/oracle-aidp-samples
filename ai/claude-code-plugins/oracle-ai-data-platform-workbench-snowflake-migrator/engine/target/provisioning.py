@@ -108,7 +108,7 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
     import subprocess
 
     from .coords import region_from_ocid
-    from .runner import (_printable, _session_expired,
+    from .runner import (DEFAULT_CLI_TIMEOUT, _printable, _session_expired,
                          expired_session_message, spool_body)
     from .executor import collect_pages, parse_cli_envelope
 
@@ -120,9 +120,12 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
                      "PYTHONNOUSERSITE", "PYTHONSTARTUP",
                      "PYTHONEXECUTABLE", "PYTHONSAFEPATH"):
             env.pop(name, None)
+        # Bounded: a child that never returns used to hold this stage
+        # open indefinitely while a cluster billed (live 2026-09-24).
         return subprocess.run(cmd, capture_output=True, text=True,
                               check=False, encoding="utf-8",
-                              errors="replace", env=env)
+                              errors="replace", env=env,
+                              timeout=DEFAULT_CLI_TIMEOUT)
 
     runner = run_process or _run
 

@@ -650,6 +650,43 @@ on its first colon, which is how the file passed before.
   has no default" — the same false negative the census rule exists to
   prevent, and the quiet kind, because the plan simply omits the warning.
 
+### Fixed — the in-AIDP stage created a name the plan never approved
+
+- Live 2026-09-24, the whole four-job chain on a real cluster. The approved
+  `ddl_plan.json` named
+  `snowmig_coverage_v2.snowmig_coverage_core.customers`; the structure stage
+  created `snowmig_coverage_v2.CORE.CUSTOMERS`.
+- In `--mode ddl-plan` the stage read the column TYPES from the plan and the
+  NAMESPACE from the source schema name — `target_schema = args.target_schema
+  or schema`, with `columns_from_ddl_plan` keyed by `(source_schema, table)`.
+  `target_fqn`, the name the reviewer approved, was never consulted.
+- Three consequences, all observed: what `DDL_PLAN.md` showed is not what
+  exists; `--bronze-schema-style db_schema`, which exists precisely so two
+  same-named schemas from different databases cannot merge, was discarded;
+  and because the copy and reconcile stages derive the target the same way,
+  `MIGRATION_REPORT.md` reported **MIGRATED_VERIFIED** for a namespace nobody
+  approved while the approved tables sat empty elsewhere in the same catalog.
+- The plan now decides the target namespace. The source schema name stands in
+  only where the plan is silent (`ctas` and `manifest` modes, or a table the
+  plan does not carry). A `--target-schema` that contradicts the plan is
+  refused rather than honoured, and a plan targeting a different catalog than
+  the run was given is refused outright — creating its tables somewhere it
+  does not name is the same substitution.
+
+### Fixed — a CLI child that never returned held the run open
+
+- Live 2026-09-24: `provision --execute` hung for **one hour and forty-seven
+  minutes**. A single `oci` child, started two minutes in, never exited. The
+  parent sat in `subprocess.run()` with no timeout, printed nothing, and
+  wrote no result artifact. A Spark cluster billed for all of it. Killing the
+  child by hand let the parent continue immediately, which is how the cause
+  was found.
+- None of the three `subprocess.run()` call sites passed `timeout=`. They all
+  do now, bounded at 900s — generous enough for a real cluster create, finite
+  because the alternative is measured in cluster-hours. A timed-out call
+  raises `CliTimeout` naming the command, and a test reads the sources and
+  fails if any call site ever ships without a timeout again.
+
 ### Fixed — "as visible to role X" was not true when secondary roles were on
 
 - Live 2026-09-23. A session connected as `role=SNOWMIG_LIMITED`, a role

@@ -564,3 +564,74 @@ def test_the_whole_payload_keeps_the_properties_end_to_end():
     assert stmt["description"] == "one row per order"
     assert stmt["expected_columns"][0]["nullable"] is False
     assert stmt["expected_columns"][0]["description"] == "the key"
+
+
+# ------------- the approved plan names the TARGET, not just the types
+#
+# Live 2026-09-24, the whole four-job chain on a real cluster. The approved
+# ddl_plan.json named
+#
+#     snowmig_coverage_v2.snowmig_coverage_core.customers
+#
+# and the structure stage created
+#
+#     snowmig_coverage_v2.CORE.CUSTOMERS
+#
+# In `--mode ddl-plan` the stage takes the COLUMN TYPES from the plan and
+# the NAMESPACE from the source schema name: `target_schema = args.
+# target_schema or schema`, while `columns_from_ddl_plan` keys by
+# `(source_schema, table)` off `source_identifier` -- so `target_fqn`, the
+# name the reviewer approved, is never read.
+#
+# Three consequences, all observed live:
+#   * what DDL_PLAN.md showed is not what exists;
+#   * `--bronze-schema-style db_schema` exists precisely to stop two
+#     same-named schemas from different databases merging, and this
+#     discards it;
+#   * the catalog ended up holding BOTH -- `snowmig_coverage_core.customers`
+#     empty from the control-plane deploy, and `core.customers` with 500
+#     rows from the notebook -- and copy and reconcile inherited the wrong
+#     namespace, so MIGRATION_REPORT.md reported MIGRATED_VERIFIED about a
+#     namespace nobody approved.
+
+def _ns_plan(source_ident="DB.SALES.ORDERS", target_fqn="lake.db_sales.orders",
+             object_type="TABLE"):
+    return {"statements": [{
+        "source_identifier": source_ident,
+        "target_fqn": target_fqn,
+        "object_type": object_type,
+        "sql": "CREATE TABLE ...",
+        "expected_columns": [{"name": "A", "type": "STRING"}],
+    }]}
+
+
+def test_the_plan_yields_the_target_name_it_carries(structure):
+    targets = structure.targets_from_ddl_plan(_ns_plan())
+    assert targets[("SALES", "ORDERS")] == ("db_sales", "orders")
+
+
+def test_a_plan_without_a_target_fqn_yields_nothing_rather_than_a_guess(
+        structure):
+    plan = _ns_plan()
+    del plan["statements"][0]["target_fqn"]
+    assert structure.targets_from_ddl_plan(plan) == {}
+
+
+def test_views_are_not_in_the_target_map(structure):
+    assert structure.targets_from_ddl_plan(
+        _ns_plan(object_type="VIEW")) == {}
+
+
+def test_a_two_part_target_is_ignored_rather_than_misread(structure):
+    assert structure.targets_from_ddl_plan(
+        _ns_plan(target_fqn="db_sales.orders")) == {}
+
+
+def test_the_plans_catalog_is_carried_too(structure):
+    """A plan that targets another catalog is the operator's mistake to see,
+    not something to silently rewrite into the one they passed."""
+    targets = structure.targets_from_ddl_plan(
+        _ns_plan(target_fqn="other_lake.db_sales.orders"))
+    assert ("SALES", "ORDERS") in targets
+    assert structure.catalogs_from_ddl_plan(_ns_plan(
+        target_fqn="other_lake.db_sales.orders")) == {"other_lake"}
