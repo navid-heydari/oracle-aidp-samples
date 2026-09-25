@@ -211,6 +211,9 @@ def _columns(run_sql, db: str, schema: str, notes: list[str]
             f"select table_schema, table_name, ordinal_position, column_name, "
             f"data_type, is_nullable, numeric_precision, numeric_scale, "
             f"character_maximum_length, datetime_precision, comment, "
+            # A collated text column maps to a bytewise STRING; the
+            # collation is what says its comparisons change.
+            f"collation_name, "
             # A column's DEFAULT and its identity sequence are the two facts
             # that make a post-cutover INSERT behave differently: an insert
             # Snowflake would have populated arrives NULL, or fails. They are
@@ -286,7 +289,8 @@ def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
                      char_length=c.get("CHARACTER_MAXIMUM_LENGTH"),
                      semi_structured=semi_structured,
                      geospatial=geospatial,
-                     timestamp_ntz=timestamp_ntz)
+                     timestamp_ntz=timestamp_ntz,
+                     collation=c.get("COLLATION_NAME"))
         if m.blocked:
             blocked_reasons.append(f'{c["COLUMN_NAME"]}: {m.reason}')
         if m.warning:

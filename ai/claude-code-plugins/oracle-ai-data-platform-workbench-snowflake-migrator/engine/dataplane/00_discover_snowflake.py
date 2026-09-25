@@ -67,7 +67,8 @@ _COLUMNS_SQL = (
     "select TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, "
     "DATA_TYPE, IS_NULLABLE, NUMERIC_PRECISION, NUMERIC_SCALE, "
     "CHARACTER_MAXIMUM_LENGTH, COLUMN_DEFAULT, IDENTITY_START, "
-    "IDENTITY_INCREMENT, COMMENT from INFORMATION_SCHEMA.COLUMNS{where} "
+    "IDENTITY_INCREMENT, COMMENT, COLLATION_NAME "
+    "from INFORMATION_SCHEMA.COLUMNS{where} "
     "order by TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION")
 
 
@@ -187,7 +188,10 @@ def discover_via_connector(source: SnowflakeSource, *,
              "numeric_precision": _plain(col.get("NUMERIC_PRECISION")),
              "numeric_scale": _plain(col.get("NUMERIC_SCALE")),
              "character_maximum_length": _plain(
-                 col.get("CHARACTER_MAXIMUM_LENGTH"))})
+                 col.get("CHARACTER_MAXIMUM_LENGTH")),
+             # A collated text column compares differently once it is a
+             # Delta STRING; the engine's mapper warns on it.
+             "collation": _plain(col.get("COLLATION_NAME"))})
 
     schemas: dict[str, dict] = {}
     for rel in tables:

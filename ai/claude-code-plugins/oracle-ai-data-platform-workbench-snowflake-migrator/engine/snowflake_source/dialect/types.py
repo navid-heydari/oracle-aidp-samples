@@ -86,11 +86,41 @@ _GEOSPATIAL_AS_STRING = (
 _INTEGER_ALIASES = {"INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "BYTEINT"}
 
 
+def _collation_warning(collation: str) -> str:
+    """A collated column keeps its text and loses its comparison rules.
+
+    Delta compares STRING bytewise. `COLLATE 'en-ci'` made 'abc' = 'ABC' true
+    in Snowflake; on the target it is false, and every join, GROUP BY,
+    DISTINCT, ORDER BY and uniqueness check on the column moves with it --
+    while row-count reconciliation still passes. The value is not damaged,
+    so this warns rather than blocks.
+    """
+    return (f"collation '{collation}' does not travel: Delta compares STRING "
+            f"bytewise, so comparisons, sorting and uniqueness on this column "
+            f"become binary (case- and accent-sensitive) on the target -- "
+            f"equality, joins, GROUP BY / DISTINCT and ORDER BY can change "
+            f"their results")
+
+
+def _join_warnings(*warnings: str | None) -> str | None:
+    """TypeMapping carries one warning; two facts about a column are both
+    kept rather than the second overwriting the first."""
+    kept = [w for w in warnings if w]
+    return "; ".join(kept) if kept else None
+
+
 def map_type(data_type: str, *, precision: int | None = None,
              scale: int | None = None, char_length: int | None = None,
              semi_structured: str = "block",
              geospatial: str = "block",
-             timestamp_ntz: str = "preserve") -> TypeMapping:
+             timestamp_ntz: str = "preserve",
+             collation: str | None = None) -> TypeMapping:
+    """One column's target type and what the mapping costs.
+
+    `collation` is INFORMATION_SCHEMA.COLUMNS.COLLATION_NAME. It only means
+    anything on a text column; NULL or empty is the default bytewise
+    comparison, which Delta shares.
+    """
     if semi_structured not in SEMI_STRUCTURED_MODES:
         raise ValueError(
             f"unknown semi_structured mode {semi_structured!r}; expected one of "
@@ -163,6 +193,9 @@ def map_type(data_type: str, *, precision: int | None = None,
         if _DIRECT[key] == "STRING" and char_length is not None:
             warning = (f"declared length {char_length} is not enforced by Delta; "
                        "recorded only")
+        if _DIRECT[key] == "STRING" and collation and str(collation).strip():
+            warning = _join_warnings(
+                warning, _collation_warning(str(collation).strip()))
         return TypeMapping(_DIRECT[key], warning=warning)
 
     return TypeMapping(None, True, f"unmapped Snowflake type: {key}")
