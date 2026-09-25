@@ -319,8 +319,16 @@ def build_create_table(record: dict, target_fqn: str) -> RewriteResult:
                      key=lambda c: c.get("ORDINAL_POSITION") or 0)
     if not columns:
         res.blocked = True
-        res.blocked_reason = ("table has no columns visible to this role "
-                              "(Delta-shared or insufficient privilege)")
+        # A failed INFORMATION_SCHEMA.COLUMNS read leaves the list empty too,
+        # and guessing "privilege" for it sends the operator after grants
+        # when the read timed out. The extractor records the failure; say it.
+        error = record.get("columns_read_error")
+        res.blocked_reason = (
+            f"the column list could not be read from the source "
+            f"(INFORMATION_SCHEMA.COLUMNS failed: {error}), so no structure "
+            f"can be emitted" if error else
+            "table has no columns visible to this role "
+            "(Delta-shared or insufficient privilege)")
         return res
 
     unmapped = [c["COLUMN_NAME"] + ": " + str(c.get("DATA_TYPE"))
