@@ -482,7 +482,13 @@ def _rewrite_view_refs(body: str, name_map: dict[str, str],
     boundaries stop `DB.S.ORDERS` from hitting `DB.S.ORDERS_ARCHIVE`, and a hit
     is blanked before shorter names are tried so nothing matches inside it.
     Returns the rewritten body and the `src -> tgt` pairs that actually hit.
+
+    A bare name after FROM or JOIN that is one of the view's own CTEs, where
+    that CTE is in scope, is the CTE and is left alone: rewriting `from
+    ORDERS` to the base table when ORDERS is `with ORDERS as (... where
+    STATUS = 'OPEN')` silently dropped the CTE's filter.
     """
+    ctes = lexer.cte_scopes(body)
     mask = "".join(
         "".join("\n" if c == "\n" else " " for c in text)
         if kind in ("string", "comment") else text
@@ -509,7 +515,9 @@ def _rewrite_view_refs(body: str, name_map: dict[str, str],
         else:
             pattern = r'(?<![\w`"$.])' + ref
         hits = [(m.span(), (m.group(1) + m.group(2)) if after_keyword else "")
-                for m in re.finditer(pattern, mask, re.IGNORECASE)]
+                for m in re.finditer(pattern, mask, re.IGNORECASE)
+                if not (after_keyword and "." not in src
+                        and _is_cte(body, m.end(2), m.end(), ctes))]
         if not hits:
             continue
         # A target part the Spark parser would not read as one word (a hyphen
@@ -527,8 +535,26 @@ def _rewrite_view_refs(body: str, name_map: dict[str, str],
     return out, changed
 
 
+def _is_cte(sql: str, start: int, end: int,
+            ctes: list[tuple[str, int, int]]) -> bool:
+    """Whether the bare name at sql[start:end] is a CTE visible there."""
+    text = sql[start:end]
+    key = _cte_key(text)
+    return any(name == key and lo <= start < hi for name, lo, hi in ctes)
+
+
+def _cte_key(text: str) -> str:
+    # Compared as lexer.cte_scopes records it: unquoted folds to upper case,
+    # a quoted name (double quote or, after translation, backtick) is exact.
+    if text[:1] in ('"', "`"):
+        return text[1:-1].replace(text[0] * 2, text[0])
+    return text.upper()
+
+
 def _unqualified_refs(sql: str) -> set[str]:
-    """Bare names still sitting where only a table can go."""
+    """Bare names still sitting where only a table can go -- other than the
+    view's own CTE names, which the target resolves from the WITH clause."""
+    ctes = lexer.cte_scopes(sql)
     mask = "".join(
         "".join("\n" if c == "\n" else " " for c in text)
         if kind in ("string", "comment") else text
@@ -537,6 +563,8 @@ def _unqualified_refs(sql: str) -> set[str]:
     for m in re.finditer(_TABLE_POSITION + r'([\w$]+)(?![\w`"$.])', mask):
         name = m.group(3)
         if name.lower() in ("lateral", "select", "unnest", "values", "table"):
+            continue
+        if _is_cte(sql, m.start(3), m.end(3), ctes):
             continue
         out.add(name)
     return out

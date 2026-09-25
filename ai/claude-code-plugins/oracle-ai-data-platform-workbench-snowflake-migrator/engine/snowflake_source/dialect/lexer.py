@@ -28,7 +28,7 @@ import re
 __all__ = ["UnterminatedLiteral", "SEGMENT_KINDS", "segments", "code_only",
            "strip_comments", "split_statements", "leading_verb", "quote_ident",
            "qualify", "like_literal", "find_code", "sub_code",
-           "cte_body_verb"]
+           "cte_body_verb", "cte_scopes"]
 
 SEGMENT_KINDS = ("code", "string", "ident", "comment")
 
@@ -379,3 +379,96 @@ def cte_body_verb(statement: str) -> str | None:
                 else:
                     return None
     return None
+
+
+def _tokens(sql: str) -> list[tuple[str, str, int, int]]:
+    """(kind, text, start, end) for each word, quoted identifier, paren and
+    comma in `sql`; kind is "word", "ident", "(", ")", "," or "other".
+    Comments are dropped; a literal is one "other" token."""
+    out: list[tuple[str, str, int, int]] = []
+    pos = 0
+    for kind, text in segments(sql):
+        if kind == "ident":
+            out.append(("ident", text, pos, pos + len(text)))
+        elif kind == "string":
+            out.append(("other", text, pos, pos + len(text)))
+        elif kind == "code":
+            for m in re.finditer(r"[A-Za-z_][A-Za-z_0-9$]*|[(),]|\S", text):
+                tok = m.group(0)
+                k = ("word" if _WORD.fullmatch(tok)
+                     else tok if tok in "()," else "other")
+                out.append((k, tok, pos + m.start(), pos + m.end()))
+        pos += len(text)
+    return out
+
+
+def _name_key(kind: str, text: str) -> str:
+    """How Snowflake compares a name: unquoted folds to upper case, quoted
+    (`"x"`, or Spark's backticks after translation) is exact."""
+    if kind == "ident":
+        quote = text[0]
+        return text[1:-1].replace(quote * 2, quote)
+    return text.upper()
+
+
+def cte_scopes(sql: str) -> list[tuple[str, int, int]]:
+    """(name, scope_start, scope_end) for every CTE `sql` declares.
+
+    A CTE name shadows a table of the same name, so a rewriter that
+    qualifies bare table names has to know where each CTE is visible: from
+    the end of its own body to the end of the enclosing parenthesis (or of
+    the statement). A non-recursive CTE's body does not see its own name --
+    `with ORDERS as (select * from ORDERS ...)` reads the table there -- and
+    a later CTE sees an earlier one. Under RECURSIVE the whole list is in
+    scope from the WITH on. `name` is compared as Snowflake does (see
+    _name_key). A WITH that is not followed by a well-formed CTE list
+    (`timestamp with time zone`) declares nothing.
+    """
+    toks = _tokens(sql)
+    match: dict[int, int] = {}          # open paren -> its closing paren
+    parent: list[int | None] = []       # innermost open paren around a token
+    stack: list[int] = []
+    for idx, tok in enumerate(toks):
+        if tok[0] == ")" and stack:
+            match[stack.pop()] = idx
+        parent.append(stack[-1] if stack else None)
+        if tok[0] == "(":
+            stack.append(idx)
+
+    def is_word(j: int, word: str | None = None) -> bool:
+        return (j < len(toks) and toks[j][0] == "word"
+                and (word is None or toks[j][1].upper() == word))
+
+    found: list[tuple[str, int, int]] = []
+    for i, tok in enumerate(toks):
+        if not is_word(i, "WITH"):
+            continue
+        p = parent[i]
+        end = toks[match[p]][2] if p is not None and p in match else len(sql)
+        j = i + 1
+        recursive = is_word(j, "RECURSIVE")
+        if recursive:
+            j += 1
+        declared: list[tuple[str, int, int]] = []
+        while j < len(toks) and toks[j][0] in ("word", "ident"):
+            key = _name_key(toks[j][0], toks[j][1])
+            j += 1
+            if j < len(toks) and toks[j][0] == "(":      # column list
+                if j not in match:
+                    break
+                j = match[j] + 1
+            if not is_word(j, "AS"):
+                break
+            j += 1
+            if j >= len(toks) or toks[j][0] != "(" or j not in match:
+                break
+            close = match[j]
+            start = tok[2] if recursive else toks[close][3]
+            declared.append((key, start, end))
+            j = close + 1
+            if j < len(toks) and toks[j][0] == ",":
+                j += 1
+                continue
+            break
+        found.extend(declared)
+    return found
