@@ -316,7 +316,20 @@ def render_planned_objects(plan: dict) -> str:
     if plan.get("restrictions_applied"):
         out += ["## Restrictions in force", "",
                 "Applied at your request, before planning:", ""]
-        out += [f"- `{k}`: {v}" for k, v in plan["restrictions_applied"].items()]
+        # With the per-entry counts (an older plan.json has none), an entry
+        # that matched nothing is flagged: it was listed here as in force
+        # while the object it meant was planned, deployed and copied.
+        matches = plan.get("restriction_matches") or {}
+        for key, value in plan["restrictions_applied"].items():
+            counts = matches.get(key)
+            if counts is None or not isinstance(value, list):
+                out.append(f"- `{key}`: {value}")
+                continue
+            out.append(f"- `{key}`: " + ", ".join(
+                f"`{e}` (**matched nothing -- check the spelling**)"
+                if not counts.get(e) else
+                f"`{e}` ({counts[e]} object{'s' if counts[e] != 1 else ''})"
+                for e in value))
         out.append("")
 
     out += ["## Target structure to exist first", ""]

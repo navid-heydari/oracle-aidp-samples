@@ -42,7 +42,7 @@ from target.ddl import (
 from .medallion import (TARGET_KEY_MAX, TARGET_NAME_RULE_TEXT, bronze_target,
                         detect_target_collisions, layer_jobs,
                         target_key_overage, unacceptable_target_names)
-from .restrictions import apply_restrictions
+from .restrictions import apply_restrictions, restriction_matches
 from .waves import compute_waves
 
 __all__ = ["build_plan", "TargetCollision", "object_kind_block"]
@@ -559,6 +559,9 @@ def build_plan(inventory: dict, dependencies: dict, *,
             loads_that_stop,
             key=lambda x: (x["table"], x["kind"], x["source_identifier"])),
         "restrictions_applied": restrictions or {},
+        # What each list entry matched in this inventory. A zero is a typo
+        # until shown otherwise, and the report says so.
+        "restriction_matches": restriction_matches(records, restrictions),
         "catalogs_to_create": catalogs,
         "schemas_to_create": [list(s) for s in schemas],
         "silver_gold_jobs": layer_jobs(scopes),

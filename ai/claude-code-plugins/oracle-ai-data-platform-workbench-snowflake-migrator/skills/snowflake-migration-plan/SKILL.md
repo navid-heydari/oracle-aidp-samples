@@ -68,6 +68,10 @@ running; do not guess a scope.
 
 `include_*` variants act as allowlists. An unrecognised key is an error, not an
 ignored line — a typo would otherwise apply nothing while appearing to work.
+A well-formed entry can still match nothing: `PLANNED_OBJECTS.md` prints each
+entry's match count and flags a zero as *matched nothing — check the spelling*;
+read those out. Names follow Snowflake's case rule in every list: unquoted
+folds to upper, `"sales_eu"` matches only that exact spelling.
 
 ## Lineage provenance matters — state it
 
