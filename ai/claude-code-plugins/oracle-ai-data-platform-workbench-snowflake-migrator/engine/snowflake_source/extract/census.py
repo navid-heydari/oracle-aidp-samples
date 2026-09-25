@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import collections
 import datetime
+import re
 import json
 from typing import Callable
 
@@ -244,6 +245,58 @@ def _refine_function(row: dict) -> dict | None:
     return None
 
 
+# The statements that put rows in a table, matched over CODE only (literals,
+# quoted identifiers and comments blanked), then the target is parsed from the
+# raw text at the same offset so a quoted name keeps its case. COPY INTO
+# @stage and COPY INTO 's3://...' are unloads: no identifier follows, so they
+# are not writes. What a CALLed procedure writes is not on the row at all.
+_WRITE_VERB = re.compile(
+    r"\b(?:insert\s+(?:overwrite\s+)?into|merge\s+into|copy\s+into"
+    r"|delete\s+from|update|truncate(?:\s+table)?(?:\s+if\s+exists)?"
+    r"|create\s+(?:or\s+replace\s+)?(?:(?:local|global)\s+)?"
+    r"(?:transient\s+|temporary\s+|temp\s+|volatile\s+)?table"
+    r"(?:\s+if\s+not\s+exists)?)(?=\s)", re.IGNORECASE)
+_IDENT_PART = r'(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)'
+# The gap after the verb is skipped in the RAW text: the mask blanks a quoted
+# name or a literal to spaces, and skipping it there runs straight across it.
+_TARGET = re.compile(rf"\s+({_IDENT_PART}(?:\s*\.\s*{_IDENT_PART}){{0,2}})")
+_PART = re.compile(_IDENT_PART)
+# A word in target position that is not a table: MERGE's `THEN UPDATE SET`,
+# and `IDENTIFIER($var)`, whose table is a runtime value.
+_NOT_A_TABLE = {"SET", "IDENTIFIER"}
+
+
+def _part(text: str) -> str:
+    if text.startswith('"'):
+        return text[1:-1].replace('""', '"')
+    return text.upper()
+
+
+def written_tables(body: str, db: str, schema: str) -> list[str]:
+    """Fully-qualified tables a pipe or task body writes, in first-seen order.
+
+    An unqualified name resolves against the object's OWN database and schema
+    -- live-verified 2026-09-25: a task run from a session with no current
+    database wrote the table in the task's schema. Empty means none could be
+    read from the body, not that the body writes nothing.
+    """
+    body = body or ""
+    mask = lexer.code_only(body)
+    found: list[str] = []
+    for m in _WRITE_VERB.finditer(mask):
+        target = _TARGET.match(body, m.end())
+        if not target:
+            continue
+        parts = [_part(p) for p in _PART.findall(target.group(1))]
+        if len(parts) == 1 and not target.group(1).startswith('"') \
+                and parts[0] in _NOT_A_TABLE:
+            continue
+        full = ".".join([db, schema][:3 - len(parts)] + parts)
+        if full not in found:
+            found.append(full)
+    return found
+
+
 # Each kind: where to read it, how to name it, and why it cannot migrate here.
 KINDS: tuple[dict, ...] = (
     {"kind": "PROCEDURE", "source": "information_schema",
@@ -283,10 +336,15 @@ KINDS: tuple[dict, ...] = (
     {"kind": "PIPE", "source": "information_schema",
      "relation": "pipes", "name_col": "PIPE_NAME",
      "schema_col": "PIPE_SCHEMA",
+     # DEFINITION is `COPY INTO <table> FROM @stage`: the table it loads.
+     "extra_cols": ("DEFINITION",), "writes_col": "DEFINITION",
+     "degraded_note": "the pipe definitions were not readable, so the "
+                      "table each pipe loads is not named",
      "reason": "Snowpipe is continuous ingestion. It has no AIDP object; it "
                "becomes a streaming job or a scheduled load, which is an "
                "architecture decision (see the data-movement options)."},
     {"kind": "TASK", "source": "show", "relation": "tasks",
+     "writes_col": "definition",
      "reason": "a task is a scheduler. AIDP Jobs are the equivalent, but the "
                "schedule, dependencies and body all have to be re-expressed. "
                "**A task that populates a migrated table means that table "
@@ -567,9 +625,10 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
                                denied=denied, answered=answered,
                                secondary=secondary)
         if readable and degraded:
-            kinds[kind]["note"] += (
-                f"; the detail columns were not readable, so every row is "
-                f"reported as a plain {kind.lower().replace('_', ' ')}")
+            kinds[kind]["note"] += "; " + (
+                spec.get("degraded_note")
+                or f"the detail columns were not readable, so every row is "
+                   f"reported as a plain {kind.lower().replace('_', ' ')}")
         for sub in sub_kinds:
             # A sub-kind exists only while the deciding column can be read.
             # Without it these rows are still counted -- under the parent kind
@@ -666,9 +725,19 @@ def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
             f'{entry["reason"]} Handler language {language!r} was not '
             f"recognised, so no path is proposed.")
 
+    # The table a pipe or task fills. Named, so the plan can say which
+    # migrating table stops being populated at cutover; absent, not empty,
+    # when the body names none this can read.
+    if spec.get("writes_col") and db is not None and row.get(spec["writes_col"]):
+        writes = written_tables(str(row[spec["writes_col"]]), db, str(schema))
+        if writes:
+            entry["writes"] = writes
+            entry["detail"] = (f'{entry["detail"]} '
+                               f'writes={",".join(writes)}').strip()
+
     if include_definitions:
         for key in ("PROCEDURE_DEFINITION", "FUNCTION_DEFINITION", "text",
-                    "definition"):
+                    "definition", "DEFINITION"):
             if row.get(key):
                 entry["definition"] = str(row[key])
                 break

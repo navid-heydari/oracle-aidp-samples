@@ -8,6 +8,7 @@ from __future__ import annotations
 import collections
 
 from snowflake_source.extract.census import secondary_roles_active
+from plan.build import object_kind_block
 from plan.data_movement import MAINTENANCE_TRAPS, architecture_decision
 from plan.smoke import smoke_verdict
 from plan.status import assess_risk, migration_status
@@ -163,7 +164,14 @@ def render_inventory(inv: dict) -> str:
             f'| {_row_cell(r)} '
             f'| {_bytes((r.get("source_metadata") or {}).get("bytes"))} '
             f'| {len(r.get("columns") or [])} | {r.get("identifier_case_form")} '
-            f'| {r.get("compatibility_status")} |')
+            f'| {_compatibility_cell(r)} |')
+    kind_blocked = [r for r in records
+                    if r.get("compatibility_status") != "blocked"
+                    and object_kind_block(r)]
+    if kind_blocked:
+        out += ["", "`blocked (<kind>)` -- the column types map, but the "
+                "object kind has no plain Delta equivalent, so the plan "
+                "refuses it; PLANNED_OBJECTS.md says what to do instead."]
 
     # Every blank in the Rows column carries its reason. "not counted" and
     # ERROR are different facts, and neither is a zero.
@@ -272,6 +280,22 @@ _CATEGORY_TITLES = {
 }
 
 
+def _compatibility_cell(rec: dict) -> str:
+    """What the planner will do with the object, not only its column types.
+
+    `compatibility_status` is the type mapping. A dynamic table whose types
+    all map read `supported` here while the plan, from the same inventory,
+    refused it. The kind comes from the planner's own table.
+    """
+    status = rec.get("compatibility_status")
+    if status == "blocked":
+        return "blocked"
+    block = object_kind_block(rec)
+    if block:
+        return f"blocked ({block[0]})"
+    return str(status)
+
+
 def render_planned_objects(plan: dict) -> str:
     s = plan.get("summary", {})
     out = ["# Objects planned to move", "",
@@ -345,6 +369,18 @@ def render_planned_objects(plan: dict) -> str:
                 "meant to persist.", ""]
         out += [f'- `{w["source_identifier"]}` ({w.get("kind")}) — {w["warning"]}'
                 for w in kinds]
+        out.append("")
+
+    # Migrating tables that a pipe or task keeps filling in Snowflake. An
+    # older plan.json carries no list and renders unchanged.
+    loads = plan.get("loads_that_stop") or []
+    if loads:
+        out += ["## Planned, but loaded by something that does not move", "",
+                "The structure and today's rows migrate. The load does not: "
+                "after cutover these tables stop receiving rows until each "
+                "load is rebuilt on AIDP.", ""]
+        out += [f'- `{x["table"]}` <- {x["kind"]} `{x["source_identifier"]}`'
+                for x in loads]
         out.append("")
 
     cannot = plan.get("cannot_migrate") or []

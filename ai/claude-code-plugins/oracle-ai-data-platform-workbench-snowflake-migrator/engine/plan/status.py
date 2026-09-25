@@ -100,6 +100,12 @@ def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
         level = _raise(level, "MEDIUM")
         notes.append(f"{len(other)} column warning(s) recorded")
 
+    for load_warning in obj.get("load_warnings") or []:
+        # A pipe or task that fills this table stays behind. Named, not
+        # counted: the note has to say which load to rebuild.
+        level = _raise(level, "MEDIUM")
+        notes.append(load_warning)
+
     kind_warning = obj.get("kind_warning")
     if kind_warning:
         # A TRANSIENT/TEMPORARY table planned as a permanent Delta table. The

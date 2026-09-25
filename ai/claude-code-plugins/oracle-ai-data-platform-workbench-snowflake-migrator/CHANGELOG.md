@@ -10,6 +10,44 @@ first release.
 
 ## [Unreleased]
 
+### Fixed — INVENTORY.md said `supported` for objects the plan refuses
+
+Live 2026-09-25: a dynamic table read `TABLE ... supported` in INVENTORY.md
+while PLANNED_OBJECTS.md, from the same inventory, refused it as
+`unsupported_object`. `compatibility_status` only describes the column types;
+the object-kind refusal lived in the planner and never reached the report most
+readers open first. The same held for secure and materialized views.
+
+- `plan.build.object_kind_block(rec)` is the one table of kind refusals (five
+  SHOW TABLES flags, two SHOW VIEWS flags), read by both the planner and
+  `render_inventory`. The Compatibility cell now reads `blocked (dynamic
+  table)`, `blocked (secure view)` and so on, with one line under the table
+  saying what that means. A type block still reads `blocked`.
+- A test asserts, per flag, that the inventory cell and the plan agree.
+
+### Added — a pipe or task that loads a migrating table names that table
+
+Live 2026-09-25: the census listed a pipe and a task that both load
+`STAGING_EVENTS`, the plan listed `STAGING_EVENTS` as migrating, and nothing
+linked them -- though the census TASK verdict says such a table stops being
+populated at cutover. The target was already on the rows being read: a pipe's
+`DEFINITION` is `COPY INTO <table>`, a task's body is on its SHOW TASKS row.
+
+- The census reads what each pipe and task body writes (INSERT, MERGE, COPY
+  INTO a table, UPDATE, DELETE, TRUNCATE, CREATE TABLE), over code only, so a
+  write inside a string or comment is not one. The detail column says
+  `writes=<table>`. An unqualified name resolves against the object's own
+  database and schema -- live-verified by running the task from a session
+  with no current database. `COPY INTO @stage` is an unload, a `CALL` names
+  no table, `IDENTIFIER($var)` is a runtime value: none is claimed, and
+  nothing is printed rather than an empty list.
+- If `INFORMATION_SCHEMA.PIPES.DEFINITION` cannot be read the pipes are still
+  counted, and the kind's note says the loaded tables are not named.
+- The plan attaches a load warning to every migrating table so fed (risk
+  MEDIUM, the note names the load), records `loads_that_stop`, and
+  PLANNED_OBJECTS.md lists them under "Planned, but loaded by something that
+  does not move".
+
 ### Fixed — the census explained one verdict per kind, hiding the sharper one
 
 Live 2026-09-25, the first estate holding both an internal and an external
