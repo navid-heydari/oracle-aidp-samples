@@ -10,6 +10,30 @@ first release.
 
 ## [Unreleased]
 
+### Fixed — reconcile failed every schema-by-schema run until the last schema
+
+- Live 2026-09-25, on AIDP: schema R3 was discovered, structured, copied and
+  verified (CUSTOMERS 10, ORDERS 90, T_CI 2 rows), and reconcile exited 1 with
+  22 objects `TARGET_UNREADABLE`. They were the manifest's other schemas,
+  never created in this target yet: `SHOW TABLES` raised `SCHEMA_NOT_FOUND`,
+  and any exception read as "could not look".
+- A schema the target has not created is now `NOT_MIGRATED` (pending, not a
+  problem), using the same not-found markers the copy reads as absent. A
+  missing schema a report claims was created is still
+  `MISSING_DESPITE_REPORT`; any other error is still `TARGET_UNREADABLE`.
+  Re-run live: `MIGRATED_VERIFIED 3, NOT_MIGRATED 12`, exit 0.
+
+### Fixed — deploy failed every view that carried a comment
+
+- Live 2026-09-25, on AIDP: the catalog CRUD API refused a view whose query
+  had a comment -- 400, "inline SQL comments are not allowed" -- in any
+  style. The `//` view the translator had correctly rewritten to `--` failed
+  at deploy.
+- The query sent as `viewText` now has its comments removed by the lexer
+  (a `--` inside a literal stays). The reviewed CREATE VIEW keeps them.
+  Re-deployed live: 7 of 7 objects, and AIDP's stored view text shows the
+  CTE kept, the column list applied and the comment gone.
+
 ### Fixed — the in-AIDP discovery wrote none of the column facts it read, nor the table's kind
 
 - 50a79ee added `COLUMN_DEFAULT`, `IDENTITY_*` and `COMMENT` to the discovery query and to nothing else. The manifest's column dict still ended at `character_maximum_length`. Every connector-built manifest planned as "facts unknown": no `R22`/`R23`, no column `COMMENT`, and a re-run could never fix it.
