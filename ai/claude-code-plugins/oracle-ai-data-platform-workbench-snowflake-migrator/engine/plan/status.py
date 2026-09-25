@@ -63,6 +63,15 @@ def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
     if blocked:
         reason = obj.get("reason") or "cannot be migrated"
         return "HIGH", f"Cannot migrate: {reason}"
+    if (obj.get("compatibility_status") == "unassessed"
+            or obj.get("columns_read") == "failed"):
+        # No column facts is not good column facts. Falling through below
+        # rated a table whose column read timed out LOW, "structure clones
+        # cleanly". The planner refuses these (`columns_unread`); this is
+        # the guard for any caller that scores the record itself.
+        error = obj.get("columns_read_error") or "no error text was recorded"
+        return "HIGH", (f"Columns were not read, so nothing was assessed: "
+                        f"{error}.")
 
     notes: list[str] = []
     level = "LOW"

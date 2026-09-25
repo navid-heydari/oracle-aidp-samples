@@ -363,6 +363,22 @@ def build_plan(inventory: dict, dependencies: dict, *,
                           + "; ".join(rec.get("blocked_reasons") or ["unspecified"])})
             continue
 
+        if rec.get("compatibility_status") == "unassessed":
+            # The schema's INFORMATION_SCHEMA.COLUMNS read failed, so the
+            # empty column list is a missing fact, not a table with nothing
+            # to map. Planned, it read `supported` / LOW / "clones cleanly"
+            # everywhere but DDL_PLAN.md, which blamed a privilege for what
+            # was a timeout. The reason is the error the read got.
+            error = rec.get("columns_read_error") or "no error text was recorded"
+            cannot.append({
+                "source_identifier": ident, "object_type": rec.get("object_type"),
+                "category": "columns_unread",
+                "reason": ("its columns could not be read, so no type was "
+                           "assessed and no DDL can be generated: the "
+                           f"INFORMATION_SCHEMA.COLUMNS read failed ({error}). "
+                           "Re-run `assess` once that read succeeds.")})
+            continue
+
         verdict = _view_verdict if rec.get("object_type") == "VIEW" else _table_verdict
         ok, category, reason = verdict(rec)
         if not ok:

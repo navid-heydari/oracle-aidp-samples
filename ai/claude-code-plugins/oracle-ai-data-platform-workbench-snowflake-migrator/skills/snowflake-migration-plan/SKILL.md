@@ -47,6 +47,7 @@ Categories:
 | `unsupported_object` | Secure view, materialized view; dynamic, external, Iceberg, event or hybrid table (`SHOW TABLES` flags) — see also `CENSUS.md` |
 | `dependency_not_migrated` | Depends on an object that is not migrating (a blocked or excluded base table or view); the reason names it |
 | `no_definition` / `unparseable_sql` | The view SQL could not be read or parsed |
+| `columns_unread` | The schema's `INFORMATION_SCHEMA.COLUMNS` read failed (the reason quotes the error, e.g. a timeout), so no column was assessed. Not a privilege verdict and not an empty table: fix the read and re-run `assess` |
 
 ## Restrictions — ask for them, do not invent them
 

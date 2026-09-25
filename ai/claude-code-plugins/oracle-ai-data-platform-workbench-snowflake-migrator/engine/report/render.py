@@ -277,6 +277,7 @@ _CATEGORY_TITLES = {
     "dependency_not_migrated": "Depends on an object that is not migrating",
     "no_definition": "Definition could not be read",
     "unparseable_sql": "SQL could not be parsed",
+    "columns_unread": "Columns could not be read",
 }
 
 
@@ -290,6 +291,10 @@ def _compatibility_cell(rec: dict) -> str:
     status = rec.get("compatibility_status")
     if status == "blocked":
         return "blocked"
+    if status == "unassessed":
+        # The column read failed: Cols 0 here is a missing fact, and the
+        # plan refuses it under `columns_unread`.
+        return "not assessed (columns unread)"
     block = object_kind_block(rec)
     if block:
         return f"blocked ({block[0]})"
