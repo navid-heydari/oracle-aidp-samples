@@ -1039,27 +1039,35 @@ def cmd_run(args) -> int:
         # nothing is worse than one that is missing: it reads as applied.
         # Only a name some stage declares is offered as a --stage-param:
         # provision refuses any other, so suggesting it would send the
-        # operator to a second refusal.
-        from target.stage_notebooks import declared_stage_params
+        # operator to a second refusal. For a job that is one of the stages
+        # the name is qualified with that stage: an unqualified name goes to
+        # every stage declaring it, and `mode` means different things to 01
+        # and 02, so an unqualified `mode` 01 cannot take is refused in turn.
+        from target.stage_notebooks import STAGES, declared_stage_params
         head = (
             "--param does not reach a notebook stage: AIDP job parameters "
             "arrive as neither argv nor environment, so this run would "
             "ignore " + ", ".join(sorted(parameters)) + " and execute "
             "whatever the notebook's PARAMS cell already holds.\n")
-        declared = declared_stage_params()
+        stage = next((s for s in STAGES if s.job == args.job), None)
+        declared = (list(stage.params) if stage
+                    else sorted(declared_stage_params()))
+        prefix = f"{stage.key}." if stage else ""
         known = sorted(n for n in parameters if n in declared)
         unknown = sorted(n for n in parameters if n not in declared)
         route = (
             "  * re-run `provision --execute --reuse-existing "
             "--refresh-notebooks "
-            + " ".join(f"--stage-param {name}=<value>" for name in known)
+            + " ".join(f"--stage-param {prefix}{name}=<value>"
+                       for name in known)
             + "` -- it rewrites each stage notebook's PARAMS cell and "
             "uploads it (console edits to that cell are lost), or\n"
             if known else "")
         undeclared = (
-            "No stage notebook declares " + ", ".join(unknown)
-            + ", so no route sets it. Declared names: "
-            + ", ".join(sorted(declared)) + ".\n" if unknown else "")
+            (f"{stage.notebook_name} does not declare " if stage
+             else "No stage notebook declares ")
+            + ", ".join(unknown) + ", so no route sets it. Declared names: "
+            + ", ".join(declared) + ".\n" if unknown else "")
         raise MissingTarget(
             head + undeclared
             + "Set stage parameters where they are actually read:\n"
@@ -1776,7 +1784,8 @@ def cmd_provision(args) -> int:
             raise MissingTarget(
                 f"--stage-param {pair!r} is not NAME=VALUE. The name is a "
                 f"stage parameter as it appears in the notebook's PARAMS "
-                f"cell, for example schema=SALES or mode=overwrite.")
+                f"cell, for example schema=SALES, or with a stage prefix "
+                f"to reach that stage only, copy_schema.mode=overwrite.")
         name, value = pair.split("=", 1)
         stage_params[name.strip()] = value.strip()
 
@@ -2211,7 +2220,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "parameter has to be IN the notebook, and this "
                          "writes it there. NAME is the stage flag without "
                          "`--` (schema, tables, mode, dry-run, counts, ...); "
-                         "a name no stage declares is refused. A switch "
+                         "a name no stage declares is refused. Prefix NAME "
+                         "with a stage (discover, structure, copy_schema, "
+                         "reconcile) to write that stage only, e.g. "
+                         "copy_schema.mode=overwrite: an unqualified value a "
+                         "declaring stage would reject is refused (`mode` is "
+                         "ddl-plan/ctas/manifest in 01 but "
+                         "skip-existing/append/overwrite in 02). A switch "
                          "takes true or false; a list flag (tables, schemas) "
                          "takes a comma-separated value. With "
                          "--reuse-existing it needs --refresh-notebooks, "

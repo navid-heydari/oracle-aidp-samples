@@ -264,7 +264,11 @@ reconcile's `counts`) live in each stage notebook's own PARAMS cell, because
 job parameters never reach a notebook. `--stage-param NAME=VALUE`
 (repeatable; NAME is the stage flag without `--`) writes one there: a name
 no stage declares is refused, a switch takes `true`/`false`, a list flag
-takes `A,B`. With `--reuse-existing` add `--refresh-notebooks`, or the
+takes `A,B`. An unqualified NAME reaches every stage that declares it, so
+its value must suit them all -- `mode` is `ddl-plan`/`ctas`/`manifest` in
+01 but `skip-existing`/`append`/`overwrite` in 02 -- and one that does not
+is refused; `copy_schema.mode=overwrite` (stages: `discover`, `structure`,
+`copy_schema`, `reconcile`) writes that stage only. With `--reuse-existing` add `--refresh-notebooks`, or the
 notebooks already on the workspace are kept and the value is refused rather
 than dropped.
 

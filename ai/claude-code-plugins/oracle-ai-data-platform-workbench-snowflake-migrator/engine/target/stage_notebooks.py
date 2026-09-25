@@ -87,14 +87,19 @@ class StageSpec:
     one flag (`nargs="*"`); `repeated` are flags given once per value
     (`action="append"`). The kinds matter because a value arrives from
     `provision --stage-param` as text: `counts=true` has to become a bare
-    `--counts`, not `--counts true`, which argparse rejects.
+    `--counts`, not `--counts true`, which argparse rejects. `choices` are
+    the argparse choices per flag, recorded because one name can mean
+    different things in different stages: `mode` is ddl-plan/ctas/manifest
+    in 01 and skip-existing/append/overwrite in 02, and a value only one of
+    them accepts would otherwise pass provision and fail on the cluster.
     """
 
     def __init__(self, *, key: str, source: str, job: str, title: str,
                  blurb: str, params: dict[str, object],
                  required: tuple[str, ...] = (),
                  lists: tuple[str, ...] = (),
-                 repeated: tuple[str, ...] = ()):
+                 repeated: tuple[str, ...] = (),
+                 choices: dict[str, tuple[str, ...]] | None = None):
         self.key = key
         self.source = source
         self.job = job
@@ -104,6 +109,7 @@ class StageSpec:
         self.required = required
         self.lists = lists
         self.repeated = repeated
+        self.choices = dict(choices or {})
 
     @property
     def notebook_name(self) -> str:
@@ -114,6 +120,10 @@ class StageSpec:
 # identifies one customer's environment does not belong in a plugin that
 # ships to everyone, so anything site-specific defaults to None and the
 # provisioner fills it in from the run's own coordinates.
+# snowmig_source.SOURCE_MODES, restated: this module assembles the data-plane
+# sources as text and does not import them. The argparse test pins the two.
+_SOURCE_MODES = ("connector", "external-catalog")
+
 STAGES: tuple[StageSpec, ...] = (
     StageSpec(
         key="discover", source="00_discover_snowflake.py",
@@ -133,6 +143,7 @@ STAGES: tuple[StageSpec, ...] = (
                 "schemas": None, "exclude-schemas": None,
                 "reports-dir": None, "force": False},
         lists=("schemas", "exclude-schemas"),
+        choices={"source-mode": _SOURCE_MODES},
     ),
     StageSpec(
         key="structure", source="01_create_structure.py",
@@ -159,6 +170,8 @@ STAGES: tuple[StageSpec, ...] = (
                 "force": False},
         required=("target-catalog",),
         repeated=("schema",),
+        choices={"source-mode": _SOURCE_MODES,
+                 "mode": ("ddl-plan", "ctas", "manifest")},
     ),
     StageSpec(
         key="copy_schema", source="02_copy_schema.py",
@@ -179,6 +192,9 @@ STAGES: tuple[StageSpec, ...] = (
                 "reports-dir": None, "dry-run": False, "force": False},
         required=("target-catalog", "schema"),
         lists=("tables",),
+        choices={"source-mode": _SOURCE_MODES,
+                 "mode": ("skip-existing", "append", "overwrite"),
+                 "verify": ("counts", "counts+sums")},
     ),
     StageSpec(
         key="reconcile", source="03_reconcile.py",
@@ -203,7 +219,8 @@ def _coerce(stage: StageSpec, key: str, value: object) -> object:
     A switch takes true/false and nothing else: `--counts true` is an
     argparse error on the cluster, minutes into a job run, and a value like
     `maybe` is a typo that must not be guessed either way. A list flag
-    takes a comma-separated value. Anything else is passed as written.
+    takes a comma-separated value. A flag with choices takes one of them,
+    for the same reason as the switch. Anything else is passed as written.
     """
     if value is None or isinstance(value, bool):
         return value
@@ -219,8 +236,45 @@ def _coerce(stage: StageSpec, key: str, value: object) -> object:
     if key in stage.lists or key in stage.repeated:
         items = (value if isinstance(value, (list, tuple))
                  else str(value).split(","))
-        return [str(v).strip() for v in items if str(v).strip()]
+        value = [str(v).strip() for v in items if str(v).strip()]
+    allowed = stage.choices.get(key)
+    if allowed is not None:
+        bad = [v for v in (value if isinstance(value, list) else [value])
+               if str(v) not in allowed]
+        if bad:
+            raise ValueError(
+                f"--stage-param {key}={bad[0]!r}: `{key}` of {stage.source} "
+                f"takes one of {', '.join(allowed)}")
     return value
+
+
+def _split_name(name: str) -> tuple[str | None, str]:
+    """`copy_schema.mode` -> ("copy_schema", "mode"); `mode` -> (None, "mode").
+
+    A stage-qualified name is how one value reaches ONE stage: a flag name
+    never contains a dot, a stage key never does either.
+    """
+    stage, dot, flag = name.partition(".")
+    return (stage, flag) if dot else (None, name)
+
+
+def _for_stage(stage: StageSpec, overrides: dict[str, object]
+               ) -> dict[str, object]:
+    """The overrides that reach `stage`: every unqualified name it declares,
+    then `<stage.key>.<name>` on top -- a qualified value wins for its own
+    stage and reaches no other."""
+    out: dict[str, object] = {}
+    qualified: dict[str, object] = {}
+    for name, value in overrides.items():
+        prefix, flag = _split_name(name)
+        if flag not in stage.params:
+            continue
+        if prefix is None:
+            out[flag] = value
+        elif prefix == stage.key:
+            qualified[flag] = value
+    out.update(qualified)
+    return out
 
 
 def declared_stage_params() -> dict[str, list[str]]:
@@ -239,20 +293,79 @@ def check_stage_params(params: dict[str, object]) -> None:
     so `tables=ORDERS dry-run=true mode=overwrite` produced a copy notebook
     carrying only the overwrite. Refusing is the only honest outcome for a
     scope flag: dropping one reads as applied.
+
+    An unqualified name goes to EVERY stage that declares it, so its value
+    has to suit every one of them. `mode=overwrite` does not: 01 declares
+    `mode` too, with other choices, and used to receive `--mode overwrite`
+    and fail argparse when its job ran. `schema=A,B` does not either: two
+    schemas to 01, the literal `A,B` to 02. Such a value is refused with
+    the `<stage>.<name>` form that sends it to the one stage meant.
     """
+    by_key = {s.key: s for s in STAGES}
     declared = declared_stage_params()
-    unknown = sorted(k for k in params if k not in declared)
+    unknown = sorted(k for k in params
+                     if _split_name(k)[0] is None and k not in declared)
     if unknown:
         raise ValueError(
             "--stage-param " + ", ".join(unknown) + ": no stage notebook "
             "declares " + ("that name" if len(unknown) == 1 else "those names")
             + ", so it would reach nothing. Declared names -- "
             + "; ".join(f"{s.notebook_name}: {', '.join(s.params)}"
-                        for s in STAGES))
+                        for s in STAGES)
+            + ". Prefix a name with a stage (" + ", ".join(by_key)
+            + ") to send it to that stage only, e.g. copy_schema.mode.")
+    for name in params:
+        prefix, flag = _split_name(name)
+        if prefix is None:
+            continue
+        stage = by_key.get(prefix)
+        if stage is None:
+            raise ValueError(
+                f"--stage-param {name}: there is no stage `{prefix}`. The "
+                f"stages are " + ", ".join(by_key) + ".")
+        if flag not in stage.params:
+            raise ValueError(
+                f"--stage-param {name}: {stage.source} does not declare "
+                f"`{flag}`, so it would reach nothing. It declares "
+                + ", ".join(stage.params) + ".")
+    for name, value in params.items():
+        if _split_name(name)[0] is not None:
+            continue
+        # The stages this unqualified value actually reaches: a stage given
+        # its own `<stage>.<name>` is not one of them.
+        reached = [s for s in STAGES if name in s.params
+                   and f"{s.key}.{name}" not in params]
+        if len(reached) < 2:
+            continue
+        items = (value if isinstance(value, (list, tuple))
+                 else str(value).split(","))
+        several = len([v for v in items if str(v).strip()]) > 1
+        rejecting, fitting = [], []
+        for stage in reached:
+            try:
+                _coerce(stage, name, value)
+            except ValueError as exc:
+                # The reason only; the name and value lead the message.
+                rejecting.append(str(exc).split(": ", 1)[-1])
+                continue
+            if several and not (name in stage.lists
+                                or name in stage.repeated):
+                rejecting.append(
+                    f"{stage.source} takes ONE `{name}`, so {value!r} "
+                    f"would reach it as that literal text")
+                continue
+            fitting.append(stage)
+        if rejecting:
+            raise ValueError(
+                f"--stage-param {name}={value!r} goes to every stage that "
+                f"declares `{name}` ("
+                + ", ".join(s.source for s in reached) + "), and "
+                + "; ".join(rejecting) + ". Name the stage it is meant for: "
+                + (" or ".join(f"{s.key}.{name}={value}" for s in fitting)
+                   or f"<stage>.{name}=<value>") + ".")
     for stage in STAGES:
-        for key, value in params.items():
-            if key in stage.params:
-                _coerce(stage, key, value)
+        for key, value in _for_stage(stage, params).items():
+            _coerce(stage, key, value)
 
 
 def dataplane_dir() -> pathlib.Path:
@@ -319,13 +432,13 @@ def _params_cell(stage: StageSpec,
         "PARAMS = {",
     ]
     merged = dict(stage.params)
-    for key, value in (overrides or {}).items():
-        # Only parameters the stage actually declares: a flag it does not
-        # accept would make argparse reject the whole run. provision()
-        # refuses an explicit name no stage declares before it gets here
-        # (check_stage_params); what is filtered here is a derived
-        # coordinate that only some other stage takes.
-        if key in merged and value is not None:
+    # Only parameters the stage actually declares: a flag it does not
+    # accept would make argparse reject the whole run. provision() refuses
+    # an explicit name no stage declares before it gets here
+    # (check_stage_params); what is filtered here is a derived coordinate
+    # that only some other stage takes, or `<other stage>.<name>`.
+    for key, value in _for_stage(stage, overrides or {}).items():
+        if value is not None:
             merged[key] = _coerce(stage, key, value)
     for key, value in merged.items():
         note = "  # REQUIRED" if key in stage.required else ""

@@ -430,11 +430,13 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     the result.
 
     `stage_params` are written into the PARAMS cell of every stage that
-    declares the name. They are checked BEFORE anything is called: a name
-    no stage declares, a switch given something other than true/false, or
-    values that would land only on a notebook this run keeps are refused
-    with a ValueError, never dropped -- a scope flag that silently does
-    nothing reads as applied.
+    declares the name, or, as `<stage key>.<name>`, of that stage only.
+    They are checked BEFORE anything is called: a name no stage declares, a
+    switch given something other than true/false, a value outside a flag's
+    choices in any stage it reaches (`mode=overwrite` reaches 01 too, which
+    rejects it), or values that would land only on a notebook this run
+    keeps are refused with a ValueError, never dropped -- a scope flag that
+    silently does nothing reads as applied.
     """
     stage_params = dict(stage_params or {})
     if stage_params:
@@ -1090,7 +1092,8 @@ def render_provision(res: dict) -> str:
         lines += [
             "## Stage parameters (`--stage-param`)", "",
             "Written into the PARAMS cell of every stage notebook that "
-            "declares the name:", ""]
+            "declares the name; a `<stage>.<name>` only into that "
+            "stage's:", ""]
         lines += [f"- `{k}` = `{v}`" for k, v in res["stage_params"].items()]
         lines.append("")
 

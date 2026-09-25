@@ -52,8 +52,12 @@ re-run with `--execute`.
 
    `--stage-param NAME=VALUE` (repeatable) writes a value into the PARAMS
    cell of every stage that declares NAME — the stage flag without `--`,
-   e.g. `schema=SALES`, `tables=ORDERS,LINES`, `dry-run=true`. A name no
-   stage declares is refused, a switch takes `true`/`false`, and with
+   e.g. `schema=SALES`, `tables=ORDERS,LINES`, `dry-run=true`. Prefix it
+   with a stage (`discover`, `structure`, `copy_schema`, `reconcile`) to
+   write that stage only: `copy_schema.mode=overwrite`. An unqualified
+   value a declaring stage would reject is refused — `mode` means
+   different things to 01 and 02 — as is a name no stage declares; a
+   switch takes `true`/`false`, and with
    `--reuse-existing` it needs `--refresh-notebooks`, because a notebook
    already on the workspace is otherwise kept as it is.
 
