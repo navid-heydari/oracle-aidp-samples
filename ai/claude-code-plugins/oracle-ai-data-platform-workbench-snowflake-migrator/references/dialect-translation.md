@@ -13,7 +13,7 @@ the same thing, or it reports what a real implementation needs and leaves the
 input untouched. SQL that "mostly works" returns numbers, and wrong numbers are
 worse than a blocked object.
 
-## Implemented (8)
+## Implemented (9)
 
 | Rule | Snowflake | AIDP / Spark |
 |---|---|---|
@@ -25,6 +25,7 @@ worse than a blocked object.
 | `T06_LISTAGG` | `LISTAGG(x, sep)` | `concat_ws(sep, collect_list(x))`. Refused with `WITHIN GROUP (ORDER BY …)`, because `collect_list` does not guarantee ordering and the semantics would be lost silently |
 | `T07_QUOTED_IDENTIFIER` | `"Order ID"` | `` `Order ID` ``. Spark reads `"..."` as a **string literal** by default, so a quoted column reference carried verbatim returns the constant text on every row. Both forms are exact, case-preserving identifiers, so the rewrite is exact: `""` → `"`, an embedded backtick is doubled, and the case is kept — `"lower"` stays `` `lower` ``. Runs after the construct rules, over the lexer's identifier segments; literals and comments are untouched |
 | `T08_STRING_ESCAPE` | `'O''Brien'` | `'O\'Brien'`. Spark reads a doubled quote as two adjacent literals and concatenates them (`'OBrien'`), so the escape is rewritten to Spark's backslash form. Existing `\'` and `\\` escapes are left alone; the empty literal `''` is untouched; `''''` becomes `'\''`. Runs over the lexer's string segments only |
+| `T21_SLASH_COMMENT` | `// note` | `-- note`. `//` is a Snowflake line comment that Spark does not have, so carried verbatim the rest of the line would be parsed as code. Both are line comments, so the rewrite is exact. Runs over the lexer's comment segments only: `'http://x'` is data, and a `//` inside a `--` or `/* */` comment is already comment text |
 
 ## Declared — recognised, not rewritten (12)
 

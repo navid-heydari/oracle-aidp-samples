@@ -20,6 +20,14 @@ contents are never interpreted, matched against, or split on.
 Scope: this recognises literal boundaries, not grammar. It is not a parser and
 does not validate SQL. Block comments do not nest -- the first `*/` closes,
 which is what every engine we target does in practice.
+
+Line comments open with `--` or `//`. The second is Snowflake's own and was
+missed: in `// don't` the apostrophe opened a literal that never closed, so a
+task body with that comment aborted `assess`, and a view with QUALIFY between
+two such comments had the construct swallowed by a phantom string. Spark has
+no `//` comment and no `//` operator, so reading it as a comment is also
+right on the Spark SQL this plugin emits -- where the translator has already
+rewritten every one to `--` (T21_SLASH_COMMENT) so the target never sees it.
 """
 from __future__ import annotations
 
@@ -93,7 +101,7 @@ def segments(sql: str) -> list[tuple[str, str]]:
         ch = sql[i]
         two = sql[i:i + 2]
 
-        if two == "--":
+        if two in ("--", "//"):
             end = sql.find("\n", i)
             end = n if end == -1 else end
             flush()

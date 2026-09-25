@@ -59,6 +59,7 @@ plan lists only the references that were actually rewritten.
 | `LISTAGG(x, sep)` | **Translated** to `concat_ws(sep, collect_list(x))` (`T06`); `WITHIN GROUP` blocks |
 | `"quoted identifier"` | **Translated** to `` `backticked` `` (`T07`): Spark reads `"..."` as a string literal. Case is kept |
 | `'it''s'` doubled quote in a literal | **Translated** to `'it\'s'` (`T08`): Spark reads `''` as two adjacent literals and concatenates them |
+| `// note` line comment | **Translated** to `-- note` (`T21`): Spark has no `//` comment |
 | `$$...$$` dollar-quoted string | Blocks: Spark has no dollar quoting (`T09`) |
 | `QUALIFY` | Blocks: no Spark equivalent; needs a subquery with `WHERE` on the window result |
 | `LATERAL FLATTEN` / `FLATTEN(` | Blocks: maps to `explode` / `LATERAL VIEW`, but the mapping depends on the VARIANT shape |

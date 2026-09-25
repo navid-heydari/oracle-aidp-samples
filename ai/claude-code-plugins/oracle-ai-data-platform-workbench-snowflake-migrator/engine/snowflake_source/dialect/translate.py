@@ -64,7 +64,7 @@ class TranslationRule:
     # identifier or a literal has to look at the "ident" or "string" segments
     # themselves -- code_only() blanks exactly those, so a code rule can never
     # see a `"` or a `''`.
-    scope: str = "code"              # "code" | "ident" | "string"
+    scope: str = "code"              # "code" | "ident" | "string" | "comment"
 
 
 # --------------------------------------------------------------------------
@@ -320,6 +320,16 @@ def _string_escapes(sql: str) -> tuple[str, str | None]:
     return "".join(parts), None
 
 
+def _slash_comments(sql: str) -> tuple[str, str | None]:
+    # `//` is a Snowflake line comment that Spark does not have: carried
+    # verbatim, the rest of the line is parsed as code on the target. `--` is
+    # the same comment in both dialects, so the rewrite is exact. Only the
+    # lexer's comment segments are touched, so `'http://x'` is data.
+    return "".join(
+        "--" + text[2:] if kind == "comment" and text.startswith("//") else text
+        for kind, text in lexer.segments(sql)), None
+
+
 # --------------------------------------------------------------------------
 # registry
 # --------------------------------------------------------------------------
@@ -365,6 +375,11 @@ RULES: tuple[TranslationRule, ...] = (
         "'it''s' -> 'it\\'s': Spark reads a doubled quote as two adjacent "
         "literals and concatenates them", "implemented",
         r"^'(?:[^'\\]|\\.)*''", _string_escapes, scope="string"),
+    TranslationRule(
+        "T21_SLASH_COMMENT", "// line comment",
+        "// comment -> -- comment: Spark has no `//` comment, so the rest of "
+        "the line would be parsed as code", "implemented",
+        r"^//", _slash_comments, scope="comment"),
     TranslationRule(
         "T09_DOLLAR_QUOTED", "$$...$$ string",
         "$$...$$ dollar-quoted string -> single-quoted literal", "declared",

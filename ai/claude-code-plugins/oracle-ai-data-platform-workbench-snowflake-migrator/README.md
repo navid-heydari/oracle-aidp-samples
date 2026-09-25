@@ -454,11 +454,12 @@ Object references inside a view are left as-is in the default Bronze mirror
 (`R40`) and rewritten to the planned names under `--bronze-catalog-prefix`
 or a schema-style option (`R41`): whole three-part names only, never inside
 a string literal or a comment. Dialect is the other half. The translator
-carries 20 rules (`translate.RULES`). 8 have a provably exact rewrite and
+carries 21 rules (`translate.RULES`). 9 have a provably exact rewrite and
 are translated with the rule id recorded in the DDL plan — `IFF`, `x::TYPE`
 on a bare column or literal, `ARRAY_CONSTRUCT`, `OBJECT_CONSTRUCT`,
 `DATEADD(unit, n, col)` (exact for `DATE` operands only, and the plan says
-so), `LISTAGG(x, sep)`, `"quoted identifiers"` → backticks and `''` → `\'`
+so), `LISTAGG(x, sep)`, `"quoted identifiers"` → backticks, `''` → `\'`
+and `//` line comments → `--`
 — but only in those exact forms; a form the rule cannot prove (an expression
 left of `::`, `LISTAGG … WITHIN GROUP`, a non-literal `DATEADD` amount) is
 refused with the construct named. 12 others — `QUALIFY`, `LATERAL FLATTEN`,
