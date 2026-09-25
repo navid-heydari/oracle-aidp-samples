@@ -45,7 +45,7 @@ Categories:
 | `unmapped_type` | A column type has no Delta equivalent, e.g. `VARIANT`, `GEOGRAPHY` |
 | `snowflake_only_sql` | A view uses a construct the translator recognises but has no exact rewrite for — `QUALIFY`, `LATERAL FLATTEN`, `DATEDIFF`/`TIMESTAMPDIFF`, `TIMESTAMPADD`/`TIMEADD`, `$$…$$`, `DECODE`, `NVL2`, a `::` cast over an expression or to `VARIANT` or `TIME`, a `DATEADD` whose amount is an expression or whose unit is quoted or a nested call. The reason names the construct and why. `IFF`, `x::TYPE` on a bare column or literal, `LISTAGG(x, sep)`, `DATEADD(unit, n, col)` and `"quoted identifiers"` are translated, not blocked. Full rule table: [references/dialect-translation.md](../../references/dialect-translation.md) |
 | `unsupported_object` | Secure view, materialized view; dynamic, external, Iceberg, event or hybrid table (`SHOW TABLES` flags) — see also `CENSUS.md` |
-| `dependency_not_migrated` | Depends on an object that is not migrating (a blocked or excluded base table or view); the reason names it |
+| `dependency_not_migrated` | Depends on an object that is not migrating (a blocked or excluded base table or view, or an object outside the assessed scope, e.g. another database); the reason names it |
 | `no_definition` / `unparseable_sql` | The view SQL could not be read or parsed |
 | `columns_unread` | The schema's `INFORMATION_SCHEMA.COLUMNS` read failed (the reason quotes the error, e.g. a timeout), so no column was assessed. Not a privilege verdict and not an empty table: fix the read and re-run `assess` |
 

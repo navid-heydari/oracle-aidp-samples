@@ -195,7 +195,8 @@ def _view_verdict(rec: dict) -> tuple[bool, str, str]:
 
 
 def _cascade_dependency_exclusions(can: list[dict], cannot: list[dict],
-                                   edges: list[dict]) -> tuple[list[dict], list[dict]]:
+                                   edges: list[dict], inventoried: set[str]
+                                   ) -> tuple[list[dict], list[dict]]:
     """Move every dependent of a `cannot` object into `cannot`, transitively.
 
     Without this only the planned ids reached compute_waves, which drops an
@@ -203,15 +204,38 @@ def _cascade_dependency_exclusions(can: list[dict], cannot: list[dict],
     at indegree 0, sorted first (rows=None -> size 0) and got a CREATE VIEW
     over a table that will never exist, under a report line promising that
     views follow their base tables.
+
+    An edge to an object outside `inventoried` is a dependency on something
+    this migration does not carry at all -- another database, usually. A
+    view joining D.S.T with OTHERDB.S.FACTS was planned into wave 2, the
+    report said views follow their base tables, and the create failed with
+    a bare 500. It is refused here, naming the outside object, and its own
+    dependents cascade from it.
     """
     can_ids = {c["source_identifier"] for c in can}
     kinds = {c["source_identifier"]: c["object_type"] for c in can}
     dependents: dict[str, set[str]] = collections.defaultdict(set)
+    outside: dict[str, set[str]] = collections.defaultdict(set)
     for edge in edges:
-        if edge["from"] != edge["to"]:
-            dependents[edge["to"]].add(edge["from"])
+        if edge["from"] == edge["to"]:
+            continue
+        dependents[edge["to"]].add(edge["from"])
+        if edge["to"] not in inventoried and edge["from"] in can_ids:
+            outside[edge["from"]].add(edge["to"])
 
     why = {c["source_identifier"]: c for c in cannot}
+    for dependent in sorted(outside):
+        names = ", ".join(sorted(outside[dependent]))
+        can_ids.discard(dependent)
+        entry = {"source_identifier": dependent,
+                 "object_type": kinds[dependent],
+                 "category": "dependency_not_migrated",
+                 "reason": f"depends on {names}, which is outside the "
+                           f"assessed scope (not in this inventory), so it "
+                           f"is not migrating with it -- migrate or "
+                           f"federate it first, or exclude this object"}
+        cannot.append(entry)
+        why[dependent] = entry
     queue = collections.deque(sorted(why))
     while queue:
         missing = queue.popleft()
@@ -469,7 +493,8 @@ def build_plan(inventory: dict, dependencies: dict, *,
                     "omitted_properties": omitted})
 
     can, cannot = _cascade_dependency_exclusions(
-        can, cannot, dependencies.get("edges", []))
+        can, cannot, dependencies.get("edges", []),
+        {r["source_identifier"] for r in records})
 
     # A pipe or task the census read as writing a table that migrates. The
     # census TASK verdict says such a table stops being populated at cutover;
