@@ -281,9 +281,16 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig ingest \
   [--semi-structured string] [--timestamp-ntz timestamp]
 
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig plan \
+  --bronze-catalog-prefix <the INTERNAL catalog created at S4> \
   [--restrictions <file>]
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig ddl
 ```
+
+The prefix is not optional here. S10 creates each approved target name as it
+stands and refuses a plan whose catalog is not its `--target-catalog`; without
+the prefix the plan's catalog is the source database name, which in this
+runbook is the EXTERNAL pointer registered at S3, and S10 refuses it with
+exit 1.
 
 `ingest` calls the **same type mapper** a live `assess` calls, so a column
 planned from the manifest reaches the same verdict as one planned from a live

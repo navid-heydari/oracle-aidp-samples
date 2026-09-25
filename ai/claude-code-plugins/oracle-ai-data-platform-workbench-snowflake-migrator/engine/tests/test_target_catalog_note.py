@@ -109,3 +109,33 @@ def test_the_note_is_what_the_job_does_when_the_catalogs_agree(
                              "--target-catalog", "lake")
     assert rc == 0, out
     assert "CREATE SCHEMA IF NOT EXISTS `lake`.`snowdb`" in out
+
+
+# The skills are what an agent runs from, so they must give the same plan
+# command README step 4 gives. After the note above was fixed, the runbook
+# skill still said `snowmig plan [--restrictions <file>]` before `ddl` --
+# the no-prefix plan S10 refuses with exit 1 -- and the plan skill still
+# called the prefix an optional variation "for deployments that want a
+# single bronze catalog".
+_ROOT = __import__("pathlib").Path(__file__).resolve().parents[2]
+
+
+def _skill(name):
+    return (_ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_the_runbook_skill_plans_with_the_s4_internal_catalog_as_prefix():
+    text = _skill("snowflake-migrator-overview")
+    block = text.split("bin/snowmig plan", 1)[1].split("bin/snowmig ddl", 1)[0]
+    assert "--bronze-catalog-prefix" in block, block
+    flat = " ".join(block.split())
+    assert "INTERNAL" in flat and "S4" in flat, block
+
+
+def test_the_plan_skill_says_the_prefix_names_the_s4_internal_catalog():
+    text = _skill("snowflake-migration-plan")
+    flat = " ".join(text.split())
+    assert "for deployments that want a single bronze catalog" not in flat
+    assert "[--bronze-catalog-prefix bronze]" not in flat
+    assert "S4 INTERNAL catalog" in flat
+    assert "EXTERNAL" in flat and "S10 refuses" in flat

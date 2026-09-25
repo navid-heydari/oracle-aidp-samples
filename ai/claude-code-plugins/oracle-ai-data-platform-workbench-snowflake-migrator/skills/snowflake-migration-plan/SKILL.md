@@ -11,7 +11,7 @@ Two commands. The first needs Snowflake; the second is offline.
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig deps
 
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig plan \
-  [--restrictions restrictions.json] [--bronze-catalog-prefix bronze]
+  --bronze-catalog-prefix <S4 INTERNAL catalog> [--restrictions restrictions.json]
 ```
 
 Every Snowflake coordinate comes from the migration config (`snowmig-config.yaml`, discovered automatically and printed as `config: <path>`). Pass `--account/--user/--auth/...` only to override a field for one run.
@@ -30,8 +30,11 @@ Snowflake view      ->  AIDP view
 
 Bronze mirrors the source 1:1, so target names equal source names and nothing is
 flattened. `--bronze-catalog-prefix` is the only variation: it puts everything in
-one catalog and folds the database into the schema name, for deployments that
-want a single bronze catalog.
+one catalog and folds the database into the schema name. Under the runbook that
+catalog is the S4 INTERNAL catalog, and the prefix is required: S10 refuses a
+plan whose catalog is not its `--target-catalog`, and without the prefix the
+plan's catalog is the source database name -- the EXTERNAL pointer registered
+at S3.
 
 ## Can and cannot, with reasons
 
