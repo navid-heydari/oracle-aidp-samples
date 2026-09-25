@@ -355,3 +355,24 @@ def test_a_table_the_plan_leaves_out_is_still_not_a_failure(
     assert tables["T"]["status"] == "verified"
     assert tables["U"]["status"] == "target_missing"
     assert rc == 0
+
+
+def test_the_refusal_offers_no_target_schema_the_plan_would_refuse(
+        monkeypatch, tmp_path, capsys):
+    """01 ran in --mode manifest (it reads no plan) and created lake.CORE;
+    the plan on disk names lake.db_core. 02 refuses -- correctly -- but its
+    hint said `pass --target-schema CORE where the plan names no target`.
+    The plan here DOES name one, so that flag is refused as a contradiction:
+    the hint pointed at a dead end."""
+    reports = _estate(tmp_path, ["T"], {"T": "lake.db_core.t"})
+    (reports / "structure_report_core.json").write_text(json.dumps(
+        {"schema": "CORE", "target": "lake.CORE",
+         "objects": {"T": {"status": "created"}}}), encoding="utf-8")
+    spark = _CaselessSpark({"`ext`.`CORE`.`T`": _SPARK_COLS,
+                            "`lake`.`CORE`.`T`": _SPARK_COLS})
+    rc = _copy(monkeypatch, spark, reports)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "lake.CORE" in out and "01_create_structure" in out
+    assert "--target-schema" not in out, out
+    assert not _inserts(spark)

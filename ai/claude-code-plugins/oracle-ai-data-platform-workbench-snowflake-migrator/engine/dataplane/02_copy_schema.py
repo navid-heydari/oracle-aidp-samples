@@ -601,15 +601,20 @@ def main(argv: list[str] | None = None) -> int:
         s_target = s_prior.get("target")
         if s_target and not _same(s_target, target):
             if not args.tables:
+                # --target-schema is a way out only where the plan is
+                # silent; where it names a target, that flag is refused as a
+                # contradiction, so offering it pointed at a dead end.
+                way_out = ("" if planned else
+                           f"pass --target-schema "
+                           f"{s_target.split('.', 1)[-1]} (the plan names no "
+                           f"target for this schema), ")
                 return fail(
                     f"error: the structure report for {args.schema} targets "
                     f"{s_target}, and this copy resolves {target}. Taking "
                     f"the scope from the manifest instead would copy into "
                     f"tables the structure step never created or checked "
                     f"there. Re-run 01_create_structure (it creates what "
-                    f"the plan names), pass --target-schema "
-                    f"{s_target.split('.', 1)[-1]} where the plan names no "
-                    f"target for this schema, or pass --tables")
+                    f"the plan names), {way_out}or pass --tables")
             log(f"the structure report targets {s_target}, not {target}; "
                 f"not used for this run (--tables sets the scope)")
         else:
