@@ -738,9 +738,14 @@ def _view_text(sql: str | None) -> str:
     The API takes the query alone, so a column list in the CREATE VIEW has
     nowhere to go but into the query: the body is wrapped so its output
     columns carry the list's names, as they do in the reviewed SQL.
+
+    Comments are removed. Live, the API refused a view carrying one --
+    "inline SQL comments are not allowed" -- in any style, where Spark SQL
+    takes it. A comment carries no meaning; the reviewed CREATE VIEW keeps
+    it, and the lexer leaves a `--` inside a literal alone.
     """
     try:
-        body = extract_view_body(sql or "")
+        body = lexer.strip_comments(extract_view_body(sql or "")).strip()
         columns = extract_view_columns(sql or "")
     except ValueError:
         return ""
