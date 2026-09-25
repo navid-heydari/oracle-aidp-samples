@@ -324,7 +324,9 @@ connector, and did the external catalog's crawler actually populate anything.
 
 ### 9. Run the jobs inside AIDP
 
-Run them with `bin/snowmig run --job <name>` (or from the console). Two of
+Run them with `bin/snowmig run --job <name>` (or from the console); the
+DataLake OCID and workspace come from the config's `aidp:` block, or
+`--datalake-ocid`/`--workspace` override it. Two of
 the four are **part of the migration**; the other two are **run later, on
 the customer's decision**.
 

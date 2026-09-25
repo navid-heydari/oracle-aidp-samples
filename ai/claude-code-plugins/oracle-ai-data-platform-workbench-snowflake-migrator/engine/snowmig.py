@@ -996,13 +996,24 @@ def cmd_run(args) -> int:
     from target.jobs import watch_job
 
     out = pathlib.Path(args.out_dir)
-    ocid = args.datalake_ocid
+    # Flags first, then the config's `aidp:` block, like every other AIDP
+    # stage. This read the flags only, so the README's `run --job <name>`
+    # after filling in aidp.workspace failed with "needs --datalake-ocid"
+    # in a directory where `catalogs` resolved all four coordinates.
+    coords = _target_coords(args)
+    ocid = coords["datalake_ocid"]
     if not ocid:
         raise MissingTarget(
-            "run needs --datalake-ocid: the workflow executes inside AIDP.")
+            "run needs the aiDataPlatform OCID: the workflow executes inside "
+            "AIDP. Put it under `aidp.datalake_ocid` in the config, or pass "
+            "--datalake-ocid.")
+    args.workspace = coords["workspace"]
     if not args.workspace:
         raise MissingTarget(
-            "run needs --workspace: a job run belongs to one workspace.")
+            "run needs the workspace: a job run belongs to one workspace. "
+            "Put its key under `aidp.workspace` in the config (provision "
+            "records it as workspace.key in provision_result.json), or pass "
+            "--workspace.")
 
     parameters = {}
     for pair in (args.param or []):
@@ -2156,6 +2167,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "terminal state, and save its output as "
                              "evidence (runbook S6, S10)")
     _add_target_args(rn)
+    rn.add_argument("--config", "--connection-config", dest="config",
+                    help="the ONE migration config: its `aidp:` block "
+                         "supplies --datalake-ocid and --workspace (and the "
+                         "oci profile). A flag overrides what it says. "
+                         "Default: ./snowmig-config.yaml, then the plugin's")
     rn.add_argument("--job", help="job display name, e.g. snowmig_00_discover")
     rn.add_argument("--job-key", help="job key; use when the name is ambiguous")
     rn.add_argument("--param", action="append", metavar="NAME=VALUE",

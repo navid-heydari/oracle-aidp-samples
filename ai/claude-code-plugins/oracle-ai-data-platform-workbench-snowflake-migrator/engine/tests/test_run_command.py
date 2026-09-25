@@ -160,3 +160,77 @@ def test_the_param_refusal_names_the_flag_that_really_rewrites_params(tmp_path):
     with pytest.raises(snowmig.MissingTarget) as exc:
         snowmig.cmd_run(_args(tmp_path, param=["schema=SALES"]))
     assert "--refresh-notebooks" in str(exc.value)
+
+
+# --- `run` reads the config's aidp: block like every other AIDP stage --------
+#
+# Found on review. The README says to fill in aidp.workspace and then "Run
+# them with bin/snowmig run --job <name>", but cmd_run read
+# args.datalake_ocid and args.workspace directly and never consulted the
+# config. In a directory where `catalogs` and `smoke` resolved all four
+# coordinates from snowmig-config.yaml, `run --job snowmig_00_discover`
+# printed "config: <path>" (loaded for the oci profile only) and then
+# "error: run needs --datalake-ocid", and `run --config` was rejected by
+# argparse as an unrecognized argument.
+
+def _cwd_config(tmp_path, monkeypatch, aidp_lines):
+    cfg = tmp_path / "snowmig-config.yaml"
+    body = ("snowflake:\n  account: ORG-ACC\n  user: SVC\n  warehouse: WH\n"
+            "  database: SALES_DB\n  auth: password\n"
+            "  password: not-a-real-password\naidp:\n")
+    body += "".join(f"  {line}\n" for line in aidp_lines)
+    cfg.write_text(body, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    return cfg
+
+
+class _SeesWorkspace(Runs):
+    def __init__(self):
+        super().__init__("SUCCESS")
+        self.workspaces: list = []
+
+    def __call__(self, op, **kw):
+        if op == "run_job":
+            self.workspaces.append(kw.get("workspace"))
+        return super().__call__(op, **kw)
+
+
+def test_run_takes_the_destination_from_the_config(tmp_path, monkeypatch):
+    _cwd_config(tmp_path, monkeypatch,
+                [f"datalake_ocid: {OCID}", "workspace: cfg-ws"])
+    fake = _SeesWorkspace()
+    seen = {}
+
+    def make(ocid, **kw):
+        seen["ocid"] = ocid
+        return fake
+    monkeypatch.setattr(provisioning, "make_provision_call", make)
+    rc = snowmig.cmd_run(_args(tmp_path, datalake_ocid=None, workspace=None))
+    assert rc == 0
+    assert seen["ocid"] == OCID
+    assert fake.workspaces == ["cfg-ws"]
+    assert "cfg-ws" in (tmp_path / "run_snowmig_01_structure.json").read_text(
+        encoding="utf-8")
+
+
+def test_run_accepts_config_and_a_flag_still_wins(tmp_path, monkeypatch):
+    cfg = _cwd_config(tmp_path, monkeypatch,
+                      [f"datalake_ocid: {OCID}", "workspace: cfg-ws"])
+    args = snowmig.build_parser().parse_args(
+        ["run", "--config", str(cfg), "--job", "snowmig_01_structure",
+         "--job-key", "job-k", "--workspace", "flag-ws",
+         "--out-dir", str(tmp_path), "--max-polls", "2",
+         "--poll-seconds", "0"])
+    fake = _SeesWorkspace()
+    _install(monkeypatch, fake)
+    assert snowmig.cmd_run(args) == 0
+    assert fake.workspaces == ["flag-ws"]
+
+
+def test_run_without_a_destination_names_the_config_key(tmp_path,
+                                                        monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(snowmig, "PLUGIN_ROOT", tmp_path)
+    with pytest.raises(snowmig.MissingTarget) as exc:
+        snowmig.cmd_run(_args(tmp_path, datalake_ocid=None))
+    assert "aidp.datalake_ocid" in str(exc.value)
