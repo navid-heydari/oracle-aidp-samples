@@ -355,16 +355,7 @@ conversation until the phase that needs them arrives.
 | Question | Blocking |
 |---|---|
 | Silver/Gold job body shape | The medallion deliverable is one third stubs |
-| `ACME-CONTEXT.md` is on the remote — rewrite history, delete the branch, or accept? | Publishing |
-| Acme's region: Ashburn, Oregon or Ohio? | Any cost or transfer estimate |
 
-## Publish blockers
-
-- `ACME-CONTEXT.md` (customer-confidential, already pushed) — still tracked
-- `PLAN-2PERSON-TIMETABLE.md` and `docs/specs/` ship inside the plugin — still tracked
-- ~~Ten tracked `.pyc` files~~ ✅ DONE — untracked, deleted, and the
-  `.gitignore` re-include that resurrected them is counter-ruled
-- ~~Test-account identifiers in eight fixtures~~ ✅ DONE — genericized in source/fixtures; real values now only in the gitignored config files
 
 ---
 

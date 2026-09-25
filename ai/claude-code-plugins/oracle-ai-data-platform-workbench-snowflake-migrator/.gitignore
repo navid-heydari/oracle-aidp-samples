@@ -77,8 +77,7 @@ venv/
 engine/target/__pycache__/
 engine/target/**/*.pyc
 
-# Customer-confidential engagement records. Never in a public sample:
-# customer context, delivery timetables, spend and estate figures. Keep them
-# in a private directory outside this repo.
+# Notes scoped to a particular deployment never belong in a public sample.
+# Keep anything of that kind in a private directory outside this repo.
 *-CONTEXT.md
 *-TIMETABLE.md

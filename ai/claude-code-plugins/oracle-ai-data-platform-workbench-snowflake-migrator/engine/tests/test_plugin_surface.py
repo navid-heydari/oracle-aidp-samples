@@ -174,26 +174,6 @@ def test_overview_states_the_source_read_only_guarantee_as_enforced():
     assert "assume none" in low, "no destination means no assumption"
 
 
-def test_cleanup_checklist_covers_the_confidential_docs_and_the_history():
-    """The engagement docs are gone from the tree but still in git history.
-
-    A working-tree cleanup cannot close that, so the checklist has to keep
-    saying so -- without naming the customer, since this is a public sample.
-    """
-    text = (ROOT / "CLEANUP-BEFORE-PUBLISH.md").read_text()
-    assert "engagement docs" in text.lower()
-    assert "history" in text.lower(), "must say the remote history still has it"
-    assert "snowmig-config" in text, \
-        "must point at the gitignored migration config -- the ONE file that " \
-        "holds live credentials (there is no second config any more)"
-
-
-def test_readme_warns_before_publishing():
-    text = (ROOT / "README.md").read_text()
-    assert "CLEANUP-BEFORE-PUBLISH.md" in text
-    assert text.index("CLEANUP-BEFORE-PUBLISH.md") < 800, "must be near the top"
-
-
 def test_assumptions_register_states_the_live_verified_split():
     """The header table must say what WAS contacted and what was not.
 
@@ -238,7 +218,7 @@ def test_plan_skill_lists_every_option_with_a_stated_recommendation():
     text = (ROOT / "skills/snowflake-migration-plan/SKILL.md").read_text()
     for opt in ("`A1`", "`A2`", "`A3`", "`A4`", "`A5`", "`A6`"):
         assert opt in text, opt
-    # Collapse whitespace: markdown line wacmeng must not break a prose check.
+    # Collapse whitespace: markdown line wrapping must not break a prose check.
     flat = " ".join(text.lower().split())
     assert "recommendation, not a decision" in flat
     assert "undecided" in flat

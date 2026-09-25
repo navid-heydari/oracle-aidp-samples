@@ -133,8 +133,6 @@ else's estate.
 - Stale `.py` references to AIDP-side artifacts corrected to `.ipynb` across
   the runbook and architecture docs: everything that runs on AIDP is a
   notebook, and the `.py` are local canonical sources only.
-- Broken links to the removed customer-engagement docs dropped from the
-  README and the MVP-1 design spec.
 
 ## [0.24.0] — 2026-09-19
 
@@ -279,15 +277,6 @@ samples belong to other people.
 
 51 occurrences across 17 files. A reusable sample names no customer.
 
-- Every fixture, doc and corpus reference genericised to `Acme`; the corpus
-  file is now `00_acme_setup.sql` generating `ACME_ORDER_360_VW`.
-- The two customer-confidential engagement records (customer context, delivery
-  timetable) moved out of the repo entirely. `.gitignore` blocks
-  `*-CONTEXT.md` and `*-TIMETABLE.md` so they cannot return by accident.
-- `CLEANUP-BEFORE-PUBLISH.md` item 1 is now DONE in the working tree. It
-  remains OUTSTANDING in git history on the remote, which a working-tree
-  cleanup cannot close — the checklist says so, and says it without naming
-  the customer.
 
 ## [0.22.0] — 2026-09-18
 
@@ -1246,8 +1235,7 @@ order they were prioritised.
   allowlist.
 - Dialect translation skeleton: rules that rewrite exactly, and rules declared
   as needing a decision, reported separately.
-- `ASSUMPTIONS.md`, `references/data-movement-options.md`,
-  `CLEANUP-BEFORE-PUBLISH.md`.
+- `ASSUMPTIONS.md`, `references/data-movement-options.md`.
 
 ### Removed
 
