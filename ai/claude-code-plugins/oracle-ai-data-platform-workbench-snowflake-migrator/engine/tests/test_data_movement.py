@@ -236,3 +236,17 @@ def test_data_options_json_names_the_implemented_copy_path(tmp_path, capsys):
     md = (tmp_path / "DATA_MOVEMENT_OPTIONS.md").read_text(encoding="utf-8")
     assert "snowmig_02_copy_schema" in md, "the two artifacts agree"
     assert "none implemented" not in capsys.readouterr().out
+
+
+def test_the_json_note_is_the_markdowns_own_sentence(tmp_path):
+    """One constant for both artifacts. The CLI and the renderer were each
+    fixed to stop saying "implements no transfer", in two lanes, in two
+    different wordings -- which is the drift the shared constant exists to
+    stop."""
+    import json
+    import snowmig
+    from report.render import DATA_OPTIONS_NOTE
+    assert snowmig.main(["data-options", "--out-dir", str(tmp_path)]) == 0
+    payload = json.loads((tmp_path / "data_options.json").read_text(
+        encoding="utf-8"))
+    assert payload["note"] == DATA_OPTIONS_NOTE

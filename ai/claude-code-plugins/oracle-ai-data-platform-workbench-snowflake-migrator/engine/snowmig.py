@@ -61,6 +61,7 @@ from plan.smoke import run_smoke, smoke_verdict
 from target.notebook import build_notebook, notebook_workspace_path
 from report.stages import build_stage_board
 from report.render import (
+    DATA_OPTIONS_NOTE,
     render_catalog, render_catalogs, render_databases,
     render_census, render_maintenance, render_preflight,
     render_stages,
@@ -1616,14 +1617,10 @@ def cmd_data_options(args) -> int:
     # `implemented` is about the OPTIONS listed: each is a proposal. The note
     # must not say more than that. It used to say this plugin "moves no bytes
     # and implements no transfer path", beside a DATA_MOVEMENT_OPTIONS.md
-    # from the same run naming the transfer path that does exist.
+    # from the same run naming the transfer path that does exist. The note is
+    # the markdown's own opening sentence, so the two cannot drift again.
     payload = {"options": options, "implemented": False,
-               "note": ("The options below are proposals, none executed by "
-                        "this command. The control-plane CLI copies no rows "
-                        "itself; the one implemented copy is the in-AIDP "
-                        "INSERT-SELECT run schema by schema by the "
-                        "snowmig_02_copy_schema job, when the operator runs "
-                        "it.")}
+               "note": DATA_OPTIONS_NOTE}
     if args.choose:
         if not args.rationale:
             raise ValueError("--choose requires --rationale")
