@@ -37,7 +37,8 @@ The migration is the overview skill's **twelve steps, S1–S12, in that
 order** (`skills/snowflake-migrator-overview/SKILL.md` is the authority on
 the sequence); the sections below are its runnable form and name the step
 each command serves. Everything reads from one config file, and nothing
-writes to AIDP without `--execute`.
+writes to AIDP without `--execute` -- except `run`, which has no dry run:
+invoking it starts a job `provision` already created.
 
 > **On the paths below.** They are written `engine/snowmig.py`, which is what
 > you type from a checkout of this repo. If the plugin is **installed** rather

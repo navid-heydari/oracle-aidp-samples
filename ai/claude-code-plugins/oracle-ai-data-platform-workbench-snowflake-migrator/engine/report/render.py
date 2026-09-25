@@ -1623,11 +1623,14 @@ def render_stages(board: dict) -> str:
     out = ["# Stages — what runs, what has run, what it found", "",
            f'Artifacts read from `{board.get("out_dir")}`. This board makes no '
            f'decisions and touches nothing.', "",
-           "**Three stages write to AIDP: `provision`** (workspace, cluster, "
+           "**Four stages write to AIDP. `provision`** (workspace, cluster, "
            "scripts, jobs), **`catalog`** (registers the target catalog) "
-           "**and `deploy`** (creates schemas, tables and views). All three "
-           "are a dry run unless `--execute` is passed with the target "
-           "coordinates. Every other stage is read-only. The one further "
+           "**and `deploy`** (creates schemas, tables and views) are a dry "
+           "run unless `--execute` is passed with the target coordinates. "
+           "**`run` has no dry run**: invoking it starts an in-AIDP job -- "
+           "`snowmig_01_structure` creates schemas and tables, "
+           "`snowmig_02_copy_schema` copies rows. Every other stage is "
+           "read-only. The one further "
            "write is `smoke --write-probe --execute`, which creates one probe "
            "schema and removes it again; `--write-probe` alone is a dry run. "
            "`notebook --upload` sends nothing: without `--execute` it is a "

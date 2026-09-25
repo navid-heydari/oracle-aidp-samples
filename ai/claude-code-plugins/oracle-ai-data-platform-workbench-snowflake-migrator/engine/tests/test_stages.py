@@ -97,8 +97,10 @@ def test_the_rendered_board_marks_every_writing_stage(tmp_path):
     assert "writes" in md.lower()
     assert "read-only" in md.lower()
     assert "`provision`" in md and "`catalog`" in md and "`deploy`" in md
+    assert "`run`" in md
     writers = {s["stage"] for s in STAGES if s["writes"]}
-    assert writers == {"provision", "catalog", "deploy"}
+    # `run` was missing, so the board called it read-only (test_stages_run.py).
+    assert writers == {"provision", "catalog", "deploy", "run"}
 
 
 def test_a_provision_run_with_failures_is_flagged(tmp_path):

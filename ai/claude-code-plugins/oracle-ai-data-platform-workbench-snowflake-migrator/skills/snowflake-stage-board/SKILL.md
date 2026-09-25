@@ -21,8 +21,11 @@ and **what it found**.
 
 Then say three things out loud:
 
-1. **Three stages write to AIDP — `provision`, `catalog` and `deploy`** — and each is a dry
-   run unless `--execute` is passed with all four AIDP coordinates. Everything
+1. **Four stages write to AIDP.** `provision`, `catalog` and `deploy` are each a dry
+   run unless `--execute` is passed with all four AIDP coordinates. **`run` has
+   no dry run**: invoking it starts an in-AIDP job — `snowmig_01_structure`
+   creates schemas and tables, `snowmig_02_copy_schema` copies rows — so ask
+   before every `run`. Everything
    else is read-only, apart from one narrow opt-in that is itself gated by
    `--execute` (`smoke --write-probe --execute`); `notebook --upload` writes
    nothing (dry run, refused with `--execute`, GAPS.md 13). If someone is
