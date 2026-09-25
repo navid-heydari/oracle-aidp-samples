@@ -88,9 +88,11 @@ def test_falls_back_to_parsed_ddl_when_account_usage_denied():
     assert "not authorized" in out["coverage_note"]
 
 
-def test_fallback_drops_edges_to_objects_outside_the_inventory():
-    # A reference we never inventoried cannot be planned, so it must not become
-    # a phantom node in the wave graph.
+def test_fallback_keeps_a_reference_outside_the_inventory_as_a_marked_edge():
+    # A reference we never inventoried cannot be planned. It used to be
+    # dropped, which hid it from the plan altogether; it is now an edge the
+    # planner can refuse the view on, marked so it is never mistaken for a
+    # node to wave (compute_waves ignores an edge whose end is not a node).
     inv = {"inventory": [
         {"source_identifier": "D.S.V", "object_type": "VIEW",
          "source_database": "D", "source_schema": "S",
@@ -101,7 +103,9 @@ def test_fallback_drops_edges_to_objects_outside_the_inventory():
             raise RuntimeError("not authorized")
 
     out = extract_dependencies(Denied({}), inv)
-    assert out["edges"] == []
+    assert out["edges"] == [{"from": "D.S.V", "to": "OTHER.X.Y",
+                             "kind": "VIEW->OBJECT", "source": "parsed_ddl",
+                             "outside_inventory": True}]
     assert any("OTHER.X.Y" in n for n in out["unresolved_references"])
 
 

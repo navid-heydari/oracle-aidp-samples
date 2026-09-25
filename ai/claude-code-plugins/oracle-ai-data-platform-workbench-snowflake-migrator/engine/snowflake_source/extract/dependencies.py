@@ -22,6 +22,17 @@ Edge direction: {"from": dependent, "to": dependency}. `to` is created first.
 Endpoints are the exact inventory `source_identifier` values, so they match
 the plan's nodes: a quoted identifier keeps its case in Snowflake, and an
 edge spelled any other way is silently dropped by the wave computation.
+
+The one exception is a VIEW's reference to an object OUTSIDE the inventory
+(another database, a UDF, anything not being migrated). It is kept as an
+edge marked `outside_inventory: True`, its `to` the name as the source gave
+it, and listed in `unresolved_references`. Both sources used to drop it, so
+a view joining an in-scope table with OTHERDB.S.FACTS kept only its in-scope
+edge, was planned as ordered under "views follow their base tables", and
+failed at create because the target has no FACTS. The planner reads the
+marked edge and refuses the view as depending on something not migrating.
+A table's outside reference (a sequence behind a DEFAULT) is not kept: its
+CREATE TABLE does not resolve it, and the DEFAULT is reported as not carried.
 """
 from __future__ import annotations
 
@@ -45,7 +56,7 @@ _WORD_BEFORE = re.compile(r"([A-Za-z_][A-Za-z0-9_$]*)\s*$")
 # Words that end a FROM item, so they are never read as its alias -- or
 # open one that is not a named relation (TABLE(...), VALUES, LATERAL).
 _NOT_ALIAS = {
-    "TABLE", "VALUES", "UNNEST",
+    "TABLE", "VALUES", "UNNEST", "IDENTIFIER",
     "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS",
     "NATURAL", "ON", "USING", "GROUP", "ORDER", "HAVING", "QUALIFY", "LIMIT",
     "OFFSET", "FETCH", "UNION", "EXCEPT", "MINUS", "INTERSECT", "WINDOW",
@@ -170,8 +181,14 @@ def parse_view_references(ddl: str, *, default_db: str,
     return sorted(found)
 
 
+def _outside(dependent: str, name: str, kind: str, source: str) -> dict:
+    return {"from": dependent, "to": name, "kind": kind, "source": source,
+            "outside_inventory": True}
+
+
 def _from_account_usage(run_sql: Callable[..., list[dict]],
-                        by_upper: dict[str, str]) -> list[dict]:
+                        by_upper: dict[str, str],
+                        view_ids: set[str]) -> list[dict]:
     rows = run_sql(
         "select referencing_database || '.' || referencing_schema || '.' || "
         "       referencing_object_name as REFERENCING, "
@@ -184,13 +201,17 @@ def _from_account_usage(run_sql: Callable[..., list[dict]],
     for r in rows:
         # Matched case-insensitively, emitted in the inventory's spelling.
         dependent = by_upper.get(str(r.get("REFERENCING") or "").upper())
-        dependency = by_upper.get(str(r.get("REFERENCED") or "").upper())
+        referenced = str(r.get("REFERENCED") or "")
+        dependency = by_upper.get(referenced.upper())
+        kind = f'{r.get("REFERENCING_TYPE")}->{r.get("REFERENCED_TYPE")}'
         if dependent and dependency and dependent != dependency:
             edges.append({
                 "from": dependent, "to": dependency,
-                "kind": f'{r.get("REFERENCING_TYPE")}->{r.get("REFERENCED_TYPE")}',
+                "kind": kind,
                 "source": "account_usage",
             })
+        elif dependent in view_ids and dependency is None and referenced:
+            edges.append(_outside(dependent, referenced, kind, "account_usage"))
     return edges
 
 
@@ -214,6 +235,8 @@ def _from_parsed_ddl(records: list[dict],
             dependency = by_upper.get(ref)
             if dependency is None:
                 unresolved.add(ref)
+                edges.append(_outside(dependent, ref, "VIEW->OBJECT",
+                                      "parsed_ddl"))
             elif dependency != dependent:
                 edges.append({"from": dependent, "to": dependency,
                               "kind": "VIEW->OBJECT", "source": "parsed_ddl"})
@@ -230,9 +253,10 @@ def extract_dependencies(run_sql: Callable[..., list[dict]],
     by_upper = {r["source_identifier"].upper(): r["source_identifier"]
                 for r in records}
     views = [r for r in records if r.get("object_type") == "VIEW"]
+    view_ids = {r["source_identifier"] for r in views}
 
     try:
-        au_edges = _from_account_usage(run_sql, by_upper)
+        au_edges = _from_account_usage(run_sql, by_upper, view_ids)
     except Exception as exc:
         note = (f"ACCOUNT_USAGE.OBJECT_DEPENDENCIES unavailable ({exc}); fell back to "
                 "parsing view DDL. Covers view->object edges ONLY -- not "
@@ -243,10 +267,11 @@ def extract_dependencies(run_sql: Callable[..., list[dict]],
 
     covered = {e["from"] for e in au_edges}
     uncovered = [r for r in views if r["source_identifier"] not in covered]
+    au_outside = {e["to"] for e in au_edges if e.get("outside_inventory")}
     if not uncovered:
         return {"edges": au_edges, "source_used": "account_usage",
                 "coverage_note": _AUTHORITATIVE_NOTE,
-                "unresolved_references": [],
+                "unresolved_references": sorted(au_outside),
                 "views_without_account_usage_edge": [], "warning": None}
 
     # Readable, but not populated for these views. The query succeeding is
@@ -273,5 +298,6 @@ def extract_dependencies(run_sql: Callable[..., list[dict]],
                     f"and are ordered by size only: {', '.join(unordered)}")
     warning += ". Re-run `deps` after the lag before relying on the wave order."
     return {"edges": au_edges + parsed, "source_used": source_used,
-            "coverage_note": note, "unresolved_references": sorted(unresolved),
+            "coverage_note": note,
+            "unresolved_references": sorted(unresolved | au_outside),
             "views_without_account_usage_edge": missing, "warning": warning}

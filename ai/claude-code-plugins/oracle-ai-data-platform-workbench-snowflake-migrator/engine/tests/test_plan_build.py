@@ -428,7 +428,10 @@ def test_a_plain_table_carries_no_kind_warning():
 # planned views against the edges, so every provenance is covered alike.
 
 def _unordered_view_inventory():
-    view = rec("D.S.V", kind="VIEW", ddl="create view V as select a from OTHERDB.S.T")
+    # A view that reads no relation at all. (This used to read OTHERDB.S.T,
+    # an out-of-inventory reference that the extractor now keeps as a marked
+    # edge -- see test_outside_references.py -- so it is no longer edgeless.)
+    view = rec("D.S.V", kind="VIEW", ddl="create view V as select 1 as a")
     view["row_count_exact"] = None
     return {"inventory": [rec("D.S.T", rows=1000), view]}
 
