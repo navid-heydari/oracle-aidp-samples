@@ -330,32 +330,28 @@ def render_planned_objects(plan: dict) -> str:
                 f"INTERNAL): {catalogs}", "",
                 f"Schemas the clone will create: {schemas}", ""]
     else:
-        # Two paths create the structure and they name things differently.
-        # The in-AIDP structure job (S10) creates <--target-catalog>.<SOURCE
-        # schema>.<table> and never reads the plan's target_fqn; the older
-        # `deploy`/`notebook` path creates the plan's names as they stand.
-        # Labelled per path, or the section tells the reader to create `d`,
-        # that `d` is the EXTERNAL pointer, and that the clone creates
-        # `d.public` -- in three consecutive lines.
-        src_schemas = ", ".join(f'`{s}`' for s in sorted(
-            {c["source_identifier"].split(".")[1].lower()
-             for c in plan.get("can_migrate") or []})) or "none"
+        # The structure job (S10) and `deploy` both create the plan's names
+        # as they stand, and S10 refuses a --target-catalog that is not the
+        # plan's catalog. This section once said S10 kept the SOURCE schema
+        # (`core`) while the job ran CREATE SCHEMA lake.snowdb_core, and with
+        # no prefix it sent the reader to a --target-catalog S10 refuses.
         if plan.get("bronze_catalog_prefix") is None:
             out += [f"Catalogs: the Target column's catalog part ({catalogs}) "
                     "is the source database mirrored, not a catalog to create "
-                    "-- under the runbook that name is the EXTERNAL pointer; "
-                    "the INTERNAL target is the one created at S4 and passed "
-                    "to `provision --target-catalog`.", ""]
-            older = (f"Older `deploy`/`notebook` path only: {schemas} "
-                     f"(requires {catalogs} to exist as INTERNAL)")
+                    "-- under the runbook that name is the EXTERNAL pointer "
+                    "at Snowflake.", "",
+                    note, "",
+                    f"Schemas the plan names: {schemas}. The structure job "
+                    "(S10) creates them only under a `--target-catalog` "
+                    "equal to the plan's catalog, so re-run `plan "
+                    "--bronze-catalog-prefix <the INTERNAL catalog created "
+                    "at S4>` and `ddl` before S10.", ""]
         else:
             out += ["Catalogs (create these, or confirm they exist and are "
-                    f"INTERNAL): {catalogs}", ""]
-            older = f"Older `deploy`/`notebook` path only: {schemas}"
-        out += [note, "",
-                "Schemas the structure job (S10) creates under that target "
-                f"catalog: {src_schemas}", "",
-                older, ""]
+                    f"INTERNAL): {catalogs}", "",
+                    note, "",
+                    "Schemas the structure job (S10) creates, and `deploy` "
+                    f"too: {schemas}", ""]
 
     out += ["## Can migrate", "",
             "| Object | Type | Target | Rows | Cols |", "|---|---|---|---:|---:|"]

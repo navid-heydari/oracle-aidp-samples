@@ -317,9 +317,9 @@ def test_views_whose_bases_all_migrate_are_unaffected_by_the_cascade():
 
 # --- the plan says whose catalog name its Target column carries -----------
 #
-# The in-AIDP structure job creates <--target-catalog>.<schema>.<table>; the
-# plan's catalog part is the source database mirrored (or a prefix). Reviewers
-# were signing off on names the job never creates, so the plan now states it.
+# The in-AIDP structure job creates the plan's target_fqn and refuses a
+# --target-catalog that is not the plan's catalog; that catalog part is the
+# source database mirrored (or a prefix), so the plan states which it is.
 
 def test_plan_carries_a_target_catalog_note_for_the_default_mirror():
     plan = build_plan({"inventory": [rec("MYDB.SALES.ORDERS")]}, {"edges": []})

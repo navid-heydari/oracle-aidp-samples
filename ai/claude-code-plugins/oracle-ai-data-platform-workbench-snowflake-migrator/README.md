@@ -199,14 +199,19 @@ the type mapper refusing to guess: re-run with `--semi-structured string` (or
 ### 4. Plan, generate DDL, get sign-off
 
 ```bash
-bin/snowmig plan [--restrictions ./restrictions.json]
+bin/snowmig plan --bronze-catalog-prefix <internal catalog> [--restrictions ./restrictions.json]
 bin/snowmig ddl 
 bin/snowmig summary
 ```
 
 **`PLANNED_OBJECTS.md` is the approval artifact — stop here for sign-off.**
 `ddl_plan.json` is the authority from this point on: the in-AIDP scripts create
-only what it contains, and report anything else as `not_in_plan`. Use
+only what it contains, and report anything else as `not_in_plan`. The structure
+job creates each approved target name as it stands and refuses a
+`--target-catalog` that is not the plan's catalog, so `<internal catalog>` here
+is the same INTERNAL catalog you create at S4 and pass to `provision
+--target-catalog`. Without the prefix the plan's catalog is the source database
+name, which under this runbook is the EXTERNAL pointer, and S10 refuses it. Use
 `--restrictions` to scope a first wave (a canary of a few tables is a good
 first live write).
 

@@ -258,29 +258,33 @@ def _target_catalog_note(catalogs: list[str], prefix: str | None,
                          style: str) -> str:
     """Say whose catalog name the Target column carries.
 
-    The in-AIDP structure job (01_create_structure) creates
-    <--target-catalog>.<source schema>.<name> and never reads the plan's
-    target_fqn; the plan's catalog part is the source database mirrored, or
-    the prefix. Reviewers were approving names the job does not create.
+    The in-AIDP structure job (01_create_structure, S10) creates each
+    approved `target_fqn` as it stands, and refuses a run whose
+    `--target-catalog` is not the plan's catalog. This note once described
+    the job before that fix ("does not read this column", keeps the source
+    schema), so the approval artifact named a schema S10 does not create,
+    and with no prefix it steered the operator to a --target-catalog the
+    job refuses.
     """
-    job = ("The in-AIDP structure job (01_create_structure) does not read this "
-           "column: it creates <--target-catalog>.<schema>.<table> under the "
-           "catalog passed to `provision --target-catalog`, keeping the source "
-           "schema and table names.")
+    job = ("The in-AIDP structure job (01_create_structure, S10) creates the "
+           "Target column as it stands -- catalog, schema and table -- and "
+           "refuses a run whose `provision --target-catalog` is not the "
+           "plan's catalog.")
     if prefix is None:
         mirrored = ", ".join(catalogs) or "the source database"
         return (f"The catalog part of the Target column is the source database "
                 f"name mirrored 1:1 ({mirrored}); no --bronze-catalog-prefix was "
-                f"given. {job} Read the Target column with that "
-                f"catalog in place of {mirrored}. In the runbook the catalog "
-                f"named after the source database is the read-only EXTERNAL "
-                f"pointer at Snowflake, not the target -- the job refuses "
-                f"source == target.")
+                f"given. {job} In the runbook the catalog named after the "
+                f"source database is the read-only EXTERNAL pointer at "
+                f"Snowflake, not a target, so this plan cannot go through the "
+                f"structure job as it stands: re-run `plan "
+                f"--bronze-catalog-prefix <the INTERNAL catalog created at S4>` "
+                f"and `ddl`, and pass that same catalog to `provision "
+                f"--target-catalog`.")
     return (f"The catalog part of the Target column is the --bronze-catalog-prefix "
             f"{prefix!r}, with the schema part in the {style!r} style. {job} "
-            f"Pass {prefix!r} to `provision --target-catalog` for the catalogs to "
-            f"agree; the schema part the job creates is the source schema, not "
-            f"the {style!r} form shown here.")
+            f"Pass {prefix!r} to `provision --target-catalog`; the schemas "
+            f"created are the ones listed here.")
 
 
 def build_plan(inventory: dict, dependencies: dict, *,

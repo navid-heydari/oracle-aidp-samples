@@ -523,27 +523,18 @@ def test_order_of_creation_keeps_the_plain_sentence_when_every_view_has_an_edge(
 # --------------------------------------------------------------------------
 # "## Target structure to exist first" must not tell the reader, in three
 # consecutive lines, to create catalog `d`, that `d` is the EXTERNAL pointer
-# and not the target, and that the clone creates `d.public` -- a schema the
-# structure job never creates. The lines are labelled per path.
+# and not the target, and that the clone creates `d.public`. It also must
+# name the schemas the structure job creates: since S10 takes the approved
+# target_fqn as it stands, that is the plan's `catalog.schema`, not the
+# source schema (these two tests once pinned `public` / "Older deploy path
+# only", which described the job before that fix; test_target_catalog_note.py
+# runs the job itself).
 # --------------------------------------------------------------------------
 
-_DEFAULT_NOTE = ("The catalog part of the Target column is the source database "
-                 "name mirrored 1:1 (d); no --bronze-catalog-prefix was given. "
-                 "The in-AIDP structure job (01_create_structure) does not read "
-                 "this column: it creates <--target-catalog>.<schema>.<table> "
-                 "under the catalog passed to `provision --target-catalog`. In "
-                 "the runbook the catalog named after the source database is "
-                 "the read-only EXTERNAL pointer at Snowflake, not the target "
-                 "-- the job refuses source == target.")
-_PREFIX_NOTE = ("The catalog part of the Target column is the "
-                "--bronze-catalog-prefix 'lake', with the schema part in the "
-                "'db_schema' style. The in-AIDP structure job "
-                "(01_create_structure) does not read this column: it creates "
-                "<--target-catalog>.<schema>.<table> under the catalog passed to "
-                "`provision --target-catalog`. Pass 'lake' to `provision "
-                "--target-catalog` for the catalogs to agree; the schema part "
-                "the job creates is the source schema, not the 'db_schema' form "
-                "shown here.")
+from plan.build import _target_catalog_note  # noqa: E402
+
+_DEFAULT_NOTE = _target_catalog_note(["d"], None, "db_schema")
+_PREFIX_NOTE = _target_catalog_note(["lake"], "lake", "db_schema")
 
 
 def _structure_section(md):
@@ -558,17 +549,16 @@ def test_default_mode_target_structure_does_not_ask_for_the_mirrored_catalog():
     assert "create these" not in section, section
     assert "Catalogs" in section, "the word test :94 pins must survive"
     assert "not a catalog to create" in section
-    assert "`provision --target-catalog`" in section
     assert _DEFAULT_NOTE in section
-    structure_line = next(l for l in section.splitlines()
-                          if l.startswith("Schemas the structure job"))
-    assert "`public`" in structure_line and "d.public" not in structure_line
-    assert "Older `deploy`/`notebook` path only: `d.public`" in section
-    assert "exist as INTERNAL" in section
+    names = next(l for l in section.splitlines()
+                 if l.startswith("Schemas the plan names"))
+    assert "`d.public`" in names
+    assert "`plan --bronze-catalog-prefix" in names
+    assert "Older" not in section
     assert "Schemas the clone will create" not in section
 
 
-def test_prefix_mode_target_structure_names_the_catalog_to_create_and_the_source_schema():
+def test_prefix_mode_target_structure_names_the_catalog_to_create_and_the_planned_schema():
     md = render_planned_objects(dict(PLAN, bronze_catalog_prefix="lake",
                                      target_catalog_note=_PREFIX_NOTE,
                                      catalogs_to_create=["lake"],
@@ -578,8 +568,8 @@ def test_prefix_mode_target_structure_names_the_catalog_to_create_and_the_source
     assert _PREFIX_NOTE in section
     structure_line = next(l for l in section.splitlines()
                           if l.startswith("Schemas the structure job"))
-    assert "`public`" in structure_line and "d_public" not in structure_line
-    assert "Older `deploy`/`notebook` path only: `lake.d_public`" in section
+    assert "`lake.d_public`" in structure_line
+    assert "Older" not in section
     assert "Schemas the clone will create" not in section
 
 

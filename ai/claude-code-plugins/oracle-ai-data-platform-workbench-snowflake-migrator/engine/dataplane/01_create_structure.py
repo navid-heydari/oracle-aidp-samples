@@ -570,9 +570,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"{', '.join(sorted(stray))}, and this run was given "
                 f"--target-catalog {args.target_catalog}. Creating the "
                 f"plan's tables somewhere it does not name would be exactly "
-                f"the substitution the plan exists to prevent. Re-run `ddl` "
-                f"for this catalog, or point this run at the one the plan "
-                f"names.")
+                f"the substitution the plan exists to prevent. Re-run `plan "
+                f"--bronze-catalog-prefix {args.target_catalog}` and `ddl` "
+                f"so the plan names this catalog, or point this run at the "
+                f"one the plan names.")
         log(f"ddl plan: {len(planned_columns)} table(s) with engine-"
             f"translated types, from {ddl_path}"
             + (f"; {len(planned_views)} view(s) it carries are NOT created "
