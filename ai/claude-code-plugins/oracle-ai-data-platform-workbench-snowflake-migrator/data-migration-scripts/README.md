@@ -106,7 +106,8 @@ In every mode the CREATE returning is not the claim: the table is `DESCRIBE`d
 afterwards and compared with the plan, column by column and in order.
 `CREATE TABLE IF NOT EXISTS` is a silent no-op on a table that is already
 there, so without the read-back a stale layout would be certified as created
-from the plan — and the copy is a positional `INSERT ... SELECT *`.
+from the plan — and the copy fills the target's columns in the target's
+order.
 
 ## Statuses and verdicts
 
@@ -138,7 +139,7 @@ every report with exit 0.
 | `skipped_nonempty` | `skip-existing` found rows already there, **equal** to the source count; not re-verified | no |
 | `count_mismatch` | counts differ — after a copy, or on a `skip-existing` target that already held a different number of rows (nothing copied) | **yes** |
 | `sum_mismatch` | counts equal, a decimal column does not sum equal | **yes** |
-| `type_drift` | a source DECIMAL column is not DECIMAL, or narrower, on the target; NOT copied — an INSERT would round or truncate with the count intact | **yes** |
+| `type_drift` | the live source's column names are not the target's (renamed, dropped or added since the plan; `layout_drift` lists them), or a source DECIMAL column is not DECIMAL, or narrower, on the target; NOT copied — the rows would land in the wrong columns, or be rounded or truncated, with the count intact. A source whose columns are only **reordered** is copied: every column is selected by name, in the target's order | **yes** |
 | `failed` | the copy raised; `insert_completed: true` means the rows landed before verification failed, so re-copy with `--mode overwrite`, never `append` | **yes** |
 | `target_missing` | no table to copy into (usually `not_in_plan` upstream) | no — **yes** when the structure report records the table `created` or `already_existed` |
 

@@ -10,20 +10,26 @@ Runs on AIDP compute. Per table:
                                 when its count equals the source's and
                                 `count_mismatch` when it does not -- a
                                 re-run never softens a recorded failure;
-       append:                  INSERT INTO ... SELECT *;
-       overwrite:               INSERT OVERWRITE ... SELECT * (rewrites ROWS,
-                                never drops the table);
+       append:                  INSERT INTO ... SELECT <columns>;
+       overwrite:               INSERT OVERWRITE ... SELECT <columns>
+                                (rewrites ROWS, never drops the table);
+     the source's columns are named, paired with the target's by name and
+     listed in the target's order, so a source whose columns were reordered
+     since the plan still lands each value in its own column;
   3. VERIFY: target count == source count (both read AFTER the copy), and
      with --verify counts+sums an exact SUM over every DECIMAL column OF
      THE SOURCE, cast to DECIMAL(38,s) with the SOURCE's scale on both
      sides. Floats are never summed for equality — float tolerance is
      wrong for money.
 
-Before any row moves, and in both verify modes, the source's DECIMAL
-columns are checked against the target's types: a target column that is not
-DECIMAL, or a DECIMAL with fewer integer digits or a smaller scale, would be
-rounded or truncated by the INSERT with the row count intact. That table is
-recorded `type_drift` and NOT copied.
+Before any row moves, and in both verify modes, the live source's columns
+are checked against the target's BY NAME: a source column the target lacks,
+or a target column the source lacks (renamed, dropped, added since the
+plan), has no right place to land, so that table is recorded `type_drift`
+and NOT copied. The source's DECIMAL columns are then checked against the
+target's types: a target column that is not DECIMAL, or a DECIMAL with fewer
+integer digits or a smaller scale, would be rounded or truncated by the
+INSERT with the row count intact -- `type_drift` too, and NOT copied.
 
 The copy's claim is the verification, not the INSERT returning: exactly the
 discipline the control-plane deploy learned from live AIDP (a 2xx is not the
@@ -191,6 +197,53 @@ def _decimal_columns(types: dict[str, str]) -> list[tuple[str, int, int]]:
     return out
 
 
+def _layout_drift(src_types: dict[str, str],
+                  tgt_types: dict[str, str]) -> tuple[dict, str] | None:
+    """`(drift, why)` when the source and target columns are not the same
+    NAMES, else None. Case-insensitive, as Spark resolves column names.
+
+    The target was checked against the plan by the structure step; nothing
+    checked it against the LIVE source, which can have been rebuilt since.
+    Column ORDER is not drift: the INSERT names every column and pairs them
+    by name. A name that is on one side only is, since its values have no
+    right place to land -- positionally, an email ended up in `city`.
+    """
+    for side, types in (("source", src_types), ("target", tgt_types)):
+        folded: dict[str, list[str]] = {}
+        for name in types:
+            folded.setdefault(name.casefold(), []).append(name)
+        clash = [names for names in folded.values() if len(names) > 1]
+        if clash:
+            return ({f"{side}_names_differing_only_in_case": clash[0]},
+                    f"the {side} has columns whose names differ only in "
+                    f"case ({', '.join(clash[0])}); Spark resolves them as "
+                    f"one name, so which value lands where cannot be "
+                    f"decided")
+    src = {n.casefold() for n in src_types}
+    tgt = {n.casefold() for n in tgt_types}
+    not_on_target = [n for n in src_types if n.casefold() not in tgt]
+    not_in_source = [n for n in tgt_types if n.casefold() not in src]
+    if not (not_on_target or not_in_source):
+        return None
+    parts = []
+    if not_on_target:
+        parts.append(f"source column(s) {', '.join(not_on_target)} are not "
+                     f"on the target")
+    if not_in_source:
+        parts.append(f"target column(s) {', '.join(not_in_source)} are not "
+                     f"in the source")
+    return ({"not_on_target": not_on_target, "not_in_source": not_in_source},
+            "; ".join(parts) + " -- renamed, dropped or added since the plan")
+
+
+def _column_pairs(src_types: dict[str, str],
+                  tgt_types: dict[str, str]) -> list[tuple[str, str]]:
+    """`[(target_column, source_column)]` in the TARGET's order, paired by
+    name. Only called once `_layout_drift` found the same names both sides."""
+    by_fold = {n.casefold(): n for n in src_types}
+    return [(t, by_fold[t.casefold()]) for t in tgt_types]
+
+
 def _type_drift(src_types: dict[str, str], tgt_types: dict[str, str]) -> dict:
     """Source DECIMAL columns the target cannot hold without silent loss.
 
@@ -271,6 +324,23 @@ def _copy(spark, src: str, tgt: str, *, mode: str, verify: str,
     # metadata only (DESCRIBE on the registered source and on the target).
     src_types = _column_types(spark, src)
     tgt_types = _column_types(spark, tgt)
+    if not src_types or not tgt_types:
+        # Nothing to pair by name: could not look, not a match.
+        return {"status": "failed", "source_count": source_count,
+                "started_at": started,
+                "reason": f"DESCRIBE of the "
+                          f"{'source' if not src_types else 'target'} "
+                          f"returned no columns, so its layout cannot be "
+                          f"compared with the other side's. NOT copied."}
+    layout = _layout_drift(src_types, tgt_types)
+    if layout:
+        drift, why = layout
+        return {"status": "type_drift", "layout_drift": drift,
+                "source_count": source_count, "started_at": started,
+                "reason": f"{why}. The source's columns are not the "
+                          f"target's, so its rows have no right place to "
+                          f"land. NOT copied. Re-plan the table from the "
+                          f"live source, or restore the source's layout."}
     drift = _type_drift(src_types, tgt_types)
     if drift:
         return {"status": "type_drift", "type_drift": drift,
@@ -296,9 +366,15 @@ def _copy(spark, src: str, tgt: str, *, mode: str, verify: str,
                 "reason": f"target already holds {target_rows} row(s); use "
                           f"--mode overwrite to rewrite them or append to add"}
 
-    statement = (f"INSERT OVERWRITE {tgt} SELECT * FROM {src}"
-                 if mode == "overwrite"
-                 else f"INSERT INTO {tgt} SELECT * FROM {src}")
+    # Every source column named, in the TARGET's order: an INSERT fills the
+    # target positionally, and `SELECT *` is the SOURCE's order, so a source
+    # rebuilt with two columns swapped landed each value in the other's
+    # column with the counts intact. (No target column list: the select
+    # list already is the target's order, and it keeps the statement the
+    # plain INSERT ... SELECT every Delta version accepts.)
+    select = ", ".join(q(s) for _t, s in _column_pairs(src_types, tgt_types))
+    verb = "INSERT OVERWRITE" if mode == "overwrite" else "INSERT INTO"
+    statement = f"{verb} {tgt} SELECT {select} FROM {src}"
     last_error = None
     for attempt in range(retries + 1):
         try:

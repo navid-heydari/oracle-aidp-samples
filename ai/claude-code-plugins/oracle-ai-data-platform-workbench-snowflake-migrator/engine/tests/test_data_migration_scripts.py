@@ -211,8 +211,10 @@ class _CatalogSpark(_FakeSpark):
                              "isTemporary": False}
                             for fqn in self.catalog if fqn.startswith(prefix)])
         if low.startswith("insert"):
-            m = re.match(r"insert (?:into|overwrite) (\S+) select \* from (\S+)",
-                         flat, re.IGNORECASE)
+            # The copy names the source's columns (in the target's order);
+            # the fake lands the count either way.
+            m = re.match(r"insert (?:into|overwrite) (\S+) select .*? from "
+                         r"(\S+)$", flat, re.IGNORECASE)
             tgt, src = m.group(1), m.group(2)
             landed = (self.counts.get(src, 0) if self.insert_lands is None
                       else self.insert_lands)
