@@ -496,7 +496,7 @@ def build_security(run_sql: Callable[..., list[dict]], inventory: dict, *,
                                 references_readable or live_settled,
                                 unattached, kinds_enumerated=enumerated,
                                 kinds_unenumerated=unenumerated,
-                                live=live),
+                                live=live, tags=tag_references),
     }
 
 
@@ -637,16 +637,23 @@ def _join(labels) -> str:
 
 def _statement(count, secure_views: list[dict], references_readable: bool,
                defined_without_attachment: int = 0, *,
-               kinds_enumerated=(), kinds_unenumerated=(), live=None) -> str:
+               kinds_enumerated=(), kinds_unenumerated=(), live=None,
+               tags=None) -> str:
     """The one sentence a reader takes away. It may only name what was asked.
 
     I3: "could not look" never renders as zero. The clean verdict is built
     from the kinds that actually answered, so a kind whose SHOW was denied
     cannot be covered by it -- it gets said out loud instead.
+
+    Tags likewise: the clean sentence used to say "no tag is attached"
+    without ever being handed the tag read, so a PII-tagged column with no
+    masking policy got a headline denying the tag the table below listed.
     """
     kinds_enumerated = list(kinds_enumerated)
     kinds_unenumerated = list(kinds_unenumerated)
     live = live or {}
+    tags = tags or {}
+    tag_count = tags.get("count") if tags.get("measured") else None
     live_settled = bool(live.get("attempted") and live.get("complete"))
     if not references_readable:
         return ("**Policy attachments could not be read**, so whether any "
@@ -662,6 +669,12 @@ def _statement(count, secure_views: list[dict], references_readable: bool,
             f"not travel with them. Values masked in Snowflake arrive readable")
     if secure_views:
         parts.append(f"**{len(secure_views)} secure view(s)** lose SECURE")
+    # Kept out of `parts` until the end: a tag is not a protection the
+    # clone strips, so on its own it must not displace the policy verdict.
+    tag_part = (f"**{tag_count} tag attachment(s)** on migrated objects do "
+                f"not travel: nothing on the target carries the "
+                f"classification, so anything keyed off it has nothing to key "
+                f"off") if tag_count else ""
     if defined_without_attachment:
         parts.append(
             f"**{defined_without_attachment} policy object(s) "
@@ -695,14 +708,20 @@ def _statement(count, secure_views: list[dict], references_readable: bool,
             f"**{len(unreachable)} object(s) could not be read directly** "
             f"({shown}), so nothing above is a verdict about them")
     if not parts:
+        tail = f" {tag_part}." if tag_part else ""
         if live_settled:
-            return (f"No {_join(kinds_enumerated)} policy and no tag is "
+            # "no tag" only when the tag read was measured and came back
+            # empty -- never inferred from the policy read.
+            no_tag = " and no tag" if tag_count == 0 else ""
+            return (f"No {_join(kinds_enumerated)} policy{no_tag} is "
                     f"attached to anything being migrated, and no secure "
                     f"views are in scope. Read per object from "
                     f"INFORMATION_SCHEMA, so this is current rather than "
-                    f"subject to the ~2 h ACCOUNT_USAGE lag.")
+                    f"subject to the ~2 h ACCOUNT_USAGE lag.{tail}")
         return (f"No {_join(kinds_enumerated)} policy is attached to anything "
                 "being migrated, and no secure views are in scope. Nothing is "
                 "protected today that the migration would strip -- as of "
-                f"{_LAG}.")
+                f"{_LAG}.{tail}")
+    if tag_part:
+        parts.append(tag_part)
     return " · ".join(parts) + ". Resolve before the clone is used for anything real."

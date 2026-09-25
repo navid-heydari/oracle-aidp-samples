@@ -735,3 +735,47 @@ def test_a_stale_account_row_the_live_read_contradicts_is_kept_and_flagged():
     e = s["exposures"][0]
     assert e["source"] == "account_usage"
     assert "confirm" in (e.get("needs_confirmation") or "").lower()
+
+
+# ------------------------------------------ the headline names the tags too
+#
+# Review 2026-09-25. _statement() never received tag_references, so on the
+# commonest governance pattern -- PII-tagged columns with no masking policy
+# -- the per-object read settled cleanly and the first line of SECURITY.md
+# read "No masking ... policy and no tag is attached to anything being
+# migrated", while the "## Tag attachments" table a few lines below listed
+# GOV.TAGS.PII on CUSTOMERS.EMAIL. The report contradicted itself and stated
+# a fact the run had just disproved.
+
+def test_a_tag_attachment_is_named_in_the_headline_not_denied():
+    s = build_security(FakeSql(_responses(**{
+        "tag_references_all_columns": [_live_tag()]})), _table_only_inv())
+    assert s["tag_references"]["count"] == 1
+    st = s["statement"]
+    assert "no tag is attached" not in st.lower(), st
+    assert "1 tag attachment(s)" in st, st
+    assert "do not travel" in st
+    # A tag is not a stripped protection: the policy verdict still leads.
+    assert st.lower().startswith("no masking"), st
+
+
+def test_a_tag_seen_only_in_the_account_view_is_named_too():
+    s = build_security(FakeSql(_responses(tag_references=[_tag_ref()])),
+                       _table_only_inv(), live_attachment_budget=0)
+    assert s["tag_references"]["count"] == 1
+    assert "1 tag attachment(s)" in s["statement"], s["statement"]
+
+
+def test_zero_tags_and_zero_policies_still_read_clean():
+    s = build_security(FakeSql(_responses()), _table_only_inv())
+    assert s["tag_references"]["count"] == 0
+    assert "no tag is attached" in s["statement"].lower(), s["statement"]
+
+
+def test_the_rendered_report_agrees_with_its_own_tag_table():
+    from report.render import render_security
+    md = render_security(build_security(FakeSql(_responses(**{
+        "tag_references_all_columns": [_live_tag()]})), _table_only_inv()))
+    head = md.split("\n## ", 1)[0]
+    assert "no tag is attached" not in head.lower()
+    assert "DB.PUBLIC.PII" in md
