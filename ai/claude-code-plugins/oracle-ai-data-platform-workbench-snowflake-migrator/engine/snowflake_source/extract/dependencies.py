@@ -28,30 +28,145 @@ from __future__ import annotations
 import re
 from typing import Callable
 
+from ..dialect import lexer
+
 __all__ = ["extract_dependencies", "parse_view_references"]
 
-_IDENT = r'[A-Za-z_][A-Za-z0-9_$]*|"[^"]+"'
-_REF = re.compile(
-    rf'\b(?:FROM|JOIN)\s+((?:{_IDENT})(?:\s*\.\s*(?:{_IDENT})){{0,2}})',
-    re.IGNORECASE)
+_IDENT = r'[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+"'
+_NAME = re.compile(rf'(?:{_IDENT})(?:\s*\.\s*(?:{_IDENT})){{0,2}}')
+_PART = re.compile(_IDENT)
+# Found in the CODE mask, so a FROM in a comment, a literal or the GET_DDL
+# `COMMENT='...'` header is not one. The raw pattern matched all three and
+# fabricated edges -- and cycles -- from prose.
+_KEYWORD = re.compile(r"\b(FROM|JOIN)\b", re.IGNORECASE)
+_ALIAS = re.compile(r"\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_$]*|\"(?:[^\"]|\"\")+\")",
+                    re.IGNORECASE)
+_WORD_BEFORE = re.compile(r"([A-Za-z_][A-Za-z0-9_$]*)\s*$")
+# Words that end a FROM item, so they are never read as its alias -- or
+# open one that is not a named relation (TABLE(...), VALUES, LATERAL).
+_NOT_ALIAS = {
+    "TABLE", "VALUES", "UNNEST",
+    "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS",
+    "NATURAL", "ON", "USING", "GROUP", "ORDER", "HAVING", "QUALIFY", "LIMIT",
+    "OFFSET", "FETCH", "UNION", "EXCEPT", "MINUS", "INTERSECT", "WINDOW",
+    "LATERAL", "AT", "BEFORE", "CHANGES", "SAMPLE", "TABLESAMPLE", "PIVOT",
+    "UNPIVOT", "MATCH_RECOGNIZE", "ASOF", "SELECT", "FROM"}
+
+
+def _skip_parens(mask: str, i: int) -> int:
+    """Index just past the parenthesis group opening at mask[i]."""
+    depth = 0
+    for j in range(i, len(mask)):
+        if mask[j] == "(":
+            depth += 1
+        elif mask[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return len(mask)
 
 
 def parse_view_references(ddl: str, *, default_db: str,
                           default_schema: str) -> list[str]:
-    """Extract fully-qualified referenced object names from a view body."""
+    """Extract fully-qualified referenced object names from a view body.
+
+    Every relation of a FROM list is read -- `from ORDERS o, Z_CUST c` has
+    two -- not only the first: a dropped one is an edge the wave order never
+    sees, and the view can be created before a view it reads. A bare name
+    that is one of the view's own CTEs, where the CTE is visible, is not a
+    table.
+    """
     if not ddl:
         return []
+    try:
+        mask = lexer.code_only(ddl)
+        ctes = lexer.cte_scopes(ddl)
+    except lexer.UnterminatedLiteral:
+        # The planner refuses this view as unparseable with the same lexer,
+        # so it is never created and its own references order nothing.
+        return []
+
     found: set[str] = set()
-    for match in _REF.finditer(ddl):
-        parts = [p.strip().strip('"') for p in match.group(1).split(".")]
-        parts = [p for p in parts if p]
-        if not parts:
+
+    def skip_blank(pos: int) -> int:
+        # Whitespace and comments are blank in the mask; so is a quoted
+        # identifier, which is where a relation may start.
+        while pos < len(mask) and mask[pos].isspace() and ddl[pos] != '"':
+            pos += 1
+        return pos
+
+    def take(pos: int) -> int | None:
+        """Read one relation at `pos`; return the index after it (and its
+        alias), or None when what stands there is not a relation."""
+        pos = skip_blank(pos)
+        if pos >= len(mask):
+            return None
+        if mask[pos] == "(":                     # a subquery: its own FROMs
+            pos = _skip_parens(mask, pos)       # are found by the outer scan
+        else:
+            # Names are read from the RAW text -- a quoted part is blanked in
+            # the mask -- but must start in code or at a quoted identifier.
+            m = _NAME.match(ddl, pos)
+            if m is None or (mask[pos] != ddl[pos] and ddl[pos] != '"'):
+                return None
+            raw_parts = _PART.findall(m.group(0))
+            if len(raw_parts) == 1:
+                one = raw_parts[0]
+                if one.upper() in _NOT_ALIAS:
+                    return None                 # LATERAL, TABLE(...) forms
+                # Compared as lexer.cte_scopes records a CTE name: unquoted
+                # folds to upper case, quoted is exact.
+                key = (one[1:-1].replace('""', '"') if one.startswith('"')
+                       else one.upper())
+                if any(n == key and lo <= pos < hi for n, lo, hi in ctes):
+                    raw_parts = []              # the view's own CTE
+            if raw_parts:
+                parts = [p.strip('"').replace('""', '"') for p in raw_parts]
+                parts = [default_db, default_schema][:3 - len(parts)] + parts
+                found.add(".".join(p.upper() for p in parts))
+            pos = m.end()
+        alias = _ALIAS.match(ddl, pos)
+        if alias and alias.group(1).upper() not in _NOT_ALIAS:
+            pos = alias.end()
+        return pos
+
+    # A FROM that is not a FROM clause: `IS DISTINCT FROM b` and
+    # `EXTRACT(year FROM ts)` are followed by an expression, whose column
+    # name would otherwise be read as a table the view depends on.
+    keywords = list(_KEYWORD.finditer(mask))
+    starts = {kw.start() for kw in keywords}
+    enclosing: dict[int, int | None] = {}
+    stack: list[int] = []
+    for i, ch in enumerate(mask):
+        if i in starts:
+            enclosing[i] = stack[-1] if stack else None
+        if ch == "(":
+            stack.append(i)
+        elif ch == ")" and stack:
+            stack.pop()
+
+    def word_before(i: int) -> str:
+        m = _WORD_BEFORE.search(mask[max(0, i - 200):i])
+        return m.group(1).upper() if m else ""
+
+    def not_a_clause(kw: re.Match) -> bool:
+        if kw.group(1).upper() != "FROM":
+            return False
+        if word_before(kw.start()) == "DISTINCT":
+            return True
+        opened = enclosing.get(kw.start())
+        return opened is not None and word_before(opened) == "EXTRACT"
+
+    for kw in keywords:
+        if not_a_clause(kw):
             continue
-        if len(parts) == 1:
-            parts = [default_db, default_schema, parts[0]]
-        elif len(parts) == 2:
-            parts = [default_db, parts[0], parts[1]]
-        found.add(".".join(p.upper() for p in parts))
+        pos = take(kw.end())
+        # Only a FROM carries a comma list; a JOIN names one relation.
+        while pos is not None and kw.group(1).upper() == "FROM":
+            pos = skip_blank(pos)
+            if pos >= len(mask) or mask[pos] != ",":
+                break
+            pos = take(pos + 1)
     return sorted(found)
 
 
