@@ -1335,3 +1335,95 @@ def test_the_refusal_names_the_flag_that_actually_works():
     i = src.index("--param does not reach a notebook stage")
     block = src[i:i + 1200]
     assert "--stage-param" in block, block[:500]
+
+
+# ---------------- one listing per folder, not one per file
+#
+# Raised on the review PR as an efficiency note: repeated workspace
+# listings compound with the pagination-following in collect_pages. The
+# plan-file loop uploaded a file and then listed the WHOLE folder to verify
+# it, once per file. Each listing is a separate `aidp` CLI process; the
+# live run made seven of them.
+#
+# The read-back discipline is the point and does not change -- a 2xx is
+# still not the claim. It is the same evidence gathered once.
+
+def _count_ops(ops, name):
+    return sum(1 for op, _kw in ops if op == name)
+
+
+def test_plan_files_are_verified_with_one_listing_for_the_folder(tmp_path):
+    files = []
+    for n in ("inventory.json", "plan.json", "ddl_plan.json"):
+        f = tmp_path / n
+        f.write_text("{}", encoding="utf-8")
+        files.append(f)
+
+    ops = []
+    uploaded = []
+
+    def call(operation, **kw):
+        ops.append((operation, kw))
+        if operation == "upload_ws_file":
+            uploaded.append(kw["path"].rsplit("/", 1)[-1])
+            return {}
+        if operation == "list_ws_objects":
+            return {"items": [{"displayName": n} for n in uploaded]}
+        if operation == "list_workspaces":
+            return {"items": [{"displayName": "ws", "key": "wsk",
+                               "lifecycleState": "ACTIVE"}]}
+        if operation == "list_clusters":
+            return {"items": [{"displayName": "c", "key": "ck",
+                               "lifecycleState": "ACTIVE"}]}
+        if operation == "list_jobs":
+            return {"items": []}
+        return {}
+
+    out = provision(workspace_name="ws", cluster_name="c", scripts=[],
+                    plan_files=files, execute=True, call=call,
+                    reuse_existing=True, delays=())
+    plan_listings = [kw for op, kw in ops
+                     if op == "list_ws_objects"
+                     and kw.get("path") == PLAN_FOLDER]
+    plan_uploads = [kw for op, kw in ops if op == "upload_ws_file"
+                    and str(kw.get("path", "")).startswith(PLAN_FOLDER)]
+    assert len(plan_uploads) == 3, plan_uploads
+    assert len(plan_listings) == 1, (
+        f"one listing verifies the whole folder; got {len(plan_listings)}")
+    plan_steps = [s for s in out["steps"] if s["step"] == "upload"
+                  and PLAN_FOLDER in str(s["detail"])]
+    assert plan_steps and all(s["verified"] for s in plan_steps), plan_steps
+
+
+def test_a_file_whose_upload_raised_is_failed_not_merely_unseen(tmp_path):
+    good = tmp_path / "plan.json"
+    good.write_text("{}", encoding="utf-8")
+    bad = tmp_path / "ddl_plan.json"
+    bad.write_text("{}", encoding="utf-8")
+
+    def call(operation, **kw):
+        if operation == "upload_ws_file" and kw["path"].endswith("ddl_plan.json"):
+            raise RuntimeError("403 Forbidden")
+        if operation == "list_ws_objects":
+            return {"items": [{"displayName": "plan.json"}]}
+        if operation == "list_workspaces":
+            return {"items": [{"displayName": "ws", "key": "wsk",
+                               "lifecycleState": "ACTIVE"}]}
+        if operation == "list_clusters":
+            return {"items": [{"displayName": "c", "key": "ck",
+                               "lifecycleState": "ACTIVE"}]}
+        if operation == "list_jobs":
+            return {"items": []}
+        return {}
+
+    out = provision(workspace_name="ws", cluster_name="c", scripts=[],
+                    plan_files=[good, bad], execute=True, call=call,
+                    reuse_existing=True, delays=())
+    by_detail = {s["detail"].split(":")[0]: s for s in out["steps"]
+                 if s["step"] == "upload"}
+    failed = [s for s in out["steps"]
+              if s["step"] == "upload" and s["action"] == "failed"]
+    assert failed, out["steps"]
+    assert "403" in failed[0]["detail"]
+    assert any(s["action"] == "uploaded" for s in out["steps"]
+               if s["step"] == "upload")

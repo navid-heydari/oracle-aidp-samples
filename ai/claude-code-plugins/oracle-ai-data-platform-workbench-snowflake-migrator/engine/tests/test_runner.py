@@ -416,3 +416,55 @@ def test_the_provisioning_transport_says_the_same_thing():
         make_provision_call(OCID, run_process=_expired_proc)("list_workspaces")
     message = str(err.value)
     assert "oci session authenticate" in message and "expired" in message
+
+
+# ------------- one home for two rules about the platform, not the caller
+#
+# Raised on the review PR: `_is_conflict` and `_active` in provisioning.py
+# duplicated catalog_deploy.py -- `_is_conflict` byte for byte, and the
+# ACTIVE test as a named helper in one module and the same inline
+# expression four times in the other. Both answer a question about the
+# platform, so both now live here.
+
+def test_a_409_is_a_conflict():
+    from target.runner import is_conflict
+    assert is_conflict(RuntimeError("backend returned 409 Conflict"))
+    assert is_conflict(RuntimeError("an ongoing operation is in progress"))
+    assert is_conflict(RuntimeError("ONGOING operation"))
+
+
+def test_other_failures_are_not_conflicts():
+    from target.runner import is_conflict
+    for msg in ("400 Bad Request", "500 Server Error", "not authorized"):
+        assert not is_conflict(RuntimeError(msg)), msg
+
+
+def test_active_means_active():
+    from target.runner import is_active
+    assert is_active({"lifecycleState": "ACTIVE"})
+    assert is_active({"lifecycleState": "active"})
+
+
+def test_a_missing_lifecycle_state_is_not_evidence_of_settling():
+    from target.runner import is_active
+    assert is_active({}) is True
+    assert is_active({"lifecycleState": None}) is True
+    assert is_active(None) is True
+
+
+def test_a_settling_state_is_not_active():
+    from target.runner import is_active
+    for state in ("CREATING", "UPDATING", "DELETING", "FAILED"):
+        assert not is_active({"lifecycleState": state}), state
+
+
+def test_neither_helper_is_defined_twice():
+    """The point of the move: one definition, not three."""
+    import pathlib as _p
+    root = _p.Path(__file__).resolve().parents[1] / "target"
+    for name in ("def is_conflict", "def is_active",
+                 "def _is_conflict", "def _active"):
+        hits = [f.name for f in root.glob("*.py")
+                if name + "(" in f.read_text(encoding="utf-8")]
+        expected = ["runner.py"] if name.startswith("def is_") else []
+        assert hits == expected, f"{name}: {hits}"

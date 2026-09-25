@@ -650,6 +650,38 @@ on its first colon, which is how the file passed before.
   has no default" — the same false negative the census rule exists to
   prevent, and the quiet kind, because the plan simply omits the warning.
 
+### Fixed — the rest of the review PR's list
+
+Everything @navid-heydari raised as non-blocking. Both of the two flagged
+"low confidence" turned out to be real.
+
+- **`cancel_unconfirmed` described the restart HISTORY, not the run in
+  hand.** It was `any(new_run is None for r in restarts)`. A first cold-start
+  attempt that cannot confirm its cancel keeps the original run and records
+  `new_run: None`; a second that cancels cleanly and resubmits records a
+  real one. The run being watched is then a fresh submission onto a slot
+  that *was* free — and the CLI still printed "cold start suspected; cancel
+  unconfirmed" and exited non-zero about it. It now reflects the last
+  attempt, which is the one that describes the run being watched.
+- **The poll budget was not restored after a cold-start restart.** `waited`
+  reset and `polls_left` did not, so a replacement run inherited whatever
+  the wedged one left and could be reported STILL RUNNING after a poll or
+  two. The budget describes how long to watch *a run*, so a replacement gets
+  it; the total stays bounded by `cold_start_restarts`.
+- **`is_conflict` and `is_active` have one home.** `_is_conflict` was
+  byte-identical in `provisioning.py` and `catalog_deploy.py`, and the
+  ACTIVE test was a named helper in one and the same inline expression four
+  times in the other. Both answer a question about the platform rather than
+  about a caller, so both moved to `runner.py`; a test asserts neither is
+  defined twice again.
+- **One listing per folder, not one per file.** The plan-file loop uploaded
+  a file and then listed the whole folder to confirm it, once per file — the
+  live run spent seven listings, each its own CLI process. The read-back
+  discipline is unchanged, because a 2xx never was the claim; it is the same
+  evidence gathered once. An upload that raises is still reported as the
+  failure it is, not as an absence from the listing. The notebook loop
+  already listed once up front and is untouched.
+
 ### Fixed — the in-AIDP stage created a name the plan never approved
 
 - Live 2026-09-24, the whole four-job chain on a real cluster. The approved

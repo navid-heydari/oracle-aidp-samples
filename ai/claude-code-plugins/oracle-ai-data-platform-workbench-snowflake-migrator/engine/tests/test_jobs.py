@@ -553,3 +553,158 @@ def test_cancel_run_reports_the_cancel_error_instead_of_swallowing_it():
     assert state == "RUNNING"
     assert len(seen) == 1 and "FileNotFoundError" in seen[0]
     assert "aidp not found" in seen[0]
+
+
+# ---------------- the two watch_job edge cases raised on the review PR
+#
+# Both were reported as "low confidence, confusing-but-not-crashing". Both
+# are real.
+#
+# 1. `cancel_unconfirmed` was `any(new_run is None for r in restarts)` --
+#    the whole restart HISTORY. A first attempt that cannot confirm its
+#    cancel keeps the original run and records `new_run: None`; a second
+#    attempt that cancels cleanly and resubmits records a real `new_run`.
+#    The run being watched is then a properly submitted one on a free slot,
+#    and the flag still said the cancel was unconfirmed -- so the CLI
+#    printed "cold start suspected; cancel unconfirmed" and exited non-zero
+#    about a run that was fine.
+#
+# 2. The poll budget was set once and never restored. After a restart
+#    `waited` resets but `polls_left` does not, so the new run inherits
+#    whatever the abandoned one left -- and STILL RUNNING can be reported
+#    for a run that was barely watched.
+
+class _FlakyCancel:
+    """First cold start: the cancel never reaches a terminal state, so the
+    original run is kept. Second: the cancel confirms and a new run goes in,
+    which then succeeds."""
+
+    def __init__(self):
+        self.submitted: list[str] = []
+        self.cancel_attempts = 0
+        self.confirmed: set = set()
+
+    def __call__(self, operation, **kw):
+        if operation == "list_job_runs":
+            return {"items": []}
+        if operation == "run_job":
+            key = f"run-{len(self.submitted) + 1}"
+            self.submitted.append(key)
+            return {"key": key}
+        if operation == "get_job_run":
+            key = kw["key"]
+            if key in self.confirmed:
+                return {"state": {"status": "CANCELED"}}
+            # run-2 is the healthy resubmission.
+            if key == "run-2":
+                return {"state": {"status": "SUCCESS"}}
+            return {"state": {"status": "RUNNING"}}
+        if operation == "list_task_runs":
+            started = 1789854291517 if kw["run_key"] == "run-2" else None
+            return {"items": [{"key": "t1", "startTime": started}]}
+        if operation == "cancel_job_run":
+            self.cancel_attempts += 1
+            if self.cancel_attempts >= 2:      # the second one confirms
+                self.confirmed.add(kw["run_key"])
+            return {}
+        if operation == "fetch_task_output":
+            return _notebook_payload("done\n")
+        raise AssertionError(operation)
+
+
+def test_cancel_unconfirmed_describes_the_run_being_watched():
+    fake = _FlakyCancel()
+    res = watch_job(fake, workspace="ws", job_key="j", poll_seconds=30,
+                    cold_start_seconds=60, max_polls=30,
+                    cold_start_restarts=2, sleep=lambda s: None)
+    assert len(res["restarts"]) == 2, res["restarts"]
+    assert res["restarts"][0]["new_run"] is None      # the failed cancel
+    assert res["restarts"][1]["new_run"] == "run-2"   # the confirmed one
+    assert res["cancel_unconfirmed"] is False, (
+        "the run being watched was submitted onto a slot whose cancel WAS "
+        "confirmed; the earlier failed attempt is history, not its state")
+
+
+def test_an_unconfirmed_cancel_on_the_last_attempt_is_still_reported():
+    """The flag must keep working where it belongs."""
+    class NeverConfirms(_FlakyCancel):
+        def __call__(self, operation, **kw):
+            if operation == "cancel_job_run":
+                return {}                     # never reaches terminal
+            return super().__call__(operation, **kw)
+
+    res = watch_job(NeverConfirms(), workspace="ws", job_key="j",
+                    poll_seconds=30, cold_start_seconds=60, max_polls=12,
+                    cold_start_restarts=1, sleep=lambda s: None)
+    assert res["restarts"][-1]["new_run"] is None
+    assert res["cancel_unconfirmed"] is True
+
+
+class _SlowSecondRun:
+    """run-1 is wedged; run-2 is picked up but needs three polls to finish.
+
+    With the budget shared, run-2 is watched for whatever run-1 left and
+    reported STILL RUNNING. With the budget restored it reaches SUCCESS.
+    """
+
+    def __init__(self):
+        self.submitted: list[str] = []
+        self.polls_of_run2 = 0
+
+    def __call__(self, operation, **kw):
+        if operation == "list_job_runs":
+            return {"items": []}
+        if operation == "run_job":
+            key = f"run-{len(self.submitted) + 1}"
+            self.submitted.append(key)
+            return {"key": key}
+        if operation == "get_job_run":
+            key = kw["key"]
+            if key == "run-2":
+                self.polls_of_run2 += 1
+                return {"state": {"status": "SUCCESS" if
+                                  self.polls_of_run2 >= 3 else "RUNNING"}}
+            return {"state": {"status": "CANCELED" if self.cancelled
+                              else "RUNNING"}}
+        if operation == "list_task_runs":
+            started = 1789854291517 if kw["run_key"] == "run-2" else None
+            return {"items": [{"key": "t1", "startTime": started}]}
+        if operation == "cancel_job_run":
+            self.cancelled = True
+            return {}
+        if operation == "fetch_task_output":
+            return _notebook_payload("done\n")
+        raise AssertionError(operation)
+
+    cancelled = False
+
+
+def test_the_poll_budget_is_restored_for_a_resubmitted_run():
+    """The budget the caller set describes how long to watch A RUN. A run
+    that replaces a wedged one gets that budget, not its leftovers.
+
+    max_polls=3: two polls wedge run-1 and trigger the restart, leaving one.
+    run-2 needs three. Sharing the budget reports STILL RUNNING about a run
+    that was watched once.
+    """
+    fake = _SlowSecondRun()
+    res = watch_job(fake, workspace="ws", job_key="j", poll_seconds=30,
+                    cold_start_seconds=60, max_polls=3,
+                    cold_start_restarts=1, sleep=lambda s: None)
+    assert fake.submitted == ["run-1", "run-2"]
+    assert res["run_key"] == "run-2"
+    assert res["terminal"] is True, (
+        "run-2 was picked up and finished; it was reported unfinished only "
+        "because it inherited run-1's spent budget")
+    assert res["ok"] is True
+
+
+def test_the_restored_budget_is_still_bounded():
+    """Restarts are capped, so the budget cannot be renewed forever."""
+    fake = ColdStart(ignore_runs=99)          # never picks anything up
+    res = watch_job(fake, workspace="ws", job_key="j", poll_seconds=30,
+                    cold_start_seconds=60, max_polls=4,
+                    cold_start_restarts=2, sleep=lambda s: None)
+    assert res["terminal"] is False
+    assert len(res["restarts"]) <= 2
+    assert len(fake.submitted) <= 3           # original + 2 restarts

@@ -36,6 +36,7 @@ from migration_config import ConfigError, load_config, snowflake_block
 from plan.preflight import SECRET_PATH_FIELDS
 
 from .naming import translate_name
+from .runner import is_active, is_conflict
 from .stage_notebooks import (
     DIAGNOSE_NOTEBOOK_NAME, STAGES, build_diagnose_notebook,
     build_stage_notebook)
@@ -315,20 +316,6 @@ def _match(items: list[dict], display_name: str) -> dict | None:
     return None
 
 
-def _is_conflict(exc: Exception) -> bool:
-    """A 409 "ongoing operation": the workspace is still settling after its
-    own POST returned. Retried with the bounded backoff, as catalog_deploy
-    does for a table posted into a settling schema."""
-    text = str(exc)
-    return "409" in text or "ongoing" in text.lower()
-
-
-def _active(item: dict) -> bool:
-    """ACTIVE -- or carrying no lifecycleState at all, since an absent field
-    is not evidence of settling."""
-    return str(item.get("lifecycleState") or "ACTIVE").upper() == "ACTIVE"
-
-
 def _poll(list_fn, display_name: str, delays: tuple[float, ...], *,
           require_active: bool = False) -> dict | None:
     """The item once it is visible (and ACTIVE, when asked for); None when it
@@ -343,7 +330,7 @@ def _poll(list_fn, display_name: str, delays: tuple[float, ...], *,
             found = None
         if found is not None:
             last = found
-            if not require_active or _active(found):
+            if not require_active or is_active(found):
                 return found
         if attempt < len(delays):
             time.sleep(delays[attempt])
@@ -546,7 +533,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         # stop, because the cluster POST below retries on the 409 anyway.
         found = _poll(lambda: call("list_workspaces"), ws_name.name, delays,
                       require_active=True)
-        settling = found is not None and not _active(found)
+        settling = found is not None and not is_active(found)
         step("workspace", "create_requested" if found is None else "created",
              found is not None,
              f'{ws_name.name}: visible, but lifecycleState='
@@ -606,7 +593,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                      body=build_cluster_body(cl_name.name))
                 break
             except Exception as exc:
-                if _is_conflict(exc) and attempt < len(delays):
+                if is_conflict(exc) and attempt < len(delays):
                     step("cluster", "retried", None,
                          f"attempt {attempt + 1}: 409/ongoing operation on "
                          f"workspace {ws_key}; waiting {delays[attempt]:g}s")
@@ -723,22 +710,44 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                  f"{folder}: {str(exc)[:120]}")
 
     for folder, files in ((PLAN_FOLDER, plan_files),):
+        # Upload the folder's files, THEN read the folder back once. The
+        # read-back is the claim and is unchanged -- a 2xx never was one --
+        # but it is the same evidence gathered once instead of per file.
+        # Each listing is its own CLI process; the live run spent seven.
+        upload_errors: dict[str, str] = {}
+        for path in files:
+            try:
+                call("upload_ws_file", workspace=ws_key,
+                     path=f"{folder}/{path.name}", local_path=str(path))
+            except Exception as exc:
+                upload_errors[path.name] = str(exc)[:200]
+        if not files:
+            continue
+        try:
+            items = call("list_ws_objects", workspace=ws_key,
+                         path=folder).get("items") or []
+            listing_failure = None
+        except Exception as exc:
+            items, listing_failure = [], str(exc)[:200]
         for path in files:
             remote = f"{folder}/{path.name}"
-            try:
-                call("upload_ws_file", workspace=ws_key, path=remote,
-                     local_path=str(path))
-                items = call("list_ws_objects", workspace=ws_key,
-                             path=folder).get("items") or []
-                found = any(
-                    str(i.get("path") or "").endswith("/" + path.name)
-                    or i.get("displayName") == path.name for i in items)
-                step("upload", "uploaded" if found else "upload_requested",
-                     found,
-                     remote if found else f"{remote}: not visible in listing")
-            except Exception as exc:
+            if path.name in upload_errors:
+                # The upload itself raised: that is what to report, not the
+                # absence it necessarily causes in the listing.
                 step("upload", "failed", False,
-                     f"{remote}: {str(exc)[:200]}")
+                     f"{remote}: {upload_errors[path.name]}")
+                continue
+            if listing_failure is not None:
+                step("upload", "upload_requested", None,
+                     f"{remote}: uploaded, but the folder could not be "
+                     f"listed to confirm it ({listing_failure})")
+                continue
+            found = any(
+                str(i.get("path") or "").endswith("/" + path.name)
+                or i.get("displayName") == path.name for i in items)
+            step("upload", "uploaded" if found else "upload_requested",
+                 found,
+                 remote if found else f"{remote}: not visible in listing")
 
     if credential_object:
         # The derived `snowflake:` block, written to a temp file for the

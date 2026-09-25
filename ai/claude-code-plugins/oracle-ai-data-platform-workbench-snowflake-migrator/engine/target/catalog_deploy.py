@@ -83,6 +83,7 @@ from typing import Callable
 import time
 import uuid
 
+from .runner import is_active, is_conflict
 from .catalog_api import (
     PROPERTIES_THIS_BODY_CANNOT_CARRY, build_schema_body, build_table_body,
     build_view_body)
@@ -259,11 +260,6 @@ def _diagnose_never_appeared(call, catalog: str, schema_key: str,
                                 "refused -- remove it manually if it is there"))
         probes.append(entry)
     return landed
-
-
-def _is_conflict(exc: Exception) -> bool:
-    text = str(exc)
-    return "409" in text or "ongoing" in text.lower()
 
 
 _TRANSIENT = re.compile(r"\b5\d\d\b|\b429\b|time[d]?[ -]?out", re.IGNORECASE)
@@ -496,7 +492,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
             for attempt in range(len(schema_wait) + 1):
                 found = _look(catalog, schema)
                 if found is not None and \
-                        str(found.get("lifecycleState") or "ACTIVE").upper() == "ACTIVE":
+                        is_active(found):
                     break
                 if attempt < len(schema_wait):
                     time.sleep(schema_wait[attempt])
@@ -505,7 +501,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
             # Present but still settling: creating tables now is what gets
             # them accepted-then-dropped.
             for attempt in range(len(schema_wait) + 1):
-                if str(found.get("lifecycleState") or "ACTIVE").upper() == "ACTIVE":
+                if is_active(found):
                     break
                 if attempt < len(schema_wait):
                     time.sleep(schema_wait[attempt])
@@ -515,7 +511,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
             out["errors"].append(
                 f"could not resolve the server's key for schema {requested}; "
                 f"falling back to the requested name")
-        elif str(found.get("lifecycleState") or "ACTIVE").upper() != "ACTIVE":
+        elif not is_active(found):
             out["errors"].append(
                 f"schema {requested} is "
                 f'{found.get("lifecycleState")}, not ACTIVE. Creating tables '
@@ -597,7 +593,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 create_error = str(exc)
                 out["errors"].append(f"CREATE {stmt.get('object_type')} "
                                      f"{stmt['target_fqn']}: {exc}")
-                if _is_conflict(exc) and attempt < len(retry_delays):
+                if is_conflict(exc) and attempt < len(retry_delays):
                     time.sleep(retry_delays[attempt])
                     continue
                 break

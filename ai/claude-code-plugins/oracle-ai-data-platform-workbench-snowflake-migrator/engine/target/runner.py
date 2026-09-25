@@ -60,6 +60,25 @@ def spool_body(body: dict, *, prefix: str) -> str:
     return path
 
 
+def is_conflict(exc: Exception) -> bool:
+    """A 409 "ongoing operation": the resource is still settling after its
+    own POST returned. Worth retrying with a bounded backoff.
+
+    Shared because it is a fact about the platform, not about a caller: the
+    catalog deploy and the provisioner both meet it, and two copies of a
+    rule about someone else's API is two things to update when that API
+    grows another way of saying the same thing.
+    """
+    text = str(exc)
+    return "409" in text or "ongoing" in text.lower()
+
+
+def is_active(item: dict) -> bool:
+    """ACTIVE -- or carrying no lifecycleState at all, since an absent field
+    is not evidence of settling."""
+    return str((item or {}).get("lifecycleState") or "ACTIVE").upper() == "ACTIVE"
+
+
 class BackendError(RuntimeError):
     """The aidp/oci CLI exited non-zero."""
 

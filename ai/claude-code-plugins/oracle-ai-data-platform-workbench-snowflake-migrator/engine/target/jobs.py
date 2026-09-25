@@ -316,6 +316,12 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
                                               if cancel_errors else None),
                              "new_run": run_key,
                              "after_seconds": after})
+            # The budget the caller set describes how long to watch A RUN.
+            # It was spent on a run that never started, so the replacement
+            # gets it back rather than inheriting the leftovers and being
+            # reported STILL RUNNING after a poll or two. Bounded overall by
+            # cold_start_restarts, which is what caps the total wait.
+            polls_left = max_polls
             if on_restart:
                 on_restart(stale, run_key)
             status, message = "UNKNOWN", ""
@@ -328,6 +334,11 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
             "output": output, "terminal": terminal, "restarts": restarts,
             "polls": attempt,
             "unrecognised": (not terminal) and status not in ACTIVE_STATES,
-            "cancel_unconfirmed": any(r.get("new_run") is None
-                                      for r in restarts),
+            # The state of the run being WATCHED, not of every attempt
+            # ever made. An earlier attempt that could not confirm its
+            # cancel is history the caller can read in `restarts`; if a
+            # later one cancelled cleanly and resubmitted, the run in hand
+            # is on a slot that was free.
+            "cancel_unconfirmed": bool(restarts)
+                                  and restarts[-1].get("new_run") is None,
             "ok": terminal and status in SUCCESS_STATES}
