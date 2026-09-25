@@ -153,7 +153,7 @@ def build_inventory(run_sql: Callable[..., list[dict]],
         constraints = build_constraints(run_sql, db, notes)
 
         for schema in schemas:
-            columns = _columns(run_sql, db, schema, notes)
+            columns, columns_error = _columns(run_sql, db, schema, notes)
             for kind, show in (("TABLE", "tables"), ("VIEW", "views")):
                 try:
                     objects = _show_all(
@@ -171,7 +171,8 @@ def build_inventory(run_sql: Callable[..., list[dict]],
                                 geospatial=geospatial,
                                 timestamp_ntz=timestamp_ntz,
                                 constraints=constraints.get(
-                                    f'{db}.{schema}.{obj["name"]}', [])))
+                                    f'{db}.{schema}.{obj["name"]}', []),
+                                columns_error=columns_error))
 
     collisions = detect_collisions([r["source_identifier"] for r in inventory])
     return {
@@ -190,12 +191,19 @@ def build_inventory(run_sql: Callable[..., list[dict]],
     }
 
 
-def _columns(run_sql, db: str, schema: str, notes: list[str]) -> dict[str, list[dict]]:
-    """Column metadata for one schema, keyed by object name.
+def _columns(run_sql, db: str, schema: str, notes: list[str]
+             ) -> tuple[dict[str, list[dict]], str | None]:
+    """Column metadata for one schema, keyed by object name, and the error
+    text when the read FAILED (None when it answered).
 
     Read per schema rather than per database: one unfiltered query over a large
     database's INFORMATION_SCHEMA.COLUMNS can exceed Snowflake's result limit
     and fail, taking every object's types with it.
+
+    The error is returned, not only noted, because an empty dict is also what
+    a schema with nothing visible returns. Without it every object in a
+    schema whose read timed out was typed over zero columns and came out
+    `supported`.
     """
     by_obj: dict[str, list[dict]] = collections.defaultdict(list)
     try:
@@ -214,10 +222,10 @@ def _columns(run_sql, db: str, schema: str, notes: list[str]) -> dict[str, list[
             f"order by table_name, ordinal_position", {"schema": schema})
     except Exception as exc:
         notes.append(f"{db}.{schema} columns: {exc}")
-        return by_obj
+        return by_obj, str(exc)[:300]
     for c in rows:
         by_obj[c["TABLE_NAME"]].append(c)
-    return by_obj
+    return by_obj, None
 
 
 def _row_count(run_sql, db: str, schema: str, name: str, kind: str, *,
@@ -250,11 +258,21 @@ def _row_count(run_sql, db: str, schema: str, name: str, kind: str, *,
             "row_count_note": "exact, from COUNT(*)"}
 
 
+def _compatibility(blocked_reasons: list[str],
+                   columns_error: str | None) -> str:
+    """`unassessed` when the column read failed: no blocked reason over no
+    columns is an absence of evidence, and must not read as `supported`."""
+    if columns_error:
+        return "unassessed"
+    return "blocked" if blocked_reasons else "supported"
+
+
 def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
             columns: list[dict], *, row_counts: str, notes: list[str],
             semi_structured: str = "block", geospatial: str = "block",
             timestamp_ntz: str = "preserve",
-            constraints: list[dict] | None = None) -> dict:
+            constraints: list[dict] | None = None,
+            columns_error: str | None = None) -> dict:
     name = obj["name"]
     blocked_reasons: list[str] = []
     warnings: list[str] = []
@@ -286,11 +304,15 @@ def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
         "source_schema": schema,
         "identifier_case_form": case_form(name),
         "migration_status": "discovered",
-        "compatibility_status": "blocked" if blocked_reasons else "supported",
+        "compatibility_status": _compatibility(blocked_reasons, columns_error),
         "blocked_reasons": blocked_reasons,
         "warnings": warnings,
         "type_notes": type_notes,
         "evidence_location": f"show {kind.lower()}s in {db}.{schema}",
+        # Whether the verdict above was computed over columns anyone READ.
+        # "ok" with zero columns is a visibility fact; "failed" is a read
+        # that never answered, and its error travels with the record.
+        "columns_read": "failed" if columns_error else "ok",
         "columns": enriched,
         # PK/UNIQUE/FK as the source declares them. The DDL rule that says
         # they are "captured in the inventory, not emitted as DDL" is only
@@ -298,6 +320,8 @@ def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
         "constraints": list(constraints or []),
         "source_metadata": {k: _jsonable(obj[k]) for k in _META_KEYS if k in obj},
     }
+    if columns_error:
+        rec["columns_read_error"] = columns_error
     rec.update(_row_count(run_sql, db, schema, name, kind,
                           row_counts=row_counts, obj=obj, notes=notes))
 

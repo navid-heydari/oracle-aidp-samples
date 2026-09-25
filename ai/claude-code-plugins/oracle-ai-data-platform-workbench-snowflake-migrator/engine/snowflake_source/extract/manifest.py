@@ -102,7 +102,7 @@ def _column_record(col: dict, *, semi_structured: str, geospatial: str,
 
 def _record(db: str, schema: str, kind: str, obj: dict, *,
             semi_structured: str, geospatial: str, timestamp_ntz: str,
-            notes: list[str]) -> dict:
+            notes: list[str], read_error: str | None = None) -> dict:
     name = obj["name"]
     blocked_reasons: list[str] = []
     warnings: list[str] = []
@@ -121,6 +121,11 @@ def _record(db: str, schema: str, kind: str, obj: dict, *,
             type_notes.append(m.note)
         enriched.append(col_rec)
 
+    # Discovery records an object whose columns it could not read in the
+    # schema's `errors`. With no column here and such an error, the verdict
+    # below would be computed over nothing -- the same `unassessed` case as
+    # a failed column read in a live assess.
+    unread = read_error if not enriched and read_error else None
     if not enriched:
         # Discovery records this as an error too; carrying it forward keeps
         # "we read it and it has no columns" distinct from "we never read it".
@@ -134,11 +139,14 @@ def _record(db: str, schema: str, kind: str, obj: dict, *,
         "source_schema": schema,
         "identifier_case_form": case_form(name),
         "migration_status": "discovered",
-        "compatibility_status": "blocked" if blocked_reasons else "supported",
+        "compatibility_status": ("unassessed" if unread else
+                                 "blocked" if blocked_reasons else
+                                 "supported"),
         "blocked_reasons": blocked_reasons,
         "warnings": warnings,
         "type_notes": type_notes,
         "evidence_location": "discovery_manifest.json (in-AIDP workflow)",
+        "columns_read": "failed" if unread else "ok",
         "columns": enriched,
         # The keys are catalog._META_KEYS, spelled exactly as a live `assess`
         # writes them: restrictions.max_bytes, render_inventory, maintenance
@@ -149,6 +157,8 @@ def _record(db: str, schema: str, kind: str, obj: dict, *,
             ("rows", obj.get("source_rows")),
             ("bytes", obj.get("source_bytes"))) if v is not None},
     }
+    if unread:
+        rec["columns_read_error"] = str(unread)[:300]
 
     rows = obj.get("source_rows")
     if rows is None:
@@ -227,6 +237,9 @@ def inventory_from_manifest(manifest: dict, *, database: str,
             notes.append("a schema entry in the manifest carries no name and "
                          "was skipped rather than guessed")
             continue
+        read_errors = {str(e.get("object")): str(e.get("error") or "")
+                       for e in schema.get("errors") or []
+                       if e.get("object") and e.get("error")}
         for kind, key in (("TABLE", "tables"), ("VIEW", "views")):
             for obj in schema.get(key) or []:
                 if not obj.get("name"):
@@ -236,7 +249,8 @@ def inventory_from_manifest(manifest: dict, *, database: str,
                 record = _record(
                     database, sname, kind, obj,
                     semi_structured=semi_structured, geospatial=geospatial,
-                    timestamp_ntz=timestamp_ntz, notes=notes)
+                    timestamp_ntz=timestamp_ntz, notes=notes,
+                    read_error=read_errors.get(str(obj["name"])))
                 if not facts_known:
                     record["column_facts_unknown"] = True
                 inventory.append(record)
