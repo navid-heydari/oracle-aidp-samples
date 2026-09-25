@@ -187,7 +187,8 @@ STAGES: tuple[StageSpec, ...] = (
             "shape."),
         params={"source-mode": "connector", "source-config": None,
                 "source-catalog": None, "target-catalog": None,
-                "schema": None, "target-schema": None, "tables": None,
+                "schema": None, "target-schema": None, "ddl-plan": None,
+                "tables": None,
                 "mode": "skip-existing", "verify": "counts",
                 "reports-dir": None, "dry-run": False, "force": False},
         required=("target-catalog", "schema"),
@@ -203,7 +204,8 @@ STAGES: tuple[StageSpec, ...] = (
         blurb=(
             "Compares what the target holds against what discovery recorded "
             "and reports the verdict per table. Read-only on both ends."),
-        params={"target-catalog": None, "reports-dir": None, "counts": False},
+        params={"target-catalog": None, "ddl-plan": None, "reports-dir": None,
+                "counts": False},
         required=("target-catalog",),
     ),
 )
