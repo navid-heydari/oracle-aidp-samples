@@ -254,6 +254,22 @@ def _load_warning(load: dict) -> str:
             f"rebuilt on AIDP (a Job, or a streaming or scheduled load)")
 
 
+def _name_parts(rec: dict) -> tuple[str, str, str]:
+    """(database, schema, name) from the record's own fields.
+
+    Not `source_identifier.split(".", 2)`: Snowflake allows a dot inside a
+    quoted name, so `MYDB.PUBLIC.orders.v2` split that way gave a table
+    `orders.v2` and a four-part target the name check passed fragment by
+    fragment -- and `ddl` then refused the whole estate on it.
+    """
+    ident = rec["source_identifier"]
+    db, schema = rec.get("source_database"), rec.get("source_schema")
+    if db is not None and schema is not None and ident.startswith(f"{db}.{schema}."):
+        return db, schema, ident[len(db) + len(schema) + 2:]
+    db, schema, name = ident.split(".", 2)
+    return db, schema, name
+
+
 def _target_catalog_note(catalogs: list[str], prefix: str | None,
                          style: str) -> str:
     """Say whose catalog name the Target column carries.
@@ -308,10 +324,30 @@ def build_plan(inventory: dict, dependencies: dict, *,
     kind_warnings: list[dict] = []
     for rec in kept:
         ident = rec["source_identifier"]
-        db, schema, name = ident.split(".", 2)
+        db, schema, name = _name_parts(rec)
         targets[ident] = bronze_target(db, schema, name,
                                        catalog_prefix=bronze_catalog_prefix,
                                        schema_style=bronze_schema_style)
+
+        # A dot inside a quoted part makes the joined target more than
+        # three parts. Checked on the parts, because the joined FQN splits
+        # into fragments that each pass the name rule.
+        dotted = [p for p in (db, schema, name) if "." in str(p)]
+        if dotted:
+            cannot.append({
+                "source_identifier": ident,
+                "object_type": rec.get("object_type"),
+                "category": "unacceptable_target_name",
+                "reason": (
+                    "the source name part(s) "
+                    + ", ".join(repr(p) for p in dotted)
+                    + f" contain a '.', so the target {targets[ident]!r} is "
+                      f"not a three-part catalog.schema.name -- "
+                      f"{TARGET_NAME_RULE_TEXT}. Snowflake allows it "
+                      f"because the source name is double-quoted. Rename it "
+                      f"in Snowflake, or exclude it, and re-run: this plugin "
+                      f"does not rewrite an object name.")})
+            continue
 
         # A name the destination will refuse is refused here, not at the
         # create. Planning it means generating DDL for it, attempting it, and
