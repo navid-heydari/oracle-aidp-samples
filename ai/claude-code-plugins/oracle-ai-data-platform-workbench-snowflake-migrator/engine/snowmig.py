@@ -105,7 +105,7 @@ from target.executor import (
 # prints as a traceback instead of a message -- observed live.
 from target.executor import BackendError as ExecutorBackendError
 from target.runner import DEFAULT_CLI_TIMEOUT, BackendError
-from target.runner import make_call
+from target.runner import CatalogTransportError, make_call
 from target.runner import make_run_sql as make_aidp_run_sql
 
 HALT = 3
@@ -2437,7 +2437,8 @@ def main(argv: list[str] | None = None) -> int:
             prepare_out_dir(args.out_dir)
         return args.func(args)
     except (AuthError, MissingTarget, RefusedToExecute, CatalogRefused,
-            DeployRefused, ProvisionTransportError, JobRunCollision,
+            DeployRefused, ProvisionTransportError, CatalogTransportError,
+            JobRunCollision,
             ConnectionConfigError, ConfigError, FileNotFoundError, OSError,
             InvalidRestriction, NoBackendAvailable, BackendError,
             ExecutorBackendError,

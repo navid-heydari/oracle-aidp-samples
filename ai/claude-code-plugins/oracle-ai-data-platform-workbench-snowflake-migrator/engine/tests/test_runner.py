@@ -468,3 +468,50 @@ def test_neither_helper_is_defined_twice():
                 if name + "(" in f.read_text(encoding="utf-8")]
         expected = ["runner.py"] if name.startswith("def is_") else []
         assert hits == expected, f"{name}: {hits}"
+
+
+# ------------- a catalog-transport failure is a message, not a traceback
+#
+# Found on review, reproduced through the real snowmig.main. make_call
+# raised a bare RuntimeError for a non-zero exit -- its own expired-session
+# message included -- and let subprocess.TimeoutExpired out unwrapped.
+# main()'s except tuple names neither, while the sibling transports raise
+# the named ProvisionTransportError / BackendError it does catch. So an
+# expired session on `catalogs` or `catalog --execute` printed a stack
+# trace ("UNCAUGHT RuntimeError: list_catalogs: the OCI CLI session
+# profile has expired...") instead of the one-line error and its remedy.
+
+def _timeout_proc(cmd, **kw):
+    import subprocess
+    raise subprocess.TimeoutExpired(cmd, 900)
+
+
+def test_a_catalog_transport_failure_is_a_named_error():
+    from target.coords import Target
+    from target.runner import CatalogTransportError
+    target = Target(datalake_ocid=OCID, workspace="w", cluster_id="c",
+                    catalog="cat")
+    for proc in (_expired_proc, FakeProc(returncode=2, stderr="403 denied"),
+                 _timeout_proc):
+        with pytest.raises(CatalogTransportError) as err:
+            make_call(target, backend="oci_raw",
+                      run_process=proc)("list_catalogs")
+        assert isinstance(err.value, RuntimeError), "callers catch it as one"
+        assert str(err.value).startswith("list_catalogs")
+
+
+@pytest.mark.parametrize("proc", [_expired_proc, _timeout_proc],
+                         ids=["expired-session", "timeout"])
+def test_catalogs_reports_a_transport_failure_as_one_line(
+        tmp_path, monkeypatch, capsys, proc):
+    import snowmig
+    monkeypatch.setattr(snowmig, "_oci_runner", lambda args: proc)
+    monkeypatch.setattr(snowmig, "detect_backend", lambda: "oci_raw")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(snowmig, "PLUGIN_ROOT", tmp_path)
+    rc = snowmig.main(["catalogs", "--out-dir", str(tmp_path),
+                       "--datalake-ocid", OCID])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: list_catalogs"), err[:300]
+    assert "Traceback" not in err
