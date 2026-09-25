@@ -28,8 +28,10 @@ connector mode returns the estate whole, so there is nothing to resume.
 
 `--schemas` is pushed into the INFORMATION_SCHEMA queries as a predicate, not
 applied after the fetch, and a scoped run MERGES into the manifest: the named
-schemas are refreshed and every other schema is kept. `--force` alone (no
-`--schemas`) re-discovers the whole estate from an empty manifest.
+schemas are refreshed and every other schema is kept. A named schema that
+returns no rows keeps its previous discovery, gains an error, and fails the
+run; `--force` drops it instead. `--force` alone (no `--schemas`)
+re-discovers the whole estate from an empty manifest.
 """
 from __future__ import annotations
 
@@ -310,6 +312,49 @@ def discover_schema_via_catalog(source: SnowflakeSource, schema: str) -> dict:
     return out
 
 
+def _unanswered_schemas(existing: list[dict], requested: set[str],
+                        fresh: list[dict], exclude: set[str], *,
+                        force: bool, keep: list[dict]) -> int:
+    """Failures for --schemas names that returned no rows; the kept entries
+    are appended to `keep`.
+
+    Zero rows is not "the schema is gone". After a grant revocation
+    INFORMATION_SCHEMA returns nothing, with no error, and a misspelt or
+    wrongly-cased name does the same. The scoped merge used to drop the
+    named schema and add nothing, so SALES vanished from the manifest --
+    and from reconcile, failed copy and all -- with exit 0. Now the prior
+    discovery is kept with the reason attached and the run fails; --force
+    is the deliberate drop.
+    """
+    returned = {s["name"] for s in fresh}
+    prior = {s["name"]: s for s in existing}
+    failures = 0
+    for name in sorted(requested - returned):
+        if name.lower() in exclude:
+            continue
+        alike = sorted(n for n in prior if n.lower() == name.lower()
+                       and n != name)
+        hint = (f"; schema names are case-sensitive, and the manifest has "
+                f"{', '.join(alike)}" if alike else "")
+        if force:
+            log(f"--schemas {name} returned no rows and --force was given: "
+                + ("dropped from the manifest" if name in prior
+                   else "nothing of that name to drop") + hint)
+            continue
+        failures += 1
+        reason = (f"re-discovery with --schemas {name} returned no rows: not "
+                  f"visible to this role, empty, or misspelled{hint}. The "
+                  f"previous discovery is kept; --force drops it")
+        log(f"SCHEMA RETURNED NO ROWS: {reason}")
+        if name in prior:
+            entry = dict(prior[name])
+            entry["errors"] = [e for e in entry.get("errors") or []
+                               if e.get("kind") != "REDISCOVERY"] + [
+                {"object": "*", "kind": "REDISCOVERY", "error": reason}]
+            keep.append(entry)
+    return failures
+
+
 def render_summary(manifest: dict) -> str:
     src = manifest.get("source") or {}
     where = (f'catalog `{src.get("external_catalog")}`'
@@ -362,8 +407,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--reports-dir", default=DEFAULT_REPORTS_DIR)
     ap.add_argument("--force", action="store_true",
                     help="rediscover the named --schemas even if the manifest "
-                         "already carries them (the others are kept); without "
-                         "--schemas, rediscover the whole estate")
+                         "already carries them (the others are kept), and "
+                         "drop a named schema that returns no rows instead "
+                         "of keeping it and failing; without --schemas, "
+                         "rediscover the whole estate")
     args = ap.parse_args(argv)
 
     from pyspark.sql import SparkSession
@@ -421,9 +468,12 @@ def main(argv: list[str] | None = None) -> int:
                 # advice then did to a finished discovery. An unscoped run is
                 # the whole estate and stays authoritative.
                 requested = set(args.schemas)
-                fresh = sorted(
-                    [s for s in manifest["schemas"] if s["name"] not in requested]
-                    + fresh, key=lambda s: s["name"])
+                kept = [s for s in manifest["schemas"]
+                        if s["name"] not in requested]
+                failures += _unanswered_schemas(
+                    manifest["schemas"], requested, fresh, exclude,
+                    force=args.force, keep=kept)
+                fresh = sorted(kept + fresh, key=lambda s: s["name"])
             manifest["schemas"] = fresh
     else:
         done = {s["name"] for s in manifest["schemas"]}

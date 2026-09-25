@@ -1788,6 +1788,58 @@ def test_force_without_schemas_rediscovers_the_whole_estate(discover, estate, tm
         "a full re-discovery is authoritative and drops what no longer exists"
 
 
+# A scoped re-run whose named schema returns NOTHING. After a grant
+# revocation INFORMATION_SCHEMA simply returns zero rows for SALES -- no
+# error -- and the scoped merge dropped every entry named in --schemas and
+# added only what came back. Following DISCOVERY.md's own "re-run with
+# --schemas <name>" advice therefore deleted SALES and exited 0; reconcile
+# went from STRUCTURE_ONLY_COPY_FAILED / exit 1 to exit 0 with SALES absent,
+# its failed copy still in the target. A lower-case typo ('sales') exited 0
+# too. The run could not look, and it recorded the schema as gone.
+
+def test_a_scoped_rerun_that_sees_nothing_keeps_the_schema_and_fails(
+        discover, estate, tmp_path, capsys):
+    base = ["--source-mode", "connector", "--reports-dir", str(tmp_path)]
+    assert discover.main(base) == 0
+    del estate.tables[1]                          # SALES: no longer visible
+    capsys.readouterr()
+    assert discover.main(base + ["--schemas", "SALES"]) == 1
+    out = capsys.readouterr().out
+    got = _manifest_schemas(tmp_path)
+    assert sorted(got) == ["FIN", "HR", "SALES"], "SALES must not vanish"
+    assert got["SALES"]["tables"][0]["name"] == "ORDERS", \
+        "the previous discovery of it is kept"
+    assert any("returned no rows" in e["error"] and "misspelled" in e["error"]
+               for e in got["SALES"]["errors"]), got["SALES"]["errors"]
+    assert "SALES" in out and "--force" in out
+    # A second failed look does not pile up a second copy of the error.
+    assert discover.main(base + ["--schemas", "SALES"]) == 1
+    assert len(_manifest_schemas(tmp_path)["SALES"]["errors"]) == 1
+
+
+def test_force_drops_a_named_schema_that_returns_nothing(discover, estate,
+                                                         tmp_path):
+    base = ["--source-mode", "connector", "--reports-dir", str(tmp_path)]
+    assert discover.main(base) == 0
+    del estate.tables[1]
+    assert discover.main(base + ["--force", "--schemas", "SALES"]) == 0
+    assert sorted(_manifest_schemas(tmp_path)) == ["FIN", "HR"], \
+        "--force keeps the deliberate-drop semantics"
+
+
+def test_a_misspelled_schema_is_a_failure_not_a_silent_success(
+        discover, estate, tmp_path, capsys):
+    base = ["--source-mode", "connector", "--reports-dir", str(tmp_path)]
+    assert discover.main(base) == 0
+    capsys.readouterr()
+    assert discover.main(base + ["--schemas", "sales"]) == 1
+    out = capsys.readouterr().out
+    assert "case-sensitive" in out and "SALES" in out, out
+    got = _manifest_schemas(tmp_path)
+    assert sorted(got) == ["FIN", "HR", "SALES"], "no phantom `sales` entry"
+    assert got["SALES"]["errors"] == []
+
+
 def test_a_scoped_external_catalog_force_keeps_the_other_schemas(discover, estate,
                                                                  tmp_path):
     base = ["--source-mode", "external-catalog", "--source-catalog", "ext",
