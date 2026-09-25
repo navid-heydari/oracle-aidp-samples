@@ -438,3 +438,36 @@ def test_the_count_literal_escapes_a_backslash():
     from dataplane.snowmig_source import _sql_literal
     assert _sql_literal("a" + _BS) == "a" + _BS * 2
     assert _sql_literal("it's") == "it''s"
+
+
+# ------------------ the guard lexes `//` line comments as Snowflake does
+#
+# Snowflake accepts `//` as a line comment, exactly like `--`. The engine's
+# lexer learned that this round; the cluster-side guard did not, so an
+# apostrophe inside a `//` comment opened a phantom string literal that ran
+# on past the newline and swallowed the `;` after it. The guard -- the I1
+# check documented as failing closed -- then ACCEPTED
+#     select 1 // it's
+#     ; drop table T
+# as one read, while Snowflake runs it as two statements.
+
+def test_a_second_statement_after_a_slash_slash_comment_is_refused():
+    with pytest.raises(PushdownRefused):
+        assert_pushdown_read_only("select 1 // it's\n; drop table T")
+
+
+def test_a_write_hidden_behind_a_slash_slash_comment_is_refused():
+    with pytest.raises(PushdownRefused):
+        assert_pushdown_read_only("// select 1\ndelete from T")
+
+
+def test_a_slash_slash_comment_on_a_read_is_still_a_read():
+    assert_pushdown_read_only("select a from T // why: it's the audit copy\n")
+
+
+def test_slash_slash_inside_a_literal_is_not_a_comment():
+    """`'s3://bucket'` is data; treating its `//` as a comment would blank
+    the closing quote and the `;` after it with it."""
+    with pytest.raises(PushdownRefused):
+        assert_pushdown_read_only("select 's3://b' as u; delete from T")
+

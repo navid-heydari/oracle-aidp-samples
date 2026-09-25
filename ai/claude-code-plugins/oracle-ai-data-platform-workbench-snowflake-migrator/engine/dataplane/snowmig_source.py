@@ -57,8 +57,8 @@ class SourceWriteRefused(PermissionError):
 def _code_only(sql: str) -> str:
     """`sql` with string literals and comments blanked, length preserved.
 
-    A `;` inside a literal is data, not a statement boundary, and `--` inside
-    one is not a comment. Blanking rather than deleting keeps offsets, so the
+    A `;` inside a literal is data, not a statement boundary, and `--` or
+    `//` inside one is not a comment. Blanking rather than deleting keeps offsets, so the
     scan cannot be confused about where anything starts.
 
     Lexed as SNOWFLAKE lexes: a backslash escapes only inside a '...'
@@ -100,7 +100,10 @@ def _code_only(sql: str) -> str:
             out.append("  ")
             i += 2
             continue
-        if two == "--":
+        # `//` is a line comment in Snowflake exactly as `--` is. Missing it
+        # let an apostrophe in `// it's` open a phantom literal that hid the
+        # `;` on the next line -- two statements read as one.
+        if two in ("--", "//"):
             while i < n and sql[i] != "\n":
                 out.append(" ")
                 i += 1
