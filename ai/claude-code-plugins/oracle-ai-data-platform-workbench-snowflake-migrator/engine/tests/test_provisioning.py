@@ -1283,3 +1283,55 @@ def test_the_timeout_is_long_enough_for_a_real_call():
     """Bounded, not impatient: a cluster create legitimately takes minutes."""
     from target.runner import DEFAULT_CLI_TIMEOUT
     assert DEFAULT_CLI_TIMEOUT >= 300
+
+
+# --------------- the stage parameter the refusal message promised
+#
+# Live 2026-09-24. `run --param schema=CORE` is refused, correctly: AIDP job
+# parameters reach a notebook as neither argv nor environment, so the value
+# would be silently ignored. The refusal then named
+# `provision --refresh-notebooks` as the way to set stage parameters -- and
+# provision writes only five coordinates into PARAMS and has no flag for any
+# other. `schema` is REQUIRED by 02_copy_schema and is exactly the one it
+# could not supply, so following the advice re-provisioned everything and
+# left `schema` None.
+
+def test_a_stage_param_reaches_the_notebook_params_cell():
+    from target.stage_notebooks import STAGES, build_stage_notebook
+    stage = next(s for s in STAGES if s.key == "copy_schema")
+    nb = build_stage_notebook(stage, overrides={"schema": "SALES",
+                                                "target-catalog": "lake"})
+    params = next(c for c in nb["cells"]
+                  if "PARAMS = {" in "".join(c["source"]))
+    text = "".join(params["source"])
+    assert "'schema': 'SALES'" in text, text[:400]
+
+
+def test_a_stage_that_does_not_declare_the_name_ignores_it():
+    from target.stage_notebooks import STAGES, build_stage_notebook
+    stage = next(s for s in STAGES if s.key == "reconcile")
+    nb = build_stage_notebook(stage, overrides={"schema": "SALES",
+                                                "target-catalog": "lake"})
+    text = "".join("".join(c["source"]) for c in nb["cells"]
+                   if "PARAMS = {" in "".join(c["source"]))
+    assert "'schema'" not in text, text[:300]
+
+
+def test_an_explicit_stage_param_outranks_a_derived_coordinate():
+    """The operator naming a value beats provision deriving one."""
+    from target.stage_notebooks import STAGES, build_stage_notebook
+    stage = next(s for s in STAGES if s.key == "copy_schema")
+    nb = build_stage_notebook(stage, overrides={"target-catalog": "chosen"})
+    text = "".join("".join(c["source"]) for c in nb["cells"]
+                   if "PARAMS = {" in "".join(c["source"]))
+    assert "'target-catalog': 'chosen'" in text
+
+
+def test_the_refusal_names_the_flag_that_actually_works():
+    """The message may not send an operator down a path that cannot set
+    the value they asked for."""
+    import snowmig
+    src = pathlib.Path(snowmig.__file__).read_text(encoding="utf-8")
+    i = src.index("--param does not reach a notebook stage")
+    block = src[i:i + 1200]
+    assert "--stage-param" in block, block[:500]

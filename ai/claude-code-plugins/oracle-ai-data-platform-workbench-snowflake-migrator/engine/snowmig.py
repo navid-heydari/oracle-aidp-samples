@@ -1026,9 +1026,11 @@ def cmd_run(args) -> int:
             "whatever the notebook's PARAMS cell already holds.\n"
             "Set stage parameters where they are actually read:\n"
             "  * re-run `provision --execute --reuse-existing "
-            "--refresh-notebooks` with the coordinate flags -- it rewrites "
-            "each stage notebook's PARAMS cell and uploads it (console edits "
-            "to that cell are lost), or\n"
+            "--refresh-notebooks "
+            + " ".join(f"--stage-param {name}=<value>"
+                       for name in sorted(parameters))
+            + "` -- it rewrites each stage notebook's PARAMS cell and "
+            "uploads it (console edits to that cell are lost), or\n"
             "  * edit the PARAMS cell of "
             "backup-snowflake-migration/scripts/<stage>.ipynb in the "
             "console.\n"
@@ -1678,6 +1680,16 @@ def cmd_provision(args) -> int:
                     f"warehouse(s) not in warehouses.json: "
                     f'{", ".join(sorted(missing))}')
 
+    stage_params = {}
+    for pair in getattr(args, "stage_param", []) or []:
+        if "=" not in pair:
+            raise MissingTarget(
+                f"--stage-param {pair!r} is not NAME=VALUE. The name is a "
+                f"stage parameter as it appears in the notebook's PARAMS "
+                f"cell, for example schema=SALES or mode=overwrite.")
+        name, value = pair.split("=", 1)
+        stage_params[name.strip()] = value.strip()
+
     source_config = None
     if args.source_config:
         source_config = pathlib.Path(args.source_config)
@@ -1715,6 +1727,7 @@ def cmd_provision(args) -> int:
     res = provision(
         call=call, workspace_name=args.workspace_name,
         cluster_name=args.cluster_name, scripts=list(scripts),
+        stage_params=stage_params,
         plan_files=plan_files, requirements=requirements,
         maven=args.maven or [], external_catalog=external_catalog,
         target_catalog=target_catalog, source_mode=args.source_mode,
@@ -2098,6 +2111,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "default: a migration creates its own environment "
                          "so its blast radius is knowable, and a taken name "
                          "is a collision to resolve, not a shortcut")
+    pv.add_argument("--stage-param", action="append", default=[],
+                    metavar="NAME=VALUE",
+                    help="a value to write into every stage notebook's "
+                         "PARAMS cell that declares it, repeatable. This is "
+                         "how `schema` reaches 02_copy_schema: job "
+                         "parameters do not reach a notebook, so a stage "
+                         "parameter has to be IN the notebook, and this "
+                         "writes it there. A stage that does not declare the "
+                         "name ignores it. Scope is an INPUT -- never edit "
+                         "the stage logic to make it cover less")
     pv.add_argument("--refresh-notebooks", action="store_true",
                     help="with --reuse-existing, regenerate the stage "
                          "notebooks from this run's flags even where they "

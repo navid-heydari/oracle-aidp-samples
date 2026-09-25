@@ -407,6 +407,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               cluster_name: str = "migration-assets",
               scripts: list[pathlib.Path],
               plan_files: list[pathlib.Path] = (),
+              stage_params: dict | None = None,
               requirements: pathlib.Path | None = None,
               maven: list[str] = (),
               external_catalog: str | None = None,
@@ -776,6 +777,11 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     # notebook's own PARAMS cell -- visible and editable in the console,
     # regenerated here when the defaults change.
     defaults = {"reports-dir": REPORTS_FOLDER, "source-mode": source_mode}
+    # Written last so an explicit --stage-param wins over a derived
+    # coordinate: the operator naming a value outranks this function
+    # guessing one. A stage that does not declare the key ignores it
+    # (build_stage_notebook filters per stage).
+    explicit = dict(stage_params or {})
     if external_catalog:
         defaults["source-catalog"] = external_catalog
     if target_catalog:
@@ -784,6 +790,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         # The scripts read the credential from the derived copy ON THE MOUNT,
         # so the path they receive is the /Workspace one, not the local one.
         defaults["source-config"] = f"/Workspace/{credential_object}"
+    defaults.update(explicit)
     try:
         existing = call("list_jobs", workspace=ws_key).get("items") or []
     except Exception as exc:

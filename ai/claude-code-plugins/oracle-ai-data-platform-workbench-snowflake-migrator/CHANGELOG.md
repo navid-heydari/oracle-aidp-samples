@@ -673,6 +673,23 @@ on its first colon, which is how the file passed before.
   the run was given is refused outright — creating its tables somewhere it
   does not name is the same substitution.
 
+### Added — `provision --stage-param`, so the refusal names a route that works
+
+- `run --param schema=CORE` is refused, correctly: AIDP job parameters reach
+  a notebook as neither argv nor environment, so the value would be silently
+  ignored and the stage would run whatever its PARAMS cell already held.
+- The refusal then pointed at `provision --refresh-notebooks` as the way to
+  set stage parameters. It was not one: provisioning writes five coordinates
+  into PARAMS and had no flag for anything else, and `schema` — REQUIRED by
+  `02_copy_schema` — was exactly the value it could not supply. An operator
+  following the advice re-provisioned every notebook and found `schema`
+  still `None`.
+- `--stage-param NAME=VALUE`, repeatable, writes into every stage notebook
+  that declares the name; a stage that does not declare it ignores it, which
+  `build_stage_notebook` already did. An explicit value outranks a derived
+  coordinate. The refusal now quotes the flag back with the parameter the
+  operator asked for.
+
 ### Fixed — a CLI child that never returned held the run open
 
 - Live 2026-09-24: `provision --execute` hung for **one hour and forty-seven
