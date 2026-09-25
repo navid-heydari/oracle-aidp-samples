@@ -1,0 +1,88 @@
+%% Snowflake -> Oracle AIDP migrator: phase diagram (v1)
+%% GENERATED from engine/report/stages.py STAGES -- do not edit by hand;
+%% regenerate with `bin/snowmig stages --write-diagram`.
+%% Solid = next phase, thick = into a phase that writes to AIDP, dotted = alternative path.
+
+flowchart TB
+
+  subgraph SETUP["Setup &nbsp;&#40;environment and catalogs&#41;"]
+    direction TB
+    PREFLIGHT["<b>preflight</b><br/><i>operator machine -> Snowflake + AIDP control plane</i>"]
+    PROVISION["<b>provision</b><br/>runbook S1 S2 S5<br/><i>AIDP control-plane API (no cluster)</i>"]
+    CATALOG["<b>catalog</b><br/>runbook S3 S4<br/><i>AIDP control-plane API (no cluster)</i>"]
+  end
+
+  subgraph DISCOVERY["Discovery &nbsp;&#40;read-only against Snowflake&#41;"]
+    direction TB
+    ASSESS["<b>assess</b><br/>runbook S7 (views)<br/><i>operator machine -> Snowflake (read-only)</i>"]
+    INGEST["<b>ingest</b><br/>runbook S7<br/><i>operator machine (offline)</i>"]
+    DEPS["<b>deps</b><br/><i>operator machine -> Snowflake (read-only)</i>"]
+    MAINTENANCE["<b>maintenance</b><br/><i>operator machine -> Snowflake (read-only)</i>"]
+    SECURITY["<b>security</b><br/><i>operator machine -> Snowflake (read-only)</i>"]
+    COMPUTE["<b>compute</b><br/>runbook S12<br/><i>operator machine -> Snowflake (read-only)</i>"]
+    DISCOVER_WORKFLOW["<b>discover-workflow</b><br/>runbook S6<br/><i>migration cluster (provisioned at S2)</i>"]
+  end
+
+  subgraph PLANNING["Planning &nbsp;&#40;offline, no network&#41;"]
+    direction TB
+    DATA_OPTIONS["<b>data-options</b><br/>runbook S11<br/><i>operator machine (offline)</i>"]
+    PLAN["<b>plan</b><br/>runbook S7-S9<br/><i>operator machine (offline)</i>"]
+    DDL["<b>ddl</b><br/>runbook S7<br/><i>operator machine (offline)</i>"]
+  end
+
+  subgraph TARGET["Target &nbsp;&#40;AIDP structure and data plane&#41;"]
+    direction TB
+    SMOKE["<b>smoke</b><br/><i>AIDP control-plane API (no cluster)</i>"]
+    STRUCTURE_WORKFLOW["<b>structure-workflow</b><br/>runbook S10<br/><i>migration cluster (provisioned at S2)</i>"]
+    DEPLOY["<b>deploy</b><br/>runbook S10 (catalog API)<br/><i>AIDP control-plane API; --transport sql uses the configured aidp.cluster_id</i>"]
+    COPY_WORKFLOW["<b>copy-workflow</b><br/>runbook S11<br/><i>migration cluster (provisioned at S2)</i>"]
+    RECONCILE_WORKFLOW["<b>reconcile-workflow</b><br/>runbook S11<br/><i>migration cluster (provisioned at S2)</i>"]
+    NOTEBOOK["<b>notebook</b><br/><i>operator machine (offline)</i>"]
+  end
+
+  subgraph REPORTING["Reporting"]
+    direction TB
+    SUMMARY["<b>summary</b><br/>runbook S9 S12<br/><i>operator machine (offline)</i>"]
+    PUBLISH["<b>publish</b><br/><i>AIDP control-plane API (no cluster)</i>"]
+    TOKENS["<b>tokens</b><br/><i>operator machine (offline)</i>"]
+  end
+
+  subgraph TEARDOWN["Teardown &nbsp;&#40;release the migration's compute&#41;"]
+    direction TB
+    TEARDOWN["<b>teardown</b><br/><i>AIDP control-plane API (no cluster)</i>"]
+  end
+
+  PREFLIGHT --> ASSESS
+  ASSESS --> INGEST
+  INGEST --> DEPS
+  DEPS --> MAINTENANCE
+  MAINTENANCE --> SECURITY
+  SECURITY --> COMPUTE
+  COMPUTE --> DATA_OPTIONS
+  DATA_OPTIONS --> PLAN
+  PLAN --> DDL
+  DDL --> SMOKE
+  SMOKE ==> PROVISION
+  PROVISION ==> CATALOG
+  CATALOG --> DISCOVER_WORKFLOW
+  DISCOVER_WORKFLOW ==> STRUCTURE_WORKFLOW
+  STRUCTURE_WORKFLOW ==> DEPLOY
+  DEPLOY ==> COPY_WORKFLOW
+  COPY_WORKFLOW --> RECONCILE_WORKFLOW
+  RECONCILE_WORKFLOW --> NOTEBOOK
+  NOTEBOOK --> SUMMARY
+  SUMMARY ==> PUBLISH
+  PUBLISH --> TOKENS
+  TOKENS ==> TEARDOWN
+  ASSESS -. or .- INGEST
+  STRUCTURE_WORKFLOW -. or .- DEPLOY
+
+  classDef local fill:#eef6ff,stroke:#5b8dd9,color:#12314f
+  classDef writer fill:#fff1e6,stroke:#d98b3a,color:#5a3410
+  classDef optional fill:#f2f2f2,stroke:#888,color:#222,stroke-dasharray: 4 3
+  classDef done fill:#e8f6ea,stroke:#3c9a4c,color:#173d1e
+  classDef attention fill:#fdeaea,stroke:#c94343,color:#4d1414
+
+  class ASSESS,DEPS,MAINTENANCE,SECURITY,COMPUTE,PLAN,DDL,SMOKE,NOTEBOOK,SUMMARY local
+  class PROVISION,CATALOG,STRUCTURE_WORKFLOW,DEPLOY,COPY_WORKFLOW,PUBLISH,TEARDOWN writer
+  class PREFLIGHT,INGEST,DATA_OPTIONS,DISCOVER_WORKFLOW,RECONCILE_WORKFLOW,TOKENS optional
