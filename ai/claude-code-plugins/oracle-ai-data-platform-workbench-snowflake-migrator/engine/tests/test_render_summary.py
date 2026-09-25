@@ -78,9 +78,19 @@ def test_status_becomes_shallow_clone_once_verified():
 
 
 def test_unverified_object_shows_in_progress():
-    md = render_summary(PLAN, INV, DEPLOYED, None)
+    # Exists, columns never compared. (This used D.PUBLIC.V from DEPLOYED's
+    # failed_targets, pinning a FAILED create as IN_PROGRESS.)
+    dep = dict(DEPLOYED, failed_targets=[],
+               unverified_structure_targets=["D.PUBLIC.V"])
+    md = render_summary(PLAN, INV, dep, None)
     view = next(l for l in md.splitlines() if "`D.PUBLIC.V`" in l)
     assert "IN_PROGRESS" in view
+
+
+def test_failed_object_shows_blocked():
+    md = render_summary(PLAN, INV, DEPLOYED, None)
+    view = next(l for l in md.splitlines() if "`D.PUBLIC.V`" in l)
+    assert "BLOCKED" in view and "Deploy failed" in view
 
 
 def test_blocked_object_shows_blocked_and_high_risk():

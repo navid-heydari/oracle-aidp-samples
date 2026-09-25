@@ -11,7 +11,7 @@ from snowflake_source.extract.census import secondary_roles_active
 from plan.build import object_kind_block
 from plan.data_movement import MAINTENANCE_TRAPS, architecture_decision
 from plan.smoke import smoke_verdict
-from plan.status import assess_risk, migration_status
+from plan.status import assess_risk, deploy_failure, migration_status
 
 __all__ = ["render_stages", "render_preflight", "render_census", "census_scope",
            "render_maintenance",
@@ -805,6 +805,14 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
     for c in plan.get("can_migrate") or []:
         level, note = assess_risk(c)
         status = migration_status(c["source_identifier"], deployed=deployed)
+        failure = deploy_failure(c["source_identifier"], deployed)
+        if failure:
+            # The failure leads: the planning notes are about an object that
+            # does not exist on the target. LOW means the note is only
+            # "structure clones cleanly", which a failed create contradicts.
+            note = (failure[0].upper() + failure[1:] + "."
+                    + ("" if level == "LOW" else " " + note))
+            level = "HIGH"
         rows.append((c["source_identifier"], c["object_type"],
                      "-" if c.get("rows") is None else f'{c["rows"]:,}',
                      level, status, note))
@@ -857,7 +865,7 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
         out += [f'Deployed against catalog '
                 f'`{deployed.get("catalog_in_scope")}`; '
                 f'{len(deployed.get("verified_targets") or [])} verified, '
-                f'{len(deployed.get("failed_targets") or [])} unverified.', ""]
+                f'{len(deployed.get("failed_targets") or [])} failed.', ""]
     elif deployed:
         out += ["Last run was a **dry run** — nothing was created.", ""]
     else:

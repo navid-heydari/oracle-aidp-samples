@@ -10,7 +10,8 @@ have to change if that result is ever ingested.
 """
 from __future__ import annotations
 
-__all__ = ["MIGRATION_STATUS", "RISK_LEVELS", "assess_risk", "migration_status"]
+__all__ = ["MIGRATION_STATUS", "RISK_LEVELS", "assess_risk", "deploy_failure",
+           "migration_status"]
 
 MIGRATION_STATUS = ("NOT_YET_DONE", "IN_PROGRESS", "SHALLOW_CLONE",
                     "DATA_CLONE", "DONE", "BLOCKED")
@@ -39,6 +40,12 @@ def migration_status(identifier: str, *, deployed: dict | None,
         # CREATE IF NOT EXISTS, so it was left exactly as it was found. This is
         # BLOCKED, not cloned: something else owns that name.
         return "BLOCKED"
+    if identifier in set(deployed.get("failed_targets") or []):
+        # The create failed -- refused, or accepted and never appeared, or a
+        # burned name. It was also attempted, so it used to fall through to
+        # IN_PROGRESS below: a permanent failure read as work under way while
+        # STAGES.md, from the same result, counted it failed.
+        return "BLOCKED"
     if identifier in set(deployed.get("verified_targets") or []):
         # Structure only. DATA_CLONE/DONE are never returned here: the deploy
         # result says nothing about rows (the copy job's outcome lives in
@@ -56,6 +63,28 @@ def migration_status(identifier: str, *, deployed: dict | None,
     if identifier in set(deployed.get("attempted_targets") or []):
         return "IN_PROGRESS"
     return "NOT_YET_DONE"
+
+
+def deploy_failure(identifier: str, deployed: dict | None) -> str | None:
+    """The deploy result's own sentence for a failed create, or None.
+
+    A burned name gets the short form: its full reason is a paragraph, and
+    the one thing the row must say is that only a fresh schema recovers it.
+    """
+    if not deployed or deployed.get("dry_run"):
+        return None
+    if identifier not in set(deployed.get("failed_targets") or []):
+        return None
+    entry = next((f for f in deployed.get("failed") or []
+                  if f.get("source_identifier") == identifier), {})
+    target = entry.get("target_fqn")
+    if target and target in set(deployed.get("poisoned_names") or []):
+        return (f"deploy failed and the name `{target}` is burned: a create "
+                f"that failed there once is refused for ever after, so only "
+                f"a retry into a fresh schema recovers it")
+    reason = " ".join(str(entry.get("reason") or "no reason recorded").split())
+    return "deploy failed: " + (reason if len(reason) <= 300
+                                else reason[:297] + "...")
 
 
 def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
