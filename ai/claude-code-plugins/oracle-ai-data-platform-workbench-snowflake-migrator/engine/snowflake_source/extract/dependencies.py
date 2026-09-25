@@ -53,6 +53,7 @@ _KEYWORD = re.compile(r"\b(FROM|JOIN)\b", re.IGNORECASE)
 _ALIAS = re.compile(r"\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_$]*|\"(?:[^\"]|\"\")+\")",
                     re.IGNORECASE)
 _WORD_BEFORE = re.compile(r"([A-Za-z_][A-Za-z0-9_$]*)\s*$")
+_WORD_AFTER = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_$]*)")
 # Words that end a FROM item, so they are never read as its alias -- or
 # open one that is not a named relation (TABLE(...), VALUES, LATERAL).
 _NOT_ALIAS = {
@@ -143,10 +144,14 @@ def parse_view_references(ddl: str, *, default_db: str,
 
     # A FROM that is not a FROM clause: `IS DISTINCT FROM b` and
     # `EXTRACT(year FROM ts)` are followed by an expression, whose column
-    # name would otherwise be read as a table the view depends on.
+    # name would otherwise be read as a table the view depends on; in
+    # `NTH_VALUE(x, n) FROM FIRST OVER (...)` it is a window modifier, and
+    # FIRST / LAST would become an outside edge to an object that does not
+    # exist -- which refuses the view.
     keywords = list(_KEYWORD.finditer(mask))
     starts = {kw.start() for kw in keywords}
     enclosing: dict[int, int | None] = {}
+    opener: dict[int, int] = {}                 # `)` index -> its `(`
     stack: list[int] = []
     for i, ch in enumerate(mask):
         if i in starts:
@@ -154,7 +159,7 @@ def parse_view_references(ddl: str, *, default_db: str,
         if ch == "(":
             stack.append(i)
         elif ch == ")" and stack:
-            stack.pop()
+            opener[i] = stack.pop()
 
     def word_before(i: int) -> str:
         m = _WORD_BEFORE.search(mask[max(0, i - 200):i])
@@ -166,7 +171,13 @@ def parse_view_references(ddl: str, *, default_db: str,
         if word_before(kw.start()) == "DISTINCT":
             return True
         opened = enclosing.get(kw.start())
-        return opened is not None and word_before(opened) == "EXTRACT"
+        if opened is not None and word_before(opened) == "EXTRACT":
+            return True
+        before = mask[:kw.start()].rstrip()
+        after = _WORD_AFTER.match(mask, kw.end())
+        return (before.endswith(")") and after is not None
+                and after.group(1).upper() in ("FIRST", "LAST")
+                and word_before(opener.get(len(before) - 1, 0)) == "NTH_VALUE")
 
     for kw in keywords:
         if not_a_clause(kw):

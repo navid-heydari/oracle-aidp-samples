@@ -20,7 +20,8 @@ reported as not carried.
 """
 from fake_sql import FakeSql
 from plan.build import build_plan
-from snowflake_source.extract.dependencies import extract_dependencies
+from snowflake_source.extract.dependencies import (extract_dependencies,
+                                                   parse_view_references)
 
 
 def _inv():
@@ -104,6 +105,44 @@ def test_a_from_that_names_no_object_makes_no_outside_edge():
                             "from identifier('D.S.T'), table(flatten(x))"}]}
     deps = extract_dependencies(_Denied({}), inv)
     assert deps["edges"] == [] and deps["unresolved_references"] == []
+
+
+def test_nth_value_from_first_or_last_is_not_a_from_clause():
+    # Round-3 fixup review, reproduced at the lane head: Snowflake's
+    # `NTH_VALUE(x, n) FROM FIRST|LAST OVER (...)` was read as a FROM clause,
+    # so parse_view_references returned DB.S.FIRST beside the real DB.S.T.
+    # Once an outside reference is kept as an edge (C5), that name -- an
+    # object that does not exist -- refuses a valid view as
+    # dependency_not_migrated whenever lineage comes from parsed DDL.
+    for direction in ("first", "LAST"):
+        ddl = (f"create view V as select nth_value(a, 2) from {direction} "
+               "ignore nulls over (order by b) from T")
+        assert parse_view_references(ddl, default_db="D",
+                                     default_schema="S") == ["D.S.T"]
+    inv = {"inventory": [
+        {"source_identifier": "D.S.T", "object_type": "TABLE",
+         "source_database": "D", "source_schema": "S"},
+        {"source_identifier": "D.S.V", "object_type": "VIEW",
+         "source_database": "D", "source_schema": "S",
+         "view_ddl_get_ddl": "create view V as select nth_value(a, 2) "
+                             "from first over (order by b) from T"}]}
+    deps = extract_dependencies(_Denied({}), inv)
+    assert _pairs(deps) == {("D.S.V", "D.S.T")}
+    assert deps["unresolved_references"] == []
+
+
+def test_a_table_named_first_after_another_call_is_still_read():
+    # The guard is narrow: only the `)` closing an NTH_VALUE call makes
+    # `FROM FIRST` a window modifier. A relation really named FIRST, after
+    # any other call's `)`, is still a reference.
+    refs = parse_view_references(
+        "create view V as select count(*) from first",
+        default_db="D", default_schema="S")
+    assert refs == ["D.S.FIRST"]
+    refs = parse_view_references(
+        "create view V as select nth_value(a, 2) over (order by b) from LAST",
+        default_db="D", default_schema="S")
+    assert refs == ["D.S.LAST"]
 
 
 def test_the_plan_still_builds_over_an_outside_edge():
