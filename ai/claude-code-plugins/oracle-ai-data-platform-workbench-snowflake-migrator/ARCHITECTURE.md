@@ -74,8 +74,10 @@ reconcile), and their reports land in the workspace, not in `--out-dir`.
 
 `stages` is not a pipeline step; it is the read-out of one.
 
-**Three stages write — `provision`, `catalog` and `deploy` — plus, narrowly
-and opt-in, `smoke --write-probe --execute`.** The stage board
+**Four stages write — `provision`, `catalog` and `deploy`, each a dry run
+without `--execute`, and `run`, which has no dry run and starts an in-AIDP
+job when invoked — plus, narrowly and opt-in, `smoke --write-probe
+--execute`.** The stage board
 says exactly that, lists `provision` and `catalog` in their dependency
 positions, and reads their artifacts (a `create_requested` that never became
 visible is flagged as pending, not success).

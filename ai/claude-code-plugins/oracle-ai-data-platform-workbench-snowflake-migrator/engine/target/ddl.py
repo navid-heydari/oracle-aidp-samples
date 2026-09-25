@@ -30,7 +30,8 @@ from dataclasses import asdict, dataclass, field
 
 from snowflake_source.dialect import lexer
 from snowflake_source.dialect.views import (  # noqa: F401  (re-exported)
-    detect_unsupported_constructs, extract_view_body, translate_view_body,
+    detect_unsupported_constructs, extract_view_body, extract_view_columns,
+    translate_view_body,
 )
 
 __all__ = ["RuleApplication", "RewriteResult", "UnsupportedDDL",
@@ -318,8 +319,16 @@ def build_create_table(record: dict, target_fqn: str) -> RewriteResult:
                      key=lambda c: c.get("ORDINAL_POSITION") or 0)
     if not columns:
         res.blocked = True
-        res.blocked_reason = ("table has no columns visible to this role "
-                              "(Delta-shared or insufficient privilege)")
+        # A failed INFORMATION_SCHEMA.COLUMNS read leaves the list empty too,
+        # and guessing "privilege" for it sends the operator after grants
+        # when the read timed out. The extractor records the failure; say it.
+        error = record.get("columns_read_error")
+        res.blocked_reason = (
+            f"the column list could not be read from the source "
+            f"(INFORMATION_SCHEMA.COLUMNS failed: {error}), so no structure "
+            f"can be emitted" if error else
+            "table has no columns visible to this role "
+            "(Delta-shared or insufficient privilege)")
         return res
 
     unmapped = [c["COLUMN_NAME"] + ": " + str(c.get("DATA_TYPE"))
@@ -482,7 +491,13 @@ def _rewrite_view_refs(body: str, name_map: dict[str, str],
     boundaries stop `DB.S.ORDERS` from hitting `DB.S.ORDERS_ARCHIVE`, and a hit
     is blanked before shorter names are tried so nothing matches inside it.
     Returns the rewritten body and the `src -> tgt` pairs that actually hit.
+
+    A bare name after FROM or JOIN that is one of the view's own CTEs, where
+    that CTE is in scope, is the CTE and is left alone: rewriting `from
+    ORDERS` to the base table when ORDERS is `with ORDERS as (... where
+    STATUS = 'OPEN')` silently dropped the CTE's filter.
     """
+    ctes = lexer.cte_scopes(body)
     mask = "".join(
         "".join("\n" if c == "\n" else " " for c in text)
         if kind in ("string", "comment") else text
@@ -509,7 +524,9 @@ def _rewrite_view_refs(body: str, name_map: dict[str, str],
         else:
             pattern = r'(?<![\w`"$.])' + ref
         hits = [(m.span(), (m.group(1) + m.group(2)) if after_keyword else "")
-                for m in re.finditer(pattern, mask, re.IGNORECASE)]
+                for m in re.finditer(pattern, mask, re.IGNORECASE)
+                if not (after_keyword and "." not in src
+                        and _is_cte(body, m.end(2), m.end(), ctes))]
         if not hits:
             continue
         # A target part the Spark parser would not read as one word (a hyphen
@@ -527,8 +544,26 @@ def _rewrite_view_refs(body: str, name_map: dict[str, str],
     return out, changed
 
 
+def _is_cte(sql: str, start: int, end: int,
+            ctes: list[tuple[str, int, int]]) -> bool:
+    """Whether the bare name at sql[start:end] is a CTE visible there."""
+    text = sql[start:end]
+    key = _cte_key(text)
+    return any(name == key and lo <= start < hi for name, lo, hi in ctes)
+
+
+def _cte_key(text: str) -> str:
+    # Compared as lexer.cte_scopes records it: unquoted folds to upper case,
+    # a quoted name (double quote or, after translation, backtick) is exact.
+    if text[:1] in ('"', "`"):
+        return text[1:-1].replace(text[0] * 2, text[0])
+    return text.upper()
+
+
 def _unqualified_refs(sql: str) -> set[str]:
-    """Bare names still sitting where only a table can go."""
+    """Bare names still sitting where only a table can go -- other than the
+    view's own CTE names, which the target resolves from the WITH clause."""
+    ctes = lexer.cte_scopes(sql)
     mask = "".join(
         "".join("\n" if c == "\n" else " " for c in text)
         if kind in ("string", "comment") else text
@@ -537,6 +572,8 @@ def _unqualified_refs(sql: str) -> set[str]:
     for m in re.finditer(_TABLE_POSITION + r'([\w$]+)(?![\w`"$.])', mask):
         name = m.group(3)
         if name.lower() in ("lateral", "select", "unnest", "values", "table"):
+            continue
+        if _is_cte(sql, m.start(3), m.end(3), ctes):
             continue
         out.add(name)
     return out
@@ -570,6 +607,7 @@ def build_create_view(record: dict, target_fqn: str,
 
     try:
         body = extract_view_body(ddl)
+        view_columns = extract_view_columns(ddl)
         # Inside the guard on purpose: a translator that cannot read one view
         # blocks THAT view with the reason, it does not abort the stage.
         translated = translate_view_body(body)
@@ -587,8 +625,9 @@ def build_create_view(record: dict, target_fqn: str,
     for applied in translated.applied:
         res.rules_applied.append(RuleApplication(
             applied["rule_id"], f'{applied["construct"]}: {applied["detail"]}'))
-    # The type mapper's notes on a `::TIMESTAMP` or `::TIME` cast travel with
-    # the view, the same way a column's mapping warning travels with a table.
+    # The type mapper's notes on a `::TIMESTAMP` cast travel with the view,
+    # the same way a column's mapping warning travels with a table. (They are
+    # also a caveat on the T02 application, so R43 below is not "exact".)
     res.warnings.extend(translated.warnings)
 
     positional = _context_refs(name_map or {},
@@ -664,7 +703,21 @@ def build_create_view(record: dict, target_fqn: str,
     # `description`, so the reviewed statement and the applied object carry
     # the same documentation rather than one of them quietly carrying less.
     res.description = str(meta.get("comment") or "")
+    # The header column list RENAMES the body's output columns, so it is
+    # emitted as written. Dropped, `V(CUSTOMER, TOTAL) as select CUST_ID,
+    # SUM(AMT)` was created with columns CUST_ID and SUM(AMT) while the plan
+    # and the catalog API's viewFields said CUSTOMER and TOTAL.
+    if view_columns:
+        res.rules_applied.append(RuleApplication(
+            "R44_VIEW_COLUMN_LIST",
+            "the source view's column list is carried: "
+            + ", ".join(view_columns)
+            + ". The catalog-API body has no column-list field, so its "
+              "viewText names them with SELECT * FROM (<body>) AS "
+              "named_columns(<list>)"))
     res.sql = (f"CREATE VIEW IF NOT EXISTS {_qualify(target_fqn)}"
+               + (" (" + ", ".join(_q(c) for c in view_columns) + ")"
+                  if view_columns else "")
                + (f" COMMENT {quote_spark_string(res.description)}"
                   if res.description else "")
                + f" AS\n{rewritten}")
@@ -680,11 +733,26 @@ def build_create_view(record: dict, target_fqn: str,
 
 
 def _view_text(sql: str | None) -> str:
-    """The SELECT body of a generated CREATE VIEW, for the catalog API."""
+    """The SELECT of a generated CREATE VIEW, for the catalog API.
+
+    The API takes the query alone, so a column list in the CREATE VIEW has
+    nowhere to go but into the query: the body is wrapped so its output
+    columns carry the list's names, as they do in the reviewed SQL.
+
+    Comments are removed. Live, the API refused a view carrying one --
+    "inline SQL comments are not allowed" -- in any style, where Spark SQL
+    takes it. A comment carries no meaning; the reviewed CREATE VIEW keeps
+    it, and the lexer leaves a `--` inside a literal alone.
+    """
     try:
-        return extract_view_body(sql or "")
+        body = lexer.strip_comments(extract_view_body(sql or "")).strip()
+        columns = extract_view_columns(sql or "")
     except ValueError:
         return ""
+    if not columns:
+        return body
+    return (f"SELECT * FROM (\n{body}\n) AS named_columns("
+            + ", ".join(_q(c) for c in columns) + ")")
 
 
 def build_ddl_payload(inventory: dict, plan: dict) -> dict:
@@ -703,7 +771,11 @@ def build_ddl_payload(inventory: dict, plan: dict) -> dict:
     by_id = {r["source_identifier"]: r for r in inventory["inventory"]}
     name_map = plan.get("target_names", {})
     cycles = [list(c) for c in plan.get("cycles", [])]
-    in_cycle = {n for c in cycles for n in c}
+    # Stuck, but in no cycle: it depends on one. Named as such -- it used to
+    # be folded into the cycle and told it was in "dependency cycle with"
+    # objects it only reads.
+    behind = dict(plan.get("blocked_behind_cycle") or {})
+    in_cycle = {n for c in cycles for n in c} | set(behind)
     ordered = [i for wave in plan.get("waves", []) for i in wave]
     ordered += [i for i in plan.get("clone_targets", [])
                 if i not in ordered and i not in in_cycle]
@@ -711,15 +783,23 @@ def build_ddl_payload(inventory: dict, plan: dict) -> dict:
     statements, blocked = [], []
     for ident in sorted(i for i in plan.get("clone_targets", []) if i in in_cycle):
         rec = by_id.get(ident) or {}
-        others = sorted(n for c in cycles if ident in c for n in c if n != ident)
-        blocked.append({
-            "source_identifier": ident,
-            "object_type": rec.get("object_type"),
-            "reason": ("not emitted: dependency cycle with "
-                       + (", ".join(others) or "itself")
-                       + "; PLANNED_OBJECTS.md lists it under Dependency "
-                       "cycles for a human decision, and no edge was broken "
-                       "to force an order")})
+        if ident in behind:
+            reason = ("not emitted: not in a cycle, but it depends on the "
+                      "dependency cycle " + ", ".join(behind[ident])
+                      + ", which cannot be ordered; PLANNED_OBJECTS.md lists "
+                      "it as blocked behind that cycle, and no edge was "
+                      "broken to force an order")
+        else:
+            others = sorted(n for c in cycles if ident in c
+                            for n in c if n != ident)
+            reason = ("not emitted: dependency cycle with "
+                      + (", ".join(others) or "itself")
+                      + "; PLANNED_OBJECTS.md lists it under Dependency "
+                      "cycles for a human decision, and no edge was broken "
+                      "to force an order")
+        blocked.append({"source_identifier": ident,
+                        "object_type": rec.get("object_type"),
+                        "reason": reason})
     for ident in ordered:
         rec = by_id.get(ident)
         if rec is None:

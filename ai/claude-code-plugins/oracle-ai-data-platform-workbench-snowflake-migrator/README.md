@@ -37,7 +37,8 @@ The migration is the overview skill's **twelve steps, S1–S12, in that
 order** (`skills/snowflake-migrator-overview/SKILL.md` is the authority on
 the sequence); the sections below are its runnable form and name the step
 each command serves. Everything reads from one config file, and nothing
-writes to AIDP without `--execute`.
+writes to AIDP without `--execute` -- except `run`, which has no dry run:
+invoking it starts a job `provision` already created.
 
 > **On the paths below.** They are written `engine/snowmig.py`, which is what
 > you type from a checkout of this repo. If the plugin is **installed** rather
@@ -199,14 +200,19 @@ the type mapper refusing to guess: re-run with `--semi-structured string` (or
 ### 4. Plan, generate DDL, get sign-off
 
 ```bash
-bin/snowmig plan [--restrictions ./restrictions.json]
+bin/snowmig plan --bronze-catalog-prefix <internal catalog> [--restrictions ./restrictions.json]
 bin/snowmig ddl 
 bin/snowmig summary
 ```
 
 **`PLANNED_OBJECTS.md` is the approval artifact — stop here for sign-off.**
 `ddl_plan.json` is the authority from this point on: the in-AIDP scripts create
-only what it contains, and report anything else as `not_in_plan`. Use
+only what it contains, and report anything else as `not_in_plan`. The structure
+job creates each approved target name as it stands and refuses a
+`--target-catalog` that is not the plan's catalog, so `<internal catalog>` here
+is the same INTERNAL catalog you create at S4 and pass to `provision
+--target-catalog`. Without the prefix the plan's catalog is the source database
+name, which under this runbook is the EXTERNAL pointer, and S10 refuses it. Use
 `--restrictions` to scope a first wave (a canary of a few tables is a good
 first live write).
 
@@ -252,6 +258,19 @@ same name** on the AIDP default config, the workspace folder
 **unscheduled** jobs. `--external-catalog` and `--target-catalog` are names
 being pre-declared for the job parameters, not catalogs that must already
 exist. Read `PROVISION.md`: pending is pending, never rounded up.
+
+Stage parameters (the schema a copy covers, `tables`, `mode`, `dry-run`,
+reconcile's `counts`) live in each stage notebook's own PARAMS cell, because
+job parameters never reach a notebook. `--stage-param NAME=VALUE`
+(repeatable; NAME is the stage flag without `--`) writes one there: a name
+no stage declares is refused, a switch takes `true`/`false`, a list flag
+takes `A,B`. An unqualified NAME reaches every stage that declares it, so
+its value must suit them all -- `mode` is `ddl-plan`/`ctas`/`manifest` in
+01 but `skip-existing`/`append`/`overwrite` in 02 -- and one that does not
+is refused; `copy_schema.mode=overwrite` (stages: `discover`, `structure`,
+`copy_schema`, `reconcile`) writes that stage only. With `--reuse-existing` add `--refresh-notebooks`, or the
+notebooks already on the workspace are kept and the value is refused rather
+than dropped.
 
 **Hand-off.** After `--execute`, `provision_result.json` records the
 **workspace key** under `workspace.key` and the **cluster key** under
@@ -309,7 +328,9 @@ connector, and did the external catalog's crawler actually populate anything.
 
 ### 9. Run the jobs inside AIDP
 
-Run them with `bin/snowmig run --job <name>` (or from the console). Two of
+Run them with `bin/snowmig run --job <name>` (or from the console); the
+DataLake OCID and workspace come from the config's `aidp:` block, or
+`--datalake-ocid`/`--workspace` override it. Two of
 the four are **part of the migration**; the other two are **run later, on
 the customer's decision**.
 
@@ -421,8 +442,11 @@ first `assess`:
 | `--geospatial block\|string` | `block` | same decision for `GEOGRAPHY`/`GEOMETRY` |
 | `--timestamp-ntz preserve\|timestamp` | `preserve` | the catalog API cannot express `timestamp_ntz`; `timestamp` changes timezone semantics and records the caveat |
 
-**Exit codes:** `0` ok · `1` error · `3` halt (an identifier-case or
-target-name collision — shown, never resolved for you).
+**Exit codes:** `0` ok · `1` error · `3` halt — a condition to resolve
+with you, shown and never resolved for you: an identifier-case or
+target-name collision (`assess`, `plan`), or a column type the target
+refuses at CREATE TABLE (`ddl`; on most estates `TIMESTAMP_NTZ`, remedied
+offline with `ddl --timestamp-ntz timestamp`).
 
 Dev mode needs none of this:
 
@@ -454,14 +478,15 @@ Object references inside a view are left as-is in the default Bronze mirror
 (`R40`) and rewritten to the planned names under `--bronze-catalog-prefix`
 or a schema-style option (`R41`): whole three-part names only, never inside
 a string literal or a comment. Dialect is the other half. The translator
-carries 20 rules (`translate.RULES`). 8 have a provably exact rewrite and
+carries 21 rules (`translate.RULES`). 9 have a provably exact rewrite and
 are translated with the rule id recorded in the DDL plan — `IFF`, `x::TYPE`
 on a bare column or literal, `ARRAY_CONSTRUCT`, `OBJECT_CONSTRUCT`,
 `DATEADD(unit, n, col)` (exact for `DATE` operands only, and the plan says
-so), `LISTAGG(x, sep)`, `"quoted identifiers"` → backticks and `''` → `\'`
+so), `LISTAGG(x, sep)`, `"quoted identifiers"` → backticks, `''` → `\'`
+and `//` line comments → `--`
 — but only in those exact forms; a form the rule cannot prove (an expression
-left of `::`, `LISTAGG … WITHIN GROUP`, a non-literal `DATEADD` amount) is
-refused with the construct named. 12 others — `QUALIFY`, `LATERAL FLATTEN`,
+left of `::`, `LISTAGG … WITHIN GROUP` or `… OVER`, a non-literal `DATEADD`
+amount) is refused with the construct named. 12 others — `QUALIFY`, `LATERAL FLATTEN`,
 `DATEDIFF`, `PIVOT`, `DECODE`, `$$…$$`, … — **block** the view with the
 construct named, rather than being rewritten on a guess; a mixed view is
 blocked, never partially translated. Secure and materialized views are

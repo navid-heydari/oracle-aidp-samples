@@ -11,7 +11,7 @@ Two commands. The first needs Snowflake; the second is offline.
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig deps
 
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig plan \
-  [--restrictions restrictions.json] [--bronze-catalog-prefix bronze]
+  --bronze-catalog-prefix <S4 INTERNAL catalog> [--restrictions restrictions.json]
 ```
 
 Every Snowflake coordinate comes from the migration config (`snowmig-config.yaml`, discovered automatically and printed as `config: <path>`). Pass `--account/--user/--auth/...` only to override a field for one run.
@@ -30,8 +30,11 @@ Snowflake view      ->  AIDP view
 
 Bronze mirrors the source 1:1, so target names equal source names and nothing is
 flattened. `--bronze-catalog-prefix` is the only variation: it puts everything in
-one catalog and folds the database into the schema name, for deployments that
-want a single bronze catalog.
+one catalog and folds the database into the schema name. Under the runbook that
+catalog is the S4 INTERNAL catalog, and the prefix is required: S10 refuses a
+plan whose catalog is not its `--target-catalog`, and without the prefix the
+plan's catalog is the source database name -- the EXTERNAL pointer registered
+at S3.
 
 ## Can and cannot, with reasons
 
@@ -43,10 +46,11 @@ Categories:
 |---|---|
 | `restriction` | The user's own restriction excluded it. Name which one |
 | `unmapped_type` | A column type has no Delta equivalent, e.g. `VARIANT`, `GEOGRAPHY` |
-| `snowflake_only_sql` | A view uses a construct the translator recognises but has no exact rewrite for — `QUALIFY`, `LATERAL FLATTEN`, `DATEDIFF`/`TIMESTAMPDIFF`, `TIMESTAMPADD`/`TIMEADD`, `$$…$$`, `DECODE`, `NVL2`, a `::` cast over an expression or to `VARIANT`, a `DATEADD` whose amount is an expression or whose unit is quoted or a nested call. The reason names the construct and why. `IFF`, `x::TYPE` on a bare column or literal, `LISTAGG(x, sep)`, `DATEADD(unit, n, col)` and `"quoted identifiers"` are translated, not blocked. Full rule table: [references/dialect-translation.md](../../references/dialect-translation.md) |
+| `snowflake_only_sql` | A view uses a construct the translator recognises but has no exact rewrite for — `QUALIFY`, `LATERAL FLATTEN`, `DATEDIFF`/`TIMESTAMPDIFF`, `TIMESTAMPADD`/`TIMEADD`, `$$…$$`, `DECODE`, `NVL2`, a `::` cast over an expression or to `VARIANT` or `TIME`, a `DATEADD` whose amount is an expression or whose unit is quoted or a nested call. The reason names the construct and why. `IFF`, `x::TYPE` on a bare column or literal, `LISTAGG(x, sep)`, `DATEADD(unit, n, col)` and `"quoted identifiers"` are translated, not blocked. Full rule table: [references/dialect-translation.md](../../references/dialect-translation.md) |
 | `unsupported_object` | Secure view, materialized view; dynamic, external, Iceberg, event or hybrid table (`SHOW TABLES` flags) — see also `CENSUS.md` |
-| `dependency_not_migrated` | Depends on an object that is not migrating (a blocked or excluded base table or view); the reason names it |
+| `dependency_not_migrated` | Depends on an object that is not migrating (a blocked or excluded base table or view, or an object outside the assessed scope, e.g. another database); the reason names it |
 | `no_definition` / `unparseable_sql` | The view SQL could not be read or parsed |
+| `columns_unread` | The schema's `INFORMATION_SCHEMA.COLUMNS` read failed (the reason quotes the error, e.g. a timeout), so no column was assessed. Not a privilege verdict and not an empty table: fix the read and re-run `assess` |
 
 ## Restrictions — ask for them, do not invent them
 
@@ -67,6 +71,10 @@ running; do not guess a scope.
 
 `include_*` variants act as allowlists. An unrecognised key is an error, not an
 ignored line — a typo would otherwise apply nothing while appearing to work.
+A well-formed entry can still match nothing: `PLANNED_OBJECTS.md` prints each
+entry's match count and flags a zero as *matched nothing — check the spelling*;
+read those out. Names follow Snowflake's case rule in every list: unquoted
+folds to upper, `"sales_eu"` matches only that exact spelling.
 
 ## Lineage provenance matters — state it
 
@@ -85,7 +93,9 @@ ignored line — a typo would otherwise apply nothing while appearing to work.
    that copies nothing. Name a Standard catalog only if the user has explicitly
    asked for one.
 3. The waves — views follow their base tables.
-4. Cycles, if any: they need a human decision, not a broken edge.
+4. Cycles, if any: they need a human decision, not a broken edge. Objects
+   listed as *blocked behind a cycle* are not members; they wait on the cycle
+   named and move once it is resolved.
 5. The Silver/Gold job stubs: created, disabled, never triggered.
 6. **The data-movement architecture options — always.**
 

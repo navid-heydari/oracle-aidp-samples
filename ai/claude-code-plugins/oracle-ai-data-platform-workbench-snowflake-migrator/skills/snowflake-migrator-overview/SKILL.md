@@ -218,7 +218,10 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig run \
 
 `run` starts the job, polls it to a terminal state, and writes `RUN_*.md` with
 the task output as evidence. A poll budget that runs out is reported as
-**STILL RUNNING** -- never rounded to success, never to failure.
+**STILL RUNNING** -- never rounded to success, never to failure. A status
+that could not be read (a 503, an expired session) is **STATUS COULD NOT BE
+READ**, exit 1, with the run key in `RUN_*.md`: the run was submitted and may
+still be going, so check it in the console before starting another.
 
 #### The first run on a new workspace often is never picked up
 
@@ -281,9 +284,16 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig ingest \
   [--semi-structured string] [--timestamp-ntz timestamp]
 
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig plan \
+  --bronze-catalog-prefix <the INTERNAL catalog created at S4> \
   [--restrictions <file>]
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig ddl
 ```
+
+The prefix is not optional here. S10 creates each approved target name as it
+stands and refuses a plan whose catalog is not its `--target-catalog`; without
+the prefix the plan's catalog is the source database name, which in this
+runbook is the EXTERNAL pointer registered at S3, and S10 refuses it with
+exit 1.
 
 `ingest` calls the **same type mapper** a live `assess` calls, so a column
 planned from the manifest reaches the same verdict as one planned from a live
@@ -343,8 +353,10 @@ shape.
 The plan it reads is `ddl_plan.json` **on the workspace**, so upload the
 approved one to `backup-snowflake-migration/plan/` before running. The stage
 runs in `ddl-plan` mode: those types are engine-translated. `manifest` mode
-cannot be used with a connector-built manifest, which records SNOWFLAKE types
-that Delta rejects verbatim.
+refuses a connector-built manifest before creating anything: it records
+SNOWFLAKE types, which Delta rejects or, like `FLOAT` (64-bit in Snowflake,
+32-bit in Spark), accepts with a different meaning. A table another mode
+recorded as created is re-checked by a `ddl-plan` run, not skipped.
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig run \
@@ -357,7 +369,15 @@ rather than accepted and dropped. Each stage notebook carries its own `PARAMS`
 cell; `provision --execute --reuse-existing --refresh-notebooks` rewrites it
 and re-uploads (without `--refresh-notebooks`, `--reuse-existing` keeps a
 notebook already on the workspace, because its PARAMS cell may have been
-edited in the console). To narrow what S10 creates, narrow the **plan** it
+edited in the console). The values it writes are `--stage-param NAME=VALUE`,
+repeatable, where NAME is the stage flag without `--` (`schema`, `tables`,
+`mode`, `dry-run`, `counts`, …): a name no stage declares is refused, a
+switch takes `true`/`false`, a list flag takes a comma-separated value, an
+unqualified value some declaring stage would reject is refused (`mode` is
+`ddl-plan`/`ctas`/`manifest` in 01 but `skip-existing`/`append`/`overwrite`
+in 02; write `copy_schema.mode=overwrite` to reach 02 only), and
+`--stage-param` with `--reuse-existing` but without `--refresh-notebooks` is
+refused rather than dropped. To narrow what S10 creates, narrow the **plan** it
 reads — that is the input — and never edit the stage logic to make it cover
 less.
 
@@ -500,8 +520,14 @@ Use `--out-dir` only when the user wants artifacts kept somewhere they chose
    reported as flagged, with the reason, and resolved at S8 with the user. Do
    not substitute a "close enough" type silently.
 
-8. **A halt is a halt.** Exit code 3 means an identifier-case or target-name
-   collision. Show the collisions and stop; do not pick a winner.
+8. **A halt is a halt.** Exit code 3 means a condition to resolve with the
+   user, never an error to retry and never one to pick a winner on. From
+   `assess` or `plan` it is an identifier-case or target-name collision:
+   show the collisions and stop. From `ddl` it is a column type the target
+   refuses at CREATE TABLE -- on a default-assessed estate, `TIMESTAMP_NTZ`:
+   show the columns stderr and `DDL_PLAN.md` name, and put the remedy
+   (`ddl --timestamp-ntz timestamp`, offline, which changes timezone
+   semantics) to the user as a decision.
 
 9. **Never report success ahead of verification.** AIDP creates are
    asynchronous and settle late or fail silently. "Pending", "still settling"

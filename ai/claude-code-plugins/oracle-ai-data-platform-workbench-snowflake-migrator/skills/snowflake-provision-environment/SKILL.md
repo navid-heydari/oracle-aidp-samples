@@ -44,11 +44,22 @@ re-run with `--execute`.
    `scripts/`, and whatever plan artifacts exist in `--out-dir`
    (`plan.json`, `ddl_plan.json`, `SUMMARY.md`, …) into `plan/`, each upload
    read back before it is called done.
-5. **Four jobs** — `snowmig_00_discover` → `03_reconcile`. Each runs a
-   **generated driver notebook** that calls its script with the arguments
-   inline, because job parameters reach a notebook neither as argv nor as
+5. **Four jobs** — `snowmig_00_discover` → `03_reconcile`. Each runs one
+   **self-contained stage notebook** whose own `PARAMS` cell carries the
+   arguments, because job parameters reach a notebook neither as argv nor as
    environment (established live). No schedule: running one is always the
-   user's call, and the driver is editable in the console.
+   user's call, and the PARAMS cell is editable in the console.
+
+   `--stage-param NAME=VALUE` (repeatable) writes a value into the PARAMS
+   cell of every stage that declares NAME — the stage flag without `--`,
+   e.g. `schema=SALES`, `tables=ORDERS,LINES`, `dry-run=true`. Prefix it
+   with a stage (`discover`, `structure`, `copy_schema`, `reconcile`) to
+   write that stage only: `copy_schema.mode=overwrite`. An unqualified
+   value a declaring stage would reject is refused — `mode` means
+   different things to 01 and 02 — as is a name no stage declares; a
+   switch takes `true`/`false`, and with
+   `--reuse-existing` it needs `--refresh-notebooks`, because a notebook
+   already on the workspace is otherwise kept as it is.
 
    A job is a **workflow**: logged, re-runnable, and its task output is
    exportable as evidence. Run one with `snowmig.py run --job <name>`, never

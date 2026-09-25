@@ -33,10 +33,13 @@ def test_attempted_but_unverified_is_in_progress():
     assert migration_status("D.S.T", deployed=dep) == "IN_PROGRESS"
 
 
-def test_failed_verification_is_in_progress_not_done():
+def test_a_failed_create_is_blocked_not_in_progress():
+    # This test once pinned IN_PROGRESS, which is how SUMMARY.md came to
+    # show a burned-name failure as work under way. See
+    # test_status_failed_deploy.py.
     dep = {"dry_run": False, "attempted_targets": ["D.S.T"],
            "verified_targets": [], "failed_targets": ["D.S.T"]}
-    assert migration_status("D.S.T", deployed=dep) == "IN_PROGRESS"
+    assert migration_status("D.S.T", deployed=dep) == "BLOCKED"
 
 
 def test_dry_run_never_reports_progress():

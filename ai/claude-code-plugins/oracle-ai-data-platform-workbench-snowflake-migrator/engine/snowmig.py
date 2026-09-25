@@ -18,8 +18,10 @@ can be re-run alone. The main ones:
   notebook-> <nb>.ipynb          + NOTEBOOK.md              (offline; --upload is
                                                              refused, see GAPS 13)
   summary -> SUMMARY.md                                     (offline)
-  data-options -> data_options.json + DATA_MOVEMENT_OPTIONS.md  (offline; PROPOSAL
-                  ONLY -- this plugin moves no bytes and implements no transfer)
+  data-options -> data_options.json + DATA_MOVEMENT_OPTIONS.md  (offline; the
+                  options are PROPOSALS. This CLI copies no rows itself; the
+                  one implemented copy is the in-AIDP snowmig_02_copy_schema
+                  job, run schema by schema by the operator)
   demo    -> every artifact above + DEMO.md                 (offline; DEV MODE --
              the whole pipeline against an EMULATED estate and an EMULATED AIDP,
              so the flow can be understood with no credentials and no risk)
@@ -27,12 +29,17 @@ can be re-run alone. The main ones:
 Bronze mirrors the source: Snowflake database -> AIDP catalog, schema -> schema,
 table -> table, view -> view. Silver and Gold get disabled job stubs.
 
-The target catalog is EXTERNAL/SNOWFLAKE by default -- a registered, read-only
-pointer at the live source that copies nothing. A STANDARD catalog is created
-only when the user explicitly asks for one, and its tables are then created on
-AIDP compute by the `notebook` script, not through the catalog CRUD API.
+`catalog` registers an EXTERNAL/SNOWFLAKE catalog by default -- a read-only
+pointer at the live source that copies nothing. The STANDARD target catalog
+(`catalog --catalog-type standard`, runbook S4) is created as a container; its
+schemas and tables are created on AIDP compute by the structure job
+(`run --job snowmig_01_structure`, runbook S10), not through the catalog CRUD
+API. Rows move only when the operator runs `snowmig_02_copy_schema`.
 
-Exit codes: 0 ok | 1 error | 3 HALT (identifier-case or target-name collision)
+Exit codes: 0 ok | 1 error | 3 HALT: a condition to resolve with the user --
+an identifier-case or target-name collision (assess, plan), or a column type
+the target refuses at CREATE TABLE (ddl; usually TIMESTAMP_NTZ, remedy
+`ddl --timestamp-ntz timestamp`)
 """
 from __future__ import annotations
 
@@ -54,6 +61,7 @@ from plan.smoke import run_smoke, smoke_verdict
 from target.notebook import build_notebook, notebook_workspace_path
 from report.stages import build_stage_board
 from report.render import (
+    DATA_OPTIONS_NOTE,
     render_catalog, render_catalogs, render_databases,
     render_census, render_maintenance, render_preflight,
     render_stages,
@@ -105,7 +113,7 @@ from target.executor import (
 # prints as a traceback instead of a message -- observed live.
 from target.executor import BackendError as ExecutorBackendError
 from target.runner import DEFAULT_CLI_TIMEOUT, BackendError
-from target.runner import make_call
+from target.runner import CatalogTransportError, make_call
 from target.runner import make_run_sql as make_aidp_run_sql
 
 HALT = 3
@@ -357,15 +365,15 @@ def _snowflake_coords(args) -> dict:
     def pick(flag: str, key: str | None = None):
         return getattr(args, flag, None) or config.get(key or flag)
 
-    auth = getattr(args, "auth", None)
-    # argparse defaults `--auth` to keypair, so "the user typed it" cannot be
-    # distinguished from the default -- the config wins when it says
-    # something else and no flag was passed.
-    if config.get("auth") and auth == "keypair" \
-            and "--auth" not in sys.argv:
-        auth = str(config["auth"])
+    # `--auth` has no argparse default, so None means "not typed" and the
+    # flag, the config and then keypair apply in that order. It used to
+    # default to keypair and guess "typed" from `"--auth" in sys.argv`,
+    # which `--auth=keypair`, the prefix `--au` and main(argv) all defeat:
+    # the config's `auth: password` silently won over an explicit flag.
+    auth = (getattr(args, "auth", None) or config.get("auth")
+            or "keypair")
 
-    return {"auth": auth or "keypair",
+    return {"auth": str(auth),
             "account": pick("account"), "host": pick("host"),
             "user": pick("user"),
             "role": pick("role"), "warehouse": pick("warehouse"),
@@ -479,6 +487,18 @@ def cmd_stages(args) -> int:
     return 0
 
 
+def census_floor_line(census: dict) -> str:
+    """The console line for a census that did not read everything.
+
+    `unreadable` holds a denied kind, a SHOW read at the result cap, and an
+    object whose body could not be scanned -- one entry each. Calling every
+    entry an unreadable KIND overstated one skipped task body as a whole
+    kind lost.
+    """
+    return (f'  census: {len(census["unreadable"])} read(s) incomplete '
+            f'(CENSUS.md, "Could not be read") -- the counts are a floor')
+
+
 def cmd_assess(args) -> int:
     out = pathlib.Path(args.out_dir)
     inv = _assess_inventory(args)
@@ -490,8 +510,7 @@ def cmd_assess(args) -> int:
         print(f'  census: {c["total"]} object(s) that are not tables or views '
               f'and cannot migrate')
         if c["unreadable"]:
-            print(f'  census: {len(c["unreadable"])} kind(s) unreadable — the '
-                  f'count is a floor', file=sys.stderr)
+            print(census_floor_line(c), file=sys.stderr)
     if inv.get("identifier_case_collisions"):
         print("HALT: identifier-case collisions; see INVENTORY.md", file=sys.stderr)
         return HALT
@@ -916,7 +935,7 @@ def cmd_ddl(args) -> int:
         print("  Nothing was created. Re-run `ddl --timestamp-ntz timestamp` "
               "(offline), or fix the INPUT and re-run `ddl` -- do not hand "
               "this plan to the structure workflow.", file=sys.stderr)
-        return 3
+        return HALT
     return 0
 
 
@@ -996,13 +1015,24 @@ def cmd_run(args) -> int:
     from target.jobs import watch_job
 
     out = pathlib.Path(args.out_dir)
-    ocid = args.datalake_ocid
+    # Flags first, then the config's `aidp:` block, like every other AIDP
+    # stage. This read the flags only, so the README's `run --job <name>`
+    # after filling in aidp.workspace failed with "needs --datalake-ocid"
+    # in a directory where `catalogs` resolved all four coordinates.
+    coords = _target_coords(args)
+    ocid = coords["datalake_ocid"]
     if not ocid:
         raise MissingTarget(
-            "run needs --datalake-ocid: the workflow executes inside AIDP.")
+            "run needs the aiDataPlatform OCID: the workflow executes inside "
+            "AIDP. Put it under `aidp.datalake_ocid` in the config, or pass "
+            "--datalake-ocid.")
+    args.workspace = coords["workspace"]
     if not args.workspace:
         raise MissingTarget(
-            "run needs --workspace: a job run belongs to one workspace.")
+            "run needs the workspace: a job run belongs to one workspace. "
+            "Put its key under `aidp.workspace` in the config (provision "
+            "records it as workspace.key in provision_result.json), or pass "
+            "--workspace.")
 
     parameters = {}
     for pair in (args.param or []):
@@ -1019,19 +1049,42 @@ def cmd_run(args) -> int:
         # start a run that quietly ignored it, and the stage ran at whatever
         # its PARAMS cell already said. A scope flag that silently does
         # nothing is worse than one that is missing: it reads as applied.
-        raise MissingTarget(
+        # Only a name some stage declares is offered as a --stage-param:
+        # provision refuses any other, so suggesting it would send the
+        # operator to a second refusal. For a job that is one of the stages
+        # the name is qualified with that stage: an unqualified name goes to
+        # every stage declaring it, and `mode` means different things to 01
+        # and 02, so an unqualified `mode` 01 cannot take is refused in turn.
+        from target.stage_notebooks import STAGES, declared_stage_params
+        head = (
             "--param does not reach a notebook stage: AIDP job parameters "
             "arrive as neither argv nor environment, so this run would "
             "ignore " + ", ".join(sorted(parameters)) + " and execute "
-            "whatever the notebook's PARAMS cell already holds.\n"
-            "Set stage parameters where they are actually read:\n"
+            "whatever the notebook's PARAMS cell already holds.\n")
+        stage = next((s for s in STAGES if s.job == args.job), None)
+        declared = (list(stage.params) if stage
+                    else sorted(declared_stage_params()))
+        prefix = f"{stage.key}." if stage else ""
+        known = sorted(n for n in parameters if n in declared)
+        unknown = sorted(n for n in parameters if n not in declared)
+        route = (
             "  * re-run `provision --execute --reuse-existing "
             "--refresh-notebooks "
-            + " ".join(f"--stage-param {name}=<value>"
-                       for name in sorted(parameters))
+            + " ".join(f"--stage-param {prefix}{name}=<value>"
+                       for name in known)
             + "` -- it rewrites each stage notebook's PARAMS cell and "
             "uploads it (console edits to that cell are lost), or\n"
-            "  * edit the PARAMS cell of "
+            if known else "")
+        undeclared = (
+            (f"{stage.notebook_name} does not declare " if stage
+             else "No stage notebook declares ")
+            + ", ".join(unknown) + ", so no route sets it. Declared names: "
+            + ", ".join(declared) + ".\n" if unknown else "")
+        raise MissingTarget(
+            head + undeclared
+            + "Set stage parameters where they are actually read:\n"
+            + route
+            + "  * edit the PARAMS cell of "
             "backup-snowflake-migration/scripts/<stage>.ipynb in the "
             "console.\n"
             "Scope is an INPUT either way -- never edit the stage logic to "
@@ -1076,22 +1129,61 @@ def cmd_run(args) -> int:
               f"within {args.cold_start_seconds:.0f}s (its task never "
               f"started). Cancelled it; resubmitted as {fresh}.", flush=True)
 
-    result = watch_job(call, workspace=args.workspace, job_key=job_key,
-                       parameters=parameters or None,
-                       poll_seconds=args.poll_seconds,
-                       max_polls=args.max_polls, on_poll=_on_poll,
-                       cold_start_seconds=args.cold_start_seconds,
-                       cold_start_restarts=args.cold_start_restarts,
-                       on_restart=_on_restart)
-    result["job"] = args.job
-    result["job_key"] = job_key
-    result["workspace"] = args.workspace
-    result["parameters"] = parameters
+    # Every run key is printed the moment it exists. Once a run is submitted
+    # it is the operator's evidence, whatever the watch does next: a watch
+    # that raised used to leave the key only inside an echoed GET URI.
+    submitted: list[str] = []
+
+    def _on_submit(run_key: str) -> None:
+        submitted.append(run_key)
+        print(f"  submitted: run {run_key}", flush=True)
 
     slug = (args.job or job_key).replace("/", "_")
-    _write(out, f"run_{slug}.json", result)
-    _write(out, f"RUN_{slug}.md", _render_run(result))
 
+    def _record(result: dict) -> None:
+        result["job"] = args.job
+        result["job_key"] = job_key
+        result["workspace"] = args.workspace
+        result["parameters"] = parameters
+        result["submitted_runs"] = list(submitted)
+        _write(out, f"run_{slug}.json", result)
+        _write(out, f"RUN_{slug}.md", _render_run(result))
+
+    try:
+        result = watch_job(call, workspace=args.workspace, job_key=job_key,
+                           parameters=parameters or None,
+                           poll_seconds=args.poll_seconds,
+                           max_polls=args.max_polls, on_poll=_on_poll,
+                           cold_start_seconds=args.cold_start_seconds,
+                           cold_start_restarts=args.cold_start_restarts,
+                           on_restart=_on_restart, on_submit=_on_submit)
+    except Exception as exc:
+        if not submitted:
+            # Nothing reached AIDP, so the transport's own message is true.
+            raise
+        # A run WAS submitted. Its record is written, and the message says
+        # so: "nothing was sent ... re-run this stage" about a run that may
+        # be copying rows right now sends the operator to start another.
+        text = str(exc)[:300]
+        _record({"run_key": submitted[-1], "status": "UNREADABLE",
+                 "message": text, "output": "", "terminal": False,
+                 "restarts": [], "polls": None, "unrecognised": False,
+                 "status_unreadable": True, "status_error": text,
+                 "cancel_unconfirmed": False, "ok": False})
+        print(f"  {slug}: run {submitted[-1]} WAS submitted, but the watch "
+              f"stopped: {text}\n  It may still be running. Check it in the "
+              f"console before anything else; do not start another run "
+              f"until it has ended. The record is RUN_{slug}.md.",
+              file=sys.stderr)
+        return 1
+    _record(result)
+
+    if result.get("status_unreadable"):
+        print(f'  {slug}: run {result["run_key"]} was submitted, but its '
+              f'status could not be read ({result.get("status_error")}). It '
+              f'may still be running: check it in the console, and do not '
+              f'start another run until it has ended.', file=sys.stderr)
+        return 1
     if not result["terminal"]:
         if result.get("unrecognised"):
             # Neither a verdict nor "still going": a status this plugin does
@@ -1124,7 +1216,16 @@ def cmd_run(args) -> int:
 def _render_run(result: dict) -> str:
     """The workflow run as evidence: what ran, what it returned, its log."""
     polls = result.get("polls", "?")
-    if not result.get("terminal") and result.get("unrecognised"):
+    if result.get("status_unreadable"):
+        verdict = (f"**STATUS COULD NOT BE READ** — run "
+                   f"`{result.get('run_key')}` was submitted, but its status "
+                   f"could not be read"
+                   + (f" after {polls} poll(s)" if polls else "")
+                   + f": {result.get('status_error')}. It may still be "
+                   f"running. This is neither success nor failure: check it "
+                   f"in the console, and do not start another run until it "
+                   f"has ended.")
+    elif not result.get("terminal") and result.get("unrecognised"):
         verdict = (f'**UNRECOGNISED STATE `{result.get("status")}`** — after '
                    f'{polls} poll(s) the run reports a status this plugin '
                    f'classifies as neither running nor ended. This is neither '
@@ -1524,9 +1625,13 @@ def cmd_summary(args) -> int:
 def cmd_data_options(args) -> int:
     out = pathlib.Path(args.out_dir)
     options = options_for(args.phase) if args.phase else list(DATA_OPTIONS)
+    # `implemented` is about the OPTIONS listed: each is a proposal. The note
+    # must not say more than that. It used to say this plugin "moves no bytes
+    # and implements no transfer path", beside a DATA_MOVEMENT_OPTIONS.md
+    # from the same run naming the transfer path that does exist. The note is
+    # the markdown's own opening sentence, so the two cannot drift again.
     payload = {"options": options, "implemented": False,
-               "note": ("Proposal only. This plugin moves no bytes and implements "
-                        "no transfer path.")}
+               "note": DATA_OPTIONS_NOTE}
     if args.choose:
         if not args.rationale:
             raise ValueError("--choose requires --rationale")
@@ -1548,7 +1653,8 @@ def cmd_data_options(args) -> int:
         print(f"  recorded: {state} (executed: False)")
     _write(out, "data_options.json", payload)
     _write(out, "DATA_MOVEMENT_OPTIONS.md", render_data_options(options))
-    print(f"  {len(options)} option(s) presented; none implemented")
+    print(f"  {len(options)} option(s) presented, each a proposal; the "
+          f"implemented copy is the snowmig_02_copy_schema job")
     return 0
 
 
@@ -1686,7 +1792,8 @@ def cmd_provision(args) -> int:
             raise MissingTarget(
                 f"--stage-param {pair!r} is not NAME=VALUE. The name is a "
                 f"stage parameter as it appears in the notebook's PARAMS "
-                f"cell, for example schema=SALES or mode=overwrite.")
+                f"cell, for example schema=SALES, or with a stage prefix "
+                f"to reach that stage only, copy_schema.mode=overwrite.")
         name, value = pair.split("=", 1)
         stage_params[name.strip()] = value.strip()
 
@@ -1813,8 +1920,9 @@ def _add_snowflake_args(p) -> None:
                         "rehearsing a least-privilege migration and only "
                         "appearing to")
     p.add_argument("--warehouse")
-    p.add_argument("--auth", default="keypair",
-                   choices=["keypair", "pat", "password", "externalbrowser"])
+    p.add_argument("--auth", default=None,
+                   choices=["keypair", "pat", "password", "externalbrowser"],
+                   help="default: the config's `auth:`, else keypair")
     p.add_argument("--key-path")
     # No --key-passphrase: every secret is a path or lives in the config.
     # main() refuses the old spelling by name (see _REMOVED_SECRET_FLAGS).
@@ -2118,9 +2226,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "how `schema` reaches 02_copy_schema: job "
                          "parameters do not reach a notebook, so a stage "
                          "parameter has to be IN the notebook, and this "
-                         "writes it there. A stage that does not declare the "
-                         "name ignores it. Scope is an INPUT -- never edit "
-                         "the stage logic to make it cover less")
+                         "writes it there. NAME is the stage flag without "
+                         "`--` (schema, tables, mode, dry-run, counts, ...); "
+                         "a name no stage declares is refused. Prefix NAME "
+                         "with a stage (discover, structure, copy_schema, "
+                         "reconcile) to write that stage only, e.g. "
+                         "copy_schema.mode=overwrite: an unqualified value a "
+                         "declaring stage would reject is refused (`mode` is "
+                         "ddl-plan/ctas/manifest in 01 but "
+                         "skip-existing/append/overwrite in 02). A switch "
+                         "takes true or false; a list flag (tables, schemas) "
+                         "takes a comma-separated value. With "
+                         "--reuse-existing it needs --refresh-notebooks, "
+                         "since a kept notebook is not rewritten. Scope is "
+                         "an INPUT -- never edit the stage logic to make it "
+                         "cover less")
     pv.add_argument("--refresh-notebooks", action="store_true",
                     help="with --reuse-existing, regenerate the stage "
                          "notebooks from this run's flags even where they "
@@ -2135,6 +2255,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "terminal state, and save its output as "
                              "evidence (runbook S6, S10)")
     _add_target_args(rn)
+    rn.add_argument("--config", "--connection-config", dest="config",
+                    help="the ONE migration config: its `aidp:` block "
+                         "supplies --datalake-ocid and --workspace (and the "
+                         "oci profile). A flag overrides what it says. "
+                         "Default: ./snowmig-config.yaml, then the plugin's")
     rn.add_argument("--job", help="job display name, e.g. snowmig_00_discover")
     rn.add_argument("--job-key", help="job key; use when the name is ambiguous")
     rn.add_argument("--param", action="append", metavar="NAME=VALUE",
@@ -2400,7 +2525,8 @@ def main(argv: list[str] | None = None) -> int:
             prepare_out_dir(args.out_dir)
         return args.func(args)
     except (AuthError, MissingTarget, RefusedToExecute, CatalogRefused,
-            DeployRefused, ProvisionTransportError, JobRunCollision,
+            DeployRefused, ProvisionTransportError, CatalogTransportError,
+            JobRunCollision,
             ConnectionConfigError, ConfigError, FileNotFoundError, OSError,
             InvalidRestriction, NoBackendAvailable, BackendError,
             ExecutorBackendError,

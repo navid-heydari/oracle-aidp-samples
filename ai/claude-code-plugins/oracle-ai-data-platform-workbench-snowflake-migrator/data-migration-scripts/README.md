@@ -53,6 +53,15 @@ every statement these notebooks issue against the source is a SELECT.
 The shared helper (`how the source is read, in either mode`) is inlined into
 every notebook that needs it; it is no longer a separate upload.
 
+All three of 01, 02 and 03 address the **target schema the approved plan
+names** (`target_fqn` in `ddl_plan.json`, e.g. `db_core` under a bronze
+prefix), not `--schema` itself; the source schema's own name stands in only
+where the plan names none. `--target-schema` may restate the plan's schema
+in any case, never contradict it. Schema names compare case-insensitively,
+as Spark resolves them, and the copy refuses to run when the structure
+report on disk targets a different schema rather than widening its scope to
+the whole manifest.
+
 ## Two source modes — use `connector`
 
 **Discover schemas and tables by running the workflow in `connector` mode.
@@ -97,7 +106,8 @@ In every mode the CREATE returning is not the claim: the table is `DESCRIBE`d
 afterwards and compared with the plan, column by column and in order.
 `CREATE TABLE IF NOT EXISTS` is a silent no-op on a table that is already
 there, so without the read-back a stale layout would be certified as created
-from the plan — and the copy is a positional `INSERT ... SELECT *`.
+from the plan — and the copy fills the target's columns in the target's
+order.
 
 ## Statuses and verdicts
 
@@ -129,9 +139,9 @@ every report with exit 0.
 | `skipped_nonempty` | `skip-existing` found rows already there, **equal** to the source count; not re-verified | no |
 | `count_mismatch` | counts differ — after a copy, or on a `skip-existing` target that already held a different number of rows (nothing copied) | **yes** |
 | `sum_mismatch` | counts equal, a decimal column does not sum equal | **yes** |
-| `type_drift` | a source DECIMAL column is not DECIMAL, or narrower, on the target; NOT copied — an INSERT would round or truncate with the count intact | **yes** |
-| `failed` | the copy raised; `insert_completed: true` means the rows landed before verification failed, so re-copy with `--mode overwrite`, never `append` | **yes** |
-| `target_missing` | no table to copy into (usually `not_in_plan` upstream) | no |
+| `type_drift` | the live source's column names are not the target's (renamed, dropped or added since the plan; `layout_drift` lists them), or a source DECIMAL column is not DECIMAL, or narrower, on the target; NOT copied — the rows would land in the wrong columns, or be rounded or truncated, with the count intact. A source whose columns are only **reordered** is copied: every column is selected by name, in the target's order | **yes** |
+| `failed` | the copy raised — including a `DESCRIBE` of the target that failed for any reason but not-found (a metastore timeout, a permission denied: "could not look" is never recorded as absent); `insert_completed: true` means the rows landed before verification failed, so re-copy with `--mode overwrite`, never `append` | **yes** |
+| `target_missing` | Spark says there is no table to copy into (usually `not_in_plan` upstream) | no — **yes** when the structure report records the table `created` or `already_existed`, or the approved plan places the table at this target (also with `--tables`, or before `01_create_structure` has run) |
 
 A re-run never softens a recorded failure: `count_mismatch`, `sum_mismatch`,
 `type_drift` and `failed` stand until a real re-copy verifies the table.
@@ -151,12 +161,13 @@ live catalog)
 | `MISSING_DESPITE_REPORT` | a report says created or verified; the catalog lacks it | **yes** |
 | `STRUCTURE_FAILED` | the CREATE raised | **yes** |
 | `STRUCTURE_TYPE_DRIFT` | the table's layout is not the plan's — outranks a verified copy, since counts match when rows land in the wrong columns | **yes** |
-| `STRUCTURE_ONLY_COPY_FAILED` | the copy ended in a mismatch, drift or failure | **yes** |
+| `STRUCTURE_ONLY_COPY_FAILED` | the copy ended in a mismatch, drift or failure, or recorded `target_missing` for a table the catalog lists | **yes** |
 | `COUNT_DRIFT` | `--counts` only: verified at N rows, the target now holds a different number — changed since the copy, not by it | **yes** |
 | `TARGET_UNREADABLE` | `SHOW TABLES` failed; not the same as empty | **yes** |
 
-A report written for a **different target catalog** is ignored by reconcile
-(and named in the report), never applied to this one.
+A report written for a **different target** — another catalog, or another
+schema than the one the plan names — is ignored by reconcile (and named in
+the report), never applied to this one.
 
 ## The intended run, per schema
 

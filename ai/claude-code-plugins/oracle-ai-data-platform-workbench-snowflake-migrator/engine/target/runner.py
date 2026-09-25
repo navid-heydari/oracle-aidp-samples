@@ -19,7 +19,8 @@ from typing import Callable
 from .coords import region_from_ocid
 from .executor import build_command, parse_cli_json
 
-__all__ = ["BackendError", "make_run_sql", "spool_body"]
+__all__ = ["BackendError", "CatalogTransportError", "make_run_sql",
+           "spool_body"]
 
 _MAX_STDERR = 500
 
@@ -39,9 +40,12 @@ def _session_expired(*streams: str | None) -> bool:
 def expired_session_message(profile: str | None, region: str | None) -> str:
     who = f" --profile {profile}" if profile else ""
     where = f" --region {region}" if region else ""
-    return ("the OCI CLI session profile has expired; nothing was sent. "
-            f"Refresh it with `oci session authenticate{who}{where}` and "
-            "re-run this stage.")
+    # "This call", not "nothing": the message is raised by ONE call, and a
+    # run submitted by an earlier call in the same stage was sent. Saying
+    # nothing was sent after a job run was accepted invited a second run.
+    return ("the OCI CLI session profile has expired, so this call was not "
+            f"sent. Refresh it with `oci session authenticate{who}{where}` "
+            "and re-run.")
 
 
 def spool_body(body: dict, *, prefix: str) -> str:
@@ -85,6 +89,18 @@ class BackendError(RuntimeError):
 
 class CliTimeout(RuntimeError):
     """A CLI child did not return inside its budget."""
+
+
+class CatalogTransportError(RuntimeError):
+    """A catalog CRUD call (make_call) failed: a non-zero CLI exit, an
+    expired session, a timeout, or a listing the CLI cannot page.
+
+    Named so the CLI reports it as its one-line `error:` with the remedy,
+    like ProvisionTransportError and BackendError. It was a bare
+    RuntimeError (and a timeout escaped as subprocess.TimeoutExpired), which
+    main() does not catch, so `catalogs` on an expired session printed a
+    traceback. Still a RuntimeError, so every caller that catches one --
+    the deploy's retry and read-back loops -- is unchanged."""
 
 
 # Generous, because a cluster create legitimately takes minutes -- but
@@ -187,15 +203,23 @@ def make_call(target, *, backend: str, run_process=None):
         try:
             cmd = build_command(backend, operation, target, **kwargs)
             print("  $ " + " ".join(_printable(c) for c in cmd))
-            proc = runner(cmd)
+            try:
+                proc = runner(cmd)
+            except subprocess.TimeoutExpired as exc:
+                raise CatalogTransportError(
+                    f"{operation}: `{' '.join(cmd[:3])}` timed out after "
+                    f"{exc.timeout:g}s and was killed. A slow call and a "
+                    f"stuck one look the same from here: re-run, and if it "
+                    f"recurs check the network path to the endpoint."
+                ) from exc
             if proc.returncode != 0:
                 if _session_expired(proc.stdout, proc.stderr):
-                    raise RuntimeError(
+                    raise CatalogTransportError(
                         f"{operation}: "
                         + expired_session_message(
                             getattr(target, "oci_profile", None),
                             region_from_ocid(target.datalake_ocid)))
-                raise RuntimeError(
+                raise CatalogTransportError(
                     f"{operation} failed (exit {proc.returncode}): "
                     f"{(proc.stderr or proc.stdout or '')[:300]}")
             rows, headers = parse_cli_envelope(proc.stdout)
@@ -210,7 +234,7 @@ def make_call(target, *, backend: str, run_process=None):
             # The CLI's paging flags are undocumented, so the rest cannot be
             # asked for. Page one handed back as the whole collection would
             # make every object past it "absent"; say so instead.
-            raise RuntimeError(
+            raise CatalogTransportError(
                 f"{operation}: the aidp CLI answered with a next-page token "
                 f"({str(next_page)[:40]!r}), so this listing is only its "
                 f"first page and the rest cannot be requested through that "

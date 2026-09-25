@@ -14,8 +14,15 @@ catalog is consulted directly so the report cannot be flattered by a stale
 script report: an object a report calls verified but the catalog no longer
 holds -- or, with --counts, no longer holds at the verified row count -- is
 flagged, and an object in the catalog that no report claims is flagged the
-other way. A script report written for a DIFFERENT target catalog is
+other way. A script report written for a DIFFERENT target -- another
+catalog, or another schema than the one the approved plan names -- is
 ignored (and said so), not applied to this one.
+
+The target schema is resolved as 01_create_structure and 02_copy_schema
+resolve it: the approved plan's `target_fqn` for the source schema, and only
+where the plan is silent the one the reports recorded (else the source
+schema's own name). Schema names compare case-insensitively, as Spark
+resolves them.
 
 "Could not look" never renders as zero: an unreadable schema is marked
 UNREADABLE, distinct from empty.
@@ -90,11 +97,78 @@ def _for_catalog(report: dict | None,
     return report, None
 
 
+def _for_schema(report: dict | None,
+                target_schema: str) -> tuple[dict | None, str | None]:
+    """`report` if it was written for `target_schema`, else (None, target).
+
+    The catalog check alone let a copy report verified against `lake.CORE`
+    (the pre-fix copy's schema) certify `lake.db_core`, where the plan put
+    the tables and where they held 0 rows: MIGRATED_VERIFIED, exit 0.
+    """
+    if not report:
+        return report, None
+    target = str(report.get("target") or "")
+    if "." in target and \
+            target.split(".", 1)[1].casefold() != target_schema.casefold():
+        return None, target
+    return report, None
+
+
+def plan_targets(ddl_plan: dict,
+                 target_catalog: str) -> dict[str, set[str]]:
+    """`{source_schema: {target_schema}}` from the plan's TABLE statements
+    in `target_catalog` -- the same `target_fqn` 01 creates the tables at."""
+    out: dict[str, set[str]] = {}
+    for stmt in ddl_plan.get("statements") or []:
+        source = str(stmt.get("source_identifier") or "").split(".")
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(source) != 3 or len(target) != 3:
+            continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue
+        if target[0].casefold() != target_catalog.casefold():
+            continue
+        out.setdefault(source[1], set()).add(target[1])
+    return out
+
+
+def _target_schema(schema: str, planned: set[str],
+                   reports: list[dict]) -> str:
+    """The plan's schema; where the plan is silent, the recorded one."""
+    recorded = [str(r.get("target")).split(".", 1)[1] for r in reports
+                if r and "." in str(r.get("target") or "")]
+    if planned:
+        for name in sorted(planned):
+            if any(name.casefold() == r.casefold() for r in recorded):
+                return name
+        return sorted(planned)[0]
+    return recorded[0] if recorded else schema
+
+
+# What Spark says when a table, or the schema holding it, is simply not
+# there -- the same markers 02_copy_schema reads as "absent" (a test pins the
+# two lists equal). Only these mean "absent"; any other error is "could not
+# look".
+_NOT_FOUND = ("TABLE_OR_VIEW_NOT_FOUND", "SCHEMA_NOT_FOUND",
+              "NoSuchTableException", "NoSuchNamespaceException",
+              "NoSuchDatabaseException", "Table or view not found")
+
+
 def _live_tables(spark, catalog: str, schema: str) -> set[str] | None:
-    """Lower-cased table names the catalog holds, or None when unreadable."""
+    """Lower-cased table names the catalog holds; an EMPTY set when the
+    schema does not exist yet; None when it could not be read.
+
+    A schema the target has not created is a schema not migrated yet. Every
+    SHOW TABLES error used to read as "could not look", so live, a
+    schema-by-schema run exited 1 with every not-yet-created schema
+    TARGET_UNREADABLE -- after each schema but the last.
+    """
     try:
         rows = spark.sql(f"SHOW TABLES IN {q(catalog)}.{q(schema)}").collect()
-    except Exception:
+    except Exception as exc:
+        text = str(exc).lower()
+        if any(marker.lower() in text for marker in _NOT_FOUND):
+            return set()
         return None
     out = set()
     for r in rows:
@@ -104,7 +178,8 @@ def _live_tables(spark, catalog: str, schema: str) -> set[str] | None:
 
 
 def reconcile(spark, *, manifest: dict, target_catalog: str,
-              reports: pathlib.Path, counts: bool) -> dict:
+              reports: pathlib.Path, counts: bool,
+              planned_targets: dict[str, set[str]] | None = None) -> dict:
     out = {"target_catalog": target_catalog,
            "generated_at": datetime.datetime.now(
                datetime.timezone.utc).isoformat(),
@@ -119,13 +194,19 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
         copy, c_other = _for_catalog(
             _load(reports, f"copy_report_{schema.lower()}.json"),
             target_catalog)
+        # The structure report first: it records where 01 created the
+        # tables, which is where the copy has to have put the rows.
+        target_schema = _target_schema(
+            schema, (planned_targets or {}).get(schema) or set(),
+            [structure, copy])
+        structure, s_wrong = _for_schema(structure, target_schema)
+        copy, c_wrong = _for_schema(copy, target_schema)
         ignored = {kind: other for kind, other in
-                   (("structure", s_other), ("copy", c_other)) if other}
+                   (("structure", s_other or s_wrong),
+                    ("copy", c_other or c_wrong)) if other}
         for kind, other in ignored.items():
             log(f"{schema}: the {kind} report targets {other}, not "
-                f"{target_catalog} — ignored for this catalog")
-        target_schema = ((copy or structure or {}).get("target") or
-                         f"{target_catalog}.{schema}").split(".", 1)[1]
+                f"{target_catalog}.{target_schema} — ignored for this target")
         live = _live_tables(spark, target_catalog, target_schema)
 
         rows = []
@@ -136,6 +217,7 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
             c_rec = (copy or {}).get("tables", {}).get(name, {})
             c_status = c_rec.get("status", "not_attempted")
             exists = (None if live is None else name.lower() in live)
+            reason = None
 
             if live is None:
                 verdict = "TARGET_UNREADABLE"
@@ -155,6 +237,16 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                 # A copy into it can verify counts and still have landed rows
                 # in the wrong columns, so this outranks any copy status.
                 verdict = "STRUCTURE_TYPE_DRIFT"
+            elif c_status == "target_missing":
+                # The copy found no table here, and the catalog lists one
+                # now: the copy never ran against it. Falling through to
+                # STRUCTURE_ONLY put "does not exist" beside "In target:
+                # yes" under "No table is in a problem state".
+                verdict = "STRUCTURE_ONLY_COPY_FAILED"
+                reason = ("the copy recorded target_missing, but the "
+                          "catalog lists it now: nothing was copied into "
+                          "it. Re-run 02_copy_schema. (copy: "
+                          + str(c_rec.get("reason") or "no reason") + ")")
             elif c_status == "verified":
                 verdict = "MIGRATED_VERIFIED"
             elif c_status in ("count_mismatch", "sum_mismatch", "type_drift",
@@ -173,7 +265,7 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
 
             row = {"table": name, "structure": s_status, "copy": c_status,
                    "exists_in_target": exists, "verdict": verdict,
-                   "reason": c_rec.get("reason")
+                   "reason": reason or c_rec.get("reason")
                              or (structure or {}).get("objects", {})
                              .get(name, {}).get("reason")}
             if counts and exists:
@@ -263,8 +355,8 @@ def render(rec: dict) -> str:
                       "confirmed, and this is not the same as empty.**", ""]
         for kind, other in (s.get("reports_ignored_for_other_catalog")
                             or {}).items():
-            lines += [f"The {kind} report on disk targets `{other}`, not this "
-                      f"catalog — ignored here.", ""]
+            lines += [f"The {kind} report on disk targets `{other}`, not "
+                      f"this target — ignored here.", ""]
         lines += ["| Table | Structure | Copy | In target | Verdict | Why |",
                   "|---|---|---|---|---|---|"]
         for t in s["tables"]:
@@ -298,6 +390,11 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--target-catalog", required=True)
     ap.add_argument("--reports-dir", default=DEFAULT_REPORTS_DIR)
+    ap.add_argument("--ddl-plan",
+                    help="path to ddl_plan.json (default: ../plan/"
+                         "ddl_plan.json next to --reports-dir); its "
+                         "target_fqn names the target schema, as in "
+                         "01_create_structure")
     ap.add_argument("--counts", action="store_true",
                     help="also read a live COUNT(*) per existing table, and "
                          "flag a verified table whose count has changed since "
@@ -310,12 +407,21 @@ def main(argv: list[str] | None = None) -> int:
         return fail(f"error: {reports / MANIFEST_NAME} not found; run 00_discover "
               f"first")
 
+    ddl_path = (pathlib.Path(args.ddl_plan) if args.ddl_plan
+                else reports.parent / "plan" / "ddl_plan.json")
+    planned = None
+    if ddl_path.is_file():
+        planned = plan_targets(json.loads(ddl_path.read_text(encoding="utf-8")),
+                               args.target_catalog)
+    elif args.ddl_plan:
+        return fail(f"error: --ddl-plan {ddl_path} is not there")
+
     from pyspark.sql import SparkSession
     spark = SparkSession.builder.getOrCreate()
 
     rec = reconcile(spark, manifest=manifest,
                     target_catalog=args.target_catalog, reports=reports,
-                    counts=args.counts)
+                    counts=args.counts, planned_targets=planned)
     (reports / "reconciliation.json").write_text(json.dumps(rec, indent=2), encoding="utf-8")
     (reports / "MIGRATION_REPORT.md").write_text(render(rec), encoding="utf-8")
     log(f"totals: {rec['totals']}")

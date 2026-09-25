@@ -42,7 +42,7 @@ from target.ddl import (
 from .medallion import (TARGET_KEY_MAX, TARGET_NAME_RULE_TEXT, bronze_target,
                         detect_target_collisions, layer_jobs,
                         target_key_overage, unacceptable_target_names)
-from .restrictions import apply_restrictions
+from .restrictions import apply_restrictions, restriction_matches
 from .waves import compute_waves
 
 __all__ = ["build_plan", "TargetCollision", "object_kind_block"]
@@ -195,7 +195,8 @@ def _view_verdict(rec: dict) -> tuple[bool, str, str]:
 
 
 def _cascade_dependency_exclusions(can: list[dict], cannot: list[dict],
-                                   edges: list[dict]) -> tuple[list[dict], list[dict]]:
+                                   edges: list[dict], inventoried: set[str]
+                                   ) -> tuple[list[dict], list[dict]]:
     """Move every dependent of a `cannot` object into `cannot`, transitively.
 
     Without this only the planned ids reached compute_waves, which drops an
@@ -203,15 +204,38 @@ def _cascade_dependency_exclusions(can: list[dict], cannot: list[dict],
     at indegree 0, sorted first (rows=None -> size 0) and got a CREATE VIEW
     over a table that will never exist, under a report line promising that
     views follow their base tables.
+
+    An edge to an object outside `inventoried` is a dependency on something
+    this migration does not carry at all -- another database, usually. A
+    view joining D.S.T with OTHERDB.S.FACTS was planned into wave 2, the
+    report said views follow their base tables, and the create failed with
+    a bare 500. It is refused here, naming the outside object, and its own
+    dependents cascade from it.
     """
     can_ids = {c["source_identifier"] for c in can}
     kinds = {c["source_identifier"]: c["object_type"] for c in can}
     dependents: dict[str, set[str]] = collections.defaultdict(set)
+    outside: dict[str, set[str]] = collections.defaultdict(set)
     for edge in edges:
-        if edge["from"] != edge["to"]:
-            dependents[edge["to"]].add(edge["from"])
+        if edge["from"] == edge["to"]:
+            continue
+        dependents[edge["to"]].add(edge["from"])
+        if edge["to"] not in inventoried and edge["from"] in can_ids:
+            outside[edge["from"]].add(edge["to"])
 
     why = {c["source_identifier"]: c for c in cannot}
+    for dependent in sorted(outside):
+        names = ", ".join(sorted(outside[dependent]))
+        can_ids.discard(dependent)
+        entry = {"source_identifier": dependent,
+                 "object_type": kinds[dependent],
+                 "category": "dependency_not_migrated",
+                 "reason": f"depends on {names}, which is outside the "
+                           f"assessed scope (not in this inventory), so it "
+                           f"is not migrating with it -- migrate or "
+                           f"federate it first, or exclude this object"}
+        cannot.append(entry)
+        why[dependent] = entry
     queue = collections.deque(sorted(why))
     while queue:
         missing = queue.popleft()
@@ -254,33 +278,53 @@ def _load_warning(load: dict) -> str:
             f"rebuilt on AIDP (a Job, or a streaming or scheduled load)")
 
 
+def _name_parts(rec: dict) -> tuple[str, str, str]:
+    """(database, schema, name) from the record's own fields.
+
+    Not `source_identifier.split(".", 2)`: Snowflake allows a dot inside a
+    quoted name, so `MYDB.PUBLIC.orders.v2` split that way gave a table
+    `orders.v2` and a four-part target the name check passed fragment by
+    fragment -- and `ddl` then refused the whole estate on it.
+    """
+    ident = rec["source_identifier"]
+    db, schema = rec.get("source_database"), rec.get("source_schema")
+    if db is not None and schema is not None and ident.startswith(f"{db}.{schema}."):
+        return db, schema, ident[len(db) + len(schema) + 2:]
+    db, schema, name = ident.split(".", 2)
+    return db, schema, name
+
+
 def _target_catalog_note(catalogs: list[str], prefix: str | None,
                          style: str) -> str:
     """Say whose catalog name the Target column carries.
 
-    The in-AIDP structure job (01_create_structure) creates
-    <--target-catalog>.<source schema>.<name> and never reads the plan's
-    target_fqn; the plan's catalog part is the source database mirrored, or
-    the prefix. Reviewers were approving names the job does not create.
+    The in-AIDP structure job (01_create_structure, S10) creates each
+    approved `target_fqn` as it stands, and refuses a run whose
+    `--target-catalog` is not the plan's catalog. This note once described
+    the job before that fix ("does not read this column", keeps the source
+    schema), so the approval artifact named a schema S10 does not create,
+    and with no prefix it steered the operator to a --target-catalog the
+    job refuses.
     """
-    job = ("The in-AIDP structure job (01_create_structure) does not read this "
-           "column: it creates <--target-catalog>.<schema>.<table> under the "
-           "catalog passed to `provision --target-catalog`, keeping the source "
-           "schema and table names.")
+    job = ("The in-AIDP structure job (01_create_structure, S10) creates the "
+           "Target column as it stands -- catalog, schema and table -- and "
+           "refuses a run whose `provision --target-catalog` is not the "
+           "plan's catalog.")
     if prefix is None:
         mirrored = ", ".join(catalogs) or "the source database"
         return (f"The catalog part of the Target column is the source database "
                 f"name mirrored 1:1 ({mirrored}); no --bronze-catalog-prefix was "
-                f"given. {job} Read the Target column with that "
-                f"catalog in place of {mirrored}. In the runbook the catalog "
-                f"named after the source database is the read-only EXTERNAL "
-                f"pointer at Snowflake, not the target -- the job refuses "
-                f"source == target.")
+                f"given. {job} In the runbook the catalog named after the "
+                f"source database is the read-only EXTERNAL pointer at "
+                f"Snowflake, not a target, so this plan cannot go through the "
+                f"structure job as it stands: re-run `plan "
+                f"--bronze-catalog-prefix <the INTERNAL catalog created at S4>` "
+                f"and `ddl`, and pass that same catalog to `provision "
+                f"--target-catalog`.")
     return (f"The catalog part of the Target column is the --bronze-catalog-prefix "
             f"{prefix!r}, with the schema part in the {style!r} style. {job} "
-            f"Pass {prefix!r} to `provision --target-catalog` for the catalogs to "
-            f"agree; the schema part the job creates is the source schema, not "
-            f"the {style!r} form shown here.")
+            f"Pass {prefix!r} to `provision --target-catalog`; the schemas "
+            f"created are the ones listed here.")
 
 
 def build_plan(inventory: dict, dependencies: dict, *,
@@ -304,10 +348,30 @@ def build_plan(inventory: dict, dependencies: dict, *,
     kind_warnings: list[dict] = []
     for rec in kept:
         ident = rec["source_identifier"]
-        db, schema, name = ident.split(".", 2)
+        db, schema, name = _name_parts(rec)
         targets[ident] = bronze_target(db, schema, name,
                                        catalog_prefix=bronze_catalog_prefix,
                                        schema_style=bronze_schema_style)
+
+        # A dot inside a quoted part makes the joined target more than
+        # three parts. Checked on the parts, because the joined FQN splits
+        # into fragments that each pass the name rule.
+        dotted = [p for p in (db, schema, name) if "." in str(p)]
+        if dotted:
+            cannot.append({
+                "source_identifier": ident,
+                "object_type": rec.get("object_type"),
+                "category": "unacceptable_target_name",
+                "reason": (
+                    "the source name part(s) "
+                    + ", ".join(repr(p) for p in dotted)
+                    + f" contain a '.', so the target {targets[ident]!r} is "
+                      f"not a three-part catalog.schema.name -- "
+                      f"{TARGET_NAME_RULE_TEXT}. Snowflake allows it "
+                      f"because the source name is double-quoted. Rename it "
+                      f"in Snowflake, or exclude it, and re-run: this plugin "
+                      f"does not rewrite an object name.")})
+            continue
 
         # A name the destination will refuse is refused here, not at the
         # create. Planning it means generating DDL for it, attempting it, and
@@ -363,6 +427,22 @@ def build_plan(inventory: dict, dependencies: dict, *,
                           + "; ".join(rec.get("blocked_reasons") or ["unspecified"])})
             continue
 
+        if rec.get("compatibility_status") == "unassessed":
+            # The schema's INFORMATION_SCHEMA.COLUMNS read failed, so the
+            # empty column list is a missing fact, not a table with nothing
+            # to map. Planned, it read `supported` / LOW / "clones cleanly"
+            # everywhere but DDL_PLAN.md, which blamed a privilege for what
+            # was a timeout. The reason is the error the read got.
+            error = rec.get("columns_read_error") or "no error text was recorded"
+            cannot.append({
+                "source_identifier": ident, "object_type": rec.get("object_type"),
+                "category": "columns_unread",
+                "reason": ("its columns could not be read, so no type was "
+                           "assessed and no DDL can be generated: the "
+                           f"INFORMATION_SCHEMA.COLUMNS read failed ({error}). "
+                           "Re-run `assess` once that read succeeds.")})
+            continue
+
         verdict = _view_verdict if rec.get("object_type") == "VIEW" else _table_verdict
         ok, category, reason = verdict(rec)
         if not ok:
@@ -413,7 +493,8 @@ def build_plan(inventory: dict, dependencies: dict, *,
                     "omitted_properties": omitted})
 
     can, cannot = _cascade_dependency_exclusions(
-        can, cannot, dependencies.get("edges", []))
+        can, cannot, dependencies.get("edges", []),
+        {r["source_identifier"] for r in records})
 
     # A pipe or task the census read as writing a table that migrates. The
     # census TASK verdict says such a table stops being populated at cutover;
@@ -463,6 +544,8 @@ def build_plan(inventory: dict, dependencies: dict, *,
             catalogs, bronze_catalog_prefix, bronze_schema_style),
         "waves": waved["waves"],
         "cycles": waved["cycles"],
+        # Not in a cycle, but depending on one, so equally unorderable.
+        "blocked_behind_cycle": waved["blocked_behind_cycle"],
         "target_names": targets,
         "clone_targets": sorted(can_ids),
         "can_migrate": sorted(can, key=lambda c: c["source_identifier"]),
@@ -478,6 +561,9 @@ def build_plan(inventory: dict, dependencies: dict, *,
             loads_that_stop,
             key=lambda x: (x["table"], x["kind"], x["source_identifier"])),
         "restrictions_applied": restrictions or {},
+        # What each list entry matched in this inventory. A zero is a typo
+        # until shown otherwise, and the report says so.
+        "restriction_matches": restriction_matches(records, restrictions),
         "catalogs_to_create": catalogs,
         "schemas_to_create": [list(s) for s in schemas],
         "silver_gold_jobs": layer_jobs(scopes),

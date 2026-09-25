@@ -114,7 +114,7 @@ table.
 
 **The data plane reads every row of every in-scope table.**
 `02_copy_schema`, running as an AIDP job on your cluster, copies a schema with
-`INSERT INTO <target> SELECT * FROM <source>` and, with
+`INSERT INTO <target> SELECT <every column> FROM <source>` and, with
 `--verify counts+sums`, aggregates the rows again. Row data flows
 Snowflake → your AIDP cluster → your AIDP catalog storage, never through the
 operator's machine and never to the plugin's authors. The connector is

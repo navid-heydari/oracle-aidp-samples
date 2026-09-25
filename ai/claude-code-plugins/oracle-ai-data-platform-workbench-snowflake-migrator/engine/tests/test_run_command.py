@@ -160,3 +160,150 @@ def test_the_param_refusal_names_the_flag_that_really_rewrites_params(tmp_path):
     with pytest.raises(snowmig.MissingTarget) as exc:
         snowmig.cmd_run(_args(tmp_path, param=["schema=SALES"]))
     assert "--refresh-notebooks" in str(exc.value)
+
+
+# --- `run` reads the config's aidp: block like every other AIDP stage --------
+#
+# Found on review. The README says to fill in aidp.workspace and then "Run
+# them with bin/snowmig run --job <name>", but cmd_run read
+# args.datalake_ocid and args.workspace directly and never consulted the
+# config. In a directory where `catalogs` and `smoke` resolved all four
+# coordinates from snowmig-config.yaml, `run --job snowmig_00_discover`
+# printed "config: <path>" (loaded for the oci profile only) and then
+# "error: run needs --datalake-ocid", and `run --config` was rejected by
+# argparse as an unrecognized argument.
+
+def _cwd_config(tmp_path, monkeypatch, aidp_lines):
+    cfg = tmp_path / "snowmig-config.yaml"
+    body = ("snowflake:\n  account: ORG-ACC\n  user: SVC\n  warehouse: WH\n"
+            "  database: SALES_DB\n  auth: password\n"
+            "  password: not-a-real-password\naidp:\n")
+    body += "".join(f"  {line}\n" for line in aidp_lines)
+    cfg.write_text(body, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    return cfg
+
+
+class _SeesWorkspace(Runs):
+    def __init__(self):
+        super().__init__("SUCCESS")
+        self.workspaces: list = []
+
+    def __call__(self, op, **kw):
+        if op == "run_job":
+            self.workspaces.append(kw.get("workspace"))
+        return super().__call__(op, **kw)
+
+
+def test_run_takes_the_destination_from_the_config(tmp_path, monkeypatch):
+    _cwd_config(tmp_path, monkeypatch,
+                [f"datalake_ocid: {OCID}", "workspace: cfg-ws"])
+    fake = _SeesWorkspace()
+    seen = {}
+
+    def make(ocid, **kw):
+        seen["ocid"] = ocid
+        return fake
+    monkeypatch.setattr(provisioning, "make_provision_call", make)
+    rc = snowmig.cmd_run(_args(tmp_path, datalake_ocid=None, workspace=None))
+    assert rc == 0
+    assert seen["ocid"] == OCID
+    assert fake.workspaces == ["cfg-ws"]
+    assert "cfg-ws" in (tmp_path / "run_snowmig_01_structure.json").read_text(
+        encoding="utf-8")
+
+
+def test_run_accepts_config_and_a_flag_still_wins(tmp_path, monkeypatch):
+    cfg = _cwd_config(tmp_path, monkeypatch,
+                      [f"datalake_ocid: {OCID}", "workspace: cfg-ws"])
+    args = snowmig.build_parser().parse_args(
+        ["run", "--config", str(cfg), "--job", "snowmig_01_structure",
+         "--job-key", "job-k", "--workspace", "flag-ws",
+         "--out-dir", str(tmp_path), "--max-polls", "2",
+         "--poll-seconds", "0"])
+    fake = _SeesWorkspace()
+    _install(monkeypatch, fake)
+    assert snowmig.cmd_run(args) == 0
+    assert fake.workspaces == ["flag-ws"]
+
+
+def test_run_without_a_destination_names_the_config_key(tmp_path,
+                                                        monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(snowmig, "PLUGIN_ROOT", tmp_path)
+    with pytest.raises(snowmig.MissingTarget) as exc:
+        snowmig.cmd_run(_args(tmp_path, datalake_ocid=None))
+    assert "aidp.datalake_ocid" in str(exc.value)
+
+
+# --- the evidence survives a watch that could not read the run ---------------
+#
+# Found on review. After POST /jobRuns, one failed status poll aborted
+# cmd_run before it wrote anything: exit 1, no run_<job>.json / RUN_<job>.md,
+# and for an expired session "nothing was sent ... re-run this stage" about
+# a run that had been submitted (live repro: 'poll 1: RUNNING', then the
+# error, 'job runs submitted: [run-1]', 'artifacts written: []').
+
+class _ExpiresAfterSubmit(Runs):
+    def __init__(self):
+        super().__init__("RUNNING")
+
+    def __call__(self, op, **kw):
+        if op == "get_job_run":
+            from target.runner import expired_session_message
+            self.ops.append(op)
+            # The transport's real text, whatever it currently says.
+            raise RuntimeError("get_job_run: "
+                               + expired_session_message(None, "us-ashburn-1"))
+        return super().__call__(op, **kw)
+
+
+@pytest.fixture()
+def _no_oci_config(tmp_path, monkeypatch):
+    # _oci_runner reads the auth mode off the OCI config's section headers;
+    # point it at nothing so these tests never touch the operator's file.
+    monkeypatch.setenv("OCI_CONFIG_FILE", str(tmp_path / "no-oci-config"))
+
+
+def test_an_unreadable_run_still_leaves_its_evidence(tmp_path, monkeypatch,
+                                                     capsys, _no_oci_config):
+    import json
+    _install(monkeypatch, _ExpiresAfterSubmit())
+    rc = snowmig.cmd_run(_args(tmp_path, max_polls=5))
+    assert rc == 1
+    record = json.loads((tmp_path / "run_snowmig_01_structure.json")
+                        .read_text(encoding="utf-8"))
+    assert record["run_key"] == "run-1"
+    md = _run_md(tmp_path)
+    assert "run-1" in md and "could not be read" in md
+    printed = capsys.readouterr()
+    assert "run-1" in printed.out + printed.err
+    assert "nothing was sent" not in (printed.out + printed.err + md)
+
+
+class _ResubmitFails(Runs):
+    """The cold-start watchdog cancels run-1 cleanly; the resubmit raises."""
+
+    def __init__(self):
+        super().__init__("RUNNING", started=False)
+
+    def __call__(self, op, **kw):
+        if op == "run_job" and self.submitted:
+            self.ops.append(op)
+            raise RuntimeError("run_job failed (exit 1): 503")
+        if op == "get_job_run" and "cancel_job_run" in self.ops:
+            return {"state": {"status": "CANCELED", "stateMessage": ""}}
+        return super().__call__(op, **kw)
+
+
+def test_a_watch_that_raises_after_a_submit_still_writes_the_record(
+        tmp_path, monkeypatch, capsys, _no_oci_config):
+    import json
+    _install(monkeypatch, _ResubmitFails())
+    rc = snowmig.cmd_run(_args(tmp_path, max_polls=6, poll_seconds=30))
+    assert rc == 1
+    record = json.loads((tmp_path / "run_snowmig_01_structure.json")
+                        .read_text(encoding="utf-8"))
+    assert record["run_key"] == "run-1"
+    assert "503" in record["message"]
+    assert "run-1" in capsys.readouterr().err

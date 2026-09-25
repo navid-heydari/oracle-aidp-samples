@@ -28,14 +28,22 @@ twin by spelling it exactly. An unquoted entry matches every case-variant, as
 it always did; its exclusion reason names the entry and says the match was
 case-insensitive, and only a quoted, exact hit is reported as the operator's
 explicit choice, so the report never blames a twin the operator did not name
-on the operator.
+on the operator. Database and schema entries follow the same rule: they
+upper-cased the entry WITH its quote characters, so `"sales_eu"` -- the
+quoted form the collision remedy teaches -- could never match anything.
+
+A value can be well-formed and still match nothing -- a typo in an object
+name. That is not rejected (another estate may hold it), but it is not
+silent either: `restriction_matches` counts what each list entry matched,
+the plan records the counts, and PLANNED_OBJECTS.md flags a zero instead of
+listing the entry as in force like any other.
 """
 from __future__ import annotations
 
 import re
 
 __all__ = ["InvalidRestriction", "OBJECT_TYPES", "SCHEMA", "apply_restrictions",
-           "validate_restrictions"]
+           "restriction_matches", "validate_restrictions"]
 
 
 class InvalidRestriction(ValueError):
@@ -112,6 +120,28 @@ def _upper(values) -> set[str]:
     return {str(v).upper() for v in values or []}
 
 
+def _name_matcher(entries):
+    """value -> the entry that matches it, or None, for one name part.
+
+    Snowflake's rule, as for exclude_objects: `"sales_eu"` is exactly
+    sales_eu, an unquoted entry folds to upper on both sides.
+    """
+    exact: dict[str, str] = {}
+    folded: dict[str, str] = {}
+    for entry in entries or []:
+        text = str(entry)
+        stripped = text.strip()
+        if len(stripped) >= 2 and stripped[0] == stripped[-1] == '"':
+            exact[stripped[1:-1]] = text
+        else:
+            folded[text.upper()] = text
+
+    def match(value: str):
+        return exact.get(value) or folded.get(str(value).upper())
+
+    return match
+
+
 def _split_quoted(entry: str) -> list[tuple[str, bool]]:
     """`d.s."Orders"` -> [("d", False), ("s", False), ("Orders", True)].
 
@@ -180,8 +210,11 @@ def apply_restrictions(records: list[dict],
     if not r:
         return list(records), []
 
-    inc_db, exc_db = _upper(r.get("include_databases")), _upper(r.get("exclude_databases"))
-    inc_sc, exc_sc = _upper(r.get("include_schemas")), _upper(r.get("exclude_schemas"))
+    inc_db = _name_matcher(r.get("include_databases"))
+    exc_db = _name_matcher(r.get("exclude_databases"))
+    inc_sc = _name_matcher(r.get("include_schemas"))
+    exc_sc = _name_matcher(r.get("exclude_schemas"))
+    has_inc_db, has_inc_sc = bool(r.get("include_databases")), bool(r.get("include_schemas"))
     inc_ty, exc_ty = _upper(r.get("include_object_types")), _upper(r.get("exclude_object_types"))
     match_inc = _object_matcher(r.get("include_objects"))
     match_exc = _object_matcher(r.get("exclude_objects"))
@@ -199,8 +232,8 @@ def apply_restrictions(records: list[dict],
     kept, excluded = [], []
     for rec in records:
         ident = rec["source_identifier"]
-        db = str(rec.get("source_database", "")).upper()
-        schema = str(rec.get("source_schema", "")).upper()
+        db = str(rec.get("source_database", ""))
+        schema = str(rec.get("source_schema", ""))
         kind = str(rec.get("object_type", "")).upper()
         name = ident.rsplit(".", 1)[-1]
 
@@ -219,19 +252,19 @@ def apply_restrictions(records: list[dict],
             excluded.append(_exclusion(rec, "include_objects",
                                        "not in the user's include_objects list"))
             continue
-        if exc_db and db in exc_db:
+        if exc_db(db):
             excluded.append(_exclusion(rec, "exclude_databases",
                                        f"database {db} excluded by the user"))
             continue
-        if inc_db and db not in inc_db:
+        if has_inc_db and not inc_db(db):
             excluded.append(_exclusion(rec, "include_databases",
                                        f"database {db} is not in the include list"))
             continue
-        if exc_sc and schema in exc_sc:
+        if exc_sc(schema):
             excluded.append(_exclusion(rec, "exclude_schemas",
                                        f"schema {schema} excluded by the user"))
             continue
-        if inc_sc and schema not in inc_sc:
+        if has_inc_sc and not inc_sc(schema):
             excluded.append(_exclusion(rec, "include_schemas",
                                        f"schema {schema} is not in the include list"))
             continue
@@ -284,3 +317,40 @@ def apply_restrictions(records: list[dict],
 
         kept.append(rec)
     return kept, excluded
+
+
+def restriction_matches(records: list[dict],
+                        restrictions: dict | None) -> dict[str, dict[str, int]]:
+    """{key: {entry: objects it matched}} for every list-valued restriction.
+
+    Counted against every record, independent of the order the rules fire
+    in, so an entry shadowed by an earlier rule still counts what it names.
+    The caps are left out: a cap that excludes nothing is a result, not a
+    spelling mistake.
+    """
+    r = validate_restrictions(restrictions)
+    out: dict[str, dict[str, int]] = {}
+    for key, value in r.items():
+        if SCHEMA[key] is not list:
+            continue
+        counts = {}
+        for entry in value:
+            if key.endswith("_databases"):
+                m = _name_matcher([entry])
+                hit = lambda rec: m(str(rec.get("source_database", "")))
+            elif key.endswith("_schemas"):
+                m = _name_matcher([entry])
+                hit = lambda rec: m(str(rec.get("source_schema", "")))
+            elif key.endswith("_object_types"):
+                hit = lambda rec: (str(rec.get("object_type", "")).upper()
+                                   == entry.upper())
+            elif key.endswith("_objects"):
+                m = _object_matcher([entry])
+                hit = lambda rec: m(rec["source_identifier"])
+            else:
+                pattern = re.compile(entry, re.IGNORECASE)
+                hit = lambda rec: pattern.search(
+                    rec["source_identifier"].rsplit(".", 1)[-1])
+            counts[entry] = sum(1 for rec in records if hit(rec))
+        out[key] = counts
+    return out

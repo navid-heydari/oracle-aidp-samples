@@ -64,7 +64,7 @@ class TranslationRule:
     # identifier or a literal has to look at the "ident" or "string" segments
     # themselves -- code_only() blanks exactly those, so a code rule can never
     # see a `"` or a `''`.
-    scope: str = "code"              # "code" | "ident" | "string"
+    scope: str = "code"              # "code" | "ident" | "string" | "comment"
 
 
 # --------------------------------------------------------------------------
@@ -148,6 +148,21 @@ def _cast(sql: str) -> tuple[str, str | None, list[str]]:
         scale = int(parsed.group(3)) if parsed.group(3) else None
         if name in _NUMERIC_BARE and precision is None:
             precision, scale = 38, 0
+        if name == "TIME":
+            # The mapper's TIME -> STRING is right for a TIME column, whose
+            # text is preserved. For a cast it is not: the usual operand is a
+            # timestamp (`order_ts::time`, time-of-day extraction), and
+            # CAST(ts AS STRING) keeps the whole 'yyyy-MM-dd HH:mm:ss' where
+            # Snowflake returns 'HH:MI:SS'. Which one applies depends on the
+            # operand's type, which a token rule cannot see.
+            problems.append(
+                f"::{written}: Spark has no TIME type. CAST(x AS STRING) "
+                f"returns a TIMESTAMP operand's full date and time where "
+                f"Snowflake returns the time of day, and the operand's type "
+                f"is not visible to a token rule, so the cast is refused "
+                f"(date_format(x, 'HH:mm:ss') is the rewrite for a "
+                f"timestamp operand)")
+            return m.group(0)
         mapped = map_type(name, precision=precision, scale=scale)
         if mapped.blocked:
             problems.append(f"::{written}: {mapped.reason}")
@@ -258,6 +273,7 @@ def _dateadd(sql: str) -> tuple[str, str | None]:
 
 _LISTAGG = (
     r"(?P<kw>\bLISTAGG\s*\()\s*([^,()]+?)\s*,\s*('(?:[^']*)')\s*\)")
+_OVER = re.compile(r"\s*OVER\b", re.IGNORECASE)
 
 
 def _listagg(sql: str) -> tuple[str, str | None]:
@@ -265,6 +281,20 @@ def _listagg(sql: str) -> tuple[str, str | None]:
         return sql, ("LISTAGG ... WITHIN GROUP (ORDER BY ...) -- Spark's "
                      "collect_list does not guarantee ordering, so the ordering "
                      "semantics would be lost silently")
+    # LISTAGG(...) OVER (...) is the window form. The match ends at LISTAGG's
+    # own closing paren, so it became concat_ws(...) OVER (...) -- a scalar
+    # function with a window clause, which Spark rejects at create -- and was
+    # stamped exact. Checked over the code mask, so a comment between the
+    # call and OVER does not hide it.
+    mask = lexer.code_only(sql)
+    if any(_OVER.match(mask, m.end()) for m in re.finditer(
+            _LISTAGG, sql, re.IGNORECASE)
+            if mask[m.start("kw"):m.end("kw")] == sql[m.start("kw"):m.end("kw")]):
+        return sql, ("LISTAGG(...) OVER (...) -- the window form. "
+                     "concat_ws(sep, collect_list(x)) is an aggregate rewrite; "
+                     "with the OVER clause left after it, Spark rejects the "
+                     "view. The window would have to move inside, onto "
+                     "collect_list, which is not an implemented rule")
     # The separator IS a literal and is reproduced verbatim, so the anchor is
     # the LISTAGG keyword rather than the whole span.
     out = lexer.sub_code(
@@ -320,6 +350,16 @@ def _string_escapes(sql: str) -> tuple[str, str | None]:
     return "".join(parts), None
 
 
+def _slash_comments(sql: str) -> tuple[str, str | None]:
+    # `//` is a Snowflake line comment that Spark does not have: carried
+    # verbatim, the rest of the line is parsed as code on the target. `--` is
+    # the same comment in both dialects, so the rewrite is exact. Only the
+    # lexer's comment segments are touched, so `'http://x'` is data.
+    return "".join(
+        "--" + text[2:] if kind == "comment" and text.startswith("//") else text
+        for kind, text in lexer.segments(sql)), None
+
+
 # --------------------------------------------------------------------------
 # registry
 # --------------------------------------------------------------------------
@@ -365,6 +405,11 @@ RULES: tuple[TranslationRule, ...] = (
         "'it''s' -> 'it\\'s': Spark reads a doubled quote as two adjacent "
         "literals and concatenates them", "implemented",
         r"^'(?:[^'\\]|\\.)*''", _string_escapes, scope="string"),
+    TranslationRule(
+        "T21_SLASH_COMMENT", "// line comment",
+        "// comment -> -- comment: Spark has no `//` comment, so the rest of "
+        "the line would be parsed as code", "implemented",
+        r"^//", _slash_comments, scope="comment"),
     TranslationRule(
         "T09_DOLLAR_QUOTED", "$$...$$ string",
         "$$...$$ dollar-quoted string -> single-quoted literal", "declared",
@@ -514,9 +559,16 @@ def translate_sql(sql: str) -> TranslationResult:
         if new_sql != result.sql:
             entry = {"rule_id": rule.rule_id, "construct": rule.construct,
                      "detail": rule.description}
-            if rule.caveat:
-                entry["caveat"] = rule.caveat
+            warnings = list(rest[0]) if rest else []
+            # A rewrite that carries a semantic warning -- `::TIMESTAMP`'s
+            # timezone semantics -- is exact in shape only, so the warning is
+            # a caveat on this application too. R43 counts caveats; without
+            # this it called the view "every one is an exact rewrite" next to
+            # the warning that says otherwise.
+            caveats = ([rule.caveat] if rule.caveat else []) + warnings
+            if caveats:
+                entry["caveat"] = "; ".join(caveats)
             result.applied.append(entry)
             result.sql = new_sql
-            result.warnings.extend(rest[0] if rest else [])
+            result.warnings.extend(warnings)
     return result

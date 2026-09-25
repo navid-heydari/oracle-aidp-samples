@@ -110,10 +110,11 @@ def test_the_stage_board_reads_the_demo_run_as_complete(demo):
     board = build_stage_board(out)
     # Every stage the demo drives has run. `preflight` is deliberately not
     # one of them: it confirms a real connection config with a real user,
-    # which an emulated run has nothing to say about.
+    # which an emulated run has nothing to say about. Nor is `run`: it
+    # starts an in-AIDP job, and the demo emulates no job runtime.
     not_run = [s["stage"] for s in board["stages"]
                if s["status"] == "NOT_RUN"]
-    assert not_run == ["preflight"], not_run
+    assert not_run == ["preflight", "run"], not_run
     assert board["next_stage"] is None, \
         "an optional stage must not be proposed as next"
 

@@ -43,6 +43,7 @@ import json
 from typing import Callable
 
 from ..dialect import lexer
+from .catalog import SHOW_PAGE_SIZE, show_paged
 
 __all__ = ["KINDS", "LANGUAGE_VERDICTS", "VISIBILITY_GRANTS", "build_census"]
 
@@ -478,10 +479,19 @@ def _read_information_schema(run_sql, db: str, spec: dict
     return _select(run_sql, db, spec, cols), bool(extra)
 
 
-def _read_show(run_sql, db: str | None, spec: dict) -> list[dict]:
+def _read_show(run_sql, db: str | None, spec: dict
+               ) -> tuple[list[dict], str | None]:
+    """Rows, and why they are capped (None when complete).
+
+    One bare SHOW stops at 10,000 rows and still succeeds, so an account
+    with more roles, or a database with more tasks, streams or tags, read as
+    "10000 found / yes". `show_paged` pages past the cap where that is exact
+    and otherwise says the count is capped.
+    """
     if db is None:                      # account-scoped: no IN DATABASE
-        return run_sql(f'show {spec["relation"]}')
-    return run_sql(f'show {spec["relation"]} in database {lexer.qualify(db)}')
+        return show_paged(run_sql, f'show {spec["relation"]}')
+    return show_paged(
+        run_sql, f'show {spec["relation"]} in database {lexer.qualify(db)}')
 
 
 def _role_text(role: str | None, secondary: list[str] | None = None) -> str:
@@ -597,6 +607,7 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
         denied: list[str] = []
         answered = 0
         degraded = False
+        capped: list[str] = []
         note = ""
         # An account-scoped kind is read once. `None` is the "no database"
         # target, not a database named None.
@@ -607,7 +618,11 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
                         run_sql, db, spec)
                     degraded = degraded or degraded_here
                 else:
-                    rows = _read_show(run_sql, db, spec)
+                    rows, cap = _read_show(run_sql, db, spec)
+                    if cap:
+                        capped.append(db if db else "account")
+                        where = f"in {db}" if db else "account-scoped read"
+                        notes.append(f"{kind} {where}: {cap}")
             except Exception as exc:
                 denied.append(db if db else "account")
                 note = str(exc)[:200]
@@ -617,13 +632,22 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
             answered += 1
             for row in rows:
                 entry = _entry(kind, spec, db, row,
-                               include_definitions=include_definitions)
+                               include_definitions=include_definitions,
+                               notes=notes)
                 objects.append(entry)
                 tally[entry["kind"]] = tally.get(entry["kind"], 0) + 1
         readable = not denied
         kinds[kind] = _summary(tally[kind], readable, scope, note, role,
                                denied=denied, answered=answered,
                                secondary=secondary)
+        if capped:
+            # Not a privilege gap: a role that sees everything would get the
+            # same truncated answer, so the note must not promise grants fix it.
+            kinds[kind]["capped"] = True
+            kinds[kind]["note"] += (
+                f"; stopped at the {SHOW_PAGE_SIZE:,}-row SHOW cap in "
+                f'{", ".join(capped)} and could not be paged, so this is a '
+                f"lower bound whatever the role's grants")
         if readable and degraded:
             kinds[kind]["note"] += "; " + (
                 spec.get("degraded_note")
@@ -665,7 +689,17 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
 
 
 def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
-           include_definitions: bool) -> dict:
+           include_definitions: bool, notes: list[str] | None = None) -> dict:
+    """One census row. Never raises on what the row CONTAINS.
+
+    The refine hook and the body scan read free text a scanner may not
+    understand -- a `// don't` comment in a task body used to raise out of
+    here, past the per-database try, and take `assess` down with no artifact
+    written. Either failure now costs that one object its refinement or its
+    linkage; the object is still counted, and `notes` (the census's
+    `unreadable` list) names it with the error.
+    """
+    notes = notes if notes is not None else []
     if spec["source"] == "information_schema":
         name = row.get(spec["name_col"])
         schema = row.get(spec["schema_col"])
@@ -714,7 +748,15 @@ def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
     # The row may not be the kind the spec assumed. `refine` narrows it and is
     # allowed to overrule the language verdict, because an external function
     # has no handler language to have a verdict about.
-    narrowed = (spec.get("refine") or (lambda _row: None))(row) or {}
+    try:
+        narrowed = (spec.get("refine") or (lambda _row: None))(row) or {}
+    except Exception as exc:
+        # Refinement only ever narrows, so without it the row keeps the kind
+        # and reason it would have had with the deciding column absent.
+        narrowed = {}
+        notes.append(f"{kind} {identifier}: not refined "
+                     f"({str(exc)[:200]}); reported as a plain "
+                     f"{kind.lower().replace('_', ' ')}")
     entry.update(narrowed)
 
     # Appended after the narrowing so it lands on the reason the object
@@ -729,7 +771,18 @@ def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
     # migrating table stops being populated at cutover; absent, not empty,
     # when the body names none this can read.
     if spec.get("writes_col") and db is not None and row.get(spec["writes_col"]):
-        writes = written_tables(str(row[spec["writes_col"]]), db, str(schema))
+        try:
+            writes = written_tables(str(row[spec["writes_col"]]), db,
+                                    str(schema))
+        except Exception as exc:
+            # Not "writes none": the body could not be scanned, so which
+            # table it fills is unknown, and the detail says so.
+            writes = []
+            entry["detail"] = (f'{entry["detail"]} '
+                               f'writes not determined').strip()
+            notes.append(f"{kind} {identifier}: body not scannable "
+                         f"({str(exc)[:200]}), so the table(s) it writes are "
+                         f"not determined; the object is still counted")
         if writes:
             entry["writes"] = writes
             entry["detail"] = (f'{entry["detail"]} '
@@ -749,6 +802,7 @@ def _scope_statement(total: int, by_kind, kinds: dict,
                      secondary: list[str] | None = None) -> str:
     denied = [k for k, v in kinds.items() if v.get("unread") == "denied"]
     indistinct = [k for k, v in kinds.items() if v.get("unread") == "degraded"]
+    capped = [k for k, v in kinds.items() if v.get("capped")]
     who = _role_text(role, secondary)
     if total == 0 and not denied:
         # Every statement succeeded and returned nothing. With a minimal
@@ -776,6 +830,10 @@ def _scope_statement(total: int, by_kind, kinds: dict,
     if denied:
         text += (f" **{', '.join(denied)} could not be read**, so even this "
                  f"count is a floor, not a total.")
+    if capped:
+        text += (f" **{', '.join(capped)} stopped at the SHOW result cap** "
+                 f"and could not be paged, so those counts are a floor that "
+                 f"no grant would raise.")
     if indistinct:
         text += (f" {', '.join(indistinct)} could not be told apart from the "
                  f"kind they are counted under, so they are reported as *not "

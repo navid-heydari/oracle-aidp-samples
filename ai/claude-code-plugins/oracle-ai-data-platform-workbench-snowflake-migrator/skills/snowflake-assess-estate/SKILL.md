@@ -68,6 +68,10 @@ decision.
   `blocked (<kind>)` is an object kind the plan refuses whatever its
   types -- a dynamic, external, Iceberg, event or hybrid table, or a
   secure or materialized view
+- anything whose column read failed (`compatibility_status: unassessed`,
+  `columns_read: failed`, the error in `columns_read_error`). Its types were
+  never seen, so it is neither supported nor blocked: say the read failed and
+  why (a timeout is not a missing grant), and re-run before planning it
 - any pipe or task in CENSUS.md whose detail says `writes=<table>`: that
   table migrates, but its load does not
 - views, noting their SQL is captured verbatim and translated only as far as

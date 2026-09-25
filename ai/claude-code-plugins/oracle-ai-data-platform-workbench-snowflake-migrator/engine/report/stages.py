@@ -9,11 +9,13 @@ Two rules it holds to, both learned the hard way elsewhere in this plugin:
   * A stage that could not look is FLAGGED, never shown as clean. "0
     exposures" and "we could not read the policy references" are opposite
     findings and must not render the same.
-  * Three stages write to AIDP -- `provision`, `catalog` and `deploy` -- and
-    the board says which. The one further write is `smoke --write-probe
-    --execute`: one probe schema, created and removed; `--write-probe` alone
-    is a dry run. `notebook --upload` sends nothing -- a dry run without
-    `--execute`, refused with it (GAPS.md 13).
+  * Four stages write to AIDP, and the board says which: `provision`,
+    `catalog` and `deploy`, each a dry run without `--execute`, and `run`,
+    which has no dry run -- it starts an in-AIDP job that creates tables or
+    copies rows. The one further write is `smoke --write-probe --execute`:
+    one probe schema, created and removed; `--write-probe` alone is a dry
+    run. `notebook --upload` sends nothing -- a dry run without `--execute`,
+    refused with it (GAPS.md 13).
 """
 from __future__ import annotations
 
@@ -80,6 +82,16 @@ STAGES: tuple[dict, ...] = (
      "artifact": "deploy_result.json",
      "purpose": "create schemas, tables and views in a STANDARD catalog. "
                 "Refuses an EXTERNAL target. Dry-run unless --execute"},
+    # Optional: a structure-only clone never runs a job. `run` has no dry
+    # run -- the dry run was at `provision` -- so invoking it IS the write,
+    # and it was once missing here while the board called the rest
+    # read-only. One artifact per job (run_<job>.json), hence the glob.
+    {"stage": "run", "needs": "AIDP (a provisioned job)", "writes": True,
+     "optional": True, "artifact": "run_*.json",
+     "purpose": "start an in-AIDP job and bring back its result: "
+                "snowmig_01_structure creates schemas and tables, "
+                "snowmig_02_copy_schema copies rows. No dry run -- it "
+                "starts the job when invoked"},
     {"stage": "notebook", "needs": "nothing (offline)", "writes": False,
      "artifact": "NOTEBOOK.md",
      "purpose": "the clone as an executable AIDP notebook"},
@@ -92,6 +104,13 @@ _UNKNOWN = "could not be determined"
 
 
 def _load(out_dir: pathlib.Path, name: str):
+    if "*" in name:
+        # One artifact per invocation target (run_<job>.json): the stage has
+        # run if any exists, and each is reported.
+        paths = sorted(out_dir.glob(name))
+        if not paths:
+            return None
+        return {"_many": [_load(out_dir, p.name) for p in paths]}
     path = out_dir / name
     if not path.exists():
         return None
@@ -296,6 +315,30 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
         if errors:
             text += f', {errors} error(s)'
         return (text, bool(bad or unverified or drift or errors))
+
+    if stage == "run":
+        # The last recorded result per job. A run whose budget ran out is
+        # STILL RUNNING, never rounded to either verdict. A status watch_job
+        # does not classify (`unrecognised`) is neither done nor running;
+        # cmd_run says so and exits 1, and the board must not round it up.
+        parts, attention = [], False
+        for run in data.get("_many") or []:
+            if run.get("_unreadable"):
+                parts.append("a run artifact is unreadable")
+                attention = True
+                continue
+            job = run.get("job") or run.get("job_key") or "?"
+            if not run.get("terminal") and run.get("unrecognised"):
+                verdict = f'**UNRECOGNISED STATE {run.get("status") or "?"}**'
+            elif not run.get("terminal"):
+                verdict = "STILL RUNNING"
+            elif run.get("ok"):
+                verdict = "SUCCESS"
+            else:
+                verdict = f'**{run.get("status") or "FAILED"}**'
+            attention = attention or verdict != "SUCCESS"
+            parts.append(f"{job}: {verdict}")
+        return ("; ".join(parts) or "written", attention)
 
     if stage == "data-options":
         choice = data.get("choice")

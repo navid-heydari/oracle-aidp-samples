@@ -76,7 +76,7 @@ cluster. So `--source-mode connector` is the default and
 | Database | **Catalog (INTERNAL)** | plan mirrors 1:1; created via structure clone | AIDP lower-cases identifiers; case collisions HALT the plan |
 | Schema | Schema | structure clone | |
 | Table | **Managed Delta table** | from the approved `ddl_plan` (engine-translated types, default), or CTAS `WHERE 1=0` through the source | `NUMBER(p,s)`→`DECIMAL(p,s)` exact; `VARIANT/GEOGRAPHY` **blocked** unless the operator opts into string; `TIMESTAMP_NTZ` needs an explicit downgrade decision |
-| View | View | 8 dialect rewrites (`IFF`, `::` via the type mapper, `DATEADD` — exact for DATE operands only, caveat recorded on the plan — `LISTAGG`, quoted identifiers, `''` escapes…); 12 constructs (`QUALIFY`, `LATERAL FLATTEN`, …) **refused and named** for a human | target re-derives column types — drift is reported, narrowing flagged |
+| View | View | 9 dialect rewrites (`IFF`, `::` via the type mapper, `DATEADD` — exact for DATE operands only, caveat recorded on the plan — `LISTAGG`, quoted identifiers, `''` escapes, `//` comments…); 12 constructs (`QUALIFY`, `LATERAL FLATTEN`, …) **refused and named** for a human | target re-derives column types — drift is reported, narrowing flagged |
 | Warehouse | **Compute cluster** | `provision` creates `migration_assets`; per-warehouse clusters proposed by `compute` with sizing left as a decision | same-name clusters, default config, per request |
 | Table data | Delta rows | `02_copy_schema.ipynb` per schema: INSERT-SELECT through the connector (or the external catalog), verified by counts (+ exact decimal sums) | per-table snapshots — see §6 consistency |
 | Task / Stream / Pipe / Dynamic table | **AIDP Job** (to be rewritten) | census inventories them with effort bands; **not auto-translated**. A dynamic, external, Iceberg, event or hybrid table that `SHOW TABLES` flags is blocked by `plan` with the reason named (`PLANNED_OBJECTS.md`, "Object kinds with no AIDP equivalent") | the blast-radius risk: a task that fed a migrated table stops feeding it after cutover |
@@ -128,7 +128,7 @@ before it is called done; a 2xx is never the claim.
 | Work | Who |
 |---|---|
 | Discovery, inventory, census, lineage, sizing inputs | scripts (batched SQL, paginated) |
-| Type mapping, DDL, the 8 SQL rewrites (7 exact; `DATEADD` exact for DATE operands only, and the plan says so) | scripts — refuse rather than guess |
+| Type mapping, DDL, the 9 SQL rewrites (8 exact; `DATEADD` exact for DATE operands only, and the plan says so) | scripts — refuse rather than guess |
 | Environment provisioning, uploads, job wiring | scripts, with per-step read-back |
 | Data copy + verification (counts, exact decimal sums) | scripts, resumable per schema |
 | Plan-vs-reality reconciliation | script, consulting the live catalog |

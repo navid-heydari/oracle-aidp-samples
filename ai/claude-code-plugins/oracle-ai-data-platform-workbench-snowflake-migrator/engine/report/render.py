@@ -11,7 +11,7 @@ from snowflake_source.extract.census import secondary_roles_active
 from plan.build import object_kind_block
 from plan.data_movement import MAINTENANCE_TRAPS, architecture_decision
 from plan.smoke import smoke_verdict
-from plan.status import assess_risk, migration_status
+from plan.status import assess_risk, deploy_failure, migration_status
 
 __all__ = ["render_stages", "render_preflight", "render_census", "census_scope",
            "render_maintenance",
@@ -19,7 +19,7 @@ __all__ = ["render_stages", "render_preflight", "render_census", "census_scope",
            "render_inventory", "render_ddl_plan", "render_planned_objects",
            "render_soft_clone_summary", "render_catalog", "render_compute",
            "render_summary",
-           "render_smoke", "render_data_options",
+           "render_smoke", "render_data_options", "DATA_OPTIONS_NOTE",
            "architecture_section"]
 
 
@@ -277,6 +277,7 @@ _CATEGORY_TITLES = {
     "dependency_not_migrated": "Depends on an object that is not migrating",
     "no_definition": "Definition could not be read",
     "unparseable_sql": "SQL could not be parsed",
+    "columns_unread": "Columns could not be read",
 }
 
 
@@ -290,6 +291,10 @@ def _compatibility_cell(rec: dict) -> str:
     status = rec.get("compatibility_status")
     if status == "blocked":
         return "blocked"
+    if status == "unassessed":
+        # The column read failed: Cols 0 here is a missing fact, and the
+        # plan refuses it under `columns_unread`.
+        return "not assessed (columns unread)"
     block = object_kind_block(rec)
     if block:
         return f"blocked ({block[0]})"
@@ -311,7 +316,20 @@ def render_planned_objects(plan: dict) -> str:
     if plan.get("restrictions_applied"):
         out += ["## Restrictions in force", "",
                 "Applied at your request, before planning:", ""]
-        out += [f"- `{k}`: {v}" for k, v in plan["restrictions_applied"].items()]
+        # With the per-entry counts (an older plan.json has none), an entry
+        # that matched nothing is flagged: it was listed here as in force
+        # while the object it meant was planned, deployed and copied.
+        matches = plan.get("restriction_matches") or {}
+        for key, value in plan["restrictions_applied"].items():
+            counts = matches.get(key)
+            if counts is None or not isinstance(value, list):
+                out.append(f"- `{key}`: {value}")
+                continue
+            out.append(f"- `{key}`: " + ", ".join(
+                f"`{e}` (**matched nothing -- check the spelling**)"
+                if not counts.get(e) else
+                f"`{e}` ({counts[e]} object{'s' if counts[e] != 1 else ''})"
+                for e in value))
         out.append("")
 
     out += ["## Target structure to exist first", ""]
@@ -325,32 +343,28 @@ def render_planned_objects(plan: dict) -> str:
                 f"INTERNAL): {catalogs}", "",
                 f"Schemas the clone will create: {schemas}", ""]
     else:
-        # Two paths create the structure and they name things differently.
-        # The in-AIDP structure job (S10) creates <--target-catalog>.<SOURCE
-        # schema>.<table> and never reads the plan's target_fqn; the older
-        # `deploy`/`notebook` path creates the plan's names as they stand.
-        # Labelled per path, or the section tells the reader to create `d`,
-        # that `d` is the EXTERNAL pointer, and that the clone creates
-        # `d.public` -- in three consecutive lines.
-        src_schemas = ", ".join(f'`{s}`' for s in sorted(
-            {c["source_identifier"].split(".")[1].lower()
-             for c in plan.get("can_migrate") or []})) or "none"
+        # The structure job (S10) and `deploy` both create the plan's names
+        # as they stand, and S10 refuses a --target-catalog that is not the
+        # plan's catalog. This section once said S10 kept the SOURCE schema
+        # (`core`) while the job ran CREATE SCHEMA lake.snowdb_core, and with
+        # no prefix it sent the reader to a --target-catalog S10 refuses.
         if plan.get("bronze_catalog_prefix") is None:
             out += [f"Catalogs: the Target column's catalog part ({catalogs}) "
                     "is the source database mirrored, not a catalog to create "
-                    "-- under the runbook that name is the EXTERNAL pointer; "
-                    "the INTERNAL target is the one created at S4 and passed "
-                    "to `provision --target-catalog`.", ""]
-            older = (f"Older `deploy`/`notebook` path only: {schemas} "
-                     f"(requires {catalogs} to exist as INTERNAL)")
+                    "-- under the runbook that name is the EXTERNAL pointer "
+                    "at Snowflake.", "",
+                    note, "",
+                    f"Schemas the plan names: {schemas}. The structure job "
+                    "(S10) creates them only under a `--target-catalog` "
+                    "equal to the plan's catalog, so re-run `plan "
+                    "--bronze-catalog-prefix <the INTERNAL catalog created "
+                    "at S4>` and `ddl` before S10.", ""]
         else:
             out += ["Catalogs (create these, or confirm they exist and are "
-                    f"INTERNAL): {catalogs}", ""]
-            older = f"Older `deploy`/`notebook` path only: {schemas}"
-        out += [note, "",
-                "Schemas the structure job (S10) creates under that target "
-                f"catalog: {src_schemas}", "",
-                older, ""]
+                    f"INTERNAL): {catalogs}", "",
+                    note, "",
+                    "Schemas the structure job (S10) creates, and `deploy` "
+                    f"too: {schemas}", ""]
 
     out += ["## Can migrate", "",
             "| Object | Type | Target | Rows | Cols |", "|---|---|---|---:|---:|"]
@@ -401,6 +415,14 @@ def render_planned_objects(plan: dict) -> str:
                 "Excluded from the ordering; they need a human decision rather than "
                 "an arbitrary broken edge.", ""]
         out += [f'- {", ".join(f"`{n}`" for n in c)}' for c in plan["cycles"]] + [""]
+        # In no cycle, but depending on one: held back for the same reason,
+        # and labelled apart so nobody hunts for a cycle it is not in.
+        behind = plan.get("blocked_behind_cycle") or {}
+        if behind:
+            out += ["Blocked behind a cycle (not members; each depends on "
+                    "the cycle named):", ""]
+            out += [f'- `{n}` behind {", ".join(f"`{m}`" for m in c)}'
+                    for n, c in sorted(behind.items())] + [""]
 
     out += ["## Order of creation", ""]
     unordered = plan.get("views_without_dependency_edge") or []
@@ -593,6 +615,17 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
         out += [f'{res["blocked_count"]} object(s) were blocked before deployment '
                 "and never attempted. See the planned-objects report.", ""]
 
+    if res.get("schemas_not_active"):
+        out += ["## Schema still settling — nothing was posted into it", "",
+                "These schemas had not reported ACTIVE when the wait ran out. "
+                "A create against a settling schema is accepted and then "
+                "silently dropped, so none was sent: **no name was burned**, "
+                "and the objects below are failed only because they were not "
+                "attempted. Re-run once the schema reports ACTIVE.", ""]
+        out += [f"- `{name}` — {state}"
+                for name, state in sorted(res["schemas_not_active"].items())]
+        out.append("")
+
     if res.get("mismatches"):
         out += ["## Structure differs — left as found, NOT cloned", "",
                 "These names already existed in AIDP with a different structure. "
@@ -670,6 +703,14 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
         out.append("")
     if res.get("chunk_errors"):
         out += ["## Batch errors", ""] + [f"- {e}" for e in res["chunk_errors"]] + [""]
+    if res.get("errors"):
+        # Everything the run recorded as an error: a schema that never
+        # settled, a listing that failed mid-poll, each refused create. It
+        # used to live only in deploy_result.json, so the summary could
+        # blame a burned name for what the errors said was the schema.
+        out += ["## Errors recorded during the run", ""]
+        out += [f"- {e}" for e in res["errors"]]
+        out.append("")
 
     jobs = plan.get("silver_gold_jobs") or []
     if jobs and not res.get("dry_run"):
@@ -804,6 +845,14 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
     for c in plan.get("can_migrate") or []:
         level, note = assess_risk(c)
         status = migration_status(c["source_identifier"], deployed=deployed)
+        failure = deploy_failure(c["source_identifier"], deployed)
+        if failure:
+            # The failure leads: the planning notes are about an object that
+            # does not exist on the target. LOW means the note is only
+            # "structure clones cleanly", which a failed create contradicts.
+            note = (failure[0].upper() + failure[1:] + "."
+                    + ("" if level == "LOW" else " " + note))
+            level = "HIGH"
         rows.append((c["source_identifier"], c["object_type"],
                      "-" if c.get("rows") is None else f'{c["rows"]:,}',
                      level, status, note))
@@ -856,7 +905,7 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
         out += [f'Deployed against catalog '
                 f'`{deployed.get("catalog_in_scope")}`; '
                 f'{len(deployed.get("verified_targets") or [])} verified, '
-                f'{len(deployed.get("failed_targets") or [])} unverified.', ""]
+                f'{len(deployed.get("failed_targets") or [])} failed.', ""]
     elif deployed:
         out += ["Last run was a **dry run** — nothing was created.", ""]
     else:
@@ -908,12 +957,21 @@ def render_smoke(result: dict) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+# What data_options.json says in its `note`, and what DATA_MOVEMENT_OPTIONS.md
+# opens with. One constant, because the two artifacts of one run disagreed:
+# the markdown named the implemented path while a note hard-coded where the
+# JSON was written said the plugin "implements no transfer path".
+DATA_OPTIONS_NOTE = (
+    "Proposal only. The control-plane CLI moves no bytes. One path is "
+    "implemented by the data plane: in-AIDP INSERT-SELECT from the EXTERNAL "
+    "catalog, run schema by schema by the `snowmig_02_copy_schema` job. The "
+    "other options are not implemented.")
+
+
 def render_data_options(options: list[dict]) -> str:
+    _, headline, rest = DATA_OPTIONS_NOTE.split(". ", 2)
     out = ["# Data-movement options — for you to choose", "",
-           "**The control-plane CLI moves no bytes.** One path is implemented "
-           "by the data plane: in-AIDP INSERT-SELECT from the EXTERNAL catalog, "
-           "run schema by schema by the `snowmig_02_copy_schema` job. The other "
-           "options below are not implemented. They are the realistic ways data "
+           f"**{headline}.** {rest} They are the realistic ways data "
            "could move, with the trade-offs and the open unknowns attached, so "
            "the choice is made deliberately rather than defaulting to whichever "
            "path got built first.", "",
@@ -1211,7 +1269,10 @@ def render_census(census: dict) -> str:
                 "| Kind | Count | Read | Scope |", "|---|---:|---|---|"]
         for kind, info in sorted(kinds.items()):
             count = info.get("count")
-            if info.get("readable"):
+            if info.get("capped"):
+                # Answered, but truncated: "yes" would call it complete.
+                read = "**capped** — SHOW row limit reached; lower bound"
+            elif info.get("readable"):
                 read = "yes" if count else "yes (0 visible; lower bound)"
             elif info.get("unread") == "partial":
                 # A real count that is also incomplete. Calling this denied
@@ -1400,8 +1461,10 @@ def render_security(sec: dict) -> str:
                 out.append(f"| {label} | *not visible to this role* "
                            f"| **denied** |")
                 continue
+            read = ("**capped** — SHOW row limit reached; lower bound"
+                    if info.get("capped") else "yes")
             out.append(f'| {label} | {c if c is not None else "*not measured*"} '
-                       f"| yes |")
+                       f"| {read} |")
         out.append("")
         missing = [label for label, key in (("aggregation", "aggregation"),
                                             ("projection", "projection"))
@@ -1609,11 +1672,14 @@ def render_stages(board: dict) -> str:
     out = ["# Stages — what runs, what has run, what it found", "",
            f'Artifacts read from `{board.get("out_dir")}`. This board makes no '
            f'decisions and touches nothing.', "",
-           "**Three stages write to AIDP: `provision`** (workspace, cluster, "
+           "**Four stages write to AIDP. `provision`** (workspace, cluster, "
            "scripts, jobs), **`catalog`** (registers the target catalog) "
-           "**and `deploy`** (creates schemas, tables and views). All three "
-           "are a dry run unless `--execute` is passed with the target "
-           "coordinates. Every other stage is read-only. The one further "
+           "**and `deploy`** (creates schemas, tables and views) are a dry "
+           "run unless `--execute` is passed with the target coordinates. "
+           "**`run` has no dry run**: invoking it starts an in-AIDP job -- "
+           "`snowmig_01_structure` creates schemas and tables, "
+           "`snowmig_02_copy_schema` copies rows. Every other stage is "
+           "read-only. The one further "
            "write is `smoke --write-probe --execute`, which creates one probe "
            "schema and removes it again; `--write-probe` alone is a dry run. "
            "`notebook --upload` sends nothing: without `--execute` it is a "

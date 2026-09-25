@@ -197,3 +197,56 @@ def test_the_rendered_per_option_note_is_not_empty():
         if line.startswith("- **A"):
             body = line.split("—", 1)[1]
             assert len(body.strip(" .()")) > 40, f"empty note: {line}"
+
+
+# --- the CLI's own surfaces scope the "no bytes" claim ----------------------
+#
+# Found on review. The CHANGELOG's "every surface now says the control plane
+# copies no data; snowmig_02_copy_schema moves rows" fix covered the docs and
+# skills, and missed the CLI itself: the snowmig.py module docstring (which
+# IS the root --help) still said the plugin "moves no bytes and implements
+# no transfer", and cmd_data_options hard-coded the same note into
+# data_options.json. So one data-options run wrote a JSON saying there is
+# no transfer path next to a DATA_MOVEMENT_OPTIONS.md naming the one there
+# is. --help also sent STANDARD-catalog structure to `notebook`, whose
+# upload is refused, instead of the structure job at S10. The surface test
+# scans docs, not engine .py, so nothing caught it.
+
+def _flat(text):
+    return " ".join(text.split())
+
+
+def test_root_help_does_not_claim_the_plugin_moves_no_bytes():
+    import snowmig
+    text = _flat(snowmig.build_parser().format_help())
+    assert "moves no bytes and implements no transfer" not in text
+    assert "snowmig_02_copy_schema" in text
+    assert "snowmig_01_structure" in text, "STANDARD structure is S10's job"
+    assert "by the `notebook` script" not in text
+
+
+def test_data_options_json_names_the_implemented_copy_path(tmp_path, capsys):
+    import json
+    import snowmig
+    assert snowmig.main(["data-options", "--out-dir", str(tmp_path)]) == 0
+    payload = json.loads((tmp_path / "data_options.json").read_text(
+        encoding="utf-8"))
+    assert "moves no bytes and implements no transfer" not in payload["note"]
+    assert "snowmig_02_copy_schema" in payload["note"]
+    md = (tmp_path / "DATA_MOVEMENT_OPTIONS.md").read_text(encoding="utf-8")
+    assert "snowmig_02_copy_schema" in md, "the two artifacts agree"
+    assert "none implemented" not in capsys.readouterr().out
+
+
+def test_the_json_note_is_the_markdowns_own_sentence(tmp_path):
+    """One constant for both artifacts. The CLI and the renderer were each
+    fixed to stop saying "implements no transfer", in two lanes, in two
+    different wordings -- which is the drift the shared constant exists to
+    stop."""
+    import json
+    import snowmig
+    from report.render import DATA_OPTIONS_NOTE
+    assert snowmig.main(["data-options", "--out-dir", str(tmp_path)]) == 0
+    payload = json.loads((tmp_path / "data_options.json").read_text(
+        encoding="utf-8"))
+    assert payload["note"] == DATA_OPTIONS_NOTE

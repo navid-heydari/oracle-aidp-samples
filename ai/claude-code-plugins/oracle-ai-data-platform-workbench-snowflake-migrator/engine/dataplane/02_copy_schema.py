@@ -10,20 +10,26 @@ Runs on AIDP compute. Per table:
                                 when its count equals the source's and
                                 `count_mismatch` when it does not -- a
                                 re-run never softens a recorded failure;
-       append:                  INSERT INTO ... SELECT *;
-       overwrite:               INSERT OVERWRITE ... SELECT * (rewrites ROWS,
-                                never drops the table);
+       append:                  INSERT INTO ... SELECT <columns>;
+       overwrite:               INSERT OVERWRITE ... SELECT <columns>
+                                (rewrites ROWS, never drops the table);
+     the source's columns are named, paired with the target's by name and
+     listed in the target's order, so a source whose columns were reordered
+     since the plan still lands each value in its own column;
   3. VERIFY: target count == source count (both read AFTER the copy), and
      with --verify counts+sums an exact SUM over every DECIMAL column OF
      THE SOURCE, cast to DECIMAL(38,s) with the SOURCE's scale on both
      sides. Floats are never summed for equality — float tolerance is
      wrong for money.
 
-Before any row moves, and in both verify modes, the source's DECIMAL
-columns are checked against the target's types: a target column that is not
-DECIMAL, or a DECIMAL with fewer integer digits or a smaller scale, would be
-rounded or truncated by the INSERT with the row count intact. That table is
-recorded `type_drift` and NOT copied.
+Before any row moves, and in both verify modes, the live source's columns
+are checked against the target's BY NAME: a source column the target lacks,
+or a target column the source lacks (renamed, dropped, added since the
+plan), has no right place to land, so that table is recorded `type_drift`
+and NOT copied. The source's DECIMAL columns are then checked against the
+target's types: a target column that is not DECIMAL, or a DECIMAL with fewer
+integer digits or a smaller scale, would be rounded or truncated by the
+INSERT with the row count intact -- `type_drift` too, and NOT copied.
 
 The copy's claim is the verification, not the INSERT returning: exactly the
 discipline the control-plane deploy learned from live AIDP (a 2xx is not the
@@ -64,6 +70,10 @@ _DECIMAL = re.compile(r"^decimal\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
 # nothing (skip-existing over a table with rows) never softens one of these.
 _COPY_FAILURES = ("count_mismatch", "sum_mismatch", "type_drift", "failed")
 
+# Structure statuses that mean the table IS there. A copy that then cannot
+# find it has not "nothing to do": it failed to copy into a created table.
+_STRUCTURE_PRESENT = ("created", "already_existed")
+
 
 def q(identifier: str) -> str:
     return "`" + str(identifier).replace("`", "``") + "`"
@@ -86,6 +96,100 @@ def fail(msg: str) -> int:
     print(f"ERROR: {msg}", flush=True)
     print(f"error: {msg}", file=sys.stderr)
     return 1
+
+
+def _same(a: str, b: str) -> bool:
+    """Spark resolves catalog and schema names case-insensitively, so two
+    targets that differ only in case are the same place. Comparing them as
+    exact strings dropped the structure report for `lake.core` when this run
+    spelled it `lake.CORE`, and the copy fell back to the whole manifest."""
+    return str(a).casefold() == str(b).casefold()
+
+
+def planned_target_schemas(ddl_plan: dict, schema: str) -> set[str]:
+    """Every target schema the approved plan puts source schema `schema` in.
+
+    The same reading as 01_create_structure's `targets_from_ddl_plan`: a
+    TABLE statement with a three-part `source_identifier` and a three-part
+    `target_fqn`. 01 creates the table where the plan says, so the copy has
+    to look there too -- deriving the schema from `--schema` again copied
+    into `lake.CORE` while 01 had created `lake.db_core`.
+    """
+    out: set[str] = set()
+    for stmt in ddl_plan.get("statements") or []:
+        source = str(stmt.get("source_identifier") or "").split(".")
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(source) != 3 or len(target) != 3:
+            continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue
+        if source[1] == schema:
+            out.add(target[1])
+    return out
+
+
+def planned_tables(ddl_plan: dict, schema: str,
+                   target_schema: str) -> set[str]:
+    """Casefolded source table names the plan puts at `target_schema`.
+
+    The per-table reading of `planned_target_schemas`. `target_missing` for
+    one of these is a failure whatever the structure report says: with
+    `--tables` beside a report for another target, or before 01 ran at all,
+    there is no report to say the table should be there -- and the copy
+    exited 0 with 0 rows for a table the reviewed plan places here.
+    """
+    out: set[str] = set()
+    for stmt in ddl_plan.get("statements") or []:
+        source = str(stmt.get("source_identifier") or "").split(".")
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(source) != 3 or len(target) != 3:
+            continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue
+        if source[1] == schema and _same(target[1], target_schema):
+            out.add(source[2].casefold())
+    return out
+
+
+def plan_catalogs(ddl_plan: dict) -> set[str]:
+    """Every catalog the plan targets (01 refuses a run for another one)."""
+    out = set()
+    for stmt in ddl_plan.get("statements") or []:
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(target) == 3:
+            out.add(target[0])
+    return out
+
+
+def resolve_target_schema(schema: str, planned: set[str],
+                          override: str | None) -> tuple[str | None, str | None]:
+    """`(target_schema, None)`, or `(None, refusal)`: the rule 01 applies.
+
+    The approved plan decides; `--target-schema` may restate it (in any
+    case) but not contradict it; only where the plan is silent does the
+    source schema name stand in.
+    """
+    if override:
+        if not planned:
+            return override, None
+        match = next((p for p in sorted(planned) if _same(p, override)), None)
+        if match is None:
+            return None, (
+                f"error: --target-schema {override!r} contradicts the "
+                f"approved plan, which puts {schema} in "
+                f"{', '.join(sorted(planned))} -- where 01_create_structure "
+                f"created it. The plan is the reviewed artifact; change it, "
+                f"or drop the flag.")
+        return match, None
+    if len(planned) == 1:
+        return next(iter(planned)), None
+    if len(planned) > 1:
+        return None, (
+            f"error: the approved plan puts source schema {schema} in more "
+            f"than one target schema ({', '.join(sorted(planned))}); this "
+            f"stage copies one schema per run. Pass --target-schema to say "
+            f"which.")
+    return schema, None
 
 
 def _count(spark, fqn: str) -> int:
@@ -114,6 +218,53 @@ def _decimal_columns(types: dict[str, str]) -> list[tuple[str, int, int]]:
         if m:
             out.append((name, int(m.group(1)), int(m.group(2))))
     return out
+
+
+def _layout_drift(src_types: dict[str, str],
+                  tgt_types: dict[str, str]) -> tuple[dict, str] | None:
+    """`(drift, why)` when the source and target columns are not the same
+    NAMES, else None. Case-insensitive, as Spark resolves column names.
+
+    The target was checked against the plan by the structure step; nothing
+    checked it against the LIVE source, which can have been rebuilt since.
+    Column ORDER is not drift: the INSERT names every column and pairs them
+    by name. A name that is on one side only is, since its values have no
+    right place to land -- positionally, an email ended up in `city`.
+    """
+    for side, types in (("source", src_types), ("target", tgt_types)):
+        folded: dict[str, list[str]] = {}
+        for name in types:
+            folded.setdefault(name.casefold(), []).append(name)
+        clash = [names for names in folded.values() if len(names) > 1]
+        if clash:
+            return ({f"{side}_names_differing_only_in_case": clash[0]},
+                    f"the {side} has columns whose names differ only in "
+                    f"case ({', '.join(clash[0])}); Spark resolves them as "
+                    f"one name, so which value lands where cannot be "
+                    f"decided")
+    src = {n.casefold() for n in src_types}
+    tgt = {n.casefold() for n in tgt_types}
+    not_on_target = [n for n in src_types if n.casefold() not in tgt]
+    not_in_source = [n for n in tgt_types if n.casefold() not in src]
+    if not (not_on_target or not_in_source):
+        return None
+    parts = []
+    if not_on_target:
+        parts.append(f"source column(s) {', '.join(not_on_target)} are not "
+                     f"on the target")
+    if not_in_source:
+        parts.append(f"target column(s) {', '.join(not_in_source)} are not "
+                     f"in the source")
+    return ({"not_on_target": not_on_target, "not_in_source": not_in_source},
+            "; ".join(parts) + " -- renamed, dropped or added since the plan")
+
+
+def _column_pairs(src_types: dict[str, str],
+                  tgt_types: dict[str, str]) -> list[tuple[str, str]]:
+    """`[(target_column, source_column)]` in the TARGET's order, paired by
+    name. Only called once `_layout_drift` found the same names both sides."""
+    by_fold = {n.casefold(): n for n in src_types}
+    return [(t, by_fold[t.casefold()]) for t in tgt_types]
 
 
 def _type_drift(src_types: dict[str, str], tgt_types: dict[str, str]) -> dict:
@@ -147,12 +298,29 @@ def _decimal_sums(spark, fqn: str, columns: list[tuple[str, int]]) -> dict:
     return {k: row[k] for k in row}
 
 
+# What Spark says when a table, or the schema holding it, is simply not
+# there. Only these mean "absent".
+_NOT_FOUND = ("TABLE_OR_VIEW_NOT_FOUND", "SCHEMA_NOT_FOUND",
+              "NoSuchTableException", "NoSuchNamespaceException",
+              "NoSuchDatabaseException", "Table or view not found")
+
+
 def _target_exists(spark, tgt: str) -> bool:
+    """True when DESCRIBE works, False when Spark says it is not there.
+
+    Any OTHER error propagates. Every DESCRIBE error used to read as
+    "absent": a metastore timeout or a persistent INSUFFICIENT_PERMISSIONS
+    on a table 01 had just created became `target_missing` with the error
+    thrown away -- "could not look" recorded as "not there", on every re-run.
+    """
     try:
         spark.sql(f"DESCRIBE {tgt}")
         return True
-    except Exception:
-        return False
+    except Exception as exc:
+        text = str(exc)
+        if any(marker.lower() in text.lower() for marker in _NOT_FOUND):
+            return False
+        raise
 
 
 def copy_table(source, schema: str, table: str, tgt: str, *, mode: str,
@@ -167,7 +335,14 @@ def copy_table(source, schema: str, table: str, tgt: str, *, mode: str,
     # A table with no target is a FINDING, not a crash. Live, the copy died
     # on the sixth table of a schema because the approved plan covered five
     # and the manifest listed a thousand -- taking the whole run with it.
-    if not _target_exists(spark, tgt):
+    try:
+        exists = _target_exists(spark, tgt)
+    except Exception as exc:
+        return {"status": "failed", "started_at": started,
+                "reason": f"could not DESCRIBE {tgt}: {str(exc)[:300]}. "
+                          f"Whether it exists is UNKNOWN, so nothing was "
+                          f"copied. NOT verified."}
+    if not exists:
         return {"status": "target_missing", "started_at": started,
                 "reason": f"{tgt} does not exist, so there is nothing to copy "
                           f"into. Most often the table is not in the approved "
@@ -196,6 +371,23 @@ def _copy(spark, src: str, tgt: str, *, mode: str, verify: str,
     # metadata only (DESCRIBE on the registered source and on the target).
     src_types = _column_types(spark, src)
     tgt_types = _column_types(spark, tgt)
+    if not src_types or not tgt_types:
+        # Nothing to pair by name: could not look, not a match.
+        return {"status": "failed", "source_count": source_count,
+                "started_at": started,
+                "reason": f"DESCRIBE of the "
+                          f"{'source' if not src_types else 'target'} "
+                          f"returned no columns, so its layout cannot be "
+                          f"compared with the other side's. NOT copied."}
+    layout = _layout_drift(src_types, tgt_types)
+    if layout:
+        drift, why = layout
+        return {"status": "type_drift", "layout_drift": drift,
+                "source_count": source_count, "started_at": started,
+                "reason": f"{why}. The source's columns are not the "
+                          f"target's, so its rows have no right place to "
+                          f"land. NOT copied. Re-plan the table from the "
+                          f"live source, or restore the source's layout."}
     drift = _type_drift(src_types, tgt_types)
     if drift:
         return {"status": "type_drift", "type_drift": drift,
@@ -221,9 +413,15 @@ def _copy(spark, src: str, tgt: str, *, mode: str, verify: str,
                 "reason": f"target already holds {target_rows} row(s); use "
                           f"--mode overwrite to rewrite them or append to add"}
 
-    statement = (f"INSERT OVERWRITE {tgt} SELECT * FROM {src}"
-                 if mode == "overwrite"
-                 else f"INSERT INTO {tgt} SELECT * FROM {src}")
+    # Every source column named, in the TARGET's order: an INSERT fills the
+    # target positionally, and `SELECT *` is the SOURCE's order, so a source
+    # rebuilt with two columns swapped landed each value in the other's
+    # column with the counts intact. (No target column list: the select
+    # list already is the target's order, and it keeps the statement the
+    # plain INSERT ... SELECT every Delta version accepts.)
+    select = ", ".join(q(s) for _t, s in _column_pairs(src_types, tgt_types))
+    verb = "INSERT OVERWRITE" if mode == "overwrite" else "INSERT INTO"
+    statement = f"{verb} {tgt} SELECT {select} FROM {src}"
     last_error = None
     for attempt in range(retries + 1):
         try:
@@ -313,7 +511,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--target-catalog", required=True)
     ap.add_argument("--schema", required=True,
                     help="ONE schema per run — that is the operating unit")
-    ap.add_argument("--target-schema", default=None)
+    ap.add_argument("--target-schema", default=None,
+                    help="default: the schema the approved plan's "
+                         "target_fqn names for --schema, as in "
+                         "01_create_structure; --schema itself only where "
+                         "the plan is silent. Refused when it contradicts "
+                         "the plan")
+    ap.add_argument("--ddl-plan",
+                    help="path to ddl_plan.json (default: ../plan/"
+                         "ddl_plan.json next to --reports-dir); read for "
+                         "the target schema only")
     ap.add_argument("--tables", nargs="*", default=None,
                     help="subset; default: every table the manifest lists")
     ap.add_argument("--mode", choices=("skip-existing", "append", "overwrite"),
@@ -346,16 +553,81 @@ def main(argv: list[str] | None = None) -> int:
     if record is None:
         return fail(f"error: schema {args.schema!r} not in the manifest")
 
-    target_schema = args.target_schema or args.schema
+    # The approved plan decides the target namespace, exactly as it does for
+    # 01_create_structure. A plan that is not there is a silent plan (01 in
+    # --mode ctas or manifest never reads one); a plan the operator NAMED
+    # and that is not there is a mistake worth stopping on.
+    ddl_path = (pathlib.Path(args.ddl_plan) if args.ddl_plan
+                else reports.parent / "plan" / "ddl_plan.json")
+    planned: set[str] = set()
+    ddl_plan = None
+    if ddl_path.is_file():
+        ddl_plan = json.loads(ddl_path.read_text(encoding="utf-8"))
+        stray = {c for c in plan_catalogs(ddl_plan)
+                 if not _same(c, args.target_catalog)}
+        if stray:
+            return fail(
+                f"error: the approved plan targets catalog(s) "
+                f"{', '.join(sorted(stray))}, and this run was given "
+                f"--target-catalog {args.target_catalog}; "
+                f"01_create_structure refuses that pair, so there is "
+                f"nothing here it created. Point this run at the catalog "
+                f"the plan names.")
+        planned = planned_target_schemas(ddl_plan, args.schema)
+    elif args.ddl_plan:
+        return fail(f"error: --ddl-plan {ddl_path} is not there")
+    target_schema, refusal = resolve_target_schema(
+        args.schema, planned, args.target_schema)
+    if refusal:
+        return fail(refusal)
+    log(f"target schema {target_schema}: "
+        + ("from the approved plan" if planned else
+           "from --target-schema" if args.target_schema else
+           "the source schema's own name (the plan names none for it)"))
+
     path = reports / f"copy_report_{args.schema.lower()}.json"
     target = f"{args.target_catalog}.{target_schema}"
+    in_plan = (planned_tables(ddl_plan, args.schema, target_schema)
+               if ddl_plan else set())
+
+    # What the structure step recorded for THIS target. A report for another
+    # target is not evidence about this one -- and falling back to the whole
+    # manifest because of it is how a drifted table, excluded there, came
+    # back into the copy's scope. Refused unless --tables names the scope.
+    structure_path = reports / f"structure_report_{args.schema.lower()}.json"
+    objects = None
+    if structure_path.is_file():
+        s_prior = json.loads(structure_path.read_text(encoding="utf-8"))
+        s_target = s_prior.get("target")
+        if s_target and not _same(s_target, target):
+            if not args.tables:
+                # --target-schema is a way out only where the plan is
+                # silent; where it names a target, that flag is refused as a
+                # contradiction, so offering it pointed at a dead end.
+                way_out = ("" if planned else
+                           f"pass --target-schema "
+                           f"{s_target.split('.', 1)[-1]} (the plan names no "
+                           f"target for this schema), ")
+                return fail(
+                    f"error: the structure report for {args.schema} targets "
+                    f"{s_target}, and this copy resolves {target}. Taking "
+                    f"the scope from the manifest instead would copy into "
+                    f"tables the structure step never created or checked "
+                    f"there. Re-run 01_create_structure (it creates what "
+                    f"the plan names), {way_out}or pass --tables")
+            log(f"the structure report targets {s_target}, not {target}; "
+                f"not used for this run (--tables sets the scope)")
+        else:
+            objects = s_prior.get("objects") or {}
+
     report = {"schema": args.schema, "tables": {}, "target": target}
     if path.exists():
         prior = json.loads(path.read_text(encoding="utf-8"))
         # Resumability is keyed by SOURCE schema, so a report written against
         # a DIFFERENT target must not let this run skip copies as already
-        # verified (the same trap the structure script hit live).
-        if prior.get("target") and prior["target"] != target:
+        # verified (the same trap the structure script hit live). Compared
+        # case-insensitively: `lake.CORE` and `lake.core` are one schema.
+        if prior.get("target") and not _same(prior["target"], target):
             log(f"the previous report targeted {prior['target']}, not "
                 f"{target} — starting a fresh record for this target")
             path.with_suffix(
@@ -386,15 +658,8 @@ def main(argv: list[str] | None = None) -> int:
         # found already there WITH the planned layout counts; one it recorded
         # as `type_drift` never does -- the copy below is a positional INSERT
         # INTO ... SELECT *, and that layout is not the plan's.
-        structure_path = reports / f"structure_report_{args.schema.lower()}.json"
-        created = []
-        objects = None
-        if structure_path.is_file():
-            prior = json.loads(structure_path.read_text(encoding="utf-8"))
-            if prior.get("target") in (None, target):
-                objects = prior.get("objects") or {}
-                created = [n for n, rec in objects.items()
-                           if rec.get("status") in ("created", "already_existed")]
+        created = [n for n, rec in (objects or {}).items()
+                   if rec.get("status") in _STRUCTURE_PRESENT]
         if created:
             names = created
             log(f"scope: {len(names)} table(s) the structure step created for "
@@ -488,8 +753,30 @@ def main(argv: list[str] | None = None) -> int:
                 f"{prior.get('reason') or prior['status']} (a re-run in "
                 f"skip-existing mode left the target untouched; use --mode "
                 f"overwrite to re-copy and re-verify it)"))
-        if result["status"] not in ("verified", "skipped_nonempty",
-                                    "target_missing"):
+        # `target_missing` is a finding for a table the structure step never
+        # created (not in the plan). For one it records as there, or one the
+        # approved plan places at this target, the copy moved nothing into a
+        # table that should exist: a failure, or the job reads SUCCESS with
+        # 0 rows copied. The plan counts on its own: `--tables` beside a
+        # report for another target, or a copy run before 01, has no report
+        # for this target to say so.
+        s_status = (objects or {}).get(name, {}).get("status")
+        if result["status"] == "target_missing" and \
+                s_status in _STRUCTURE_PRESENT:
+            result["reason"] = (
+                f"the structure report records this table `{s_status}` in "
+                f"{target}, yet {tgt} is not there now -- dropped since, or "
+                f"created somewhere else. NOT copied.")
+            failures += 1
+        elif result["status"] == "target_missing" and \
+                name.casefold() in in_plan:
+            result["reason"] = (
+                f"the approved plan places this table in {target}, yet {tgt} "
+                f"is not there -- 01_create_structure has not created it "
+                f"there (run it first), or it was dropped since. NOT copied.")
+            failures += 1
+        elif result["status"] not in ("verified", "skipped_nonempty",
+                                      "target_missing"):
             failures += 1
         report["tables"][name] = result
         report["updated_at"] = datetime.datetime.now(

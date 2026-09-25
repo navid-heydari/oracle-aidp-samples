@@ -28,8 +28,10 @@ connector mode returns the estate whole, so there is nothing to resume.
 
 `--schemas` is pushed into the INFORMATION_SCHEMA queries as a predicate, not
 applied after the fetch, and a scoped run MERGES into the manifest: the named
-schemas are refreshed and every other schema is kept. `--force` alone (no
-`--schemas`) re-discovers the whole estate from an empty manifest.
+schemas are refreshed and every other schema is kept. A named schema that
+returns no rows keeps its previous discovery, gains an error, and fails the
+run; `--force` drops it instead. `--force` alone (no `--schemas`)
+re-discovers the whole estate from an empty manifest.
 """
 from __future__ import annotations
 
@@ -53,10 +55,25 @@ MANIFEST_NAME = "discovery_manifest.json"
 # Snowflake's own system schema: never a migration target.
 _SYSTEM_SCHEMAS = {"information_schema"}
 
-# `{where}` is the --schemas predicate, or nothing.
+# `{where}` is the --schemas predicate, or nothing; `{flags}` is
+# _KIND_FLAGS_SELECT, or nothing on the fallback read.
+#
+# TABLE_TYPE, IS_TRANSIENT and COMMENT are written to the manifest, not only
+# read: the bridge maps them onto the same `source_metadata` keys a live
+# `assess` takes from SHOW TABLES. TABLE_TYPE once chose only the tables or
+# the views bucket, so an EVENT or EXTERNAL TABLE planned from a manifest
+# was can_migrate while the laptop path refused it.
 _TABLES_SQL = (
-    "select TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, ROW_COUNT, BYTES "
+    "select TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, IS_TRANSIENT, ROW_COUNT, "
+    "BYTES, COMMENT{flags} "
     "from INFORMATION_SCHEMA.TABLES{where} order by TABLE_SCHEMA, TABLE_NAME")
+
+# Dynamic, Iceberg and hybrid tables are BASE TABLEs by TABLE_TYPE; only
+# these columns tell them apart. They are younger than the rest of the view,
+# so an account that lacks one gets the narrower read and a recorded gap --
+# not a whole discovery lost to `invalid identifier`, and not a guess.
+_KIND_FLAGS = ("IS_DYNAMIC", "IS_ICEBERG", "IS_HYBRID")
+_KIND_FLAGS_SELECT = "".join(f", {f}" for f in _KIND_FLAGS)
 
 # COLUMN_DEFAULT, IDENTITY_* and COMMENT are here because the planning
 # stages warn on them (R22, R23) and carry the comment into the CREATE
@@ -67,7 +84,8 @@ _COLUMNS_SQL = (
     "select TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, "
     "DATA_TYPE, IS_NULLABLE, NUMERIC_PRECISION, NUMERIC_SCALE, "
     "CHARACTER_MAXIMUM_LENGTH, COLUMN_DEFAULT, IDENTITY_START, "
-    "IDENTITY_INCREMENT, COMMENT from INFORMATION_SCHEMA.COLUMNS{where} "
+    "IDENTITY_INCREMENT, COMMENT, COLLATION_NAME, DATETIME_PRECISION "
+    "from INFORMATION_SCHEMA.COLUMNS{where} "
     "order by TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION")
 
 
@@ -165,10 +183,23 @@ def discover_via_connector(source: SnowflakeSource, *,
     # DATA_ACCESS_LAYER_0031); the SQL below then reads INFORMATION_SCHEMA
     # relative to the database. Both established live.
     where = _schema_predicate(wanted)
-    tables = _rows(source.pushdown(_TABLES_SQL.format(where=where)))
+    flags_unread = None
+    try:
+        tables = _rows(source.pushdown(
+            _TABLES_SQL.format(where=where, flags=_KIND_FLAGS_SELECT)))
+    except Exception as exc:
+        if "invalid identifier" not in str(exc).lower():
+            raise
+        flags_unread = str(exc)[:300]
+        log(f"INFORMATION_SCHEMA.TABLES has no {'/'.join(_KIND_FLAGS)} here "
+            f"({flags_unread}); re-reading without them. Dynamic, Iceberg "
+            f"and hybrid tables are NOT told apart from base tables in "
+            f"this manifest")
+        tables = _rows(source.pushdown(
+            _TABLES_SQL.format(where=where, flags="")))
     columns = _rows(source.pushdown(_COLUMNS_SQL.format(where=where)))
     log(f"INFORMATION_SCHEMA: {len(tables)} relation(s), "
-        f"{len(columns)} column(s), in 2 queries"
+        f"{len(columns)} column(s), in {3 if flags_unread else 2} queries"
         + (f" scoped to {len(wanted)} schema(s)" if wanted else ""))
 
     by_object: dict[tuple[str, str], list[dict]] = {}
@@ -183,11 +214,27 @@ def discover_via_connector(source: SnowflakeSource, *,
             {"name": str(col["COLUMN_NAME"]),
              "type": _snowflake_type(col),
              "nullable": str(col.get("IS_NULLABLE") or "").upper() != "NO",
+             "ordinal_position": _plain(col.get("ORDINAL_POSITION")),
              "data_type": _plain(col.get("DATA_TYPE")),
              "numeric_precision": _plain(col.get("NUMERIC_PRECISION")),
              "numeric_scale": _plain(col.get("NUMERIC_SCALE")),
              "character_maximum_length": _plain(
-                 col.get("CHARACTER_MAXIMUM_LENGTH"))})
+                 col.get("CHARACTER_MAXIMUM_LENGTH")),
+             # A collated text column compares differently once it is a
+             # Delta STRING; the engine's mapper warns on it.
+             "collation": _plain(col.get("COLLATION_NAME")),
+             # Precision 9 (Snowflake's default) loses three digits at the
+             # Spark read; the mapper warns on anything above 6.
+             "datetime_precision": _plain(col.get("DATETIME_PRECISION")),
+             # What R22/R23 and the column comment read. Selecting them was
+             # half a fix: until they were written here too, every manifest
+             # said "facts unknown" and a re-run could never change that.
+             "column_default": _plain(col.get("COLUMN_DEFAULT")),
+             "identity_start": _plain(col.get("IDENTITY_START")),
+             "identity_increment": _plain(col.get("IDENTITY_INCREMENT")),
+             "comment": _plain(col.get("COMMENT")),
+             # Read, so a None above is a real "none", never "unknown".
+             "facts_recorded": True})
 
     schemas: dict[str, dict] = {}
     for rel in tables:
@@ -201,7 +248,15 @@ def discover_via_connector(source: SnowflakeSource, *,
         entry = {"name": name,
                  "columns": by_object.get((schema, name), []),
                  "source_rows": _plain(rel.get("ROW_COUNT")),
-                 "source_bytes": _plain(rel.get("BYTES"))}
+                 "source_bytes": _plain(rel.get("BYTES")),
+                 # Recorded as Snowflake reports them; the bridge maps them
+                 # onto the planner's kind flags.
+                 "table_type": kind}
+        for field in ("IS_TRANSIENT", "COMMENT") + _KIND_FLAGS:
+            if rel.get(field) is not None:
+                entry[field.lower()] = _plain(rel.get(field))
+        if flags_unread:
+            entry["kind_flags_unread"] = flags_unread
         if not entry["columns"]:
             record["errors"].append(
                 {"object": name, "kind": kind,
@@ -257,6 +312,49 @@ def discover_schema_via_catalog(source: SnowflakeSource, schema: str) -> dict:
     return out
 
 
+def _unanswered_schemas(existing: list[dict], requested: set[str],
+                        fresh: list[dict], exclude: set[str], *,
+                        force: bool, keep: list[dict]) -> int:
+    """Failures for --schemas names that returned no rows; the kept entries
+    are appended to `keep`.
+
+    Zero rows is not "the schema is gone". After a grant revocation
+    INFORMATION_SCHEMA returns nothing, with no error, and a misspelt or
+    wrongly-cased name does the same. The scoped merge used to drop the
+    named schema and add nothing, so SALES vanished from the manifest --
+    and from reconcile, failed copy and all -- with exit 0. Now the prior
+    discovery is kept with the reason attached and the run fails; --force
+    is the deliberate drop.
+    """
+    returned = {s["name"] for s in fresh}
+    prior = {s["name"]: s for s in existing}
+    failures = 0
+    for name in sorted(requested - returned):
+        if name.lower() in exclude:
+            continue
+        alike = sorted(n for n in prior if n.lower() == name.lower()
+                       and n != name)
+        hint = (f"; schema names are case-sensitive, and the manifest has "
+                f"{', '.join(alike)}" if alike else "")
+        if force:
+            log(f"--schemas {name} returned no rows and --force was given: "
+                + ("dropped from the manifest" if name in prior
+                   else "nothing of that name to drop") + hint)
+            continue
+        failures += 1
+        reason = (f"re-discovery with --schemas {name} returned no rows: not "
+                  f"visible to this role, empty, or misspelled{hint}. The "
+                  f"previous discovery is kept; --force drops it")
+        log(f"SCHEMA RETURNED NO ROWS: {reason}")
+        if name in prior:
+            entry = dict(prior[name])
+            entry["errors"] = [e for e in entry.get("errors") or []
+                               if e.get("kind") != "REDISCOVERY"] + [
+                {"object": "*", "kind": "REDISCOVERY", "error": reason}]
+            keep.append(entry)
+    return failures
+
+
 def render_summary(manifest: dict) -> str:
     src = manifest.get("source") or {}
     where = (f'catalog `{src.get("external_catalog")}`'
@@ -309,8 +407,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--reports-dir", default=DEFAULT_REPORTS_DIR)
     ap.add_argument("--force", action="store_true",
                     help="rediscover the named --schemas even if the manifest "
-                         "already carries them (the others are kept); without "
-                         "--schemas, rediscover the whole estate")
+                         "already carries them (the others are kept), and "
+                         "drop a named schema that returns no rows instead "
+                         "of keeping it and failing; without --schemas, "
+                         "rediscover the whole estate")
     args = ap.parse_args(argv)
 
     from pyspark.sql import SparkSession
@@ -368,9 +468,12 @@ def main(argv: list[str] | None = None) -> int:
                 # advice then did to a finished discovery. An unscoped run is
                 # the whole estate and stays authoritative.
                 requested = set(args.schemas)
-                fresh = sorted(
-                    [s for s in manifest["schemas"] if s["name"] not in requested]
-                    + fresh, key=lambda s: s["name"])
+                kept = [s for s in manifest["schemas"]
+                        if s["name"] not in requested]
+                failures += _unanswered_schemas(
+                    manifest["schemas"], requested, fresh, exclude,
+                    force=args.force, keep=kept)
+                fresh = sorted(kept + fresh, key=lambda s: s["name"])
             manifest["schemas"] = fresh
     else:
         done = {s["name"] for s in manifest["schemas"]}

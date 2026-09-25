@@ -708,3 +708,74 @@ def test_the_restored_budget_is_still_bounded():
     assert res["terminal"] is False
     assert len(res["restarts"]) <= 2
     assert len(fake.submitted) <= 3           # original + 2 restarts
+
+
+# --- a status poll that fails after the submit does not end the watch --------
+#
+# Found on review (contested; the double-load half was refuted -- the
+# in-flight guard and 02's verified-skip prevent it -- and the evidence half
+# kept). watch_job called job_run_status bare, so ONE failed GET after POST
+# /jobRuns -- a 503, an expired session -- raised straight out of the watch:
+# exit 1, no run_<job>.json, no RUN_<job>.md, the run key visible only in an
+# echoed GET URI, and an expired session printed "nothing was sent ...
+# re-run this stage" about a run that WAS sent and may still be copying.
+
+class _FlakyStatus(Fake):
+    """get_job_run raises on the polls listed in `fail_on` (1-based)."""
+
+    def __init__(self, *, states, fail_on=(), error="503 Service Unavailable"):
+        super().__init__(states=states)
+        self.fail_on, self.error, self.polls = set(fail_on), error, 0
+
+    def __call__(self, operation, **kw):
+        if operation == "get_job_run":
+            self.polls += 1
+            if self.polls in self.fail_on or "*" in self.fail_on:
+                self.ops.append(operation)
+                raise RuntimeError(self.error)
+        return super().__call__(operation, **kw)
+
+
+def test_one_failed_status_poll_is_survived():
+    fake = _FlakyStatus(states=["RUNNING", "SUCCESS"], fail_on={2})
+    seen = []
+    result = watch_job(fake, workspace="ws", job_key="j", poll_seconds=0,
+                       sleep=lambda _s: None,
+                       on_poll=lambda status, n: seen.append(status))
+    assert seen == ["RUNNING", "UNREADABLE", "SUCCESS"]
+    assert result["status"] == "SUCCESS" and result["ok"] is True
+    assert result["run_key"] == "run-1"
+    assert result["polls"] == 3, "the failed poll counts against the budget"
+
+
+def test_a_status_that_is_never_readable_is_reported_with_the_run_key():
+    fake = _FlakyStatus(states=[], fail_on={"*"})
+    result = watch_job(fake, workspace="ws", job_key="j", poll_seconds=0,
+                       max_polls=4, sleep=lambda _s: None)
+    assert result["run_key"] == "run-1"
+    assert result["terminal"] is False and result["ok"] is False
+    assert result["status"] == "UNREADABLE"
+    assert result["status_unreadable"] is True
+    assert result["unrecognised"] is False, "unreadable is not a new state"
+    assert "503" in result["status_error"]
+    assert result["polls"] == 4
+    assert "cancel_job_run" not in fake.ops, "unreadable is not a cold start"
+
+
+def test_an_expired_session_stops_the_watch_at_once():
+    """The answer cannot change within the run, so the budget is not spent
+    on it -- 40 polls x 30 s of the same error would be twenty minutes."""
+    fake = _FlakyStatus(states=[], fail_on={"*"},
+                        error="get_job_run: the OCI CLI session profile has "
+                              "expired")
+    result = watch_job(fake, workspace="ws", job_key="j", poll_seconds=0,
+                       max_polls=40, sleep=lambda _s: None)
+    assert result["polls"] == 1
+    assert result["status_unreadable"] is True
+
+
+def test_every_submitted_run_key_is_announced():
+    keys = []
+    watch_job(Fake(states=["SUCCESS"]), workspace="ws", job_key="j",
+              poll_seconds=0, sleep=lambda _s: None, on_submit=keys.append)
+    assert keys == ["run-1"]

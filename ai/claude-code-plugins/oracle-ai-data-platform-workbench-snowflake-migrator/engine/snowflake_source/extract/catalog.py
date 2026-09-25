@@ -36,7 +36,8 @@ from ..dialect.identifiers import case_form, detect_collisions
 from ..dialect.types import map_type
 from .constraints import build_constraints
 
-__all__ = ["build_inventory", "SYSTEM_DBS", "ROW_COUNT_MODES", "SHOW_PAGE_SIZE"]
+__all__ = ["build_inventory", "SYSTEM_DBS", "ROW_COUNT_MODES", "SHOW_PAGE_SIZE",
+           "show_paged"]
 
 SYSTEM_DBS = frozenset({"SNOWFLAKE", "SNOWFLAKE_SAMPLE_DATA"})
 
@@ -113,6 +114,52 @@ def _show_all(run_sql: Callable[..., list[dict]], statement: str) -> list[dict]:
         cursor = last
 
 
+def show_paged(run_sql: Callable[..., list[dict]], statement: str
+               ) -> tuple[list[dict], str | None]:
+    """Run a SHOW that may hit the row cap. Returns (rows, capped), where
+    `capped` is None for a complete read and otherwise says why the rows are
+    a lower bound.
+
+    For the census and security reads, which are database- or
+    account-scoped rather than schema-scoped. The bare statement goes first,
+    so a result under the cap costs exactly one statement, as it always did.
+    Only a result AT the cap is paged, and the paging is only trusted where
+    the rows show it can be: a `FROM '<name>'` cursor is exact when the
+    output is sorted by name, each page starts strictly after the cursor,
+    and no other row shares the cursor's name. An `IN DATABASE` result
+    ordered schema-first, a name that repeats across schemas at a page
+    boundary, or a SHOW that refuses LIMIT/FROM cannot be paged that way,
+    and the read is reported capped rather than silently short.
+    """
+    rows = list(run_sql(statement))
+    if len(rows) < SHOW_PAGE_SIZE:
+        return rows, None
+    cap = (f"the SHOW result stopped at the {SHOW_PAGE_SIZE:,}-row cap and "
+           f"could not be paged")
+    names = [r.get("name") for r in rows]
+    if not all(isinstance(n, str) and n for n in names) or names != sorted(names):
+        return rows, f"{cap}: its rows are not in name order, so a name cursor would skip rows"
+    page = rows
+    while len(page) >= SHOW_PAGE_SIZE:
+        cursor = page[-1]["name"]
+        if names.count(cursor) > 1:
+            return rows, (f"{cap}: the name {cursor!r} at the page boundary "
+                          f"is shared by more than one object")
+        literal = cursor.replace("'", "''")
+        try:
+            page = list(run_sql(
+                f"{statement} limit {SHOW_PAGE_SIZE} from '{literal}'"))
+        except Exception as exc:
+            return rows, f"{cap}: LIMIT/FROM was refused -- {str(exc)[:160]}"
+        more = [r.get("name") for r in page]
+        if not all(isinstance(n, str) and n for n in more) \
+                or more != sorted(more) or (more and more[0] <= cursor):
+            return rows, f"{cap}: a page did not resume after its cursor"
+        rows.extend(page)
+        names.extend(more)
+    return rows, None
+
+
 def build_inventory(run_sql: Callable[..., list[dict]],
                     databases: list[str] | None = None, *,
                     row_counts: str = "metadata",
@@ -153,7 +200,7 @@ def build_inventory(run_sql: Callable[..., list[dict]],
         constraints = build_constraints(run_sql, db, notes)
 
         for schema in schemas:
-            columns = _columns(run_sql, db, schema, notes)
+            columns, columns_error = _columns(run_sql, db, schema, notes)
             for kind, show in (("TABLE", "tables"), ("VIEW", "views")):
                 try:
                     objects = _show_all(
@@ -171,7 +218,8 @@ def build_inventory(run_sql: Callable[..., list[dict]],
                                 geospatial=geospatial,
                                 timestamp_ntz=timestamp_ntz,
                                 constraints=constraints.get(
-                                    f'{db}.{schema}.{obj["name"]}', [])))
+                                    f'{db}.{schema}.{obj["name"]}', []),
+                                columns_error=columns_error))
 
     collisions = detect_collisions([r["source_identifier"] for r in inventory])
     return {
@@ -190,12 +238,19 @@ def build_inventory(run_sql: Callable[..., list[dict]],
     }
 
 
-def _columns(run_sql, db: str, schema: str, notes: list[str]) -> dict[str, list[dict]]:
-    """Column metadata for one schema, keyed by object name.
+def _columns(run_sql, db: str, schema: str, notes: list[str]
+             ) -> tuple[dict[str, list[dict]], str | None]:
+    """Column metadata for one schema, keyed by object name, and the error
+    text when the read FAILED (None when it answered).
 
     Read per schema rather than per database: one unfiltered query over a large
     database's INFORMATION_SCHEMA.COLUMNS can exceed Snowflake's result limit
     and fail, taking every object's types with it.
+
+    The error is returned, not only noted, because an empty dict is also what
+    a schema with nothing visible returns. Without it every object in a
+    schema whose read timed out was typed over zero columns and came out
+    `supported`.
     """
     by_obj: dict[str, list[dict]] = collections.defaultdict(list)
     try:
@@ -203,6 +258,9 @@ def _columns(run_sql, db: str, schema: str, notes: list[str]) -> dict[str, list[
             f"select table_schema, table_name, ordinal_position, column_name, "
             f"data_type, is_nullable, numeric_precision, numeric_scale, "
             f"character_maximum_length, datetime_precision, comment, "
+            # A collated text column maps to a bytewise STRING; the
+            # collation is what says its comparisons change.
+            f"collation_name, "
             # A column's DEFAULT and its identity sequence are the two facts
             # that make a post-cutover INSERT behave differently: an insert
             # Snowflake would have populated arrives NULL, or fails. They are
@@ -214,10 +272,12 @@ def _columns(run_sql, db: str, schema: str, notes: list[str]) -> dict[str, list[
             f"order by table_name, ordinal_position", {"schema": schema})
     except Exception as exc:
         notes.append(f"{db}.{schema} columns: {exc}")
-        return by_obj
+        # Never an empty string: the caller tests this for truthiness, and
+        # TimeoutError() has no message -- a blank here read as success.
+        return by_obj, str(exc)[:300] or type(exc).__name__
     for c in rows:
         by_obj[c["TABLE_NAME"]].append(c)
-    return by_obj
+    return by_obj, None
 
 
 def _row_count(run_sql, db: str, schema: str, name: str, kind: str, *,
@@ -250,11 +310,21 @@ def _row_count(run_sql, db: str, schema: str, name: str, kind: str, *,
             "row_count_note": "exact, from COUNT(*)"}
 
 
+def _compatibility(blocked_reasons: list[str],
+                   columns_error: str | None) -> str:
+    """`unassessed` when the column read failed: no blocked reason over no
+    columns is an absence of evidence, and must not read as `supported`."""
+    if columns_error:
+        return "unassessed"
+    return "blocked" if blocked_reasons else "supported"
+
+
 def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
             columns: list[dict], *, row_counts: str, notes: list[str],
             semi_structured: str = "block", geospatial: str = "block",
             timestamp_ntz: str = "preserve",
-            constraints: list[dict] | None = None) -> dict:
+            constraints: list[dict] | None = None,
+            columns_error: str | None = None) -> dict:
     name = obj["name"]
     blocked_reasons: list[str] = []
     warnings: list[str] = []
@@ -268,7 +338,9 @@ def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
                      char_length=c.get("CHARACTER_MAXIMUM_LENGTH"),
                      semi_structured=semi_structured,
                      geospatial=geospatial,
-                     timestamp_ntz=timestamp_ntz)
+                     timestamp_ntz=timestamp_ntz,
+                     collation=c.get("COLLATION_NAME"),
+                     datetime_precision=c.get("DATETIME_PRECISION"))
         if m.blocked:
             blocked_reasons.append(f'{c["COLUMN_NAME"]}: {m.reason}')
         if m.warning:
@@ -286,11 +358,15 @@ def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
         "source_schema": schema,
         "identifier_case_form": case_form(name),
         "migration_status": "discovered",
-        "compatibility_status": "blocked" if blocked_reasons else "supported",
+        "compatibility_status": _compatibility(blocked_reasons, columns_error),
         "blocked_reasons": blocked_reasons,
         "warnings": warnings,
         "type_notes": type_notes,
         "evidence_location": f"show {kind.lower()}s in {db}.{schema}",
+        # Whether the verdict above was computed over columns anyone READ.
+        # "ok" with zero columns is a visibility fact; "failed" is a read
+        # that never answered, and its error travels with the record.
+        "columns_read": "failed" if columns_error else "ok",
         "columns": enriched,
         # PK/UNIQUE/FK as the source declares them. The DDL rule that says
         # they are "captured in the inventory, not emitted as DDL" is only
@@ -298,6 +374,8 @@ def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
         "constraints": list(constraints or []),
         "source_metadata": {k: _jsonable(obj[k]) for k in _META_KEYS if k in obj},
     }
+    if columns_error:
+        rec["columns_read_error"] = columns_error
     rec.update(_row_count(run_sql, db, schema, name, kind,
                           row_counts=row_counts, obj=obj, notes=notes))
 

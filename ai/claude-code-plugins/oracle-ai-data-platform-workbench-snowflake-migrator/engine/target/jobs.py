@@ -22,6 +22,7 @@ live-verified (2026-09-16) and replaces the ad-hoc shell it grew out of:
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Callable
 
@@ -39,6 +40,16 @@ TERMINAL_STATES = ("SUCCESS", "FAILED", "CANCELED", "TIMED_OUT",
 ACTIVE_STATES = ("PENDING", "QUEUED", "RUNNING", "CANCELING",
                  "PAUSED_MAINTENANCE", "UNKNOWN")
 SUCCESS_STATES = ("SUCCESS",)
+# What a poll reports when the status GET itself failed. Deliberately in
+# neither set above: it is not a state of the run, so it is never a verdict,
+# never "still running", and never a reason for the watchdog to cancel.
+UNREADABLE = "UNREADABLE"
+# A status error that will read the same on every later poll: an expired
+# session or a refused credential. Polling on would spend the whole budget
+# (40 x 30 s by default) re-reading an answer known on the first call.
+_PERMANENT_STATUS_ERROR = re.compile(
+    r"session profile has expired|\b401\b|\b403\b|NotAuthenticated",
+    re.IGNORECASE)
 
 
 class JobRunCollision(RuntimeError):
@@ -212,15 +223,25 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
               on_poll: Callable[[str, int], None] | None = None,
               cold_start_seconds: float = 60.0, cold_start_restarts: int = 1,
               on_restart: Callable[[str, str], None] | None = None,
-              sleep: Callable[[float], None] = time.sleep) -> dict:
+              sleep: Callable[[float], None] = time.sleep,
+              on_submit: Callable[[str], None] | None = None) -> dict:
     """Run a job, poll to a terminal state, and bring back its output.
 
     Returns {run_key, status, message, output, terminal, restarts, polls,
-    unrecognised}. `terminal: False` means the budget ran out with the job
+    unrecognised, status_unreadable, status_error}. `terminal: False` means the budget ran out with the job
     still going -- reported as running, never rounded to either verdict.
     `unrecognised: True` means the last status is in neither TERMINAL_STATES
     nor ACTIVE_STATES: a vocabulary this code does not know, which is not
     "still running" either, so the caller must not report it as such.
+
+    A status GET that FAILS is a poll that read nothing, not the end of the
+    watch: it reports UNREADABLE, counts against the budget, and the next
+    poll tries again (an expired session or a 401/403 stops at once -- it
+    will not clear). It used to raise straight out of here after the run
+    had been submitted, so the caller wrote no record and the run key was
+    lost. `status_unreadable: True` means the LAST poll read nothing, so
+    the run's real state is unknown; `on_submit` hears every run key the
+    moment it exists, so a caller can name it whatever happens next.
 
     THE COLD-START WATCHDOG. A cluster sometimes never picks up a job run --
     characteristically the FIRST run on a freshly created workspace. The run
@@ -265,7 +286,10 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
               "run already going.")
     run_key = run_job(call, workspace=workspace, job_key=job_key,
                       parameters=parameters)
+    if on_submit:
+        on_submit(run_key)
     status, message = "UNKNOWN", ""
+    status_error = None
     terminal = False
     restarts: list[dict] = []
     restarts_left = max(0, cold_start_restarts)
@@ -277,10 +301,19 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
         polls_left -= 1
         waited += poll_seconds
         attempt += 1
-        state = job_run_status(call, workspace=workspace, run_key=run_key)
-        status, message = state["status"], state["message"]
+        try:
+            state = job_run_status(call, workspace=workspace, run_key=run_key)
+            status, message = state["status"], state["message"]
+            status_error = None
+        except Exception as exc:
+            status_error = str(exc)[:300]
+            status, message = UNREADABLE, status_error
         if on_poll:
             on_poll(status, attempt)
+        if status_error is not None:
+            if _PERMANENT_STATUS_ERROR.search(status_error):
+                break
+            continue
         if status in TERMINAL_STATES:
             terminal = True
             break
@@ -311,6 +344,8 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
             stale = run_key
             run_key = run_job(call, workspace=workspace, job_key=job_key,
                               parameters=parameters)
+            if on_submit:
+                on_submit(run_key)
             restarts.append({"abandoned_run": stale, "cancel_state": ended,
                              "cancel_error": (cancel_errors[0]
                                               if cancel_errors else None),
@@ -333,7 +368,10 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
     return {"run_key": run_key, "status": status, "message": message,
             "output": output, "terminal": terminal, "restarts": restarts,
             "polls": attempt,
-            "unrecognised": (not terminal) and status not in ACTIVE_STATES,
+            "unrecognised": ((not terminal) and status not in ACTIVE_STATES
+                             and status != UNREADABLE),
+            "status_unreadable": status == UNREADABLE,
+            "status_error": status_error,
             # The state of the run being WATCHED, not of every attempt
             # ever made. An earlier attempt that could not confirm its
             # cancel is history the caller can read in `restarts`; if a

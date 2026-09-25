@@ -211,8 +211,10 @@ class _CatalogSpark(_FakeSpark):
                              "isTemporary": False}
                             for fqn in self.catalog if fqn.startswith(prefix)])
         if low.startswith("insert"):
-            m = re.match(r"insert (?:into|overwrite) (\S+) select \* from (\S+)",
-                         flat, re.IGNORECASE)
+            # The copy names the source's columns (in the target's order);
+            # the fake lands the count either way.
+            m = re.match(r"insert (?:into|overwrite) (\S+) select .*? from "
+                         r"(\S+)$", flat, re.IGNORECASE)
             tgt, src = m.group(1), m.group(2)
             landed = (self.counts.get(src, 0) if self.insert_lands is None
                       else self.insert_lands)
@@ -1788,6 +1790,58 @@ def test_force_without_schemas_rediscovers_the_whole_estate(discover, estate, tm
         "a full re-discovery is authoritative and drops what no longer exists"
 
 
+# A scoped re-run whose named schema returns NOTHING. After a grant
+# revocation INFORMATION_SCHEMA simply returns zero rows for SALES -- no
+# error -- and the scoped merge dropped every entry named in --schemas and
+# added only what came back. Following DISCOVERY.md's own "re-run with
+# --schemas <name>" advice therefore deleted SALES and exited 0; reconcile
+# went from STRUCTURE_ONLY_COPY_FAILED / exit 1 to exit 0 with SALES absent,
+# its failed copy still in the target. A lower-case typo ('sales') exited 0
+# too. The run could not look, and it recorded the schema as gone.
+
+def test_a_scoped_rerun_that_sees_nothing_keeps_the_schema_and_fails(
+        discover, estate, tmp_path, capsys):
+    base = ["--source-mode", "connector", "--reports-dir", str(tmp_path)]
+    assert discover.main(base) == 0
+    del estate.tables[1]                          # SALES: no longer visible
+    capsys.readouterr()
+    assert discover.main(base + ["--schemas", "SALES"]) == 1
+    out = capsys.readouterr().out
+    got = _manifest_schemas(tmp_path)
+    assert sorted(got) == ["FIN", "HR", "SALES"], "SALES must not vanish"
+    assert got["SALES"]["tables"][0]["name"] == "ORDERS", \
+        "the previous discovery of it is kept"
+    assert any("returned no rows" in e["error"] and "misspelled" in e["error"]
+               for e in got["SALES"]["errors"]), got["SALES"]["errors"]
+    assert "SALES" in out and "--force" in out
+    # A second failed look does not pile up a second copy of the error.
+    assert discover.main(base + ["--schemas", "SALES"]) == 1
+    assert len(_manifest_schemas(tmp_path)["SALES"]["errors"]) == 1
+
+
+def test_force_drops_a_named_schema_that_returns_nothing(discover, estate,
+                                                         tmp_path):
+    base = ["--source-mode", "connector", "--reports-dir", str(tmp_path)]
+    assert discover.main(base) == 0
+    del estate.tables[1]
+    assert discover.main(base + ["--force", "--schemas", "SALES"]) == 0
+    assert sorted(_manifest_schemas(tmp_path)) == ["FIN", "HR"], \
+        "--force keeps the deliberate-drop semantics"
+
+
+def test_a_misspelled_schema_is_a_failure_not_a_silent_success(
+        discover, estate, tmp_path, capsys):
+    base = ["--source-mode", "connector", "--reports-dir", str(tmp_path)]
+    assert discover.main(base) == 0
+    capsys.readouterr()
+    assert discover.main(base + ["--schemas", "sales"]) == 1
+    out = capsys.readouterr().out
+    assert "case-sensitive" in out and "SALES" in out, out
+    got = _manifest_schemas(tmp_path)
+    assert sorted(got) == ["FIN", "HR", "SALES"], "no phantom `sales` entry"
+    assert got["SALES"]["errors"] == []
+
+
 def test_a_scoped_external_catalog_force_keeps_the_other_schemas(discover, estate,
                                                                  tmp_path):
     base = ["--source-mode", "external-catalog", "--source-catalog", "ext",
@@ -1839,3 +1893,53 @@ def test_the_committed_discovery_notebook_matches_its_source():
     generated = build_stage_notebook(stage)
     assert json.loads(committed.read_text(encoding="utf-8")) == generated, \
         "regenerate with `snowmig.py build-notebooks`"
+
+
+# --- reconcile: a schema this target has not created yet is pending --------
+#
+# Live 2026-09-25, round-3 data-plane run: schema R3 migrated and verified,
+# and reconcile still exited 1 with 22 objects TARGET_UNREADABLE. They were
+# the manifest's other schemas, never created in this target yet. `SHOW
+# TABLES IN lake.core` raised SCHEMA_NOT_FOUND, and _live_tables read ANY
+# exception as "could not look". A schema-by-schema migration -- the
+# documented way to run it -- therefore failed reconcile after every schema
+# but the last, which is how a real problem signal gets ignored.
+
+class _NoSchemaSpark(_FakeSpark):
+    def sql(self, statement):
+        if statement.lower().startswith("show tables"):
+            raise RuntimeError(
+                "[SCHEMA_NOT_FOUND] The schema `lake`.`sales` cannot be found.")
+        return super().sql(statement)
+
+
+def test_a_schema_not_created_yet_is_not_migrated_not_unreadable(reconcile):
+    rec = reconcile.reconcile(_NoSchemaSpark(),
+                              manifest=_manifest("ORDERS", views=("V",)),
+                              target_catalog="lake",
+                              reports=pathlib.Path("/nonexistent"),
+                              counts=False)
+    s = rec["schemas"][0]
+    assert s["target_readable"] is True
+    assert s["tables"][0]["verdict"] == "NOT_MIGRATED"
+    assert s["views"][0]["verdict"] == "VIEW_NOT_CREATED_BY_THIS_PATH"
+    assert not set(rec["totals"]) & set(reconcile.PROBLEM_VERDICTS)
+
+
+def test_a_missing_schema_a_report_says_was_created_is_still_a_problem(
+        reconcile, tmp_path):
+    """Absent is only pending when nothing claims otherwise."""
+    (tmp_path / "structure_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "objects": {"ORDERS": {"status": "created"}}}), encoding="utf-8")
+    rec = reconcile.reconcile(_NoSchemaSpark(), manifest=_manifest("ORDERS"),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=False)
+    assert rec["schemas"][0]["tables"][0]["verdict"] == "MISSING_DESPITE_REPORT"
+
+
+def test_reconcile_and_the_copy_agree_on_what_absent_looks_like(
+        reconcile, copy_schema):
+    """Two scripts, one rule: the markers that make a DESCRIBE "absent" in
+    the copy make a SHOW TABLES "absent" here."""
+    assert reconcile._NOT_FOUND == copy_schema._NOT_FOUND

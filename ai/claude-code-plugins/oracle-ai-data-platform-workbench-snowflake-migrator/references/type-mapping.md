@@ -49,16 +49,24 @@ The rewrite matches whole three-part names on code and identifier segments only
 a quoted part must match exactly, an unquoted one case-insensitively, and the
 plan lists only the references that were actually rewritten.
 
+A view's header column list (`create view V(CUSTOMER, TOTAL) as select
+CUST_ID, SUM(AMT) ...`) renames the body's output columns, so it is carried
+(`R44_VIEW_COLUMN_LIST`): `CREATE VIEW <fqn> (CUSTOMER, TOTAL) AS ...` in the
+SQL, and `SELECT * FROM (<body>) AS named_columns(CUSTOMER, TOTAL)` as the
+catalog API's viewText, which has no column-list field. A list that cannot be
+read blocks the view.
+
 | Construct | What happens |
 |---|---|
 | `IFF(` | **Translated** to `IF()` (`T01`) |
-| `::` cast shorthand | **Translated** to `CAST(x AS <mapped type>)` through the type mapper (`T02`); an unmappable type blocks with the mapper's reason |
+| `::` cast shorthand | **Translated** to `CAST(x AS <mapped type>)` through the type mapper (`T02`); an unmappable type blocks with the mapper's reason. `::TIME` blocks (the result depends on the operand's type); a `::TIMESTAMP` cast carries the timezone warning as an `R43` caveat |
 | `ARRAY_CONSTRUCT(` | **Translated** to `array()` (`T03`) |
 | `OBJECT_CONSTRUCT(` | **Translated** to `named_struct()` (`T04`) |
 | `DATEADD(unit, n, col)` | **Translated** per unit (`T05`) when `n` is an integer literal or a column; any other form blocks. Exact for `DATE` operands only, and the plan says so |
-| `LISTAGG(x, sep)` | **Translated** to `concat_ws(sep, collect_list(x))` (`T06`); `WITHIN GROUP` blocks |
+| `LISTAGG(x, sep)` | **Translated** to `concat_ws(sep, collect_list(x))` (`T06`); `WITHIN GROUP` or a window `OVER (…)` blocks |
 | `"quoted identifier"` | **Translated** to `` `backticked` `` (`T07`): Spark reads `"..."` as a string literal. Case is kept |
 | `'it''s'` doubled quote in a literal | **Translated** to `'it\'s'` (`T08`): Spark reads `''` as two adjacent literals and concatenates them |
+| `// note` line comment | **Translated** to `-- note` (`T21`): Spark has no `//` comment |
 | `$$...$$` dollar-quoted string | Blocks: Spark has no dollar quoting (`T09`) |
 | `QUALIFY` | Blocks: no Spark equivalent; needs a subquery with `WHERE` on the window result |
 | `LATERAL FLATTEN` / `FLATTEN(` | Blocks: maps to `explode` / `LATERAL VIEW`, but the mapping depends on the VARIANT shape |

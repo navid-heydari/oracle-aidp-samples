@@ -1427,3 +1427,81 @@ def test_a_file_whose_upload_raised_is_failed_not_merely_unseen(tmp_path):
     assert "403" in failed[0]["detail"]
     assert any(s["action"] == "uploaded" for s in out["steps"]
                if s["step"] == "upload")
+
+
+# --- a read-back that could not look is not "never became visible" ----------
+#
+# Found on review, reproduced with the real provision() and render_provision.
+# _poll wrapped every listing in `except Exception: found = None`, so a 401
+# or 503 on the listing right after an accepted workspace or cluster create
+# was indistinguishable from "not visible yet": the halt said "the workspace
+# never became visible; nothing else was attempted", and the error text was
+# in neither provision_result.json nor PROVISION.md. "Could not look" read
+# as "absent", and a plain re-run then halted name_taken. The cluster halt
+# also left out the resume hint every other post-workspace halt carries.
+
+class _BlindAfterCreate(Fake):
+    """Every listing of `listing` raises once `create` has been accepted."""
+
+    def __init__(self, create, listing, error, **kw):
+        super().__init__(**kw)
+        self.blind_create, self.blind_listing = create, listing
+        self.blind_error, self.blind = error, False
+
+    def __call__(self, operation, **kw):
+        if operation == self.blind_listing and self.blind:
+            self.ops.append((operation, kw))
+            raise RuntimeError(self.blind_error)
+        result = super().__call__(operation, **kw)
+        if operation == self.blind_create:
+            self.blind = True
+        return result
+
+
+def test_a_workspace_read_back_that_errors_is_recorded_not_called_invisible(
+        scripts):
+    fake = _BlindAfterCreate("create_workspace", "list_workspaces",
+                             "503 Service Unavailable")
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(0, 0))
+    ws = next(s for s in res["steps"] if s["step"] == "workspace")
+    assert ws["verified"] is False
+    assert "read_back_failed" in ws["detail"] and "503" in ws["detail"]
+    halt = next(s for s in res["steps"] if s["step"] == "halt")
+    assert "never became visible" not in halt["detail"]
+    assert "could not be listed" in halt["detail"]
+    assert "--reuse-existing" in halt["detail"]
+    assert "503" in render_provision(res)
+    assert "503" in json.dumps(res)
+
+
+def test_a_cluster_read_back_that_errors_is_recorded_and_says_how_to_resume(
+        scripts):
+    fake = _BlindAfterCreate("create_cluster", "list_clusters",
+                             "401 NotAuthenticated")
+    res = provision(call=fake, workspace_name="acme", scripts=scripts,
+                    execute=True, delays=(0,))
+    cluster = next(s for s in res["steps"] if s["step"] == "cluster")
+    assert cluster["verified"] is False
+    assert "read_back_failed" in cluster["detail"]
+    assert "401" in cluster["detail"]
+    halt = next(s for s in res["steps"] if s["step"] == "halt")
+    assert "never became visible" not in halt["detail"]
+    assert "could not be listed" in halt["detail"]
+    assert "--reuse-existing" in halt["detail"], "the resume hint"
+    assert "401" in render_provision(res)
+
+
+def test_a_cluster_that_never_appears_still_says_how_to_resume(scripts):
+    class Invisible(Fake):
+        def __call__(self, operation, **kw):
+            if operation == "create_cluster":
+                self.ops.append((operation, kw))
+                return {}
+            return super().__call__(operation, **kw)
+
+    res = provision(call=Invisible(), workspace_name="acme", scripts=scripts,
+                    execute=True, delays=())
+    halt = next(s for s in res["steps"] if s["step"] == "halt")
+    assert "never became visible" in halt["detail"]
+    assert "--reuse-existing" in halt["detail"]
