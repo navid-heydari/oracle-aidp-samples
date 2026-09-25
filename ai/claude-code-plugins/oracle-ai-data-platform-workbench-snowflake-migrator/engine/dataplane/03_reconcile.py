@@ -198,6 +198,7 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
             c_rec = (copy or {}).get("tables", {}).get(name, {})
             c_status = c_rec.get("status", "not_attempted")
             exists = (None if live is None else name.lower() in live)
+            reason = None
 
             if live is None:
                 verdict = "TARGET_UNREADABLE"
@@ -217,6 +218,16 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                 # A copy into it can verify counts and still have landed rows
                 # in the wrong columns, so this outranks any copy status.
                 verdict = "STRUCTURE_TYPE_DRIFT"
+            elif c_status == "target_missing":
+                # The copy found no table here, and the catalog lists one
+                # now: the copy never ran against it. Falling through to
+                # STRUCTURE_ONLY put "does not exist" beside "In target:
+                # yes" under "No table is in a problem state".
+                verdict = "STRUCTURE_ONLY_COPY_FAILED"
+                reason = ("the copy recorded target_missing, but the "
+                          "catalog lists it now: nothing was copied into "
+                          "it. Re-run 02_copy_schema. (copy: "
+                          + str(c_rec.get("reason") or "no reason") + ")")
             elif c_status == "verified":
                 verdict = "MIGRATED_VERIFIED"
             elif c_status in ("count_mismatch", "sum_mismatch", "type_drift",
@@ -235,7 +246,7 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
 
             row = {"table": name, "structure": s_status, "copy": c_status,
                    "exists_in_target": exists, "verdict": verdict,
-                   "reason": c_rec.get("reason")
+                   "reason": reason or c_rec.get("reason")
                              or (structure or {}).get("objects", {})
                              .get(name, {}).get("reason")}
             if counts and exists:

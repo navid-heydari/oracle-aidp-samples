@@ -140,8 +140,8 @@ every report with exit 0.
 | `count_mismatch` | counts differ — after a copy, or on a `skip-existing` target that already held a different number of rows (nothing copied) | **yes** |
 | `sum_mismatch` | counts equal, a decimal column does not sum equal | **yes** |
 | `type_drift` | the live source's column names are not the target's (renamed, dropped or added since the plan; `layout_drift` lists them), or a source DECIMAL column is not DECIMAL, or narrower, on the target; NOT copied — the rows would land in the wrong columns, or be rounded or truncated, with the count intact. A source whose columns are only **reordered** is copied: every column is selected by name, in the target's order | **yes** |
-| `failed` | the copy raised; `insert_completed: true` means the rows landed before verification failed, so re-copy with `--mode overwrite`, never `append` | **yes** |
-| `target_missing` | no table to copy into (usually `not_in_plan` upstream) | no — **yes** when the structure report records the table `created` or `already_existed` |
+| `failed` | the copy raised — including a `DESCRIBE` of the target that failed for any reason but not-found (a metastore timeout, a permission denied: "could not look" is never recorded as absent); `insert_completed: true` means the rows landed before verification failed, so re-copy with `--mode overwrite`, never `append` | **yes** |
+| `target_missing` | Spark says there is no table to copy into (usually `not_in_plan` upstream) | no — **yes** when the structure report records the table `created` or `already_existed` |
 
 A re-run never softens a recorded failure: `count_mismatch`, `sum_mismatch`,
 `type_drift` and `failed` stand until a real re-copy verifies the table.
@@ -161,7 +161,7 @@ live catalog)
 | `MISSING_DESPITE_REPORT` | a report says created or verified; the catalog lacks it | **yes** |
 | `STRUCTURE_FAILED` | the CREATE raised | **yes** |
 | `STRUCTURE_TYPE_DRIFT` | the table's layout is not the plan's — outranks a verified copy, since counts match when rows land in the wrong columns | **yes** |
-| `STRUCTURE_ONLY_COPY_FAILED` | the copy ended in a mismatch, drift or failure | **yes** |
+| `STRUCTURE_ONLY_COPY_FAILED` | the copy ended in a mismatch, drift or failure, or recorded `target_missing` for a table the catalog lists | **yes** |
 | `COUNT_DRIFT` | `--counts` only: verified at N rows, the target now holds a different number — changed since the copy, not by it | **yes** |
 | `TARGET_UNREADABLE` | `SHOW TABLES` failed; not the same as empty | **yes** |
 

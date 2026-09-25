@@ -275,12 +275,29 @@ def _decimal_sums(spark, fqn: str, columns: list[tuple[str, int]]) -> dict:
     return {k: row[k] for k in row}
 
 
+# What Spark says when a table, or the schema holding it, is simply not
+# there. Only these mean "absent".
+_NOT_FOUND = ("TABLE_OR_VIEW_NOT_FOUND", "SCHEMA_NOT_FOUND",
+              "NoSuchTableException", "NoSuchNamespaceException",
+              "NoSuchDatabaseException", "Table or view not found")
+
+
 def _target_exists(spark, tgt: str) -> bool:
+    """True when DESCRIBE works, False when Spark says it is not there.
+
+    Any OTHER error propagates. Every DESCRIBE error used to read as
+    "absent": a metastore timeout or a persistent INSUFFICIENT_PERMISSIONS
+    on a table 01 had just created became `target_missing` with the error
+    thrown away -- "could not look" recorded as "not there", on every re-run.
+    """
     try:
         spark.sql(f"DESCRIBE {tgt}")
         return True
-    except Exception:
-        return False
+    except Exception as exc:
+        text = str(exc)
+        if any(marker.lower() in text.lower() for marker in _NOT_FOUND):
+            return False
+        raise
 
 
 def copy_table(source, schema: str, table: str, tgt: str, *, mode: str,
@@ -295,7 +312,14 @@ def copy_table(source, schema: str, table: str, tgt: str, *, mode: str,
     # A table with no target is a FINDING, not a crash. Live, the copy died
     # on the sixth table of a schema because the approved plan covered five
     # and the manifest listed a thousand -- taking the whole run with it.
-    if not _target_exists(spark, tgt):
+    try:
+        exists = _target_exists(spark, tgt)
+    except Exception as exc:
+        return {"status": "failed", "started_at": started,
+                "reason": f"could not DESCRIBE {tgt}: {str(exc)[:300]}. "
+                          f"Whether it exists is UNKNOWN, so nothing was "
+                          f"copied. NOT verified."}
+    if not exists:
         return {"status": "target_missing", "started_at": started,
                 "reason": f"{tgt} does not exist, so there is nothing to copy "
                           f"into. Most often the table is not in the approved "
