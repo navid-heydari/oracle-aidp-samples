@@ -310,3 +310,131 @@ def test_pushdown_refuses_before_it_looks_at_the_mode():
     src.mode = "external-catalog"          # would raise SourceConfigError
     with pytest.raises(PushdownRefused):
         SnowflakeSource.pushdown(src, "delete from T")
+
+
+# ------------------ the guard lexes a double-quoted identifier as Snowflake
+#
+# `_code_only` treated a backslash as an escape inside "..." as well as
+# '...'. Snowflake escapes an identifier's quote only by doubling it, so
+# `"a\"` is the identifier `a\` and what follows is code. The guard -- the
+# cluster-side I1 check, documented as failing closed -- read the rest of
+# the text as identifier and ACCEPTED
+#     select 1 from "a\"; delete from DB.S.ORDERS; --"
+# as one read. With crafted table names it was reachable through the
+# engine's own `source_counts` SQL, whose `_sql_literal` did not escape a
+# backslash either: `'a\'` is an unterminated literal in Snowflake.
+
+_BS, _DQ = "\\", '"'
+
+
+def _snowflake_statements(sql):
+    """Split `sql` the way Snowflake lexes it: '...' honours backslash
+    escapes and '' doubling; "..." honours ONLY "" doubling; -- runs to
+    the end of the line."""
+    stmts, cur, i, n = [], [], 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c in ("'", _DQ):
+            j = i + 1
+            while j < n:
+                if c == "'" and sql[j] == _BS:
+                    j += 2
+                    continue
+                if sql[j] == c:
+                    if sql[j:j + 2] == c * 2:
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            cur.append(sql[i:j])
+            i = j
+            continue
+        if sql[i:i + 2] == "--":
+            while i < n and sql[i] != "\n":
+                i += 1
+            continue
+        if c == ";":
+            stmts.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    stmts.append("".join(cur))
+    return [s.strip() for s in stmts if s.strip()]
+
+
+def test_a_backslash_does_not_escape_a_double_quoted_identifier():
+    sql = f"select 1 from {_DQ}a{_BS}{_DQ}; delete from DB.S.ORDERS; --{_DQ}"
+    assert len(_snowflake_statements(sql)) == 2, "the premise: Snowflake splits it"
+    with pytest.raises(PushdownRefused):
+        assert_pushdown_read_only(sql)
+
+
+def test_an_identifier_ending_in_a_backslash_is_still_one_read():
+    assert_pushdown_read_only(f"select count(*) from {_DQ}a{_BS}{_DQ}")
+
+
+def test_a_backslash_still_escapes_inside_a_string_literal():
+    # Snowflake: 'it\'s; delete' is ONE literal. Unchanged by the fix.
+    assert_pushdown_read_only(f"select 'it{_BS}'s; delete from T' as x")
+
+
+class _CaptureRead:
+    """spark.read stand-in: records the pushdown SQL, returns no rows."""
+
+    def __init__(self):
+        self.sql = None
+
+    def format(self, *_a):
+        return self
+
+    def options(self, **_k):
+        return self
+
+    def option(self, key, value=None):
+        if key == "pushdown.sql":
+            self.sql = value
+        return self
+
+    def load(self):
+        return self
+
+    def collect(self):
+        return []
+
+
+_PAYLOAD = "; delete from DB.S.ORDERS; --"
+
+
+@pytest.mark.parametrize("names", [
+    ["x" + _BS + _DQ, "y" + _BS, _PAYLOAD],
+    ["a" + _BS, _PAYLOAD],
+    [_BS + _DQ + "x delete from T", ";--" + _BS * 3, "; delete from T--"],
+    [_PAYLOAD],
+])
+def test_source_counts_over_crafted_names_is_one_read_or_refused(names):
+    """Whatever the table names, the SQL the engine builds must be what the
+    guard thinks it is: accepted means Snowflake sees ONE statement."""
+    from dataplane.snowmig_source import SnowflakeSource
+
+    class Spark:
+        read = _CaptureRead()
+
+    src = SnowflakeSource(Spark(), config={
+        "account": "x", "warehouse": "w", "database": "DB", "user": "u",
+        "auth": "password", "password": "p", "schema": "S"})
+    try:
+        src.source_counts("S", names)
+    except PushdownRefused:
+        return
+    sql = Spark.read.sql
+    statements = _snowflake_statements(sql)
+    assert len(statements) == 1, (sql, statements)
+
+
+def test_the_count_literal_escapes_a_backslash():
+    from dataplane.snowmig_source import _sql_literal
+    assert _sql_literal("a" + _BS) == "a" + _BS * 2
+    assert _sql_literal("it's") == "it''s"

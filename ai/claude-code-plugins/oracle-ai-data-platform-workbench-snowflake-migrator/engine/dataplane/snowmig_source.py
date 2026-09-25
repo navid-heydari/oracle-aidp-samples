@@ -60,6 +60,12 @@ def _code_only(sql: str) -> str:
     A `;` inside a literal is data, not a statement boundary, and `--` inside
     one is not a comment. Blanking rather than deleting keeps offsets, so the
     scan cannot be confused about where anything starts.
+
+    Lexed as SNOWFLAKE lexes: a backslash escapes only inside a '...'
+    string; a "..." identifier ends at the first quote that is not doubled.
+    Honouring a backslash there too made `"a\\"; delete from T` one
+    identifier to this scan and two statements to Snowflake -- the guard
+    failed open.
     """
     out = []
     i, n = 0, len(sql)
@@ -70,7 +76,7 @@ def _code_only(sql: str) -> str:
             out.append(" ")
             i += 1
             while i < n:
-                if sql[i] == "\\" and i + 1 < n:      # escaped char
+                if c == "'" and sql[i] == "\\" and i + 1 < n:  # escape
                     out.append("  ")
                     i += 2
                     continue
@@ -166,8 +172,13 @@ def _sql_ident(identifier: str) -> str:
 
 
 def _sql_literal(value: str) -> str:
-    """Escape a string literal for Snowflake SQL."""
-    return str(value).replace("'", "''")
+    """Escape a string literal for Snowflake SQL.
+
+    The backslash first: Snowflake reads it as an escape inside '...', so a
+    table named `a\\` made `'a\\'` an unterminated literal that swallowed the
+    SQL after it.
+    """
+    return str(value).replace("\\", "\\\\").replace("'", "''")
 
 
 def load_source_config(path: str | pathlib.Path) -> dict:
