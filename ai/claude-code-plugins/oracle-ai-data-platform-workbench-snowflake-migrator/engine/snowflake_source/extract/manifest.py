@@ -241,9 +241,13 @@ def inventory_from_manifest(manifest: dict, *, database: str,
             notes.append("a schema entry in the manifest carries no name and "
                          "was skipped rather than guessed")
             continue
+        # The entry is the failure, not its text: discovery writes
+        # str(exc)[:300], which is empty for an exception with no message,
+        # and dropping such an entry marked the object supported.
         read_errors = {str(e.get("object")): str(e.get("error") or "")
+                       or "discovery recorded an error with no message"
                        for e in schema.get("errors") or []
-                       if e.get("object") and e.get("error")}
+                       if e.get("object")}
         for kind, key in (("TABLE", "tables"), ("VIEW", "views")):
             for obj in schema.get(key) or []:
                 if not obj.get("name"):

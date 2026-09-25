@@ -120,3 +120,40 @@ def test_a_manifest_object_discovery_could_not_read_is_unassessed():
     assert "000630" in unread["columns_read_error"]
     assert recs["DB.S.OK"]["columns_read"] == "ok"
     assert recs["DB.S.OK"]["compatibility_status"] == "supported"
+
+
+# ------------------------------------------------ a failure with no message
+#
+# Review of 90d7dd9: the failure was carried as the error TEXT and tested for
+# truthiness. An exception whose message is empty -- TimeoutError() is the
+# realistic one -- produced an empty string, so the read counted as a
+# success: compatibility_status `supported`, columns_read `ok`, no
+# columns_read_error, while extraction_notes held "DB.PUBLIC columns: ".
+# That is the very defect this file pins, reached through a blank message.
+
+def test_a_failed_column_read_with_an_empty_message_is_still_unassessed():
+    base = FakeSql(_base_responses(tables=[{"name": "T", "rows": 1}]))
+
+    def run_sql(sql, params=None):
+        if "information_schema.columns" in sql.lower():
+            raise TimeoutError()
+        return base(sql, params)
+
+    rec = build_inventory(run_sql, row_counts="none")["inventory"][0]
+    assert rec["compatibility_status"] == "unassessed"
+    assert rec["columns_read"] == "failed"
+    # Something the operator can act on, not a blank: the exception type.
+    assert "TimeoutError" in rec["columns_read_error"]
+
+
+def test_a_manifest_error_entry_with_no_text_still_marks_the_object_unread():
+    """Discovery writes str(exc)[:300], which is empty for the same kind of
+    exception; the bridge dropped such an entry and marked the object
+    supported over zero columns."""
+    inv = inventory_from_manifest(_manifest_with_unread(""), database="DB")
+    recs = {r["source_identifier"]: r for r in inv["inventory"]}
+    unread = recs["DB.S.ORDERS"]
+    assert unread["compatibility_status"] == "unassessed"
+    assert unread["columns_read"] == "failed"
+    assert unread["columns_read_error"]
+    assert recs["DB.S.OK"]["compatibility_status"] == "supported"

@@ -272,7 +272,9 @@ def _columns(run_sql, db: str, schema: str, notes: list[str]
             f"order by table_name, ordinal_position", {"schema": schema})
     except Exception as exc:
         notes.append(f"{db}.{schema} columns: {exc}")
-        return by_obj, str(exc)[:300]
+        # Never an empty string: the caller tests this for truthiness, and
+        # TimeoutError() has no message -- a blank here read as success.
+        return by_obj, str(exc)[:300] or type(exc).__name__
     for c in rows:
         by_obj[c["TABLE_NAME"]].append(c)
     return by_obj, None
