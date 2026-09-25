@@ -141,7 +141,7 @@ every report with exit 0.
 | `sum_mismatch` | counts equal, a decimal column does not sum equal | **yes** |
 | `type_drift` | the live source's column names are not the target's (renamed, dropped or added since the plan; `layout_drift` lists them), or a source DECIMAL column is not DECIMAL, or narrower, on the target; NOT copied — the rows would land in the wrong columns, or be rounded or truncated, with the count intact. A source whose columns are only **reordered** is copied: every column is selected by name, in the target's order | **yes** |
 | `failed` | the copy raised — including a `DESCRIBE` of the target that failed for any reason but not-found (a metastore timeout, a permission denied: "could not look" is never recorded as absent); `insert_completed: true` means the rows landed before verification failed, so re-copy with `--mode overwrite`, never `append` | **yes** |
-| `target_missing` | Spark says there is no table to copy into (usually `not_in_plan` upstream) | no — **yes** when the structure report records the table `created` or `already_existed` |
+| `target_missing` | Spark says there is no table to copy into (usually `not_in_plan` upstream) | no — **yes** when the structure report records the table `created` or `already_existed`, or the approved plan places the table at this target (also with `--tables`, or before `01_create_structure` has run) |
 
 A re-run never softens a recorded failure: `count_mismatch`, `sum_mismatch`,
 `type_drift` and `failed` stand until a real re-copy verifies the table.

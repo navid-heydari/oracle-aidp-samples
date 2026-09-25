@@ -128,6 +128,29 @@ def planned_target_schemas(ddl_plan: dict, schema: str) -> set[str]:
     return out
 
 
+def planned_tables(ddl_plan: dict, schema: str,
+                   target_schema: str) -> set[str]:
+    """Casefolded source table names the plan puts at `target_schema`.
+
+    The per-table reading of `planned_target_schemas`. `target_missing` for
+    one of these is a failure whatever the structure report says: with
+    `--tables` beside a report for another target, or before 01 ran at all,
+    there is no report to say the table should be there -- and the copy
+    exited 0 with 0 rows for a table the reviewed plan places here.
+    """
+    out: set[str] = set()
+    for stmt in ddl_plan.get("statements") or []:
+        source = str(stmt.get("source_identifier") or "").split(".")
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(source) != 3 or len(target) != 3:
+            continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue
+        if source[1] == schema and _same(target[1], target_schema):
+            out.add(source[2].casefold())
+    return out
+
+
 def plan_catalogs(ddl_plan: dict) -> set[str]:
     """Every catalog the plan targets (01 refuses a run for another one)."""
     out = set()
@@ -537,6 +560,7 @@ def main(argv: list[str] | None = None) -> int:
     ddl_path = (pathlib.Path(args.ddl_plan) if args.ddl_plan
                 else reports.parent / "plan" / "ddl_plan.json")
     planned: set[str] = set()
+    ddl_plan = None
     if ddl_path.is_file():
         ddl_plan = json.loads(ddl_path.read_text(encoding="utf-8"))
         stray = {c for c in plan_catalogs(ddl_plan)
@@ -563,6 +587,8 @@ def main(argv: list[str] | None = None) -> int:
 
     path = reports / f"copy_report_{args.schema.lower()}.json"
     target = f"{args.target_catalog}.{target_schema}"
+    in_plan = (planned_tables(ddl_plan, args.schema, target_schema)
+               if ddl_plan else set())
 
     # What the structure step recorded for THIS target. A report for another
     # target is not evidence about this one -- and falling back to the whole
@@ -723,9 +749,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"skip-existing mode left the target untouched; use --mode "
                 f"overwrite to re-copy and re-verify it)"))
         # `target_missing` is a finding for a table the structure step never
-        # created (not in the plan). For one it records as there, the copy
-        # moved nothing into a table that should exist: a failure, or the
-        # job reads SUCCESS with 0 rows copied.
+        # created (not in the plan). For one it records as there, or one the
+        # approved plan places at this target, the copy moved nothing into a
+        # table that should exist: a failure, or the job reads SUCCESS with
+        # 0 rows copied. The plan counts on its own: `--tables` beside a
+        # report for another target, or a copy run before 01, has no report
+        # for this target to say so.
         s_status = (objects or {}).get(name, {}).get("status")
         if result["status"] == "target_missing" and \
                 s_status in _STRUCTURE_PRESENT:
@@ -733,6 +762,13 @@ def main(argv: list[str] | None = None) -> int:
                 f"the structure report records this table `{s_status}` in "
                 f"{target}, yet {tgt} is not there now -- dropped since, or "
                 f"created somewhere else. NOT copied.")
+            failures += 1
+        elif result["status"] == "target_missing" and \
+                name.casefold() in in_plan:
+            result["reason"] = (
+                f"the approved plan places this table in {target}, yet {tgt} "
+                f"is not there -- 01_create_structure has not created it "
+                f"there (run it first), or it was dropped since. NOT copied.")
             failures += 1
         elif result["status"] not in ("verified", "skipped_nonempty",
                                       "target_missing"):

@@ -291,3 +291,67 @@ def test_a_copy_report_in_another_case_is_resumed(monkeypatch, tmp_path,
     assert rc == 0
     assert "already verified" in capsys.readouterr().out
     assert not _inserts(spark)
+
+
+# ------------------------- the plan names the table, the copy cannot find it
+#
+# `target_missing` counted as a failure only when the STRUCTURE REPORT listed
+# the table as there. Two paths reach the copy with no such report for this
+# target, and on both the approved plan still names the table here:
+#
+#   * `--tables T` beside a pre-fix structure report for `lake.CORE`: 02 set
+#     that report aside ("--tables sets the scope"), recorded T
+#     target_missing in `lake.db_core`, and exited 0 with 0 rows -- then 03
+#     said NOT_MIGRATED and exited 0 too;
+#   * 02 run before 01 (no structure report at all): the same, exit 0.
+#
+# That is "the job reads SUCCESS with 0 rows copied" for a table the reviewed
+# plan puts at this target. The plan is evidence enough that it should exist.
+
+def test_tables_beside_a_stale_structure_report_fails_a_planned_table(
+        monkeypatch, tmp_path, capsys):
+    reports = _estate(tmp_path, ["T"], {"T": "lake.db_core.t"})
+    (reports / "structure_report_core.json").write_text(json.dumps(
+        {"schema": "CORE", "target": "lake.CORE",
+         "objects": {"T": {"status": "created"}}}), encoding="utf-8")
+    spark = _CaselessSpark({"`ext`.`CORE`.`T`": _SPARK_COLS,
+                            # what the pre-fix run left behind
+                            "`lake`.`CORE`.`T`": _SPARK_COLS})
+    spark.counts = {"`ext`.`core`.`t`": 4}
+
+    rc = _copy(monkeypatch, spark, reports, "--tables", "T")
+    rec = _report(reports, "copy_report_core.json")["tables"]["T"]
+    assert rec["status"] == "target_missing"
+    assert not _inserts(spark)
+    assert rc == 1, "a planned table the copy could not find is a failure"
+    assert "the approved plan places" in rec["reason"]
+    assert "lake.db_core" in rec["reason"].lower()
+
+
+def test_a_copy_before_the_structure_step_fails_a_planned_table(
+        monkeypatch, tmp_path):
+    reports = _estate(tmp_path, ["T"], {"T": "lake.db_core.t"})
+    spark = _CaselessSpark({"`ext`.`CORE`.`T`": _SPARK_COLS})
+    spark.counts = {"`ext`.`core`.`t`": 4}
+
+    rc = _copy(monkeypatch, spark, reports)
+    assert _report(reports, "copy_report_core.json")["tables"]["T"][
+        "status"] == "target_missing"
+    assert rc == 1
+
+
+def test_a_table_the_plan_leaves_out_is_still_not_a_failure(
+        monkeypatch, tmp_path):
+    """The guard: `target_missing` for a table the plan does NOT place here
+    (not_in_plan upstream) stays a finding, not a failed job."""
+    reports = _estate(tmp_path, ["T", "U"], {"T": "lake.db_core.t"})
+    spark = _CaselessSpark({"`ext`.`CORE`.`T`": _SPARK_COLS,
+                            "`ext`.`CORE`.`U`": _SPARK_COLS})
+    spark.counts = {"`ext`.`core`.`t`": 4, "`ext`.`core`.`u`": 1}
+    assert _structure(monkeypatch, spark, reports) == 0
+
+    rc = _copy(monkeypatch, spark, reports, "--tables", "T", "U")
+    tables = _report(reports, "copy_report_core.json")["tables"]
+    assert tables["T"]["status"] == "verified"
+    assert tables["U"]["status"] == "target_missing"
+    assert rc == 0
