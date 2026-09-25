@@ -396,6 +396,89 @@ def test_a_schema_that_is_not_active_is_waited_for():
     assert any("ACTIVE" in e or "active" in e for e in out["errors"])
 
 
+# --- a schema still settling gets NOTHING posted into it ---------------------
+#
+# Found on review, reproduced with the real deploy_catalog. The non-ACTIVE
+# branch after the schema wait only appended to out["errors"] and then fell
+# through to the create loop: every table was POSTed into the settling
+# schema -- exactly what the error text itself says gets creates accepted
+# and then dropped. When the object then never appeared, the burned-name
+# diagnosis ran after the schema had settled, its novel-name probe
+# succeeded, and SOFT_CLONE_SUMMARY.md told the operator the names were
+# burned, "confirmed for this run ... neither the request nor the catalog is
+# at fault", and to change the target schema. The real cause -- a schema
+# slower than the ~18 s wait -- was only in deploy_result.json; the summary
+# never rendered out["errors"]. A longer wait verified every table.
+
+class SettlesLate(Folding):
+    """The schema reports CREATING for `creating_lists` listings, then
+    ACTIVE. A create POSTed while it is CREATING is accepted and dropped.
+    With `settle_on_first_create`, it settles right after the first such
+    create -- the review's timing: the planned table is dropped, and the
+    diagnosis probe that follows lands in a schema that is ACTIVE by then."""
+
+    def __init__(self, creating_lists, *, settle_on_first_create=False):
+        super().__init__()
+        self.schemas["lake.db"] = "lake.db"
+        self.creating_lists = creating_lists
+        self.active = False
+        self.settle_on_first_create = settle_on_first_create
+
+    def __call__(self, operation, **kw):
+        if operation == "list_schemas":
+            self.ops.append((operation, kw))
+            if self.creating_lists > 0 and not self.active:
+                self.creating_lists -= 1
+                state = "CREATING"
+            else:
+                self.active, state = True, "ACTIVE"
+            return {"items": [{"key": "lake.db", "lifecycleState": state}]}
+        if operation in ("create_table", "create_view") and not self.active:
+            self.ops.append((operation, kw))
+            if self.settle_on_first_create:
+                self.active = True
+            return {}
+        return super().__call__(operation, **kw)
+
+
+def test_nothing_is_posted_into_a_schema_that_never_became_active():
+    s = SettlesLate(creating_lists=99, settle_on_first_create=True)
+    out = deploy_catalog(_plan(2), target=TARGET, execute=True, call=s,
+                         retry_delays=(), verify_delays=(), schema_wait=(0, 0))
+    assert not [op for op, _ in s.ops if op in ("create_table", "create_view")]
+    assert out["poisoned_names"] == [], "the run's own timing is not a burn"
+    assert out["diagnosis_probes"] == []
+    assert out["executed"] == 0
+    assert sorted(out["failed_targets"]) == ["DB.PUBLIC.T0", "DB.PUBLIC.T1"]
+    for failure in out["failed"]:
+        assert "CREATING" in failure["reason"]
+        assert "nothing was posted" in failure["reason"]
+        assert "re-run" in failure["reason"].lower()
+
+
+def test_a_schema_that_settles_within_the_wait_is_deployed_normally():
+    s = SettlesLate(creating_lists=2)
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=s,
+                         retry_delays=(), verify_delays=(),
+                         schema_wait=(0, 0, 0))
+    assert any(op == "create_table" for op, _ in s.ops)
+    assert out["failed"] == []
+    assert out["verified"] == 1
+
+
+def test_the_soft_clone_summary_shows_the_schema_state_and_the_errors():
+    from report.render import render_soft_clone_summary
+    s = SettlesLate(creating_lists=99, settle_on_first_create=True)
+    out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=s,
+                         retry_delays=(), verify_delays=(), schema_wait=(0,))
+    md = render_soft_clone_summary({}, out)
+    assert "lake.DB" in md and "CREATING" in md
+    assert "These names are burned" not in md
+    assert "confirmed for this run" not in md
+    for error in out["errors"]:
+        assert error[:60] in md, error
+
+
 # ==========================================================================
 # The LIST response omits tableFields; GET-by-key includes them.
 #

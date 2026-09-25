@@ -615,6 +615,17 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
         out += [f'{res["blocked_count"]} object(s) were blocked before deployment '
                 "and never attempted. See the planned-objects report.", ""]
 
+    if res.get("schemas_not_active"):
+        out += ["## Schema still settling — nothing was posted into it", "",
+                "These schemas had not reported ACTIVE when the wait ran out. "
+                "A create against a settling schema is accepted and then "
+                "silently dropped, so none was sent: **no name was burned**, "
+                "and the objects below are failed only because they were not "
+                "attempted. Re-run once the schema reports ACTIVE.", ""]
+        out += [f"- `{name}` — {state}"
+                for name, state in sorted(res["schemas_not_active"].items())]
+        out.append("")
+
     if res.get("mismatches"):
         out += ["## Structure differs — left as found, NOT cloned", "",
                 "These names already existed in AIDP with a different structure. "
@@ -692,6 +703,14 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
         out.append("")
     if res.get("chunk_errors"):
         out += ["## Batch errors", ""] + [f"- {e}" for e in res["chunk_errors"]] + [""]
+    if res.get("errors"):
+        # Everything the run recorded as an error: a schema that never
+        # settled, a listing that failed mid-poll, each refused create. It
+        # used to live only in deploy_result.json, so the summary could
+        # blame a burned name for what the errors said was the schema.
+        out += ["## Errors recorded during the run", ""]
+        out += [f"- {e}" for e in res["errors"]]
+        out.append("")
 
     jobs = plan.get("silver_gold_jobs") or []
     if jobs and not res.get("dry_run"):

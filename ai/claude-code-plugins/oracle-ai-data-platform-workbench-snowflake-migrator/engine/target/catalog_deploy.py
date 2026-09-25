@@ -381,6 +381,9 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         "executed": 0, "verified": 0,
         "schemas_created": [], "errors": [],
         "resolved_schema_keys": {}, "schemas_reused": [],
+        # Schema -> the lifecycleState it was still in after the wait. No
+        # object is posted into one of these (see the schema loop).
+        "schemas_not_active": {},
         "attempted_targets": [], "verified_targets": [], "failed_targets": [],
         "mismatched_targets": [], "mismatches": [],
         # A view we DID create, whose column types the engine re-derived.
@@ -455,6 +458,8 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
     #    table creates that follow it -- so a schema that cannot be LISTED
     #    is not "absent", and the deploy refuses while nothing is written yet.
     resolved: dict[str, str] = {}
+    # Schemas still settling after the wait -> their last lifecycleState.
+    not_active: dict[str, str] = {}
     schema_pairs = sorted({_split(s["target_fqn"])[:2] for s in statements})
     try:
         looked = {pair: _find_schema(call, *pair) for pair in schema_pairs}
@@ -512,13 +517,20 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 f"could not resolve the server's key for schema {requested}; "
                 f"falling back to the requested name")
         elif not is_active(found):
+            state = str(found.get("lifecycleState"))
             out["errors"].append(
-                f"schema {requested} is "
-                f'{found.get("lifecycleState")}, not ACTIVE. Creating tables '
+                f"schema {requested} is {state}, not ACTIVE. Creating tables "
                 f"against a settling schema is what gets them accepted and "
-                f"then silently dropped.")
+                f"then silently dropped, so nothing was posted into it.")
+            # Gated, not just recorded. This used to fall through to the
+            # create loop: every object was POSTed into the settling schema,
+            # never appeared, and the burned-name probe -- run once the
+            # schema HAD settled -- then called this run's own timing a
+            # confirmed burn and sent the operator to a fresh schema.
+            not_active[requested] = state
         resolved[requested] = (str(found.get("key")) if found else requested)
     out["resolved_schema_keys"] = dict(resolved)
+    out["schemas_not_active"] = dict(not_active)
 
     # One diagnosis per schema: whether a name is burned is a property of the
     # schema, not of each object, and the probe itself writes.
@@ -534,6 +546,21 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         is_view = stmt.get("object_type") == "VIEW"
         columns = stmt.get("expected_columns") or []
         out["attempted_targets"].append(ident)
+
+        settling = not_active.get(f"{catalog}.{schema}")
+        if settling is not None:
+            # Nothing is POSTed, so no name can be burned by this run and no
+            # diagnosis runs: the cause is known, and it is the schema.
+            out["failed_targets"].append(ident)
+            out["failed"].append({
+                "source_identifier": ident, "target_fqn": stmt["target_fqn"],
+                "reason": (
+                    f"schema {catalog}.{schema} was still {settling} after "
+                    f"the schema wait, so nothing was posted into it: a "
+                    f"create against a settling schema is accepted and then "
+                    f"silently dropped. The name is not burned. Re-run once "
+                    f"the schema reports ACTIVE.")})
+            continue
 
         # The key the SERVER uses, which is lower-cased.
         schema_key = resolved.get(f"{catalog}.{schema}", f"{catalog}.{schema}")
