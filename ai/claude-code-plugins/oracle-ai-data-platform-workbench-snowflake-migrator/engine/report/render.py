@@ -1211,7 +1211,10 @@ def render_census(census: dict) -> str:
                 "| Kind | Count | Read | Scope |", "|---|---:|---|---|"]
         for kind, info in sorted(kinds.items()):
             count = info.get("count")
-            if info.get("readable"):
+            if info.get("capped"):
+                # Answered, but truncated: "yes" would call it complete.
+                read = "**capped** — SHOW row limit reached; lower bound"
+            elif info.get("readable"):
                 read = "yes" if count else "yes (0 visible; lower bound)"
             elif info.get("unread") == "partial":
                 # A real count that is also incomplete. Calling this denied
@@ -1400,8 +1403,10 @@ def render_security(sec: dict) -> str:
                 out.append(f"| {label} | *not visible to this role* "
                            f"| **denied** |")
                 continue
+            read = ("**capped** — SHOW row limit reached; lower bound"
+                    if info.get("capped") else "yes")
             out.append(f'| {label} | {c if c is not None else "*not measured*"} '
-                       f"| yes |")
+                       f"| {read} |")
         out.append("")
         missing = [label for label, key in (("aggregation", "aggregation"),
                                             ("projection", "projection"))

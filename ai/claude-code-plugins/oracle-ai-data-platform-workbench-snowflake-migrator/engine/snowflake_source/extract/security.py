@@ -45,6 +45,7 @@ import datetime
 from typing import Callable
 
 from ..dialect import lexer
+from .catalog import SHOW_PAGE_SIZE, show_paged
 
 __all__ = ["build_security", "POLICY_CONSEQUENCE", "POLICY_KINDS",
            "POLICY_KIND_LABELS", "GRANT_CLASSES"]
@@ -150,18 +151,25 @@ GRANT_CLASSES = (
 _ACCOUNT_SCOPED_CLASSES = ("WAREHOUSE", "INTEGRATION")
 
 
-def _show(run_sql, what: str, db: str) -> list[dict]:
-    return run_sql(f"show {what} in database {lexer.qualify(db)}")
+def _show(run_sql, what: str, db: str) -> tuple[list[dict], str | None]:
+    """Rows, and why they are capped (None when complete). A bare SHOW stops
+    at 10,000 rows and still succeeds; see catalog.show_paged."""
+    return show_paged(run_sql, f"show {what} in database {lexer.qualify(db)}")
 
 
 def _collect(run_sql, what: str, databases: list[str],
              notes: list[str]) -> dict:
     items: list[dict] = []
     readable = True
+    capped: list[str] = []
     note = ""
     for db in databases:
         try:
-            for row in _show(run_sql, what, db):
+            rows, cap = _show(run_sql, what, db)
+            if cap:
+                capped.append(db)
+                notes.append(f"SHOW {what.upper()} in {db}: {cap}")
+            for row in rows:
                 items.append({
                     "name": row.get("name"),
                     "database": row.get("database_name") or db,
@@ -185,8 +193,13 @@ def _collect(run_sql, what: str, databases: list[str],
         # SHOW means "not visible to this role", which is not a zero.
         note = (f"not visible to this role: SHOW {what.upper()} was refused "
                 f"-- {note}")
+    if readable and capped:
+        note = (f"{len(items)} found -- stopped at the {SHOW_PAGE_SIZE:,}-row "
+                f'SHOW cap in {", ".join(capped)} and could not be paged, so '
+                f"this is a lower bound whatever the role's grants")
     return {"readable": readable, "note": note or f"{len(items)} found",
-            "count": len(items) if readable else None, "items": items}
+            "count": len(items) if readable else None, "items": items,
+            "capped": bool(capped)}
 
 
 def _entity_literal(db, schema, name) -> str:

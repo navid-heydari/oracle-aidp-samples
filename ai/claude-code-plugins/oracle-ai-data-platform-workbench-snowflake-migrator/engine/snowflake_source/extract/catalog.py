@@ -36,7 +36,8 @@ from ..dialect.identifiers import case_form, detect_collisions
 from ..dialect.types import map_type
 from .constraints import build_constraints
 
-__all__ = ["build_inventory", "SYSTEM_DBS", "ROW_COUNT_MODES", "SHOW_PAGE_SIZE"]
+__all__ = ["build_inventory", "SYSTEM_DBS", "ROW_COUNT_MODES", "SHOW_PAGE_SIZE",
+           "show_paged"]
 
 SYSTEM_DBS = frozenset({"SNOWFLAKE", "SNOWFLAKE_SAMPLE_DATA"})
 
@@ -111,6 +112,52 @@ def _show_all(run_sql: Callable[..., list[dict]], statement: str) -> list[dict]:
             # No usable cursor: stop rather than loop forever, and say so.
             return rows
         cursor = last
+
+
+def show_paged(run_sql: Callable[..., list[dict]], statement: str
+               ) -> tuple[list[dict], str | None]:
+    """Run a SHOW that may hit the row cap. Returns (rows, capped), where
+    `capped` is None for a complete read and otherwise says why the rows are
+    a lower bound.
+
+    For the census and security reads, which are database- or
+    account-scoped rather than schema-scoped. The bare statement goes first,
+    so a result under the cap costs exactly one statement, as it always did.
+    Only a result AT the cap is paged, and the paging is only trusted where
+    the rows show it can be: a `FROM '<name>'` cursor is exact when the
+    output is sorted by name, each page starts strictly after the cursor,
+    and no other row shares the cursor's name. An `IN DATABASE` result
+    ordered schema-first, a name that repeats across schemas at a page
+    boundary, or a SHOW that refuses LIMIT/FROM cannot be paged that way,
+    and the read is reported capped rather than silently short.
+    """
+    rows = list(run_sql(statement))
+    if len(rows) < SHOW_PAGE_SIZE:
+        return rows, None
+    cap = (f"the SHOW result stopped at the {SHOW_PAGE_SIZE:,}-row cap and "
+           f"could not be paged")
+    names = [r.get("name") for r in rows]
+    if not all(isinstance(n, str) and n for n in names) or names != sorted(names):
+        return rows, f"{cap}: its rows are not in name order, so a name cursor would skip rows"
+    page = rows
+    while len(page) >= SHOW_PAGE_SIZE:
+        cursor = page[-1]["name"]
+        if names.count(cursor) > 1:
+            return rows, (f"{cap}: the name {cursor!r} at the page boundary "
+                          f"is shared by more than one object")
+        literal = cursor.replace("'", "''")
+        try:
+            page = list(run_sql(
+                f"{statement} limit {SHOW_PAGE_SIZE} from '{literal}'"))
+        except Exception as exc:
+            return rows, f"{cap}: LIMIT/FROM was refused -- {str(exc)[:160]}"
+        more = [r.get("name") for r in page]
+        if not all(isinstance(n, str) and n for n in more) \
+                or more != sorted(more) or (more and more[0] <= cursor):
+            return rows, f"{cap}: a page did not resume after its cursor"
+        rows.extend(page)
+        names.extend(more)
+    return rows, None
 
 
 def build_inventory(run_sql: Callable[..., list[dict]],
