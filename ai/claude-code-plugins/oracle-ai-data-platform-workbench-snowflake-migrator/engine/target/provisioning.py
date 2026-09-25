@@ -317,24 +317,31 @@ def _match(items: list[dict], display_name: str) -> dict | None:
 
 
 def _poll(list_fn, display_name: str, delays: tuple[float, ...], *,
-          require_active: bool = False) -> dict | None:
-    """The item once it is visible (and ACTIVE, when asked for); None when it
-    never appeared. With `require_active`, an item that appeared but was
-    still settling when the budget ran out is returned as last seen, so the
-    caller can tell "never visible" from "visible, not yet ACTIVE"."""
-    last = None
+          require_active: bool = False) -> tuple[dict | None, str | None]:
+    """`(item, listing_error)`: the item once it is visible (and ACTIVE, when
+    asked for), else None. With `require_active`, an item that appeared but
+    was still settling when the budget ran out is returned as last seen, so
+    the caller can tell "never visible" from "visible, not yet ACTIVE".
+
+    `listing_error` is the last error when EVERY listing raised. That is
+    "could not look", not "absent": it used to be swallowed, so a 401 or 503
+    right after an accepted create was reported as "never became visible"
+    with the error recorded nowhere. One good listing is enough to make a
+    miss a real miss, so the error is then None."""
+    last, error, listed_once = None, None, False
     for attempt in range(len(delays) + 1):
         try:
             found = _match(list_fn().get("items") or [], display_name)
-        except Exception:
-            found = None
+            listed_once = True
+        except Exception as exc:
+            found, error = None, str(exc)[:200]
         if found is not None:
             last = found
             if not require_active or is_active(found):
-                return found
+                return found, None
         if attempt < len(delays):
             time.sleep(delays[attempt])
-    return last
+    return last, (None if listed_once else error)
 
 
 def _key(item: dict, fallback: str) -> str:
@@ -541,7 +548,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
 
     # 1 · workspace: look, create if absent, poll until visible AND ACTIVE --
     found = _match(call("list_workspaces").get("items") or [], ws_name.name)
-    ws_created = False
+    ws_created, ws_list_error = False, None
     if found is None:
         call("create_workspace",
              body=build_workspace_body(ws_name.name,
@@ -553,15 +560,20 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         # cluster created inside that window is a 409. So wait for ACTIVE,
         # not just for the name to appear; a slow ACTIVE is recorded, not a
         # stop, because the cluster POST below retries on the 409 anyway.
-        found = _poll(lambda: call("list_workspaces"), ws_name.name, delays,
-                      require_active=True)
+        found, ws_list_error = _poll(lambda: call("list_workspaces"),
+                                     ws_name.name, delays,
+                                     require_active=True)
         settling = found is not None and not is_active(found)
+        if ws_list_error is not None:
+            detail = f"{ws_name.name}: read_back_failed: {ws_list_error}"
+        elif settling:
+            detail = (f'{ws_name.name}: visible, but lifecycleState='
+                      f'{found.get("lifecycleState")} after the poll budget; '
+                      f'the cluster POST is retried on 409 while it settles')
+        else:
+            detail = ws_name.name
         step("workspace", "create_requested" if found is None else "created",
-             found is not None,
-             f'{ws_name.name}: visible, but lifecycleState='
-             f'{found.get("lifecycleState")} after the poll budget; the '
-             f'cluster POST is retried on 409 while it settles'
-             if settling else ws_name.name)
+             found is not None, detail)
     elif reuse_existing:
         step("workspace", "reused", True, _key(found, ws_name.name))
     else:
@@ -578,8 +590,18 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     ws_key = _key(found or {}, ws_name.name)
     out["workspace"]["key"] = ws_key
     if found is None:
-        step("halt", "stopped", False,
-             "the workspace never became visible; nothing else was attempted")
+        if ws_created and ws_list_error is not None:
+            step("halt", "stopped", False,
+                 f"the workspace {ws_name.name!r} was created (POST "
+                 f"accepted) but could not be listed to confirm it "
+                 f"({ws_list_error}); nothing else was attempted. Once "
+                 f"listing works, re-run the same command with "
+                 f"--reuse-existing to continue into it -- a plain re-run "
+                 f"would halt on name_taken")
+        else:
+            step("halt", "stopped", False,
+                 "the workspace never became visible; nothing else was "
+                 "attempted")
         return out
 
     # 2 · cluster ------------------------------------------------------------
@@ -596,6 +618,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         if ws_created else
         f"workspace {ws_name.name!r} (key {ws_key}) is the one being reused; "
         f"fix the cause above and re-run the same command.")
+    cl_list_error = None
     try:
         found = _match(
             call("list_clusters", workspace=ws_key).get("items") or [],
@@ -625,10 +648,13 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                      f"create_cluster: {str(exc)[:200]}")
                 step("halt", "stopped", False, resume)
                 return out
-        found = _poll(lambda: call("list_clusters", workspace=ws_key),
-                      cl_name.name, delays)
+        found, cl_list_error = _poll(
+            lambda: call("list_clusters", workspace=ws_key), cl_name.name,
+            delays)
         step("cluster", "create_requested" if found is None else "created",
-             found is not None, cl_name.name)
+             found is not None,
+             f"{cl_name.name}: read_back_failed: {cl_list_error}"
+             if cl_list_error is not None else cl_name.name)
     elif reuse_existing:
         step("cluster", "reused", True, _key(found, cl_name.name))
     else:
@@ -642,10 +668,13 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     if found is None:
         # Falling through would bake the DISPLAY NAME into four job bodies as
         # a clusterKey, and they would be "created" and unrunnable.
+        seen = ("was created (POST accepted) but could not be listed to "
+                f"confirm it ({cl_list_error})" if cl_list_error is not None
+                else "never became visible")
         step("halt", "stopped", False,
-             "the cluster never became visible, so its key is unknown; jobs "
-             "would be created bound to an invalid cluster. Nothing else was "
-             "attempted")
+             f"the cluster {seen}, so its key is unknown; jobs would be "
+             f"created bound to an invalid cluster. Nothing else was "
+             f"attempted. " + resume)
         return out
     cluster_key = _key(found, cl_name.name)
     out["cluster"]["key"] = cluster_key
@@ -684,13 +713,20 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                  f'{target["warehouse"]} -> {target["name"]}: '
                  f'{str(exc)[:200]}')
             continue
-        seen = _poll(lambda: call("list_clusters", workspace=ws_key),
-                     target["name"], delays)
+        seen, seen_error = _poll(
+            lambda: call("list_clusters", workspace=ws_key), target["name"],
+            delays)
         target["key"] = _key(seen or {}, target["name"]) if seen else None
+        if seen:
+            tail = ""
+        elif seen_error is not None:
+            tail = (" — accepted, but it could not be listed to confirm it; "
+                    f"read_back_failed: {seen_error}")
+        else:
+            tail = " — accepted, but it never became visible"
         step("warehouse-cluster",
              "created" if seen else "create_requested", seen is not None,
-             f'{target["warehouse"]} -> {target["name"]}'
-             + ("" if seen else " — accepted, but it never became visible"))
+             f'{target["warehouse"]} -> {target["name"]}' + tail)
 
     # 3 · libraries (only when a fallback needs them) ------------------------
     if pypi or maven:
@@ -928,10 +964,13 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                               cluster_key=cluster_key)
         try:
             call("create_job", workspace=ws_key, body=body)
-            found = _poll(lambda: call("list_jobs", workspace=ws_key),
-                          spec["name"], delays)
+            found, job_list_error = _poll(
+                lambda: call("list_jobs", workspace=ws_key), spec["name"],
+                delays)
             step("job", "created" if found else "create_requested",
-                 found is not None, spec["name"])
+                 found is not None,
+                 f'{spec["name"]}: read_back_failed: {job_list_error}'
+                 if job_list_error is not None else spec["name"])
         except Exception as exc:
             step("job", "failed", False, f'{spec["name"]}: {str(exc)[:200]}')
 
@@ -1065,7 +1104,9 @@ def render_provision(res: dict) -> str:
         "",
         "Pending is pending: `create_requested` means the API accepted the "
         "request and the object never became visible within the poll budget "
-        "— check the console before proceeding.",
+        "— check the console before proceeding. `read_back_failed` in its "
+        "detail means the listing itself errored: the object may well exist, "
+        "it just could not be looked at.",
         "",
         "Next: run the `snowmig_00_discover` job (or the script by hand), "
         "then structure, then copy schema-by-schema, then reconcile. Every "
