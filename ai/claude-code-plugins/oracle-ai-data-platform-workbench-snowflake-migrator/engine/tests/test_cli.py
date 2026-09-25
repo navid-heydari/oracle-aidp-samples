@@ -1,6 +1,9 @@
 """CLI wiring. The offline subcommands are tested with no connection."""
 import json
 import pathlib
+import sys
+
+import pytest
 
 from snowmig import main
 
@@ -1218,3 +1221,46 @@ def test_a_pat_path_still_works_unchanged(tmp_path):
     coords = snowmig._snowflake_coords(args)
     assert coords["pat_path"] == pat.as_posix()
     assert coords["token"] is None
+
+
+# ------------- an explicit --auth wins over the config, however it is spelled
+#
+# Found on review. `--auth` defaulted to "keypair", so _snowflake_coords
+# guessed whether the flag had been typed with `"--auth" not in sys.argv`.
+# `--auth=keypair` and the prefix `--au keypair` never put that literal
+# token in argv, and main(argv) does not set sys.argv at all -- so with
+# `auth: password` in the config, a one-run `--auth=keypair --key-path ...`
+# silently connected with the password, against the --config help ("Any
+# flag below overrides what it says").
+
+_PASSWORD_CONFIG = ("snowflake:\n  account: AC\n  user: U\n  auth: password\n"
+                    "  password: not-a-real-password\n  database: D\n")
+
+
+@pytest.mark.parametrize("spelling", [["--auth", "keypair"],
+                                      ["--auth=keypair"],
+                                      ["--au", "keypair"]],
+                         ids=["separate", "equals", "prefix"])
+def test_an_explicit_auth_flag_overrides_the_config(tmp_path, monkeypatch,
+                                                    spelling):
+    import snowmig
+    cfg = tmp_path / "snowmig-config.yaml"
+    cfg.write_text(_PASSWORD_CONFIG, encoding="utf-8")
+    # What the process was started with is not what main(argv) parses.
+    monkeypatch.setattr(sys, "argv", ["snowmig"])
+    args = snowmig.build_parser().parse_args(
+        ["assess", "--config", str(cfg), *spelling])
+    assert snowmig._snowflake_coords(args)["auth"] == "keypair"
+
+
+def test_without_the_flag_the_config_auth_holds_and_keypair_is_the_default(
+        tmp_path, monkeypatch):
+    import snowmig
+    cfg = tmp_path / "snowmig-config.yaml"
+    cfg.write_text(_PASSWORD_CONFIG, encoding="utf-8")
+    args = snowmig.build_parser().parse_args(["assess", "--config", str(cfg)])
+    assert snowmig._snowflake_coords(args)["auth"] == "password"
+    bare = tmp_path / "bare.yaml"
+    bare.write_text("snowflake:\n  account: AC\n  user: U\n", encoding="utf-8")
+    args = snowmig.build_parser().parse_args(["assess", "--config", str(bare)])
+    assert snowmig._snowflake_coords(args)["auth"] == "keypair"

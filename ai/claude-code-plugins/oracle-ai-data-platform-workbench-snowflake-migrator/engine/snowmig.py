@@ -361,15 +361,15 @@ def _snowflake_coords(args) -> dict:
     def pick(flag: str, key: str | None = None):
         return getattr(args, flag, None) or config.get(key or flag)
 
-    auth = getattr(args, "auth", None)
-    # argparse defaults `--auth` to keypair, so "the user typed it" cannot be
-    # distinguished from the default -- the config wins when it says
-    # something else and no flag was passed.
-    if config.get("auth") and auth == "keypair" \
-            and "--auth" not in sys.argv:
-        auth = str(config["auth"])
+    # `--auth` has no argparse default, so None means "not typed" and the
+    # flag, the config and then keypair apply in that order. It used to
+    # default to keypair and guess "typed" from `"--auth" in sys.argv`,
+    # which `--auth=keypair`, the prefix `--au` and main(argv) all defeat:
+    # the config's `auth: password` silently won over an explicit flag.
+    auth = (getattr(args, "auth", None) or config.get("auth")
+            or "keypair")
 
-    return {"auth": auth or "keypair",
+    return {"auth": str(auth),
             "account": pick("account"), "host": pick("host"),
             "user": pick("user"),
             "role": pick("role"), "warehouse": pick("warehouse"),
@@ -1852,8 +1852,9 @@ def _add_snowflake_args(p) -> None:
                         "rehearsing a least-privilege migration and only "
                         "appearing to")
     p.add_argument("--warehouse")
-    p.add_argument("--auth", default="keypair",
-                   choices=["keypair", "pat", "password", "externalbrowser"])
+    p.add_argument("--auth", default=None,
+                   choices=["keypair", "pat", "password", "externalbrowser"],
+                   help="default: the config's `auth:`, else keypair")
     p.add_argument("--key-path")
     # No --key-passphrase: every secret is a path or lives in the config.
     # main() refuses the old spelling by name (see _REMOVED_SECRET_FLAGS).
