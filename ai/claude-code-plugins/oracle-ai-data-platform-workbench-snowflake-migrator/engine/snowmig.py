@@ -487,6 +487,18 @@ def cmd_stages(args) -> int:
     return 0
 
 
+def census_floor_line(census: dict) -> str:
+    """The console line for a census that did not read everything.
+
+    `unreadable` holds a denied kind, a SHOW read at the result cap, and an
+    object whose body could not be scanned -- one entry each. Calling every
+    entry an unreadable KIND overstated one skipped task body as a whole
+    kind lost.
+    """
+    return (f'  census: {len(census["unreadable"])} read(s) incomplete '
+            f'(CENSUS.md, "Could not be read") -- the counts are a floor')
+
+
 def cmd_assess(args) -> int:
     out = pathlib.Path(args.out_dir)
     inv = _assess_inventory(args)
@@ -498,8 +510,7 @@ def cmd_assess(args) -> int:
         print(f'  census: {c["total"]} object(s) that are not tables or views '
               f'and cannot migrate')
         if c["unreadable"]:
-            print(f'  census: {len(c["unreadable"])} kind(s) unreadable — the '
-                  f'count is a floor', file=sys.stderr)
+            print(census_floor_line(c), file=sys.stderr)
     if inv.get("identifier_case_collisions"):
         print("HALT: identifier-case collisions; see INVENTORY.md", file=sys.stderr)
         return HALT

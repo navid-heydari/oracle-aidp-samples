@@ -251,3 +251,15 @@ def test_a_refine_hook_that_raises_keeps_the_row_under_its_parent_kind(
     assert stage["reason"] == spec["reason"]
     assert any("STAGE DB.S.STG" in n and "unexpected STAGE_TYPE" in n
                for n in census["unreadable"]), census["unreadable"]
+
+
+def test_the_console_does_not_call_a_skipped_body_an_unreadable_kind():
+    """One task body the census could not scan is one incomplete read, not a
+    kind lost; the console line used to say `1 kind(s) unreadable`."""
+    import snowmig
+    line = snowmig.census_floor_line({"unreadable": [
+        "TASK DB.S.T1: body not scannable (boom)",
+        "TASK DB.S.T2: body not scannable (boom)"]})
+    assert "kind(s) unreadable" not in line
+    assert "2 read(s) incomplete" in line
+    assert "floor" in line
