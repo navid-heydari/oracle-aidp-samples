@@ -114,9 +114,13 @@ def run_demo(out_dir) -> dict:
     _write(out, "inventory.json", inv)
     _write(out, "INVENTORY.md", render_inventory(inv))
     _write(out, "CENSUS.md", render_census(inv["census"]))
+    # Named from the census itself: a hand-written list named 4 of the 6
+    # kinds and left out the alert and the outbound share.
+    kinds = ", ".join(f"{n} {k.lower()}" for k, n in sorted(
+        (inv["census"].get("by_kind") or {}).items()) if n)
     stage(f'assess: {inv["object_count"]} object(s) in {DEMO_STANDARD_CATALOG.upper()}; '
           f'census found {inv["census"]["total"]} object(s) that cannot migrate '
-          f'(a task, a stream, a procedure, a JavaScript UDF)')
+          f'({kinds or "none"})')
     lessons.append(
         "TIMESTAMP_NTZ was downgraded to TIMESTAMP on purpose "
         "(`--timestamp-ntz timestamp`): the AIDP catalog API silently rejects "
@@ -220,11 +224,16 @@ def run_demo(out_dir) -> dict:
                      target_catalog=DEMO_STANDARD_CATALOG, execute=False)
     _write(out, "provision_result.json", prov)
     _write(out, "PROVISION.md", render_provision(prov))
+    # Counted from provision's own steps: data-migration-scripts/ holds only
+    # generated notebooks now, so counting *.py there said 0 beside a
+    # PROVISION.md listing five uploads.
+    uploads = sum(1 for st in prov["steps"] if st.get("step") == "upload")
+    jobs = sum(1 for st in prov["steps"] if st.get("step") == "job")
     stage(f'provision (dry run): would ensure workspace '
           f'`{prov["workspace"]["name"]}` (name translated from '
           f'"{prov["workspace"]["requested"]}"), the migration_assets '
           f'cluster, the backup-snowflake-migration/ folder with '
-          f'{len(list(scripts_dir.glob("*.py")))} script(s), and 4 jobs — '
+          f'{uploads} notebook(s) uploaded, and {jobs} jobs — '
           f'nothing created without --execute')
     lessons.append(
         "The workspace name was TRANSLATED before any create "
@@ -358,8 +367,10 @@ def _render_demo(narrative: list[str], lessons: list[str]) -> str:
         "- Snowflake is reached read-only over a real connection; the "
         "transport still refuses every non-read verb, whatever the grant "
         "allows.",
-        "- AIDP coordinates (DataLake OCID, workspace, cluster, catalog) are "
-        "asked for per conversation, never stored or assumed.",
+        "- AIDP coordinates (DataLake OCID, workspace, cluster, catalog) come "
+        "from the `aidp:` block of the one config file, or a flag for one "
+        "run; every stage announces where each came from, and none is "
+        "assumed.",
         "- `catalog` and `deploy` are dry runs unless `--execute` is passed, "
         "and nothing is reported as done until it is read back and compared.",
         "- The asynchronous-create, name-poisoning and type-drift behaviours "
