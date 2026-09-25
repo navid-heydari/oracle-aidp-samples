@@ -218,7 +218,10 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig run \
 
 `run` starts the job, polls it to a terminal state, and writes `RUN_*.md` with
 the task output as evidence. A poll budget that runs out is reported as
-**STILL RUNNING** -- never rounded to success, never to failure.
+**STILL RUNNING** -- never rounded to success, never to failure. A status
+that could not be read (a 503, an expired session) is **STATUS COULD NOT BE
+READ**, exit 1, with the run key in `RUN_*.md`: the run was submitted and may
+still be going, so check it in the console before starting another.
 
 #### The first run on a new workspace often is never picked up
 

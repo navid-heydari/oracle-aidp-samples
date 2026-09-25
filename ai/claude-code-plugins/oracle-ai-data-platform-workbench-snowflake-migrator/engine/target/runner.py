@@ -40,9 +40,12 @@ def _session_expired(*streams: str | None) -> bool:
 def expired_session_message(profile: str | None, region: str | None) -> str:
     who = f" --profile {profile}" if profile else ""
     where = f" --region {region}" if region else ""
-    return ("the OCI CLI session profile has expired; nothing was sent. "
-            f"Refresh it with `oci session authenticate{who}{where}` and "
-            "re-run this stage.")
+    # "This call", not "nothing": the message is raised by ONE call, and a
+    # run submitted by an earlier call in the same stage was sent. Saying
+    # nothing was sent after a job run was accepted invited a second run.
+    return ("the OCI CLI session profile has expired, so this call was not "
+            f"sent. Refresh it with `oci session authenticate{who}{where}` "
+            "and re-run.")
 
 
 def spool_body(body: dict, *, prefix: str) -> str:

@@ -1109,22 +1109,61 @@ def cmd_run(args) -> int:
               f"within {args.cold_start_seconds:.0f}s (its task never "
               f"started). Cancelled it; resubmitted as {fresh}.", flush=True)
 
-    result = watch_job(call, workspace=args.workspace, job_key=job_key,
-                       parameters=parameters or None,
-                       poll_seconds=args.poll_seconds,
-                       max_polls=args.max_polls, on_poll=_on_poll,
-                       cold_start_seconds=args.cold_start_seconds,
-                       cold_start_restarts=args.cold_start_restarts,
-                       on_restart=_on_restart)
-    result["job"] = args.job
-    result["job_key"] = job_key
-    result["workspace"] = args.workspace
-    result["parameters"] = parameters
+    # Every run key is printed the moment it exists. Once a run is submitted
+    # it is the operator's evidence, whatever the watch does next: a watch
+    # that raised used to leave the key only inside an echoed GET URI.
+    submitted: list[str] = []
+
+    def _on_submit(run_key: str) -> None:
+        submitted.append(run_key)
+        print(f"  submitted: run {run_key}", flush=True)
 
     slug = (args.job or job_key).replace("/", "_")
-    _write(out, f"run_{slug}.json", result)
-    _write(out, f"RUN_{slug}.md", _render_run(result))
 
+    def _record(result: dict) -> None:
+        result["job"] = args.job
+        result["job_key"] = job_key
+        result["workspace"] = args.workspace
+        result["parameters"] = parameters
+        result["submitted_runs"] = list(submitted)
+        _write(out, f"run_{slug}.json", result)
+        _write(out, f"RUN_{slug}.md", _render_run(result))
+
+    try:
+        result = watch_job(call, workspace=args.workspace, job_key=job_key,
+                           parameters=parameters or None,
+                           poll_seconds=args.poll_seconds,
+                           max_polls=args.max_polls, on_poll=_on_poll,
+                           cold_start_seconds=args.cold_start_seconds,
+                           cold_start_restarts=args.cold_start_restarts,
+                           on_restart=_on_restart, on_submit=_on_submit)
+    except Exception as exc:
+        if not submitted:
+            # Nothing reached AIDP, so the transport's own message is true.
+            raise
+        # A run WAS submitted. Its record is written, and the message says
+        # so: "nothing was sent ... re-run this stage" about a run that may
+        # be copying rows right now sends the operator to start another.
+        text = str(exc)[:300]
+        _record({"run_key": submitted[-1], "status": "UNREADABLE",
+                 "message": text, "output": "", "terminal": False,
+                 "restarts": [], "polls": None, "unrecognised": False,
+                 "status_unreadable": True, "status_error": text,
+                 "cancel_unconfirmed": False, "ok": False})
+        print(f"  {slug}: run {submitted[-1]} WAS submitted, but the watch "
+              f"stopped: {text}\n  It may still be running. Check it in the "
+              f"console before anything else; do not start another run "
+              f"until it has ended. The record is RUN_{slug}.md.",
+              file=sys.stderr)
+        return 1
+    _record(result)
+
+    if result.get("status_unreadable"):
+        print(f'  {slug}: run {result["run_key"]} was submitted, but its '
+              f'status could not be read ({result.get("status_error")}). It '
+              f'may still be running: check it in the console, and do not '
+              f'start another run until it has ended.', file=sys.stderr)
+        return 1
     if not result["terminal"]:
         if result.get("unrecognised"):
             # Neither a verdict nor "still going": a status this plugin does
@@ -1157,7 +1196,16 @@ def cmd_run(args) -> int:
 def _render_run(result: dict) -> str:
     """The workflow run as evidence: what ran, what it returned, its log."""
     polls = result.get("polls", "?")
-    if not result.get("terminal") and result.get("unrecognised"):
+    if result.get("status_unreadable"):
+        verdict = (f"**STATUS COULD NOT BE READ** — run "
+                   f"`{result.get('run_key')}` was submitted, but its status "
+                   f"could not be read"
+                   + (f" after {polls} poll(s)" if polls else "")
+                   + f": {result.get('status_error')}. It may still be "
+                   f"running. This is neither success nor failure: check it "
+                   f"in the console, and do not start another run until it "
+                   f"has ended.")
+    elif not result.get("terminal") and result.get("unrecognised"):
         verdict = (f'**UNRECOGNISED STATE `{result.get("status")}`** — after '
                    f'{polls} poll(s) the run reports a status this plugin '
                    f'classifies as neither running nor ended. This is neither '
