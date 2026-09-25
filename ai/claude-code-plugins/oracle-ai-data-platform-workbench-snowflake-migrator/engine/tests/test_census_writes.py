@@ -184,3 +184,70 @@ def test_planned_objects_lists_the_loads_that_stop():
     section = md[md.index(head) + len(head):].split("\n## ", 1)[0]
     assert "`DB.S.T`" in section
     assert "`DB.S.P`" in section
+
+
+# ------------------------------------------- one unreadable body, one object
+#
+# Review 2026-09-25. A task body `insert into T select 1 // don't` has a
+# Snowflake `//` line comment, and the apostrophe in it opened a string
+# literal the lexer never saw close. `written_tables` raised
+# UnterminatedLiteral out of `_entry`, which sat OUTSIDE the per-database
+# try, so the exception escaped build_census and `assess` itself: exit 1,
+# "error: unterminated string starting at offset 43", no object named and
+# NO inventory.json, INVENTORY.md or CENSUS.md -- after the whole inventory
+# had already been read. A re-run failed identically.
+#
+# The lexer is being taught `//` separately. Whatever else a body contains
+# that a scanner cannot read, the cost must be that object's linkage, not
+# the census: the object is still counted, and the failure is named in
+# census["unreadable"] against that object.
+
+def test_a_body_the_scanner_cannot_read_costs_its_linkage_not_the_census(
+        monkeypatch):
+    import snowflake_source.extract.census as census_mod
+
+    def boom(body, db, schema):
+        raise ValueError("unterminated string starting at offset 43")
+
+    monkeypatch.setattr(census_mod, "written_tables", boom)
+    census = build_census(FakeSql(_responses(**{
+        "show tasks": [_task("insert into T select 1 // don't")],
+        "information_schema.pipes": [_pipe("COPY INTO T FROM @STG")]})),
+        ["DB"])
+    assert census["kinds"]["TASK"]["count"] == 1
+    assert census["kinds"]["PIPE"]["count"] == 1
+    task = _one(census, "TASK")
+    assert "writes" not in task
+    assert "writes not determined" in task["detail"], task["detail"]
+    noted = [n for n in census["unreadable"] if "DB.S.T" in n]
+    assert noted and "unterminated string" in noted[0], census["unreadable"]
+    assert any("DB.S.P" in n for n in census["unreadable"])
+
+
+def test_a_genuinely_unterminated_literal_does_not_abort_the_census():
+    """No monkeypatch: the real lexer, on a body no dialect rule can close."""
+    census = build_census(FakeSql(_responses(**{"show tasks": [
+        _task("insert into T select 'abc")]})), ["DB"])
+    assert census["kinds"]["TASK"]["count"] == 1
+    assert any("TASK DB.S.T" in n for n in census["unreadable"])
+
+
+def test_a_refine_hook_that_raises_keeps_the_row_under_its_parent_kind(
+        monkeypatch):
+    """A refine only ever narrows. If it cannot, the row keeps the kind and
+    the reason the census has always given it -- and says why."""
+    from snowflake_source.extract.census import KINDS
+    spec = next(k for k in KINDS if k["kind"] == "STAGE")
+
+    def boom(row):
+        raise TypeError("unexpected STAGE_TYPE shape")
+
+    monkeypatch.setitem(spec, "refine", boom)
+    census = build_census(FakeSql(_responses(**{"information_schema.stages": [
+        {"STAGE_NAME": "STG", "STAGE_SCHEMA": "S", "STAGE_TYPE": "?"}]})),
+        ["DB"])
+    assert census["kinds"]["STAGE"]["count"] == 1
+    stage = _one(census, "STAGE")
+    assert stage["reason"] == spec["reason"]
+    assert any("STAGE DB.S.STG" in n and "unexpected STAGE_TYPE" in n
+               for n in census["unreadable"]), census["unreadable"]

@@ -617,7 +617,8 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
             answered += 1
             for row in rows:
                 entry = _entry(kind, spec, db, row,
-                               include_definitions=include_definitions)
+                               include_definitions=include_definitions,
+                               notes=notes)
                 objects.append(entry)
                 tally[entry["kind"]] = tally.get(entry["kind"], 0) + 1
         readable = not denied
@@ -665,7 +666,17 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
 
 
 def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
-           include_definitions: bool) -> dict:
+           include_definitions: bool, notes: list[str] | None = None) -> dict:
+    """One census row. Never raises on what the row CONTAINS.
+
+    The refine hook and the body scan read free text a scanner may not
+    understand -- a `// don't` comment in a task body used to raise out of
+    here, past the per-database try, and take `assess` down with no artifact
+    written. Either failure now costs that one object its refinement or its
+    linkage; the object is still counted, and `notes` (the census's
+    `unreadable` list) names it with the error.
+    """
+    notes = notes if notes is not None else []
     if spec["source"] == "information_schema":
         name = row.get(spec["name_col"])
         schema = row.get(spec["schema_col"])
@@ -714,7 +725,15 @@ def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
     # The row may not be the kind the spec assumed. `refine` narrows it and is
     # allowed to overrule the language verdict, because an external function
     # has no handler language to have a verdict about.
-    narrowed = (spec.get("refine") or (lambda _row: None))(row) or {}
+    try:
+        narrowed = (spec.get("refine") or (lambda _row: None))(row) or {}
+    except Exception as exc:
+        # Refinement only ever narrows, so without it the row keeps the kind
+        # and reason it would have had with the deciding column absent.
+        narrowed = {}
+        notes.append(f"{kind} {identifier}: not refined "
+                     f"({str(exc)[:200]}); reported as a plain "
+                     f"{kind.lower().replace('_', ' ')}")
     entry.update(narrowed)
 
     # Appended after the narrowing so it lands on the reason the object
@@ -729,7 +748,18 @@ def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
     # migrating table stops being populated at cutover; absent, not empty,
     # when the body names none this can read.
     if spec.get("writes_col") and db is not None and row.get(spec["writes_col"]):
-        writes = written_tables(str(row[spec["writes_col"]]), db, str(schema))
+        try:
+            writes = written_tables(str(row[spec["writes_col"]]), db,
+                                    str(schema))
+        except Exception as exc:
+            # Not "writes none": the body could not be scanned, so which
+            # table it fills is unknown, and the detail says so.
+            writes = []
+            entry["detail"] = (f'{entry["detail"]} '
+                               f'writes not determined').strip()
+            notes.append(f"{kind} {identifier}: body not scannable "
+                         f"({str(exc)[:200]}), so the table(s) it writes are "
+                         f"not determined; the object is still counted")
         if writes:
             entry["writes"] = writes
             entry["detail"] = (f'{entry["detail"]} '
