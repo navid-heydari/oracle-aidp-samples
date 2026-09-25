@@ -49,6 +49,13 @@ The rewrite matches whole three-part names on code and identifier segments only
 a quoted part must match exactly, an unquoted one case-insensitively, and the
 plan lists only the references that were actually rewritten.
 
+A view's header column list (`create view V(CUSTOMER, TOTAL) as select
+CUST_ID, SUM(AMT) ...`) renames the body's output columns, so it is carried
+(`R44_VIEW_COLUMN_LIST`): `CREATE VIEW <fqn> (CUSTOMER, TOTAL) AS ...` in the
+SQL, and `SELECT * FROM (<body>) AS named_columns(CUSTOMER, TOTAL)` as the
+catalog API's viewText, which has no column-list field. A list that cannot be
+read blocks the view.
+
 | Construct | What happens |
 |---|---|
 | `IFF(` | **Translated** to `IF()` (`T01`) |

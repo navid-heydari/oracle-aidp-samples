@@ -30,7 +30,8 @@ from dataclasses import asdict, dataclass, field
 
 from snowflake_source.dialect import lexer
 from snowflake_source.dialect.views import (  # noqa: F401  (re-exported)
-    detect_unsupported_constructs, extract_view_body, translate_view_body,
+    detect_unsupported_constructs, extract_view_body, extract_view_columns,
+    translate_view_body,
 )
 
 __all__ = ["RuleApplication", "RewriteResult", "UnsupportedDDL",
@@ -598,6 +599,7 @@ def build_create_view(record: dict, target_fqn: str,
 
     try:
         body = extract_view_body(ddl)
+        view_columns = extract_view_columns(ddl)
         # Inside the guard on purpose: a translator that cannot read one view
         # blocks THAT view with the reason, it does not abort the stage.
         translated = translate_view_body(body)
@@ -693,7 +695,21 @@ def build_create_view(record: dict, target_fqn: str,
     # `description`, so the reviewed statement and the applied object carry
     # the same documentation rather than one of them quietly carrying less.
     res.description = str(meta.get("comment") or "")
+    # The header column list RENAMES the body's output columns, so it is
+    # emitted as written. Dropped, `V(CUSTOMER, TOTAL) as select CUST_ID,
+    # SUM(AMT)` was created with columns CUST_ID and SUM(AMT) while the plan
+    # and the catalog API's viewFields said CUSTOMER and TOTAL.
+    if view_columns:
+        res.rules_applied.append(RuleApplication(
+            "R44_VIEW_COLUMN_LIST",
+            "the source view's column list is carried: "
+            + ", ".join(view_columns)
+            + ". The catalog-API body has no column-list field, so its "
+              "viewText names them with SELECT * FROM (<body>) AS "
+              "named_columns(<list>)"))
     res.sql = (f"CREATE VIEW IF NOT EXISTS {_qualify(target_fqn)}"
+               + (" (" + ", ".join(_q(c) for c in view_columns) + ")"
+                  if view_columns else "")
                + (f" COMMENT {quote_spark_string(res.description)}"
                   if res.description else "")
                + f" AS\n{rewritten}")
@@ -709,11 +725,21 @@ def build_create_view(record: dict, target_fqn: str,
 
 
 def _view_text(sql: str | None) -> str:
-    """The SELECT body of a generated CREATE VIEW, for the catalog API."""
+    """The SELECT of a generated CREATE VIEW, for the catalog API.
+
+    The API takes the query alone, so a column list in the CREATE VIEW has
+    nowhere to go but into the query: the body is wrapped so its output
+    columns carry the list's names, as they do in the reviewed SQL.
+    """
     try:
-        return extract_view_body(sql or "")
+        body = extract_view_body(sql or "")
+        columns = extract_view_columns(sql or "")
     except ValueError:
         return ""
+    if not columns:
+        return body
+    return (f"SELECT * FROM (\n{body}\n) AS named_columns("
+            + ", ".join(_q(c) for c in columns) + ")")
 
 
 def build_ddl_payload(inventory: dict, plan: dict) -> dict:
