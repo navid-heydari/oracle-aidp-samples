@@ -53,6 +53,15 @@ every statement these notebooks issue against the source is a SELECT.
 The shared helper (`how the source is read, in either mode`) is inlined into
 every notebook that needs it; it is no longer a separate upload.
 
+All three of 01, 02 and 03 address the **target schema the approved plan
+names** (`target_fqn` in `ddl_plan.json`, e.g. `db_core` under a bronze
+prefix), not `--schema` itself; the source schema's own name stands in only
+where the plan names none. `--target-schema` may restate the plan's schema
+in any case, never contradict it. Schema names compare case-insensitively,
+as Spark resolves them, and the copy refuses to run when the structure
+report on disk targets a different schema rather than widening its scope to
+the whole manifest.
+
 ## Two source modes — use `connector`
 
 **Discover schemas and tables by running the workflow in `connector` mode.
@@ -131,7 +140,7 @@ every report with exit 0.
 | `sum_mismatch` | counts equal, a decimal column does not sum equal | **yes** |
 | `type_drift` | a source DECIMAL column is not DECIMAL, or narrower, on the target; NOT copied — an INSERT would round or truncate with the count intact | **yes** |
 | `failed` | the copy raised; `insert_completed: true` means the rows landed before verification failed, so re-copy with `--mode overwrite`, never `append` | **yes** |
-| `target_missing` | no table to copy into (usually `not_in_plan` upstream) | no |
+| `target_missing` | no table to copy into (usually `not_in_plan` upstream) | no — **yes** when the structure report records the table `created` or `already_existed` |
 
 A re-run never softens a recorded failure: `count_mismatch`, `sum_mismatch`,
 `type_drift` and `failed` stand until a real re-copy verifies the table.
@@ -155,8 +164,9 @@ live catalog)
 | `COUNT_DRIFT` | `--counts` only: verified at N rows, the target now holds a different number — changed since the copy, not by it | **yes** |
 | `TARGET_UNREADABLE` | `SHOW TABLES` failed; not the same as empty | **yes** |
 
-A report written for a **different target catalog** is ignored by reconcile
-(and named in the report), never applied to this one.
+A report written for a **different target** — another catalog, or another
+schema than the one the plan names — is ignored by reconcile (and named in
+the report), never applied to this one.
 
 ## The intended run, per schema
 

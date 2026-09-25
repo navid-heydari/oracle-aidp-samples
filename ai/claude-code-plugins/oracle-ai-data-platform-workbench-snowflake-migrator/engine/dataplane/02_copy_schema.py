@@ -64,6 +64,10 @@ _DECIMAL = re.compile(r"^decimal\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
 # nothing (skip-existing over a table with rows) never softens one of these.
 _COPY_FAILURES = ("count_mismatch", "sum_mismatch", "type_drift", "failed")
 
+# Structure statuses that mean the table IS there. A copy that then cannot
+# find it has not "nothing to do": it failed to copy into a created table.
+_STRUCTURE_PRESENT = ("created", "already_existed")
+
 
 def q(identifier: str) -> str:
     return "`" + str(identifier).replace("`", "``") + "`"
@@ -86,6 +90,77 @@ def fail(msg: str) -> int:
     print(f"ERROR: {msg}", flush=True)
     print(f"error: {msg}", file=sys.stderr)
     return 1
+
+
+def _same(a: str, b: str) -> bool:
+    """Spark resolves catalog and schema names case-insensitively, so two
+    targets that differ only in case are the same place. Comparing them as
+    exact strings dropped the structure report for `lake.core` when this run
+    spelled it `lake.CORE`, and the copy fell back to the whole manifest."""
+    return str(a).casefold() == str(b).casefold()
+
+
+def planned_target_schemas(ddl_plan: dict, schema: str) -> set[str]:
+    """Every target schema the approved plan puts source schema `schema` in.
+
+    The same reading as 01_create_structure's `targets_from_ddl_plan`: a
+    TABLE statement with a three-part `source_identifier` and a three-part
+    `target_fqn`. 01 creates the table where the plan says, so the copy has
+    to look there too -- deriving the schema from `--schema` again copied
+    into `lake.CORE` while 01 had created `lake.db_core`.
+    """
+    out: set[str] = set()
+    for stmt in ddl_plan.get("statements") or []:
+        source = str(stmt.get("source_identifier") or "").split(".")
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(source) != 3 or len(target) != 3:
+            continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue
+        if source[1] == schema:
+            out.add(target[1])
+    return out
+
+
+def plan_catalogs(ddl_plan: dict) -> set[str]:
+    """Every catalog the plan targets (01 refuses a run for another one)."""
+    out = set()
+    for stmt in ddl_plan.get("statements") or []:
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(target) == 3:
+            out.add(target[0])
+    return out
+
+
+def resolve_target_schema(schema: str, planned: set[str],
+                          override: str | None) -> tuple[str | None, str | None]:
+    """`(target_schema, None)`, or `(None, refusal)`: the rule 01 applies.
+
+    The approved plan decides; `--target-schema` may restate it (in any
+    case) but not contradict it; only where the plan is silent does the
+    source schema name stand in.
+    """
+    if override:
+        if not planned:
+            return override, None
+        match = next((p for p in sorted(planned) if _same(p, override)), None)
+        if match is None:
+            return None, (
+                f"error: --target-schema {override!r} contradicts the "
+                f"approved plan, which puts {schema} in "
+                f"{', '.join(sorted(planned))} -- where 01_create_structure "
+                f"created it. The plan is the reviewed artifact; change it, "
+                f"or drop the flag.")
+        return match, None
+    if len(planned) == 1:
+        return next(iter(planned)), None
+    if len(planned) > 1:
+        return None, (
+            f"error: the approved plan puts source schema {schema} in more "
+            f"than one target schema ({', '.join(sorted(planned))}); this "
+            f"stage copies one schema per run. Pass --target-schema to say "
+            f"which.")
+    return schema, None
 
 
 def _count(spark, fqn: str) -> int:
@@ -313,7 +388,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--target-catalog", required=True)
     ap.add_argument("--schema", required=True,
                     help="ONE schema per run — that is the operating unit")
-    ap.add_argument("--target-schema", default=None)
+    ap.add_argument("--target-schema", default=None,
+                    help="default: the schema the approved plan's "
+                         "target_fqn names for --schema, as in "
+                         "01_create_structure; --schema itself only where "
+                         "the plan is silent. Refused when it contradicts "
+                         "the plan")
+    ap.add_argument("--ddl-plan",
+                    help="path to ddl_plan.json (default: ../plan/"
+                         "ddl_plan.json next to --reports-dir); read for "
+                         "the target schema only")
     ap.add_argument("--tables", nargs="*", default=None,
                     help="subset; default: every table the manifest lists")
     ap.add_argument("--mode", choices=("skip-existing", "append", "overwrite"),
@@ -346,16 +430,73 @@ def main(argv: list[str] | None = None) -> int:
     if record is None:
         return fail(f"error: schema {args.schema!r} not in the manifest")
 
-    target_schema = args.target_schema or args.schema
+    # The approved plan decides the target namespace, exactly as it does for
+    # 01_create_structure. A plan that is not there is a silent plan (01 in
+    # --mode ctas or manifest never reads one); a plan the operator NAMED
+    # and that is not there is a mistake worth stopping on.
+    ddl_path = (pathlib.Path(args.ddl_plan) if args.ddl_plan
+                else reports.parent / "plan" / "ddl_plan.json")
+    planned: set[str] = set()
+    if ddl_path.is_file():
+        ddl_plan = json.loads(ddl_path.read_text(encoding="utf-8"))
+        stray = {c for c in plan_catalogs(ddl_plan)
+                 if not _same(c, args.target_catalog)}
+        if stray:
+            return fail(
+                f"error: the approved plan targets catalog(s) "
+                f"{', '.join(sorted(stray))}, and this run was given "
+                f"--target-catalog {args.target_catalog}; "
+                f"01_create_structure refuses that pair, so there is "
+                f"nothing here it created. Point this run at the catalog "
+                f"the plan names.")
+        planned = planned_target_schemas(ddl_plan, args.schema)
+    elif args.ddl_plan:
+        return fail(f"error: --ddl-plan {ddl_path} is not there")
+    target_schema, refusal = resolve_target_schema(
+        args.schema, planned, args.target_schema)
+    if refusal:
+        return fail(refusal)
+    log(f"target schema {target_schema}: "
+        + ("from the approved plan" if planned else
+           "from --target-schema" if args.target_schema else
+           "the source schema's own name (the plan names none for it)"))
+
     path = reports / f"copy_report_{args.schema.lower()}.json"
     target = f"{args.target_catalog}.{target_schema}"
+
+    # What the structure step recorded for THIS target. A report for another
+    # target is not evidence about this one -- and falling back to the whole
+    # manifest because of it is how a drifted table, excluded there, came
+    # back into the copy's scope. Refused unless --tables names the scope.
+    structure_path = reports / f"structure_report_{args.schema.lower()}.json"
+    objects = None
+    if structure_path.is_file():
+        s_prior = json.loads(structure_path.read_text(encoding="utf-8"))
+        s_target = s_prior.get("target")
+        if s_target and not _same(s_target, target):
+            if not args.tables:
+                return fail(
+                    f"error: the structure report for {args.schema} targets "
+                    f"{s_target}, and this copy resolves {target}. Taking "
+                    f"the scope from the manifest instead would copy into "
+                    f"tables the structure step never created or checked "
+                    f"there. Re-run 01_create_structure (it creates what "
+                    f"the plan names), pass --target-schema "
+                    f"{s_target.split('.', 1)[-1]} where the plan names no "
+                    f"target for this schema, or pass --tables")
+            log(f"the structure report targets {s_target}, not {target}; "
+                f"not used for this run (--tables sets the scope)")
+        else:
+            objects = s_prior.get("objects") or {}
+
     report = {"schema": args.schema, "tables": {}, "target": target}
     if path.exists():
         prior = json.loads(path.read_text(encoding="utf-8"))
         # Resumability is keyed by SOURCE schema, so a report written against
         # a DIFFERENT target must not let this run skip copies as already
-        # verified (the same trap the structure script hit live).
-        if prior.get("target") and prior["target"] != target:
+        # verified (the same trap the structure script hit live). Compared
+        # case-insensitively: `lake.CORE` and `lake.core` are one schema.
+        if prior.get("target") and not _same(prior["target"], target):
             log(f"the previous report targeted {prior['target']}, not "
                 f"{target} — starting a fresh record for this target")
             path.with_suffix(
@@ -386,15 +527,8 @@ def main(argv: list[str] | None = None) -> int:
         # found already there WITH the planned layout counts; one it recorded
         # as `type_drift` never does -- the copy below is a positional INSERT
         # INTO ... SELECT *, and that layout is not the plan's.
-        structure_path = reports / f"structure_report_{args.schema.lower()}.json"
-        created = []
-        objects = None
-        if structure_path.is_file():
-            prior = json.loads(structure_path.read_text(encoding="utf-8"))
-            if prior.get("target") in (None, target):
-                objects = prior.get("objects") or {}
-                created = [n for n, rec in objects.items()
-                           if rec.get("status") in ("created", "already_existed")]
+        created = [n for n, rec in (objects or {}).items()
+                   if rec.get("status") in _STRUCTURE_PRESENT]
         if created:
             names = created
             log(f"scope: {len(names)} table(s) the structure step created for "
@@ -488,8 +622,20 @@ def main(argv: list[str] | None = None) -> int:
                 f"{prior.get('reason') or prior['status']} (a re-run in "
                 f"skip-existing mode left the target untouched; use --mode "
                 f"overwrite to re-copy and re-verify it)"))
-        if result["status"] not in ("verified", "skipped_nonempty",
-                                    "target_missing"):
+        # `target_missing` is a finding for a table the structure step never
+        # created (not in the plan). For one it records as there, the copy
+        # moved nothing into a table that should exist: a failure, or the
+        # job reads SUCCESS with 0 rows copied.
+        s_status = (objects or {}).get(name, {}).get("status")
+        if result["status"] == "target_missing" and \
+                s_status in _STRUCTURE_PRESENT:
+            result["reason"] = (
+                f"the structure report records this table `{s_status}` in "
+                f"{target}, yet {tgt} is not there now -- dropped since, or "
+                f"created somewhere else. NOT copied.")
+            failures += 1
+        elif result["status"] not in ("verified", "skipped_nonempty",
+                                      "target_missing"):
             failures += 1
         report["tables"][name] = result
         report["updated_at"] = datetime.datetime.now(
