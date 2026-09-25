@@ -18,8 +18,10 @@ can be re-run alone. The main ones:
   notebook-> <nb>.ipynb          + NOTEBOOK.md              (offline; --upload is
                                                              refused, see GAPS 13)
   summary -> SUMMARY.md                                     (offline)
-  data-options -> data_options.json + DATA_MOVEMENT_OPTIONS.md  (offline; PROPOSAL
-                  ONLY -- this plugin moves no bytes and implements no transfer)
+  data-options -> data_options.json + DATA_MOVEMENT_OPTIONS.md  (offline; the
+                  options are PROPOSALS. This CLI copies no rows itself; the
+                  one implemented copy is the in-AIDP snowmig_02_copy_schema
+                  job, run schema by schema by the operator)
   demo    -> every artifact above + DEMO.md                 (offline; DEV MODE --
              the whole pipeline against an EMULATED estate and an EMULATED AIDP,
              so the flow can be understood with no credentials and no risk)
@@ -27,10 +29,12 @@ can be re-run alone. The main ones:
 Bronze mirrors the source: Snowflake database -> AIDP catalog, schema -> schema,
 table -> table, view -> view. Silver and Gold get disabled job stubs.
 
-The target catalog is EXTERNAL/SNOWFLAKE by default -- a registered, read-only
-pointer at the live source that copies nothing. A STANDARD catalog is created
-only when the user explicitly asks for one, and its tables are then created on
-AIDP compute by the `notebook` script, not through the catalog CRUD API.
+`catalog` registers an EXTERNAL/SNOWFLAKE catalog by default -- a read-only
+pointer at the live source that copies nothing. The STANDARD target catalog
+(`catalog --catalog-type standard`, runbook S4) is created as a container; its
+schemas and tables are created on AIDP compute by the structure job
+(`run --job snowmig_01_structure`, runbook S10), not through the catalog CRUD
+API. Rows move only when the operator runs `snowmig_02_copy_schema`.
 
 Exit codes: 0 ok | 1 error | 3 HALT (identifier-case or target-name collision)
 """
@@ -1550,9 +1554,17 @@ def cmd_summary(args) -> int:
 def cmd_data_options(args) -> int:
     out = pathlib.Path(args.out_dir)
     options = options_for(args.phase) if args.phase else list(DATA_OPTIONS)
+    # `implemented` is about the OPTIONS listed: each is a proposal. The note
+    # must not say more than that. It used to say this plugin "moves no bytes
+    # and implements no transfer path", beside a DATA_MOVEMENT_OPTIONS.md
+    # from the same run naming the transfer path that does exist.
     payload = {"options": options, "implemented": False,
-               "note": ("Proposal only. This plugin moves no bytes and implements "
-                        "no transfer path.")}
+               "note": ("The options below are proposals, none executed by "
+                        "this command. The control-plane CLI copies no rows "
+                        "itself; the one implemented copy is the in-AIDP "
+                        "INSERT-SELECT run schema by schema by the "
+                        "snowmig_02_copy_schema job, when the operator runs "
+                        "it.")}
     if args.choose:
         if not args.rationale:
             raise ValueError("--choose requires --rationale")
@@ -1574,7 +1586,8 @@ def cmd_data_options(args) -> int:
         print(f"  recorded: {state} (executed: False)")
     _write(out, "data_options.json", payload)
     _write(out, "DATA_MOVEMENT_OPTIONS.md", render_data_options(options))
-    print(f"  {len(options)} option(s) presented; none implemented")
+    print(f"  {len(options)} option(s) presented, each a proposal; the "
+          f"implemented copy is the snowmig_02_copy_schema job")
     return 0
 
 
