@@ -145,11 +145,30 @@ def _target_schema(schema: str, planned: set[str],
     return recorded[0] if recorded else schema
 
 
+# What Spark says when a table, or the schema holding it, is simply not
+# there -- the same markers 02_copy_schema reads as "absent" (a test pins the
+# two lists equal). Only these mean "absent"; any other error is "could not
+# look".
+_NOT_FOUND = ("TABLE_OR_VIEW_NOT_FOUND", "SCHEMA_NOT_FOUND",
+              "NoSuchTableException", "NoSuchNamespaceException",
+              "NoSuchDatabaseException", "Table or view not found")
+
+
 def _live_tables(spark, catalog: str, schema: str) -> set[str] | None:
-    """Lower-cased table names the catalog holds, or None when unreadable."""
+    """Lower-cased table names the catalog holds; an EMPTY set when the
+    schema does not exist yet; None when it could not be read.
+
+    A schema the target has not created is a schema not migrated yet. Every
+    SHOW TABLES error used to read as "could not look", so live, a
+    schema-by-schema run exited 1 with every not-yet-created schema
+    TARGET_UNREADABLE -- after each schema but the last.
+    """
     try:
         rows = spark.sql(f"SHOW TABLES IN {q(catalog)}.{q(schema)}").collect()
-    except Exception:
+    except Exception as exc:
+        text = str(exc).lower()
+        if any(marker.lower() in text for marker in _NOT_FOUND):
+            return set()
         return None
     out = set()
     for r in rows:

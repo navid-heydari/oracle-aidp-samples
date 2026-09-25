@@ -1893,3 +1893,53 @@ def test_the_committed_discovery_notebook_matches_its_source():
     generated = build_stage_notebook(stage)
     assert json.loads(committed.read_text(encoding="utf-8")) == generated, \
         "regenerate with `snowmig.py build-notebooks`"
+
+
+# --- reconcile: a schema this target has not created yet is pending --------
+#
+# Live 2026-09-25, round-3 data-plane run: schema R3 migrated and verified,
+# and reconcile still exited 1 with 22 objects TARGET_UNREADABLE. They were
+# the manifest's other schemas, never created in this target yet. `SHOW
+# TABLES IN lake.core` raised SCHEMA_NOT_FOUND, and _live_tables read ANY
+# exception as "could not look". A schema-by-schema migration -- the
+# documented way to run it -- therefore failed reconcile after every schema
+# but the last, which is how a real problem signal gets ignored.
+
+class _NoSchemaSpark(_FakeSpark):
+    def sql(self, statement):
+        if statement.lower().startswith("show tables"):
+            raise RuntimeError(
+                "[SCHEMA_NOT_FOUND] The schema `lake`.`sales` cannot be found.")
+        return super().sql(statement)
+
+
+def test_a_schema_not_created_yet_is_not_migrated_not_unreadable(reconcile):
+    rec = reconcile.reconcile(_NoSchemaSpark(),
+                              manifest=_manifest("ORDERS", views=("V",)),
+                              target_catalog="lake",
+                              reports=pathlib.Path("/nonexistent"),
+                              counts=False)
+    s = rec["schemas"][0]
+    assert s["target_readable"] is True
+    assert s["tables"][0]["verdict"] == "NOT_MIGRATED"
+    assert s["views"][0]["verdict"] == "VIEW_NOT_CREATED_BY_THIS_PATH"
+    assert not set(rec["totals"]) & set(reconcile.PROBLEM_VERDICTS)
+
+
+def test_a_missing_schema_a_report_says_was_created_is_still_a_problem(
+        reconcile, tmp_path):
+    """Absent is only pending when nothing claims otherwise."""
+    (tmp_path / "structure_report_sales.json").write_text(json.dumps(
+        {"schema": "SALES", "target": "lake.SALES",
+         "objects": {"ORDERS": {"status": "created"}}}), encoding="utf-8")
+    rec = reconcile.reconcile(_NoSchemaSpark(), manifest=_manifest("ORDERS"),
+                              target_catalog="lake", reports=tmp_path,
+                              counts=False)
+    assert rec["schemas"][0]["tables"][0]["verdict"] == "MISSING_DESPITE_REPORT"
+
+
+def test_reconcile_and_the_copy_agree_on_what_absent_looks_like(
+        reconcile, copy_schema):
+    """Two scripts, one rule: the markers that make a DESCRIBE "absent" in
+    the copy make a SHOW TABLES "absent" here."""
+    assert reconcile._NOT_FOUND == copy_schema._NOT_FOUND
