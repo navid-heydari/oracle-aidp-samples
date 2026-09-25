@@ -366,7 +366,12 @@ rather than accepted and dropped. Each stage notebook carries its own `PARAMS`
 cell; `provision --execute --reuse-existing --refresh-notebooks` rewrites it
 and re-uploads (without `--refresh-notebooks`, `--reuse-existing` keeps a
 notebook already on the workspace, because its PARAMS cell may have been
-edited in the console). To narrow what S10 creates, narrow the **plan** it
+edited in the console). The values it writes are `--stage-param NAME=VALUE`,
+repeatable, where NAME is the stage flag without `--` (`schema`, `tables`,
+`mode`, `dry-run`, `counts`, …): a name no stage declares is refused, a
+switch takes `true`/`false`, a list flag takes a comma-separated value, and
+`--stage-param` with `--reuse-existing` but without `--refresh-notebooks` is
+refused rather than dropped. To narrow what S10 creates, narrow the **plan** it
 reads — that is the input — and never edit the stage logic to make it cover
 less.
 

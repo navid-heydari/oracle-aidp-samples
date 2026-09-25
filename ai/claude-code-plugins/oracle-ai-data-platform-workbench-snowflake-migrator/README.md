@@ -259,6 +259,15 @@ same name** on the AIDP default config, the workspace folder
 being pre-declared for the job parameters, not catalogs that must already
 exist. Read `PROVISION.md`: pending is pending, never rounded up.
 
+Stage parameters (the schema a copy covers, `tables`, `mode`, `dry-run`,
+reconcile's `counts`) live in each stage notebook's own PARAMS cell, because
+job parameters never reach a notebook. `--stage-param NAME=VALUE`
+(repeatable; NAME is the stage flag without `--`) writes one there: a name
+no stage declares is refused, a switch takes `true`/`false`, a list flag
+takes `A,B`. With `--reuse-existing` add `--refresh-notebooks`, or the
+notebooks already on the workspace are kept and the value is refused rather
+than dropped.
+
 **Hand-off.** After `--execute`, `provision_result.json` records the
 **workspace key** under `workspace.key` and the **cluster key** under
 `cluster.key`. `PROVISION.md` shows the display names, which are NOT the

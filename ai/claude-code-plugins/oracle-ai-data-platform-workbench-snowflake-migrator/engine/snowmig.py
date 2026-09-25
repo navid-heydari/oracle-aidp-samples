@@ -1019,19 +1019,34 @@ def cmd_run(args) -> int:
         # start a run that quietly ignored it, and the stage ran at whatever
         # its PARAMS cell already said. A scope flag that silently does
         # nothing is worse than one that is missing: it reads as applied.
-        raise MissingTarget(
+        # Only a name some stage declares is offered as a --stage-param:
+        # provision refuses any other, so suggesting it would send the
+        # operator to a second refusal.
+        from target.stage_notebooks import declared_stage_params
+        head = (
             "--param does not reach a notebook stage: AIDP job parameters "
             "arrive as neither argv nor environment, so this run would "
             "ignore " + ", ".join(sorted(parameters)) + " and execute "
-            "whatever the notebook's PARAMS cell already holds.\n"
-            "Set stage parameters where they are actually read:\n"
+            "whatever the notebook's PARAMS cell already holds.\n")
+        declared = declared_stage_params()
+        known = sorted(n for n in parameters if n in declared)
+        unknown = sorted(n for n in parameters if n not in declared)
+        route = (
             "  * re-run `provision --execute --reuse-existing "
             "--refresh-notebooks "
-            + " ".join(f"--stage-param {name}=<value>"
-                       for name in sorted(parameters))
+            + " ".join(f"--stage-param {name}=<value>" for name in known)
             + "` -- it rewrites each stage notebook's PARAMS cell and "
             "uploads it (console edits to that cell are lost), or\n"
-            "  * edit the PARAMS cell of "
+            if known else "")
+        undeclared = (
+            "No stage notebook declares " + ", ".join(unknown)
+            + ", so no route sets it. Declared names: "
+            + ", ".join(sorted(declared)) + ".\n" if unknown else "")
+        raise MissingTarget(
+            head + undeclared
+            + "Set stage parameters where they are actually read:\n"
+            + route
+            + "  * edit the PARAMS cell of "
             "backup-snowflake-migration/scripts/<stage>.ipynb in the "
             "console.\n"
             "Scope is an INPUT either way -- never edit the stage logic to "
@@ -2118,9 +2133,15 @@ def build_parser() -> argparse.ArgumentParser:
                          "how `schema` reaches 02_copy_schema: job "
                          "parameters do not reach a notebook, so a stage "
                          "parameter has to be IN the notebook, and this "
-                         "writes it there. A stage that does not declare the "
-                         "name ignores it. Scope is an INPUT -- never edit "
-                         "the stage logic to make it cover less")
+                         "writes it there. NAME is the stage flag without "
+                         "`--` (schema, tables, mode, dry-run, counts, ...); "
+                         "a name no stage declares is refused. A switch "
+                         "takes true or false; a list flag (tables, schemas) "
+                         "takes a comma-separated value. With "
+                         "--reuse-existing it needs --refresh-notebooks, "
+                         "since a kept notebook is not rewritten. Scope is "
+                         "an INPUT -- never edit the stage logic to make it "
+                         "cover less")
     pv.add_argument("--refresh-notebooks", action="store_true",
                     help="with --reuse-existing, regenerate the stage "
                          "notebooks from this run's flags even where they "

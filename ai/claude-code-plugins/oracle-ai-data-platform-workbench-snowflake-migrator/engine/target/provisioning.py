@@ -39,7 +39,7 @@ from .naming import translate_name
 from .runner import is_active, is_conflict
 from .stage_notebooks import (
     DIAGNOSE_NOTEBOOK_NAME, STAGES, build_diagnose_notebook,
-    build_stage_notebook)
+    build_stage_notebook, check_stage_params)
 from .provision_api import (
     build_cluster_body, build_job_body,
     build_library_items, build_provision_command, build_workspace_body,
@@ -418,10 +418,29 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
 
     With `reuse_existing`, a stage notebook already on the workspace is KEPT
     as it is unless `refresh_notebooks` is set: operators set schema, mode
-    and verify by editing its PARAMS cell in the console, and this stage
-    has no flags for those, so regenerating it would discard that work
-    without saying so. Kept notebooks are listed in the result.
+    and verify by editing its PARAMS cell in the console, so regenerating it
+    would discard that work without saying so. Kept notebooks are listed in
+    the result.
+
+    `stage_params` are written into the PARAMS cell of every stage that
+    declares the name. They are checked BEFORE anything is called: a name
+    no stage declares, a switch given something other than true/false, or
+    values that would land only on a notebook this run keeps are refused
+    with a ValueError, never dropped -- a scope flag that silently does
+    nothing reads as applied.
     """
+    stage_params = dict(stage_params or {})
+    if stage_params:
+        check_stage_params(stage_params)
+        if reuse_existing and not refresh_notebooks:
+            raise ValueError(
+                "--stage-param " + ", ".join(sorted(stage_params))
+                + " with --reuse-existing needs --refresh-notebooks: a stage "
+                "notebook already on the workspace is kept as it is, so the "
+                "value would never reach its PARAMS cell. Add "
+                "--refresh-notebooks (it regenerates every stage notebook "
+                "from this run's flags, discarding console edits to PARAMS), "
+                "or edit the PARAMS cell in the console instead.")
     ws_name = translate_name(workspace_name, kind="workspace")
     cl_name = translate_name(cluster_name, kind="cluster")
     pypi = _pypi_from_requirements(requirements)
@@ -471,6 +490,9 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         # Stage notebooks left as found on the workspace (reuse_existing
         # without refresh_notebooks), so PROVISION.md can list them.
         "notebooks_kept": [],
+        # The explicit --stage-param values, as given, so the record says
+        # what this run wrote into PARAMS beyond the derived coordinates.
+        "stage_params": dict(stage_params),
         "steps": [],
     }
 
@@ -788,9 +810,10 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     defaults = {"reports-dir": REPORTS_FOLDER, "source-mode": source_mode}
     # Written last so an explicit --stage-param wins over a derived
     # coordinate: the operator naming a value outranks this function
-    # guessing one. A stage that does not declare the key ignores it
+    # guessing one. Every explicit name is declared by at least one stage
+    # (checked on entry); a stage that does not declare it skips it
     # (build_stage_notebook filters per stage).
-    explicit = dict(stage_params or {})
+    explicit = dict(stage_params)
     if external_catalog:
         defaults["source-catalog"] = external_catalog
     if target_catalog:
@@ -1022,6 +1045,14 @@ def render_provision(res: dict) -> str:
             "edits:", ""]
         lines += [f'- `{res["scripts_folder"]}/{n}`'
                   for n in res["notebooks_kept"]]
+        lines.append("")
+
+    if res.get("stage_params"):
+        lines += [
+            "## Stage parameters (`--stage-param`)", "",
+            "Written into the PARAMS cell of every stage notebook that "
+            "declares the name:", ""]
+        lines += [f"- `{k}` = `{v}`" for k, v in res["stage_params"].items()]
         lines.append("")
 
     lines += [
