@@ -64,12 +64,13 @@ from report.render import (
 )
 from snowflake_source.conn import (
     AuthError, SourceWriteRefused, build_connect_kwargs, connect,
-    make_run_sql,
+    drop_secondary_roles, make_run_sql,
 )
 from snowflake_source.extract.catalog import (
     ROW_COUNT_MODES, build_inventory)
 from snowflake_source.extract.maintenance import build_maintenance
-from snowflake_source.extract.census import build_census
+from snowflake_source.extract.census import (build_census,
+                                             secondary_roles_active)
 from snowflake_source.extract.security import build_security
 from snowflake_source.dialect.types import (
     GEOSPATIAL_MODES, SEMI_STRUCTURED_MODES, TIMESTAMP_NTZ_MODES, map_type)
@@ -103,7 +104,7 @@ from target.executor import (
 # for HTTP errors carried in the body); both must be caught or a live 400
 # prints as a traceback instead of a message -- observed live.
 from target.executor import BackendError as ExecutorBackendError
-from target.runner import BackendError
+from target.runner import DEFAULT_CLI_TIMEOUT, BackendError
 from target.runner import make_call
 from target.runner import make_run_sql as make_aidp_run_sql
 
@@ -337,7 +338,8 @@ def _oci_runner(args):
                     argv[1:1] = ["--auth", mode]
         return subprocess.run(argv, capture_output=True, text=True,
                               check=False, encoding="utf-8", errors="replace",
-                              env=cli_environment())
+                              env=cli_environment(),
+                              timeout=DEFAULT_CLI_TIMEOUT)
     return run
 
 
@@ -422,7 +424,15 @@ def _run_sql_from_args(args):
             pat_path=as_path(coords.get("token"), coords["pat_path"]),
             password_path=as_path(coords.get("password"),
                                   coords["password_path"]))
-        return make_run_sql(connect(**kwargs))
+        conn = connect(**kwargs)
+        # Asked for, never assumed: dropping them changes what the whole run
+        # can see, so it is the operator's call and it is said out loud.
+        if getattr(args, "only_primary_role", False):
+            drop_secondary_roles(conn)
+            print("  session scoped to its PRIMARY role only (secondary "
+                  "roles dropped): every count is what THAT role can see",
+                  file=sys.stderr)
+        return make_run_sql(conn)
     finally:
         for path in spooled:
             try:
@@ -453,7 +463,9 @@ def _assess_inventory(args) -> dict:
         inv["census"] = build_census(
             run_sql, inv["databases_in_scope"],
             include_definitions=getattr(args, "capture_definitions", False),
-            role=(inv.get("session") or {}).get("ROLE"))
+            role=(inv.get("session") or {}).get("ROLE"),
+            secondary_roles=secondary_roles_active(
+                (inv.get("session") or {}).get("SECONDARY_ROLES")))
     return inv
 
 
@@ -1014,9 +1026,11 @@ def cmd_run(args) -> int:
             "whatever the notebook's PARAMS cell already holds.\n"
             "Set stage parameters where they are actually read:\n"
             "  * re-run `provision --execute --reuse-existing "
-            "--refresh-notebooks` with the coordinate flags -- it rewrites "
-            "each stage notebook's PARAMS cell and uploads it (console edits "
-            "to that cell are lost), or\n"
+            "--refresh-notebooks "
+            + " ".join(f"--stage-param {name}=<value>"
+                       for name in sorted(parameters))
+            + "` -- it rewrites each stage notebook's PARAMS cell and "
+            "uploads it (console edits to that cell are lost), or\n"
             "  * edit the PARAMS cell of "
             "backup-snowflake-migration/scripts/<stage>.ipynb in the "
             "console.\n"
@@ -1666,6 +1680,16 @@ def cmd_provision(args) -> int:
                     f"warehouse(s) not in warehouses.json: "
                     f'{", ".join(sorted(missing))}')
 
+    stage_params = {}
+    for pair in getattr(args, "stage_param", []) or []:
+        if "=" not in pair:
+            raise MissingTarget(
+                f"--stage-param {pair!r} is not NAME=VALUE. The name is a "
+                f"stage parameter as it appears in the notebook's PARAMS "
+                f"cell, for example schema=SALES or mode=overwrite.")
+        name, value = pair.split("=", 1)
+        stage_params[name.strip()] = value.strip()
+
     source_config = None
     if args.source_config:
         source_config = pathlib.Path(args.source_config)
@@ -1703,6 +1727,7 @@ def cmd_provision(args) -> int:
     res = provision(
         call=call, workspace_name=args.workspace_name,
         cluster_name=args.cluster_name, scripts=list(scripts),
+        stage_params=stage_params,
         plan_files=plan_files, requirements=requirements,
         maven=args.maven or [], external_catalog=external_catalog,
         target_catalog=target_catalog, source_mode=args.source_mode,
@@ -1778,6 +1803,15 @@ def _add_snowflake_args(p) -> None:
     p.add_argument("--account")
     p.add_argument("--user")
     p.add_argument("--role")
+    p.add_argument("--only-primary-role", action="store_true",
+                   help="drop SECONDARY roles for the session, so the run "
+                        "sees exactly what --role can see and nothing more. "
+                        "Snowflake activates every role granted to the user "
+                        "by default, so without this a count attributed to a "
+                        "restricted role may have been served by "
+                        "ACCOUNTADMIN -- which is the difference between "
+                        "rehearsing a least-privilege migration and only "
+                        "appearing to")
     p.add_argument("--warehouse")
     p.add_argument("--auth", default="keypair",
                    choices=["keypair", "pat", "password", "externalbrowser"])
@@ -2077,6 +2111,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "default: a migration creates its own environment "
                          "so its blast radius is knowable, and a taken name "
                          "is a collision to resolve, not a shortcut")
+    pv.add_argument("--stage-param", action="append", default=[],
+                    metavar="NAME=VALUE",
+                    help="a value to write into every stage notebook's "
+                         "PARAMS cell that declares it, repeatable. This is "
+                         "how `schema` reaches 02_copy_schema: job "
+                         "parameters do not reach a notebook, so a stage "
+                         "parameter has to be IN the notebook, and this "
+                         "writes it there. A stage that does not declare the "
+                         "name ignores it. Scope is an INPUT -- never edit "
+                         "the stage logic to make it cover less")
     pv.add_argument("--refresh-notebooks", action="store_true",
                     help="with --reuse-existing, regenerate the stage "
                          "notebooks from this run's flags even where they "

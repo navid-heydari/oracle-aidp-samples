@@ -207,3 +207,87 @@ def test_a_name_starting_with_a_digit_is_unacceptable():
 def test_an_upper_case_name_is_unacceptable_because_the_plan_folds_first():
     from plan.medallion import unacceptable_target_names
     assert unacceptable_target_names("db.s.ORDERS") == ["ORDERS"]
+
+
+# ------------------------------- the 255-character key, measured not guessed
+#
+# Live 2026-09-24 against the DataLake. The limit is NOT on the object name:
+# it is 255 characters on the whole key `catalog.schema.name`.
+#
+#   catalog snowmig_coverage_v2 + schema snowmig_coverage_edge (prefix 42)
+#       213-char name accepted, 214 refused        42 + 213 = 255
+#   same catalog + schema default (prefix 28)
+#       227-char name accepted, 228 refused        28 + 227 = 255
+#
+# The second was predicted from the first and hit exactly, so the rule is
+# the key length and nothing else.
+#
+# That matters more than a plain name limit, because the migrator chooses
+# two thirds of the key: `--bronze-catalog-prefix` and the `db_schema`
+# style, which concatenates database + "_" + schema, both eat the budget a
+# table name has left. And the failure mode is the bad one: 202 Accepted,
+# the object never appears, and the name is then burned in that schema.
+
+def test_a_short_key_is_fine():
+    from plan.medallion import target_key_overage
+    assert target_key_overage("db.sales.orders") == 0
+
+
+def test_a_key_of_exactly_255_is_accepted():
+    from plan.medallion import target_key_overage, TARGET_KEY_MAX
+    assert TARGET_KEY_MAX == 255
+    fqn = "c.s." + "x" * (255 - 4)
+    assert len(fqn) == 255
+    assert target_key_overage(fqn) == 0
+
+
+def test_one_character_over_is_reported_as_one_over():
+    from plan.medallion import target_key_overage
+    assert target_key_overage("c.s." + "x" * (256 - 4)) == 1
+
+
+def test_the_overage_counts_the_whole_key_not_the_name():
+    """The live shape: the same name passes under a short schema and fails
+    under a long one."""
+    from plan.medallion import target_key_overage
+    name = "x" * 227
+    assert target_key_overage(f"snowmig_coverage_v2.default.{name}") == 0
+    assert target_key_overage(
+        f"snowmig_coverage_v2.snowmig_coverage_edge.{name}") == 14
+
+
+def test_a_too_long_target_is_refused_at_plan_time():
+    from plan.build import build_plan
+    long_name = "T" + "X" * 250
+    plan = build_plan({"inventory": [rec_for_key(long_name)]}, {"edges": []})
+    assert plan["can_migrate"] == []
+    entry = plan["cannot_migrate"][0]
+    assert entry["category"] == "target_key_too_long"
+    assert "255" in entry["reason"]
+
+
+def test_the_refusal_says_what_is_eating_the_budget():
+    """An operator who only sees "name too long" shortens the table name.
+    The catalog and schema are usually where the room actually is, and they
+    are the parts this tool chose."""
+    from plan.build import build_plan
+    plan = build_plan({"inventory": [rec_for_key("T" + "X" * 250)]},
+                      {"edges": []}, bronze_catalog_prefix="a_long_prefix")
+    reason = plan["cannot_migrate"][0]["reason"]
+    assert "catalog" in reason.lower() and "schema" in reason.lower()
+    assert "bronze-catalog-prefix" in reason
+
+
+def test_an_ordinary_name_still_plans_under_a_prefix():
+    from plan.build import build_plan
+    plan = build_plan({"inventory": [rec_for_key("ORDERS")]}, {"edges": []},
+                      bronze_catalog_prefix="bronze")
+    assert [c["source_identifier"] for c in plan["can_migrate"]] == [
+        "D.SALES.ORDERS"]
+
+
+def rec_for_key(name):
+    return {"source_identifier": f"D.SALES.{name}", "object_type": "TABLE",
+            "source_database": "D", "source_schema": "SALES",
+            "compatibility_status": "supported", "blocked_reasons": [],
+            "row_count_exact": 0, "source_metadata": {}}

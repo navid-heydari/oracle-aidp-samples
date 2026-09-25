@@ -172,3 +172,95 @@ def test_an_ingested_inventory_renders_its_sizes():
     row = next(line for line in render_inventory(inv).splitlines()
                if "`DB.SALES.ORDERS`" in line)
     assert "4.0 KB" in row, row
+
+
+# ------------------- the column facts the in-AIDP path silently dropped
+#
+# Live 2026-09-23. The same estate, planned two ways, compared column by
+# column: 71 columns, identical types and identical verdicts -- and six
+# facts present from a live `assess` and absent from a manifest.
+#
+#     CUSTOMERS.SEGMENT       COLUMN_DEFAULT  live "'SMB'"  manifest None
+#     CUSTOMERS.CREDIT_LIMIT  COLUMN_DEFAULT  live "0"      manifest None
+#     CUSTOMERS.IS_ACTIVE     COLUMN_DEFAULT  live "TRUE"   manifest None
+#     CUSTOMERS.COMMENT_COL   COMMENT         live "a ..."  manifest None
+#     ORDERS.ORDER_ID         IDENTITY_START/INCREMENT      manifest None
+#
+# Those are exactly the facts R22, R23 and the column-COMMENT fidelity work
+# report on. An estate planned through runbook S6/S7 -- the path for a large
+# estate, the one that exists BECAUSE the estate is large -- gets a DDL plan
+# with no warning that its defaults and identity columns stop working at
+# cutover. The laptop path warns; the cluster path does not; neither says
+# they differ.
+#
+# Two halves: discovery never selected the columns, and the reader ignored
+# them when present. And the third thing that matters most -- a manifest
+# written before this change carries no defaults, and "absent" must not be
+# rendered as "there is no default".
+
+def _facts_manifest(cols, kind="tables"):
+    return {"schemas": [{"name": "S", kind: [{"name": "T", "columns": cols}]}]}
+
+
+def _fact_col(**over):
+    base = {"name": "C", "data_type": "NUMBER", "numeric_precision": 38,
+            "numeric_scale": 0, "character_maximum_length": None,
+            "nullable": True, "ordinal_position": 1}
+    base.update(over)
+    return base
+
+
+def test_a_default_in_the_manifest_reaches_the_inventory():
+    inv = inventory_from_manifest(
+        _facts_manifest([_fact_col(column_default="'SMB'")]), database="D")
+    col = inv["inventory"][0]["columns"][0]
+    assert col["COLUMN_DEFAULT"] == "'SMB'"
+
+
+def test_identity_in_the_manifest_reaches_the_inventory():
+    inv = inventory_from_manifest(
+        _facts_manifest([_fact_col(identity_start=1, identity_increment=1)]),
+        database="D")
+    col = inv["inventory"][0]["columns"][0]
+    assert col["IDENTITY_START"] == 1
+    assert col["IDENTITY_INCREMENT"] == 1
+
+
+def test_a_column_comment_in_the_manifest_reaches_the_inventory():
+    inv = inventory_from_manifest(
+        _facts_manifest([_fact_col(comment="a column comment")]), database="D")
+    assert inv["inventory"][0]["columns"][0]["COMMENT"] == "a column comment"
+
+
+def test_an_old_manifest_says_the_facts_are_UNKNOWN_not_absent():
+    """The one that matters. A manifest written before discovery recorded
+    these carries no key at all, and rendering that as "no default" is the
+    same false negative the census rule exists to prevent."""
+    inv = inventory_from_manifest(_facts_manifest([_fact_col()]), database="D")
+    rec = inv["inventory"][0]
+    assert any("default" in n.lower() and "unknown" in n.lower()
+               for n in inv["extraction_notes"]), inv["extraction_notes"]
+    assert rec.get("column_facts_unknown") is True
+
+
+def test_a_new_manifest_that_simply_has_no_default_is_not_unknown():
+    """`column_default: None` explicitly recorded is a real answer."""
+    inv = inventory_from_manifest(
+        _facts_manifest([_fact_col(column_default=None, identity_start=None,
+                        identity_increment=None, comment=None,
+                        facts_recorded=True)]), database="D")
+    rec = inv["inventory"][0]
+    assert rec.get("column_facts_unknown") is not True
+    assert not [n for n in inv["extraction_notes"] if "unknown" in n.lower()]
+
+
+def test_the_discovery_query_selects_the_facts_it_has_to_carry():
+    """Half of the fix is upstream: the manifest cannot carry what
+    discovery never read."""
+    import pathlib as _p
+    sql = (_p.Path(__file__).resolve().parents[1]
+           / "dataplane" / "00_discover_snowflake.py").read_text(encoding="utf-8")
+    block = sql[sql.index("_COLUMNS_SQL"):sql.index("_COLUMNS_SQL") + 700]
+    for field in ("COLUMN_DEFAULT", "IDENTITY_START", "IDENTITY_INCREMENT",
+                  "COMMENT"):
+        assert field in block, f"discovery must select {field}"

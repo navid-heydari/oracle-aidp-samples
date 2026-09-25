@@ -62,7 +62,14 @@ decision.
 
 - object counts by type, and total rows and bytes
 - the largest objects
-- anything with `compatibility_status: blocked` and why
+- anything the Compatibility column shows as blocked, and why. `blocked`
+  alone is a column type with no Delta equivalent
+  (`compatibility_status: blocked`, reasons in `blocked_reasons`);
+  `blocked (<kind>)` is an object kind the plan refuses whatever its
+  types -- a dynamic, external, Iceberg, event or hybrid table, or a
+  secure or materialized view
+- any pipe or task in CENSUS.md whose detail says `writes=<table>`: that
+  table migrates, but its load does not
 - views, noting their SQL is captured verbatim and translated only as far as
   the dialect rules go — see `snowflake-migration-plan`
 

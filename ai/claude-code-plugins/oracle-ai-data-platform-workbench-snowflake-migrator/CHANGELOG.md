@@ -10,6 +10,61 @@ first release.
 
 ## [Unreleased]
 
+### Fixed — INVENTORY.md said `supported` for objects the plan refuses
+
+Live 2026-09-25: a dynamic table read `TABLE ... supported` in INVENTORY.md
+while PLANNED_OBJECTS.md, from the same inventory, refused it as
+`unsupported_object`. `compatibility_status` only describes the column types;
+the object-kind refusal lived in the planner and never reached the report most
+readers open first. The same held for secure and materialized views.
+
+- `plan.build.object_kind_block(rec)` is the one table of kind refusals (five
+  SHOW TABLES flags, two SHOW VIEWS flags), read by both the planner and
+  `render_inventory`. The Compatibility cell now reads `blocked (dynamic
+  table)`, `blocked (secure view)` and so on, with one line under the table
+  saying what that means. A type block still reads `blocked`.
+- A test asserts, per flag, that the inventory cell and the plan agree.
+
+### Added — a pipe or task that loads a migrating table names that table
+
+Live 2026-09-25: the census listed a pipe and a task that both load
+`STAGING_EVENTS`, the plan listed `STAGING_EVENTS` as migrating, and nothing
+linked them -- though the census TASK verdict says such a table stops being
+populated at cutover. The target was already on the rows being read: a pipe's
+`DEFINITION` is `COPY INTO <table>`, a task's body is on its SHOW TASKS row.
+
+- The census reads what each pipe and task body writes (INSERT, MERGE, COPY
+  INTO a table, UPDATE, DELETE, TRUNCATE, CREATE TABLE), over code only, so a
+  write inside a string or comment is not one. The detail column says
+  `writes=<table>`. An unqualified name resolves against the object's own
+  database and schema -- live-verified by running the task from a session
+  with no current database. `COPY INTO @stage` is an unload, a `CALL` names
+  no table, `IDENTIFIER($var)` is a runtime value: none is claimed, and
+  nothing is printed rather than an empty list.
+- If `INFORMATION_SCHEMA.PIPES.DEFINITION` cannot be read the pipes are still
+  counted, and the kind's note says the loaded tables are not named.
+- The plan attaches a load warning to every migrating table so fed (risk
+  MEDIUM, the note names the load), records `loads_that_stop`, and
+  PLANNED_OBJECTS.md lists them under "Planned, but loaded by something that
+  does not move".
+
+### Fixed — the census explained one verdict per kind, hiding the sharper one
+
+Live 2026-09-25, the first estate holding both an internal and an external
+stage, and both an inbound and an outbound share. The per-object table showed
+all four correctly, but "Why each kind cannot move" printed one paragraph per
+kind — whichever object came first — so the internal stage (files must be
+unloaded) was covered by the external stage's text (nothing to unload), and
+the outbound share (a live consumer contract) by the inbound one's.
+
+- One paragraph per distinct `(kind, reason)`. When a kind has more than one
+  verdict, each heading names the objects it is about (`**STAGE**
+  (\`DB.S.STG_INTERNAL\`)`), so two STAGE paragraphs are tellable apart.
+  Kinds with one verdict still print once.
+- `detail` is labelled by the field it came from: `target_lag=1 day` for a
+  dynamic table and `mode=EGRESS` for a network rule, where both used to say
+  `state=`.
+
 ### Fixed — the CLI could not run on a Windows machine
 
 Every `read_text()`/`write_text()`/`open()` in the engine, the data-plane
@@ -603,6 +658,174 @@ on its first colon, which is how the file passed before.
   wider column select is refused, the census re-asks for the columns it has
   always read and reports the distinction as *not distinguishable*, never as
   none. Every new read is a `SHOW` or a `SELECT`; the transport is unchanged.
+
+### Fixed — a target key longer than the destination can hold
+
+- Measured live 2026-09-24, not taken from a document. The limit is **not**
+  on the object name: it is **255 characters on the whole key**
+  `catalog.schema.name`.
+
+  | catalog + schema | prefix | accepted | refused |
+  |---|---:|---:|---:|
+  | `snowmig_coverage_v2` + `snowmig_coverage_edge` | 42 | 213 | 214 |
+  | `snowmig_coverage_v2` + `default` | 28 | 227 | 228 |
+
+  The second boundary was predicted from the first and hit exactly, so it
+  is the key that is bounded and nothing else.
+- This matters more than a name limit would, because the migrator chooses
+  two thirds of the key: `--bronze-catalog-prefix`, and the `db_schema`
+  style that concatenates database + `_` + schema. Both eat the budget the
+  table name has left, and an operator told only "the name is too long"
+  would shorten the one part they cannot change.
+- The failure mode is the bad one: `202 Accepted`, the object never
+  appears, and the name is then burned in that schema. So it is refused at
+  plan time, with the key, its length, the overage, and how many characters
+  the catalog and schema have left for the name.
+- Also measured, and needing no change: a reserved word is a perfectly good
+  object name here. `select`, `table`, `from`, `order`, `group`, `index`
+  and `int` were each created and read back.
+
+### Fixed — the in-AIDP planning path dropped the column facts
+
+- Live 2026-09-23, the same estate planned both ways and compared column by
+  column: **71 columns, identical types, identical verdicts — and six facts
+  present from a live `assess` and absent from a manifest.** Three column
+  `DEFAULT`s, an `IDENTITY` start and increment, and a column `COMMENT`.
+- Those are exactly what `R22`, `R23` and the column-comment fidelity work
+  report on. So an estate planned through runbook S6/S7 — the path that
+  exists *because* the estate is too large for the laptop path — got a DDL
+  plan with no warning that its defaults and identity columns stop working
+  at cutover, while the same estate planned from a laptop warned about both.
+  Neither plan said it differed from the other.
+- Discovery now selects `COLUMN_DEFAULT`, `IDENTITY_START`,
+  `IDENTITY_INCREMENT` and `COMMENT`; the bridge carries them; and the two
+  paths were re-compared live afterwards: **0 differences over 71 columns.**
+- A manifest written by an older discovery carries none of them, and that is
+  recorded as UNKNOWN for every object rather than rendered as "this column
+  has no default" — the same false negative the census rule exists to
+  prevent, and the quiet kind, because the plan simply omits the warning.
+
+### Fixed — the rest of the review PR's list
+
+Everything @navid-heydari raised as non-blocking. Both of the two flagged
+"low confidence" turned out to be real.
+
+- **`cancel_unconfirmed` described the restart HISTORY, not the run in
+  hand.** It was `any(new_run is None for r in restarts)`. A first cold-start
+  attempt that cannot confirm its cancel keeps the original run and records
+  `new_run: None`; a second that cancels cleanly and resubmits records a
+  real one. The run being watched is then a fresh submission onto a slot
+  that *was* free — and the CLI still printed "cold start suspected; cancel
+  unconfirmed" and exited non-zero about it. It now reflects the last
+  attempt, which is the one that describes the run being watched.
+- **The poll budget was not restored after a cold-start restart.** `waited`
+  reset and `polls_left` did not, so a replacement run inherited whatever
+  the wedged one left and could be reported STILL RUNNING after a poll or
+  two. The budget describes how long to watch *a run*, so a replacement gets
+  it; the total stays bounded by `cold_start_restarts`.
+- **`is_conflict` and `is_active` have one home.** `_is_conflict` was
+  byte-identical in `provisioning.py` and `catalog_deploy.py`, and the
+  ACTIVE test was a named helper in one and the same inline expression four
+  times in the other. Both answer a question about the platform rather than
+  about a caller, so both moved to `runner.py`; a test asserts neither is
+  defined twice again.
+- **One listing per folder, not one per file.** The plan-file loop uploaded
+  a file and then listed the whole folder to confirm it, once per file — the
+  live run spent seven listings, each its own CLI process. The read-back
+  discipline is unchanged, because a 2xx never was the claim; it is the same
+  evidence gathered once. An upload that raises is still reported as the
+  failure it is, not as an absence from the listing. The notebook loop
+  already listed once up front and is untouched.
+
+### Fixed — the in-AIDP stage created a name the plan never approved
+
+- Live 2026-09-24, the whole four-job chain on a real cluster. The approved
+  `ddl_plan.json` named
+  `snowmig_coverage_v2.snowmig_coverage_core.customers`; the structure stage
+  created `snowmig_coverage_v2.CORE.CUSTOMERS`.
+- In `--mode ddl-plan` the stage read the column TYPES from the plan and the
+  NAMESPACE from the source schema name — `target_schema = args.target_schema
+  or schema`, with `columns_from_ddl_plan` keyed by `(source_schema, table)`.
+  `target_fqn`, the name the reviewer approved, was never consulted.
+- Three consequences, all observed: what `DDL_PLAN.md` showed is not what
+  exists; `--bronze-schema-style db_schema`, which exists precisely so two
+  same-named schemas from different databases cannot merge, was discarded;
+  and because the copy and reconcile stages derive the target the same way,
+  `MIGRATION_REPORT.md` reported **MIGRATED_VERIFIED** for a namespace nobody
+  approved while the approved tables sat empty elsewhere in the same catalog.
+- The plan now decides the target namespace. The source schema name stands in
+  only where the plan is silent (`ctas` and `manifest` modes, or a table the
+  plan does not carry). A `--target-schema` that contradicts the plan is
+  refused rather than honoured, and a plan targeting a different catalog than
+  the run was given is refused outright — creating its tables somewhere it
+  does not name is the same substitution.
+
+### Added — `provision --stage-param`, so the refusal names a route that works
+
+- `run --param schema=CORE` is refused, correctly: AIDP job parameters reach
+  a notebook as neither argv nor environment, so the value would be silently
+  ignored and the stage would run whatever its PARAMS cell already held.
+- The refusal then pointed at `provision --refresh-notebooks` as the way to
+  set stage parameters. It was not one: provisioning writes five coordinates
+  into PARAMS and had no flag for anything else, and `schema` — REQUIRED by
+  `02_copy_schema` — was exactly the value it could not supply. An operator
+  following the advice re-provisioned every notebook and found `schema`
+  still `None`.
+- `--stage-param NAME=VALUE`, repeatable, writes into every stage notebook
+  that declares the name; a stage that does not declare it ignores it, which
+  `build_stage_notebook` already did. An explicit value outranks a derived
+  coordinate. The refusal now quotes the flag back with the parameter the
+  operator asked for.
+
+### Fixed — a CLI child that never returned held the run open
+
+- Live 2026-09-24: `provision --execute` hung for **one hour and forty-seven
+  minutes**. A single `oci` child, started two minutes in, never exited. The
+  parent sat in `subprocess.run()` with no timeout, printed nothing, and
+  wrote no result artifact. A Spark cluster billed for all of it. Killing the
+  child by hand let the parent continue immediately, which is how the cause
+  was found.
+- None of the three `subprocess.run()` call sites passed `timeout=`. They all
+  do now, bounded at 900s — generous enough for a real cluster create, finite
+  because the alternative is measured in cluster-hours. A timed-out call
+  raises `CliTimeout` naming the command, and a test reads the sources and
+  fails if any call site ever ships without a timeout again.
+
+### Fixed — "as visible to role X" was not true when secondary roles were on
+
+- Live 2026-09-23. A session connected as `role=SNOWMIG_LIMITED`, a role
+  holding `USAGE` on exactly one database, read the whole account:
+
+      current_role()            SNOWMIG_LIMITED
+      current_secondary_roles() {"roles":"ORGADMIN,ACCOUNTADMIN","value":"ALL"}
+
+  Snowflake activates every role granted to the user by default. The same
+  `assess` against the same two databases counted **24 objects** with
+  secondary roles on and **10** with them off — same role name, same
+  command, 2.4x the estate.
+- Every count in `CENSUS.md`, `SECURITY.md` and the `INVENTORY.md` header is
+  attributed to `CURRENT_ROLE()`, so the attribution named an authority the
+  numbers were not produced under — and it erred in the unsafe direction,
+  making a restricted role look sufficient when the run had leaned on
+  `ACCOUNTADMIN`. `CURRENT_SECONDARY_ROLES()` is read now and every sentence
+  that names a role names them too.
+- **`--only-primary-role`** drops them for the session, so a run sees exactly
+  what `--role` can see. That is what a migration rehearsal needs: proving a
+  least-privilege role is sufficient BEFORE cutover, rather than finding out
+  at cutover that every read had been served by something else. Asked for,
+  never assumed, and said on the console when it happens.
+
+### Fixed — an inventory headline that disagreed with the inventory
+
+- Same run: `Databases in scope: SNOWMIG_COVERAGE, SNOWMIG_COV_B` above
+  `**16 objects**`, where `SNOWMIG_COV_B` had been refused outright and
+  contributed nothing. The refusal was disclosed thirty-five lines lower
+  under *Extraction notes*, which is not where a reader who has taken the
+  headline goes.
+- A database in scope that could not be read is marked `(**NOT READ**)` in
+  the scope line, and a note under the count says the count does not cover
+  it and that this is a privilege result rather than an empty database. An
+  object-level extraction note is not mistaken for a refused database.
 
 ### Fixed — the four items raised on the review PR
 

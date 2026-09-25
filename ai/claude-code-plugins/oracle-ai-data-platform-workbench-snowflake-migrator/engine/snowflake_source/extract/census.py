@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import collections
 import datetime
+import re
+import json
 from typing import Callable
 
 from ..dialect import lexer
@@ -243,6 +245,58 @@ def _refine_function(row: dict) -> dict | None:
     return None
 
 
+# The statements that put rows in a table, matched over CODE only (literals,
+# quoted identifiers and comments blanked), then the target is parsed from the
+# raw text at the same offset so a quoted name keeps its case. COPY INTO
+# @stage and COPY INTO 's3://...' are unloads: no identifier follows, so they
+# are not writes. What a CALLed procedure writes is not on the row at all.
+_WRITE_VERB = re.compile(
+    r"\b(?:insert\s+(?:overwrite\s+)?into|merge\s+into|copy\s+into"
+    r"|delete\s+from|update|truncate(?:\s+table)?(?:\s+if\s+exists)?"
+    r"|create\s+(?:or\s+replace\s+)?(?:(?:local|global)\s+)?"
+    r"(?:transient\s+|temporary\s+|temp\s+|volatile\s+)?table"
+    r"(?:\s+if\s+not\s+exists)?)(?=\s)", re.IGNORECASE)
+_IDENT_PART = r'(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)'
+# The gap after the verb is skipped in the RAW text: the mask blanks a quoted
+# name or a literal to spaces, and skipping it there runs straight across it.
+_TARGET = re.compile(rf"\s+({_IDENT_PART}(?:\s*\.\s*{_IDENT_PART}){{0,2}})")
+_PART = re.compile(_IDENT_PART)
+# A word in target position that is not a table: MERGE's `THEN UPDATE SET`,
+# and `IDENTIFIER($var)`, whose table is a runtime value.
+_NOT_A_TABLE = {"SET", "IDENTIFIER"}
+
+
+def _part(text: str) -> str:
+    if text.startswith('"'):
+        return text[1:-1].replace('""', '"')
+    return text.upper()
+
+
+def written_tables(body: str, db: str, schema: str) -> list[str]:
+    """Fully-qualified tables a pipe or task body writes, in first-seen order.
+
+    An unqualified name resolves against the object's OWN database and schema
+    -- live-verified 2026-09-25: a task run from a session with no current
+    database wrote the table in the task's schema. Empty means none could be
+    read from the body, not that the body writes nothing.
+    """
+    body = body or ""
+    mask = lexer.code_only(body)
+    found: list[str] = []
+    for m in _WRITE_VERB.finditer(mask):
+        target = _TARGET.match(body, m.end())
+        if not target:
+            continue
+        parts = [_part(p) for p in _PART.findall(target.group(1))]
+        if len(parts) == 1 and not target.group(1).startswith('"') \
+                and parts[0] in _NOT_A_TABLE:
+            continue
+        full = ".".join([db, schema][:3 - len(parts)] + parts)
+        if full not in found:
+            found.append(full)
+    return found
+
+
 # Each kind: where to read it, how to name it, and why it cannot migrate here.
 KINDS: tuple[dict, ...] = (
     {"kind": "PROCEDURE", "source": "information_schema",
@@ -282,10 +336,15 @@ KINDS: tuple[dict, ...] = (
     {"kind": "PIPE", "source": "information_schema",
      "relation": "pipes", "name_col": "PIPE_NAME",
      "schema_col": "PIPE_SCHEMA",
+     # DEFINITION is `COPY INTO <table> FROM @stage`: the table it loads.
+     "extra_cols": ("DEFINITION",), "writes_col": "DEFINITION",
+     "degraded_note": "the pipe definitions were not readable, so the "
+                      "table each pipe loads is not named",
      "reason": "Snowpipe is continuous ingestion. It has no AIDP object; it "
                "becomes a streaming job or a scheduled load, which is an "
                "architecture decision (see the data-movement options)."},
     {"kind": "TASK", "source": "show", "relation": "tasks",
+     "writes_col": "definition",
      "reason": "a task is a scheduler. AIDP Jobs are the equivalent, but the "
                "schedule, dependencies and body all have to be re-expressed. "
                "**A task that populates a migrated table means that table "
@@ -425,13 +484,27 @@ def _read_show(run_sql, db: str | None, spec: dict) -> list[dict]:
     return run_sql(f'show {spec["relation"]} in database {lexer.qualify(db)}')
 
 
-def _role_text(role: str | None) -> str:
-    return f"role `{role}`" if role else "the current role"
+def _role_text(role: str | None, secondary: list[str] | None = None) -> str:
+    """How to name the authority a count was produced under.
+
+    Naming only the primary role is wrong whenever secondary roles are
+    active: the read had their privileges too, so a reader who takes the
+    sentence at face value concludes a restricted role is sufficient when it
+    is not.
+    """
+    base = f"role `{role}`" if role else "the current role"
+    if secondary:
+        return (base + " **plus secondary role(s) "
+                + ", ".join(f"`{r}`" for r in secondary)
+                + "**, whose privileges these reads also had")
+    return base
 
 
-def _visibility_note(role: str | None) -> str:
+def _visibility_note(role: str | None,
+                     secondary: list[str] | None = None) -> str:
     lines = [
-        f"**Counted as visible to {_role_text(role)}.** Snowflake's SHOW and "
+        f"**Counted as visible to {_role_text(role, secondary)}.** "
+        "Snowflake's SHOW and "
         "INFORMATION_SCHEMA return only the objects the current role holds a "
         "privilege on, and a statement that returns nothing still succeeds -- "
         "so every count below is a lower bound, and a zero means *none "
@@ -443,7 +516,7 @@ def _visibility_note(role: str | None) -> str:
 
 def _summary(count: int, readable: bool, scope: str, note: str,
              role: str | None, *, denied: list[str] | None = None,
-             answered: int = 0) -> dict:
+             answered: int = 0, secondary: list[str] | None = None) -> dict:
     """One row of the counts table.
 
     `count` is None only when NOBODY looked. Where some databases answered
@@ -460,11 +533,12 @@ def _summary(count: int, readable: bool, scope: str, note: str,
             "denied_databases": denied,
             "scope": scope,
             "note": (f"{count} found in the database(s) that answered; "
-                     f"not visible to {_role_text(role)} in "
+                     f"not visible to {_role_text(role, secondary)} in "
                      f'{", ".join(denied)}, so this is a lower bound'),
         }
     if readable and not count:
-        note = f"0 visible to {_role_text(role)}; a lower bound, not a total"
+        note = (f"0 visible to {_role_text(role, secondary)}; a lower "
+                f"bound, not a total")
     return {"count": count if readable else None,
             "readable": readable,
             "unread": None if readable else "denied",
@@ -482,12 +556,35 @@ def _not_distinguishable(parent: str, scope: str) -> dict:
                      f"distinguishable rather than none")}
 
 
+def secondary_roles_active(value) -> list[str]:
+    """The roles in effect BESIDES the current one, from
+    `CURRENT_SECONDARY_ROLES()`.
+
+    Snowflake returns a JSON object: `{"roles":"A,B","value":"ALL"}` when
+    secondary roles are active, and an empty `roles` when they are not. Any
+    shape this cannot read yields no roles rather than a guess -- an empty
+    list here means "none named", and the caller must not read it as "none
+    active" when the field was missing entirely.
+    """
+    if not value:
+        return []
+    text = str(value)
+    if text.strip().startswith("{"):
+        try:
+            text = json.loads(text).get("roles", "")
+        except (ValueError, AttributeError):
+            return []
+    return [r.strip() for r in str(text).split(",") if r.strip()]
+
+
 def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
                  include_definitions: bool = False,
-                 role: str | None = None) -> dict:
+                 role: str | None = None,
+                 secondary_roles: list[str] | None = None) -> dict:
     notes: list[str] = []
     kinds: dict[str, dict] = {}
     objects: list[dict] = []
+    secondary = list(secondary_roles or [])
 
     for spec in KINDS:
         kind = spec["kind"]
@@ -525,11 +622,13 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
                 tally[entry["kind"]] = tally.get(entry["kind"], 0) + 1
         readable = not denied
         kinds[kind] = _summary(tally[kind], readable, scope, note, role,
-                               denied=denied, answered=answered)
+                               denied=denied, answered=answered,
+                               secondary=secondary)
         if readable and degraded:
-            kinds[kind]["note"] += (
-                f"; the detail columns were not readable, so every row is "
-                f"reported as a plain {kind.lower().replace('_', ' ')}")
+            kinds[kind]["note"] += "; " + (
+                spec.get("degraded_note")
+                or f"the detail columns were not readable, so every row is "
+                   f"reported as a plain {kind.lower().replace('_', ' ')}")
         for sub in sub_kinds:
             # A sub-kind exists only while the deciding column can be read.
             # Without it these rows are still counted -- under the parent kind
@@ -538,7 +637,8 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
             kinds[sub] = (
                 _not_distinguishable(kind, scope) if readable and degraded
                 else _summary(tally[sub], readable, scope, note, role,
-                              denied=denied, answered=answered))
+                              denied=denied, answered=answered,
+                              secondary=secondary))
 
     by_language = collections.Counter(
         o["language"] for o in objects if o.get("language"))
@@ -557,9 +657,10 @@ def build_census(run_sql: Callable[..., list[dict]], databases: list[str], *,
         "by_effort": dict(by_effort),
         "unreadable": notes,
         "role": role,
+        "secondary_roles": secondary,
         "completeness": "visible-to-role",
-        "visibility_note": _visibility_note(role),
-        "scope_statement": _scope_statement(len(objects), by_kind, kinds, role),
+        "visibility_note": _visibility_note(role, secondary),
+        "scope_statement": _scope_statement(len(objects), by_kind, kinds, role, secondary),
     }
 
 
@@ -590,8 +691,15 @@ def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
     if spec.get("sig_col") and row.get(spec["sig_col"]):
         entry["detail"] = str(row[spec["sig_col"]])
     elif spec["source"] == "show":
-        state = row.get("state") or row.get("target_lag") or row.get("mode")
-        entry["detail"] = f"state={state}" if state else ""
+        # Labelled by the field it came from. `state=1 day` for a dynamic
+        # table's target lag and `state=EGRESS` for a network rule's mode
+        # were both wrong under the one label.
+        for field in ("state", "target_lag", "mode"):
+            if row.get(field):
+                entry["detail"] = f"{field}={row[field]}"
+                break
+        else:
+            entry["detail"] = ""
 
     language = None
     unknown_language = False
@@ -617,9 +725,19 @@ def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
             f'{entry["reason"]} Handler language {language!r} was not '
             f"recognised, so no path is proposed.")
 
+    # The table a pipe or task fills. Named, so the plan can say which
+    # migrating table stops being populated at cutover; absent, not empty,
+    # when the body names none this can read.
+    if spec.get("writes_col") and db is not None and row.get(spec["writes_col"]):
+        writes = written_tables(str(row[spec["writes_col"]]), db, str(schema))
+        if writes:
+            entry["writes"] = writes
+            entry["detail"] = (f'{entry["detail"]} '
+                               f'writes={",".join(writes)}').strip()
+
     if include_definitions:
         for key in ("PROCEDURE_DEFINITION", "FUNCTION_DEFINITION", "text",
-                    "definition"):
+                    "definition", "DEFINITION"):
             if row.get(key):
                 entry["definition"] = str(row[key])
                 break
@@ -627,10 +745,11 @@ def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
 
 
 def _scope_statement(total: int, by_kind, kinds: dict,
-                     role: str | None = None) -> str:
+                     role: str | None = None,
+                     secondary: list[str] | None = None) -> str:
     denied = [k for k, v in kinds.items() if v.get("unread") == "denied"]
     indistinct = [k for k, v in kinds.items() if v.get("unread") == "degraded"]
-    who = _role_text(role)
+    who = _role_text(role, secondary)
     if total == 0 and not denied:
         # Every statement succeeded and returned nothing. With a minimal
         # read-only role that is the EXPECTED result on an estate full of

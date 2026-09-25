@@ -58,10 +58,16 @@ _TABLES_SQL = (
     "select TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, ROW_COUNT, BYTES "
     "from INFORMATION_SCHEMA.TABLES{where} order by TABLE_SCHEMA, TABLE_NAME")
 
+# COLUMN_DEFAULT, IDENTITY_* and COMMENT are here because the planning
+# stages warn on them (R22, R23) and carry the comment into the CREATE
+# TABLE. Without them a manifest-planned estate gets a DDL plan that is
+# silent about defaults and identity columns that stop working at cutover,
+# while the same estate planned from a laptop warns about both.
 _COLUMNS_SQL = (
     "select TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, "
     "DATA_TYPE, IS_NULLABLE, NUMERIC_PRECISION, NUMERIC_SCALE, "
-    "CHARACTER_MAXIMUM_LENGTH from INFORMATION_SCHEMA.COLUMNS{where} "
+    "CHARACTER_MAXIMUM_LENGTH, COLUMN_DEFAULT, IDENTITY_START, "
+    "IDENTITY_INCREMENT, COMMENT from INFORMATION_SCHEMA.COLUMNS{where} "
     "order by TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION")
 
 

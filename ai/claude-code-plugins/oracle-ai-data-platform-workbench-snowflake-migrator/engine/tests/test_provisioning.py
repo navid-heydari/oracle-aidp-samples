@@ -1227,3 +1227,203 @@ def test_no_transport_puts_connection_details_on_argv(transport, operation,
     transport(fake)(operation, body=body)
     assert not any("connectionDetails" in a for a in seen["cmd"]), seen["cmd"]
     assert _SECRET not in " ".join(seen["cmd"])
+
+
+# ------------------------------- a CLI call that never returns, live 2026-09-24
+#
+# `provision --execute` hung for one hour and forty-seven minutes. A single
+# `oci` child process, started two minutes into the run, never exited; the
+# parent sat in subprocess.run() waiting for it with no timeout, printed
+# nothing, and wrote no result. A Spark cluster billed for the whole of it.
+# Killing the child by hand let the parent continue immediately.
+#
+# None of the three subprocess.run() call sites passed `timeout=`. A hung
+# CLI is not exotic -- a stalled TLS handshake or a proxy black hole does
+# it -- and the cost of not bounding it is measured in cluster-hours.
+
+def test_every_subprocess_call_site_bounds_its_wait():
+    """Read the sources: no subprocess.run without a timeout."""
+    import re
+    root = pathlib.Path(__file__).resolve().parents[1]
+    offenders = []
+    for src in root.rglob("*.py"):
+        if "tests" in src.parts:
+            continue
+        text = src.read_text(encoding="utf-8")
+        for m in re.finditer(r"subprocess\.run\(", text):
+            # the call's argument list, to its balancing paren
+            i, depth = m.end(), 1
+            while i < len(text) and depth:
+                depth += (text[i] == "(") - (text[i] == ")")
+                i += 1
+            if "timeout=" not in text[m.end():i]:
+                line = text[:m.start()].count("\n") + 1
+                offenders.append(f"{src.relative_to(root)}:{line}")
+    assert not offenders, (
+        "subprocess.run without timeout=: " + ", ".join(offenders))
+
+
+def test_a_timed_out_cli_call_is_reported_not_raised():
+    """The operator gets a named failure, not a traceback and not a hang."""
+    import subprocess
+    from target.runner import run_cli, CliTimeout
+
+    def hang(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, kw.get("timeout", 1))
+
+    with pytest.raises(CliTimeout) as e:
+        run_cli(["oci", "raw-request", "--target-uri", "https://x"],
+                run_process=hang, timeout=1)
+    msg = str(e.value)
+    assert "1" in msg and "timed out" in msg.lower()
+    assert "oci" in msg
+
+
+def test_the_timeout_is_long_enough_for_a_real_call():
+    """Bounded, not impatient: a cluster create legitimately takes minutes."""
+    from target.runner import DEFAULT_CLI_TIMEOUT
+    assert DEFAULT_CLI_TIMEOUT >= 300
+
+
+# --------------- the stage parameter the refusal message promised
+#
+# Live 2026-09-24. `run --param schema=CORE` is refused, correctly: AIDP job
+# parameters reach a notebook as neither argv nor environment, so the value
+# would be silently ignored. The refusal then named
+# `provision --refresh-notebooks` as the way to set stage parameters -- and
+# provision writes only five coordinates into PARAMS and has no flag for any
+# other. `schema` is REQUIRED by 02_copy_schema and is exactly the one it
+# could not supply, so following the advice re-provisioned everything and
+# left `schema` None.
+
+def test_a_stage_param_reaches_the_notebook_params_cell():
+    from target.stage_notebooks import STAGES, build_stage_notebook
+    stage = next(s for s in STAGES if s.key == "copy_schema")
+    nb = build_stage_notebook(stage, overrides={"schema": "SALES",
+                                                "target-catalog": "lake"})
+    params = next(c for c in nb["cells"]
+                  if "PARAMS = {" in "".join(c["source"]))
+    text = "".join(params["source"])
+    assert "'schema': 'SALES'" in text, text[:400]
+
+
+def test_a_stage_that_does_not_declare_the_name_ignores_it():
+    from target.stage_notebooks import STAGES, build_stage_notebook
+    stage = next(s for s in STAGES if s.key == "reconcile")
+    nb = build_stage_notebook(stage, overrides={"schema": "SALES",
+                                                "target-catalog": "lake"})
+    text = "".join("".join(c["source"]) for c in nb["cells"]
+                   if "PARAMS = {" in "".join(c["source"]))
+    assert "'schema'" not in text, text[:300]
+
+
+def test_an_explicit_stage_param_outranks_a_derived_coordinate():
+    """The operator naming a value beats provision deriving one."""
+    from target.stage_notebooks import STAGES, build_stage_notebook
+    stage = next(s for s in STAGES if s.key == "copy_schema")
+    nb = build_stage_notebook(stage, overrides={"target-catalog": "chosen"})
+    text = "".join("".join(c["source"]) for c in nb["cells"]
+                   if "PARAMS = {" in "".join(c["source"]))
+    assert "'target-catalog': 'chosen'" in text
+
+
+def test_the_refusal_names_the_flag_that_actually_works():
+    """The message may not send an operator down a path that cannot set
+    the value they asked for."""
+    import snowmig
+    src = pathlib.Path(snowmig.__file__).read_text(encoding="utf-8")
+    i = src.index("--param does not reach a notebook stage")
+    block = src[i:i + 1200]
+    assert "--stage-param" in block, block[:500]
+
+
+# ---------------- one listing per folder, not one per file
+#
+# Raised on the review PR as an efficiency note: repeated workspace
+# listings compound with the pagination-following in collect_pages. The
+# plan-file loop uploaded a file and then listed the WHOLE folder to verify
+# it, once per file. Each listing is a separate `aidp` CLI process; the
+# live run made seven of them.
+#
+# The read-back discipline is the point and does not change -- a 2xx is
+# still not the claim. It is the same evidence gathered once.
+
+def _count_ops(ops, name):
+    return sum(1 for op, _kw in ops if op == name)
+
+
+def test_plan_files_are_verified_with_one_listing_for_the_folder(tmp_path):
+    files = []
+    for n in ("inventory.json", "plan.json", "ddl_plan.json"):
+        f = tmp_path / n
+        f.write_text("{}", encoding="utf-8")
+        files.append(f)
+
+    ops = []
+    uploaded = []
+
+    def call(operation, **kw):
+        ops.append((operation, kw))
+        if operation == "upload_ws_file":
+            uploaded.append(kw["path"].rsplit("/", 1)[-1])
+            return {}
+        if operation == "list_ws_objects":
+            return {"items": [{"displayName": n} for n in uploaded]}
+        if operation == "list_workspaces":
+            return {"items": [{"displayName": "ws", "key": "wsk",
+                               "lifecycleState": "ACTIVE"}]}
+        if operation == "list_clusters":
+            return {"items": [{"displayName": "c", "key": "ck",
+                               "lifecycleState": "ACTIVE"}]}
+        if operation == "list_jobs":
+            return {"items": []}
+        return {}
+
+    out = provision(workspace_name="ws", cluster_name="c", scripts=[],
+                    plan_files=files, execute=True, call=call,
+                    reuse_existing=True, delays=())
+    plan_listings = [kw for op, kw in ops
+                     if op == "list_ws_objects"
+                     and kw.get("path") == PLAN_FOLDER]
+    plan_uploads = [kw for op, kw in ops if op == "upload_ws_file"
+                    and str(kw.get("path", "")).startswith(PLAN_FOLDER)]
+    assert len(plan_uploads) == 3, plan_uploads
+    assert len(plan_listings) == 1, (
+        f"one listing verifies the whole folder; got {len(plan_listings)}")
+    plan_steps = [s for s in out["steps"] if s["step"] == "upload"
+                  and PLAN_FOLDER in str(s["detail"])]
+    assert plan_steps and all(s["verified"] for s in plan_steps), plan_steps
+
+
+def test_a_file_whose_upload_raised_is_failed_not_merely_unseen(tmp_path):
+    good = tmp_path / "plan.json"
+    good.write_text("{}", encoding="utf-8")
+    bad = tmp_path / "ddl_plan.json"
+    bad.write_text("{}", encoding="utf-8")
+
+    def call(operation, **kw):
+        if operation == "upload_ws_file" and kw["path"].endswith("ddl_plan.json"):
+            raise RuntimeError("403 Forbidden")
+        if operation == "list_ws_objects":
+            return {"items": [{"displayName": "plan.json"}]}
+        if operation == "list_workspaces":
+            return {"items": [{"displayName": "ws", "key": "wsk",
+                               "lifecycleState": "ACTIVE"}]}
+        if operation == "list_clusters":
+            return {"items": [{"displayName": "c", "key": "ck",
+                               "lifecycleState": "ACTIVE"}]}
+        if operation == "list_jobs":
+            return {"items": []}
+        return {}
+
+    out = provision(workspace_name="ws", cluster_name="c", scripts=[],
+                    plan_files=[good, bad], execute=True, call=call,
+                    reuse_existing=True, delays=())
+    by_detail = {s["detail"].split(":")[0]: s for s in out["steps"]
+                 if s["step"] == "upload"}
+    failed = [s for s in out["steps"]
+              if s["step"] == "upload" and s["action"] == "failed"]
+    assert failed, out["steps"]
+    assert "403" in failed[0]["detail"]
+    assert any(s["action"] == "uploaded" for s in out["steps"]
+               if s["step"] == "upload")

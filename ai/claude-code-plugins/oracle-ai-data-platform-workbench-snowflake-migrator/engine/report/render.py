@@ -5,6 +5,10 @@ anything that halted or was skipped rather than burying it.
 """
 from __future__ import annotations
 
+import collections
+
+from snowflake_source.extract.census import secondary_roles_active
+from plan.build import object_kind_block
 from plan.data_movement import MAINTENANCE_TRAPS, architecture_decision
 from plan.smoke import smoke_verdict
 from plan.status import assess_risk, migration_status
@@ -87,16 +91,55 @@ def _row_cell(record: dict) -> str:
     return "-"
 
 
+def _unreadable_databases(inv: dict) -> list[str]:
+    """Databases in scope that yielded nothing because they were refused.
+
+    The note is already written by the extractor; this finds it so the
+    headline can carry the same fact. Matched on the extractor's own
+    `database <name>: ` prefix rather than by searching for the name inside
+    arbitrary error text, which would also match an object in that database.
+    """
+    out = []
+    for note in inv.get("extraction_notes") or []:
+        text = str(note)
+        if text.startswith("database ") and ":" in text:
+            name = text[len("database "):text.index(":")].strip()
+            if name and name not in out:
+                out.append(name)
+    return out
+
+
 def render_inventory(inv: dict) -> str:
     s = inv.get("session", {})
+    # Naming the primary role alone is wrong wherever secondary roles were
+    # active: those privileges served these reads too.
+    secondary = secondary_roles_active(s.get("SECONDARY_ROLES"))
+    role = f'role `{s.get("ROLE")}`'
+    if secondary:
+        role += (" **+ secondary "
+                 + ", ".join(f"`{r}`" for r in secondary) + "**")
+
+    # A database in scope that answered nothing is not part of this count,
+    # and the scope line may not imply it is.
+    refused = _unreadable_databases(inv)
+    scope = list(inv.get("databases_in_scope") or [])
+    scope_text = ", ".join(
+        f"{d} (**NOT READ**)" if d in refused else d for d in scope) or "-"
+
     out = ["# Snowflake estate inventory", "",
            f'Probed **{inv.get("probed_at")}** · account `{s.get("A")}` · '
-           f'region `{s.get("R")}` · role `{s.get("ROLE")}`',
-           f'Databases in scope: {", ".join(inv.get("databases_in_scope") or []) or "-"}',
+           f'region `{s.get("R")}` · {role}',
+           f'Databases in scope: {scope_text}',
            "",
            f'**{inv.get("object_count", 0)} objects** — '
            + " · ".join(f"{k} {v}" for k, v in (inv.get("counts_by_type") or {}).items()),
            ""]
+
+    if refused:
+        out += [f'> **{len(refused)} database(s) in scope could not be read '
+                f'at all**: {", ".join(f"`{d}`" for d in refused)}. The count '
+                f'above covers the rest. This is a privilege result, not an '
+                f'empty database — see Extraction notes.', ""]
 
     collisions = inv.get("identifier_case_collisions") or {}
     if collisions:
@@ -121,7 +164,14 @@ def render_inventory(inv: dict) -> str:
             f'| {_row_cell(r)} '
             f'| {_bytes((r.get("source_metadata") or {}).get("bytes"))} '
             f'| {len(r.get("columns") or [])} | {r.get("identifier_case_form")} '
-            f'| {r.get("compatibility_status")} |')
+            f'| {_compatibility_cell(r)} |')
+    kind_blocked = [r for r in records
+                    if r.get("compatibility_status") != "blocked"
+                    and object_kind_block(r)]
+    if kind_blocked:
+        out += ["", "`blocked (<kind>)` -- the column types map, but the "
+                "object kind has no plain Delta equivalent, so the plan "
+                "refuses it; PLANNED_OBJECTS.md says what to do instead."]
 
     # Every blank in the Rows column carries its reason. "not counted" and
     # ERROR are different facts, and neither is a zero.
@@ -230,6 +280,22 @@ _CATEGORY_TITLES = {
 }
 
 
+def _compatibility_cell(rec: dict) -> str:
+    """What the planner will do with the object, not only its column types.
+
+    `compatibility_status` is the type mapping. A dynamic table whose types
+    all map read `supported` here while the plan, from the same inventory,
+    refused it. The kind comes from the planner's own table.
+    """
+    status = rec.get("compatibility_status")
+    if status == "blocked":
+        return "blocked"
+    block = object_kind_block(rec)
+    if block:
+        return f"blocked ({block[0]})"
+    return str(status)
+
+
 def render_planned_objects(plan: dict) -> str:
     s = plan.get("summary", {})
     out = ["# Objects planned to move", "",
@@ -303,6 +369,18 @@ def render_planned_objects(plan: dict) -> str:
                 "meant to persist.", ""]
         out += [f'- `{w["source_identifier"]}` ({w.get("kind")}) — {w["warning"]}'
                 for w in kinds]
+        out.append("")
+
+    # Migrating tables that a pipe or task keeps filling in Snowflake. An
+    # older plan.json carries no list and renders unchanged.
+    loads = plan.get("loads_that_stop") or []
+    if loads:
+        out += ["## Planned, but loaded by something that does not move", "",
+                "The structure and today's rows migrate. The load does not: "
+                "after cutover these tables stop receiving rows until each "
+                "load is rebuilt on AIDP.", ""]
+        out += [f'- `{x["table"]}` <- {x["kind"]} `{x["source_identifier"]}`'
+                for x in loads]
         out.append("")
 
     cannot = plan.get("cannot_migrate") or []
@@ -1179,12 +1257,33 @@ def render_census(census: dict) -> str:
         out.append("")
 
         out += ["## Why each kind cannot move, and where it would go", ""]
-        seen: set[str] = set()
+        # One paragraph per DISTINCT VERDICT, not per kind. `refine` gives
+        # objects of one kind different reasons -- an internal stage needs
+        # its files unloaded, an external one does not; an inbound share is
+        # someone else's data, an outbound one is a live consumer contract.
+        # Keeping the first per kind covered the second case with the
+        # first's text, in the section a reader goes to for the verdict.
+        seen: set[tuple[str, str]] = set()
+        variants: dict[str, int] = collections.Counter(
+            (o["kind"], o["reason"]) for o in objects)
+        kinds_with_variants = {k for (k, _r), n in variants.items()
+                               if sum(1 for (k2, _) in variants if k2 == k) > 1}
         for o in objects:
-            if o["kind"] in seen:
+            key = (o["kind"], o["reason"])
+            if key in seen:
                 continue
-            seen.add(o["kind"])
-            out += [f'**{o["kind"]}** — {o["reason"]}', ""]
+            seen.add(key)
+            heading = f'**{o["kind"]}**'
+            if o["kind"] in kinds_with_variants:
+                # Say which objects this paragraph is about, or two STAGE
+                # paragraphs are indistinguishable.
+                members = [m["source_identifier"] for m in objects
+                           if (m["kind"], m["reason"]) == key]
+                shown = ", ".join(f"`{m}`" for m in members[:4])
+                if len(members) > 4:
+                    shown += f" and {len(members) - 4} more"
+                heading += f" ({shown})"
+            out += [f'{heading} — {o["reason"]}', ""]
             if o.get("aidp_path"):
                 out += [f'AIDP path: {o["aidp_path"]}', ""]
 

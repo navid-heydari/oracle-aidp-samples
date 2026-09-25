@@ -39,13 +39,13 @@ from target.ddl import (
     uncarried_column_facts,
 )
 
-from .medallion import (TARGET_NAME_RULE_TEXT, bronze_target,
+from .medallion import (TARGET_KEY_MAX, TARGET_NAME_RULE_TEXT, bronze_target,
                         detect_target_collisions, layer_jobs,
-                        unacceptable_target_names)
+                        target_key_overage, unacceptable_target_names)
 from .restrictions import apply_restrictions
 from .waves import compute_waves
 
-__all__ = ["build_plan", "TargetCollision"]
+__all__ = ["build_plan", "TargetCollision", "object_kind_block"]
 
 # Values that mean "this property is not set"; the same list ddl.py skips.
 _UNSET = (None, "", "false", "FALSE", "N", "OFF", "null", "NULL")
@@ -96,23 +96,56 @@ def _is_set(value) -> bool:
         "true", "y", "yes", "1")
 
 
-# SHOW TABLES flag -> why a plain Delta copy is not that object. First match
-# wins; a table carrying several flags is still one refusal.
+# SHOW TABLES flag -> (short label, why a plain Delta copy is not that
+# object). First match wins; a table carrying several flags is still one
+# refusal. The label is what INVENTORY.md prints in its Compatibility column,
+# so the inventory and the plan read one table and cannot disagree.
 _TABLE_KIND_BLOCKS = (
-    ("is_dynamic", "Snowflake dynamic table: refreshed by Snowflake from its "
-                   "defining query; the census lists them; no equivalent is "
-                   "generated -- a copy would be a snapshot that never refreshes"),
-    ("is_external", "Snowflake external table: its data lives in the stage's "
-                    "object storage, not in Snowflake; point AIDP at that "
-                    "location rather than copying a materialisation of it"),
-    ("is_iceberg", "Snowflake Iceberg table: already open-format in object "
-                   "storage; register that Iceberg location in AIDP rather "
-                   "than copying it into Delta"),
-    ("is_event", "Snowflake event table: a log and trace sink written by "
-                 "Snowflake itself; AIDP has no equivalent object"),
-    ("is_hybrid", "Snowflake hybrid (Unistore) table: row-store OLTP "
-                  "semantics do not carry to Delta"),
+    ("is_dynamic", "dynamic table",
+     "Snowflake dynamic table: refreshed by Snowflake from its "
+     "defining query; the census lists them; no equivalent is "
+     "generated -- a copy would be a snapshot that never refreshes"),
+    ("is_external", "external table",
+     "Snowflake external table: its data lives in the stage's "
+     "object storage, not in Snowflake; point AIDP at that "
+     "location rather than copying a materialisation of it"),
+    ("is_iceberg", "Iceberg table",
+     "Snowflake Iceberg table: already open-format in object "
+     "storage; register that Iceberg location in AIDP rather "
+     "than copying it into Delta"),
+    ("is_event", "event table",
+     "Snowflake event table: a log and trace sink written by "
+     "Snowflake itself; AIDP has no equivalent object"),
+    ("is_hybrid", "hybrid table",
+     "Snowflake hybrid (Unistore) table: row-store OLTP "
+     "semantics do not carry to Delta"),
 )
+
+# The same for views, from SHOW VIEWS.
+_VIEW_KIND_BLOCKS = (
+    ("is_secure", "secure view",
+     "Snowflake secure view: its definition and row-visibility rules have "
+     "no Delta equivalent"),
+    ("is_materialized", "materialized view",
+     "Snowflake materialized view: no AIDP equivalent; rebuild as a table "
+     "plus a refresh job"),
+)
+
+
+def object_kind_block(rec: dict) -> tuple[str, str] | None:
+    """(label, reason) when the object's KIND has no plain-Delta equivalent.
+
+    Independent of the column types, which `compatibility_status` covers.
+    Read by the planner, which refuses the object, and by render_inventory,
+    which once said `supported` for a dynamic table this refuses.
+    """
+    blocks = (_VIEW_KIND_BLOCKS if rec.get("object_type") == "VIEW"
+              else _TABLE_KIND_BLOCKS)
+    meta = rec.get("source_metadata") or {}
+    for flag, label, reason in blocks:
+        if _is_set(meta.get(flag)):
+            return label, reason
+    return None
 
 # SHOW TABLES `kind` values that migrate, as permanent tables, with a warning.
 _TABLE_KIND_WARNINGS = {
@@ -127,10 +160,9 @@ _TABLE_KIND_WARNINGS = {
 
 def _table_verdict(rec: dict) -> tuple[bool, str, str]:
     """(can_migrate, category, reason) for one table, from its SHOW flags."""
-    meta = rec.get("source_metadata") or {}
-    for flag, reason in _TABLE_KIND_BLOCKS:
-        if _is_set(meta.get(flag)):
-            return False, "unsupported_object", reason
+    block = object_kind_block(rec)
+    if block:
+        return False, "unsupported_object", block[1]
     return True, "", ""
 
 
@@ -144,15 +176,9 @@ def _table_kind_warning(rec: dict) -> dict | None:
 
 def _view_verdict(rec: dict) -> tuple[bool, str, str]:
     """(can_migrate, category, reason) for one view."""
-    meta = rec.get("source_metadata") or {}
-    if _is_set(meta.get("is_secure")):
-        return False, "unsupported_object", (
-            "Snowflake secure view: its definition and row-visibility rules have "
-            "no Delta equivalent")
-    if _is_set(meta.get("is_materialized")):
-        return False, "unsupported_object", (
-            "Snowflake materialized view: no AIDP equivalent; rebuild as a table "
-            "plus a refresh job")
+    block = object_kind_block(rec)
+    if block:
+        return False, "unsupported_object", block[1]
     ddl = rec.get("view_ddl_get_ddl") or rec.get("view_text_show")
     if not ddl:
         return False, "no_definition", (
@@ -204,6 +230,28 @@ def _cascade_dependency_exclusions(can: list[dict], cannot: list[dict],
             why[dependent] = entry
             queue.append(dependent)
     return [c for c in can if c["source_identifier"] in can_ids], cannot
+
+
+def _loads_into(census: dict | None) -> dict[str, list[dict]]:
+    """Migrating-table candidates -> the pipes and tasks that write them.
+
+    From the census's own reading of each body (`writes`). A load whose
+    target could not be read is simply absent here: no entry is not a claim
+    that nothing loads the table, which is why the census says what it read.
+    """
+    loads: dict[str, list[dict]] = collections.defaultdict(list)
+    for obj in (census or {}).get("objects") or []:
+        for table in obj.get("writes") or []:
+            loads[table].append({"kind": obj["kind"],
+                                 "source_identifier": obj["source_identifier"]})
+    return loads
+
+
+def _load_warning(load: dict) -> str:
+    return (f'loaded in Snowflake by {load["kind"]} '
+            f'{load["source_identifier"]}, which does not migrate: after '
+            f"cutover this table stops receiving rows unless that load is "
+            f"rebuilt on AIDP (a Job, or a streaming or scheduled load)")
 
 
 def _target_catalog_note(catalogs: list[str], prefix: str | None,
@@ -264,6 +312,31 @@ def build_plan(inventory: dict, dependencies: dict, *,
         # A name the destination will refuse is refused here, not at the
         # create. Planning it means generating DDL for it, attempting it, and
         # burning the name on a 400 -- which is how it was found.
+        # A key the destination cannot hold, refused here rather than at
+        # the create -- where it returns 202, never appears, and burns the
+        # name in that schema.
+        over = target_key_overage(targets[ident])
+        if over:
+            target = targets[ident]
+            catalog, schema, _, = (target.split(".", 2) + ["", ""])[:3]
+            cannot.append({
+                "source_identifier": ident,
+                "object_type": rec.get("object_type"),
+                "category": "target_key_too_long",
+                "reason": (
+                    f"the target key {target!r} is {len(target)} characters; "
+                    f"the destination stores at most {TARGET_KEY_MAX} and "
+                    f"answers a longer one with 202 Accepted, creates "
+                    f"nothing, and burns the name. It is over by {over}. "
+                    f"The limit is on the WHOLE key: catalog {catalog!r} "
+                    f"({len(catalog)}) + schema {schema!r} ({len(schema)}) "
+                    f"leave {max(0, TARGET_KEY_MAX - len(catalog) - len(schema) - 2)} "
+                    f"characters for the object name. Shorten "
+                    f"--bronze-catalog-prefix, or use "
+                    f"--bronze-schema-style db, before renaming anything in "
+                    f"Snowflake.")})
+            continue
+
         bad = unacceptable_target_names(targets[ident])
         if bad:
             cannot.append({
@@ -342,6 +415,17 @@ def build_plan(inventory: dict, dependencies: dict, *,
     can, cannot = _cascade_dependency_exclusions(
         can, cannot, dependencies.get("edges", []))
 
+    # A pipe or task the census read as writing a table that migrates. The
+    # census TASK verdict says such a table stops being populated at cutover;
+    # this is where it gets named. Kept out of `warnings`, which assess_risk
+    # reports as column warnings -- this is a sentence about the table.
+    loads = _loads_into(inventory.get("census"))
+    loads_that_stop: list[dict] = []
+    for c in can:
+        fed = loads.get(c["source_identifier"]) or []
+        c["load_warnings"] = [_load_warning(f) for f in fed]
+        loads_that_stop += [{"table": c["source_identifier"], **f} for f in fed]
+
     collisions = detect_target_collisions(
         {c["source_identifier"]: targets[c["source_identifier"]] for c in can})
     if collisions:
@@ -389,6 +473,10 @@ def build_plan(inventory: dict, dependencies: dict, *,
             (w for w in kind_warnings
              if w["source_identifier"] in {c["source_identifier"] for c in can}),
             key=lambda w: w["source_identifier"]),
+        # Migrating tables loaded by a pipe or task that does not migrate.
+        "loads_that_stop": sorted(
+            loads_that_stop,
+            key=lambda x: (x["table"], x["kind"], x["source_identifier"])),
         "restrictions_applied": restrictions or {},
         "catalogs_to_create": catalogs,
         "schemas_to_create": [list(s) for s in schemas],
