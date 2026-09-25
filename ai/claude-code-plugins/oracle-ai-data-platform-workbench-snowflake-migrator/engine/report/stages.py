@@ -318,7 +318,9 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
 
     if stage == "run":
         # The last recorded result per job. A run whose budget ran out is
-        # STILL RUNNING, never rounded to either verdict.
+        # STILL RUNNING, never rounded to either verdict. A status watch_job
+        # does not classify (`unrecognised`) is neither done nor running;
+        # cmd_run says so and exits 1, and the board must not round it up.
         parts, attention = [], False
         for run in data.get("_many") or []:
             if run.get("_unreadable"):
@@ -326,7 +328,9 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
                 attention = True
                 continue
             job = run.get("job") or run.get("job_key") or "?"
-            if not run.get("terminal"):
+            if not run.get("terminal") and run.get("unrecognised"):
+                verdict = f'**UNRECOGNISED STATE {run.get("status") or "?"}**'
+            elif not run.get("terminal"):
                 verdict = "STILL RUNNING"
             elif run.get("ok"):
                 verdict = "SUCCESS"

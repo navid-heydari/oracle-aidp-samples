@@ -71,3 +71,25 @@ def test_the_stage_board_skill_names_run_as_a_writer():
     assert "Three stages write" not in text
     point = text.split("Then say three things out loud:", 1)[1].split("\n2. ", 1)[0]
     assert "`run`" in point and "no dry run" in point
+
+
+def test_an_unrecognised_run_state_is_not_rounded_up_to_still_running(tmp_path):
+    """A status this plugin does not classify is neither done nor running.
+
+    watch_job keeps a separate `unrecognised` flag for a non-terminal run
+    whose status is not one of the ACTIVE_STATES, and cmd_run prints
+    UNRECOGNISED STATE for it and exits 1, saying that reporting STILL
+    RUNNING "would round it up". The board read every non-terminal run as
+    STILL RUNNING, so run_snowmig_02_copy_schema.json with status
+    WEIRD_STATE was on the board as "snowmig_02_copy_schema: STILL RUNNING"
+    -- an agent reading it would tell the user to wait for a run that may
+    never finish.
+    """
+    _write(tmp_path, "run_snowmig_02_copy_schema.json",
+           {"job": "snowmig_02_copy_schema", "terminal": False, "ok": False,
+            "unrecognised": True, "status": "X"})
+    row = next(r for r in build_stage_board(tmp_path)["stages"]
+               if r["stage"] == "run")
+    assert "STILL RUNNING" not in row["found"]
+    assert "UNRECOGNISED STATE X" in row["found"]
+    assert row["attention"] is True
