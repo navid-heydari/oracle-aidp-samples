@@ -273,6 +273,7 @@ def _dateadd(sql: str) -> tuple[str, str | None]:
 
 _LISTAGG = (
     r"(?P<kw>\bLISTAGG\s*\()\s*([^,()]+?)\s*,\s*('(?:[^']*)')\s*\)")
+_OVER = re.compile(r"\s*OVER\b", re.IGNORECASE)
 
 
 def _listagg(sql: str) -> tuple[str, str | None]:
@@ -280,6 +281,20 @@ def _listagg(sql: str) -> tuple[str, str | None]:
         return sql, ("LISTAGG ... WITHIN GROUP (ORDER BY ...) -- Spark's "
                      "collect_list does not guarantee ordering, so the ordering "
                      "semantics would be lost silently")
+    # LISTAGG(...) OVER (...) is the window form. The match ends at LISTAGG's
+    # own closing paren, so it became concat_ws(...) OVER (...) -- a scalar
+    # function with a window clause, which Spark rejects at create -- and was
+    # stamped exact. Checked over the code mask, so a comment between the
+    # call and OVER does not hide it.
+    mask = lexer.code_only(sql)
+    if any(_OVER.match(mask, m.end()) for m in re.finditer(
+            _LISTAGG, sql, re.IGNORECASE)
+            if mask[m.start("kw"):m.end("kw")] == sql[m.start("kw"):m.end("kw")]):
+        return sql, ("LISTAGG(...) OVER (...) -- the window form. "
+                     "concat_ws(sep, collect_list(x)) is an aggregate rewrite; "
+                     "with the OVER clause left after it, Spark rejects the "
+                     "view. The window would have to move inside, onto "
+                     "collect_list, which is not an implemented rule")
     # The separator IS a literal and is reproduced verbatim, so the anchor is
     # the LISTAGG keyword rather than the whole span.
     out = lexer.sub_code(

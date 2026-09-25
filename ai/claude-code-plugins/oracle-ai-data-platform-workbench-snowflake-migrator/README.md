@@ -461,8 +461,8 @@ on a bare column or literal, `ARRAY_CONSTRUCT`, `OBJECT_CONSTRUCT`,
 so), `LISTAGG(x, sep)`, `"quoted identifiers"` → backticks, `''` → `\'`
 and `//` line comments → `--`
 — but only in those exact forms; a form the rule cannot prove (an expression
-left of `::`, `LISTAGG … WITHIN GROUP`, a non-literal `DATEADD` amount) is
-refused with the construct named. 12 others — `QUALIFY`, `LATERAL FLATTEN`,
+left of `::`, `LISTAGG … WITHIN GROUP` or `… OVER`, a non-literal `DATEADD`
+amount) is refused with the construct named. 12 others — `QUALIFY`, `LATERAL FLATTEN`,
 `DATEDIFF`, `PIVOT`, `DECODE`, `$$…$$`, … — **block** the view with the
 construct named, rather than being rewritten on a guess; a mixed view is
 blocked, never partially translated. Secure and materialized views are

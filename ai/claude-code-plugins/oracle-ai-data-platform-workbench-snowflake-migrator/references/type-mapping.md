@@ -63,7 +63,7 @@ read blocks the view.
 | `ARRAY_CONSTRUCT(` | **Translated** to `array()` (`T03`) |
 | `OBJECT_CONSTRUCT(` | **Translated** to `named_struct()` (`T04`) |
 | `DATEADD(unit, n, col)` | **Translated** per unit (`T05`) when `n` is an integer literal or a column; any other form blocks. Exact for `DATE` operands only, and the plan says so |
-| `LISTAGG(x, sep)` | **Translated** to `concat_ws(sep, collect_list(x))` (`T06`); `WITHIN GROUP` blocks |
+| `LISTAGG(x, sep)` | **Translated** to `concat_ws(sep, collect_list(x))` (`T06`); `WITHIN GROUP` or a window `OVER (…)` blocks |
 | `"quoted identifier"` | **Translated** to `` `backticked` `` (`T07`): Spark reads `"..."` as a string literal. Case is kept |
 | `'it''s'` doubled quote in a literal | **Translated** to `'it\'s'` (`T08`): Spark reads `''` as two adjacent literals and concatenates them |
 | `// note` line comment | **Translated** to `-- note` (`T21`): Spark has no `//` comment |
