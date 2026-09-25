@@ -544,6 +544,8 @@ def build_plan(inventory: dict, dependencies: dict, *,
             catalogs, bronze_catalog_prefix, bronze_schema_style),
         "waves": waved["waves"],
         "cycles": waved["cycles"],
+        # Not in a cycle, but depending on one, so equally unorderable.
+        "blocked_behind_cycle": waved["blocked_behind_cycle"],
         "target_names": targets,
         "clone_targets": sorted(can_ids),
         "can_migrate": sorted(can, key=lambda c: c["source_identifier"]),

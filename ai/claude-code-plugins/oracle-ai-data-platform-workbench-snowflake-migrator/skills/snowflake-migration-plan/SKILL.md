@@ -90,7 +90,9 @@ folds to upper, `"sales_eu"` matches only that exact spelling.
    that copies nothing. Name a Standard catalog only if the user has explicitly
    asked for one.
 3. The waves — views follow their base tables.
-4. Cycles, if any: they need a human decision, not a broken edge.
+4. Cycles, if any: they need a human decision, not a broken edge. Objects
+   listed as *blocked behind a cycle* are not members; they wait on the cycle
+   named and move once it is resolved.
 5. The Silver/Gold job stubs: created, disabled, never triggered.
 6. **The data-movement architecture options — always.**
 

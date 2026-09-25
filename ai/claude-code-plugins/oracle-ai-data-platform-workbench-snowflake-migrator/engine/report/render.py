@@ -415,6 +415,14 @@ def render_planned_objects(plan: dict) -> str:
                 "Excluded from the ordering; they need a human decision rather than "
                 "an arbitrary broken edge.", ""]
         out += [f'- {", ".join(f"`{n}`" for n in c)}' for c in plan["cycles"]] + [""]
+        # In no cycle, but depending on one: held back for the same reason,
+        # and labelled apart so nobody hunts for a cycle it is not in.
+        behind = plan.get("blocked_behind_cycle") or {}
+        if behind:
+            out += ["Blocked behind a cycle (not members; each depends on "
+                    "the cycle named):", ""]
+            out += [f'- `{n}` behind {", ".join(f"`{m}`" for m in c)}'
+                    for n, c in sorted(behind.items())] + [""]
 
     out += ["## Order of creation", ""]
     unordered = plan.get("views_without_dependency_edge") or []

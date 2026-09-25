@@ -766,7 +766,11 @@ def build_ddl_payload(inventory: dict, plan: dict) -> dict:
     by_id = {r["source_identifier"]: r for r in inventory["inventory"]}
     name_map = plan.get("target_names", {})
     cycles = [list(c) for c in plan.get("cycles", [])]
-    in_cycle = {n for c in cycles for n in c}
+    # Stuck, but in no cycle: it depends on one. Named as such -- it used to
+    # be folded into the cycle and told it was in "dependency cycle with"
+    # objects it only reads.
+    behind = dict(plan.get("blocked_behind_cycle") or {})
+    in_cycle = {n for c in cycles for n in c} | set(behind)
     ordered = [i for wave in plan.get("waves", []) for i in wave]
     ordered += [i for i in plan.get("clone_targets", [])
                 if i not in ordered and i not in in_cycle]
@@ -774,15 +778,23 @@ def build_ddl_payload(inventory: dict, plan: dict) -> dict:
     statements, blocked = [], []
     for ident in sorted(i for i in plan.get("clone_targets", []) if i in in_cycle):
         rec = by_id.get(ident) or {}
-        others = sorted(n for c in cycles if ident in c for n in c if n != ident)
-        blocked.append({
-            "source_identifier": ident,
-            "object_type": rec.get("object_type"),
-            "reason": ("not emitted: dependency cycle with "
-                       + (", ".join(others) or "itself")
-                       + "; PLANNED_OBJECTS.md lists it under Dependency "
-                       "cycles for a human decision, and no edge was broken "
-                       "to force an order")})
+        if ident in behind:
+            reason = ("not emitted: not in a cycle, but it depends on the "
+                      "dependency cycle " + ", ".join(behind[ident])
+                      + ", which cannot be ordered; PLANNED_OBJECTS.md lists "
+                      "it as blocked behind that cycle, and no edge was "
+                      "broken to force an order")
+        else:
+            others = sorted(n for c in cycles if ident in c
+                            for n in c if n != ident)
+            reason = ("not emitted: dependency cycle with "
+                      + (", ".join(others) or "itself")
+                      + "; PLANNED_OBJECTS.md lists it under Dependency "
+                      "cycles for a human decision, and no edge was broken "
+                      "to force an order")
+        blocked.append({"source_identifier": ident,
+                        "object_type": rec.get("object_type"),
+                        "reason": reason})
     for ident in ordered:
         rec = by_id.get(ident)
         if rec is None:
