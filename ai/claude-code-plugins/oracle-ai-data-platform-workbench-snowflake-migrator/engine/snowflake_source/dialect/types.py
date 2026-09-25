@@ -102,6 +102,30 @@ def _collation_warning(collation: str) -> str:
             f"their results")
 
 
+# Spark TIMESTAMP and TIMESTAMP_NTZ hold microseconds.
+_SPARK_TIMESTAMP_PRECISION = 6
+
+
+def _precision_warning(key: str, datetime_precision) -> str | None:
+    """Digits below the microsecond are dropped at the read.
+
+    Precision 9 is Snowflake's DEFAULT, so this fires on most timestamp
+    columns of a real estate. It is a warning, not a note: values that
+    differed only in their last three digits compare equal on the target,
+    and the counts+sums verification sums DECIMAL columns only, so nothing
+    downstream notices.
+    """
+    try:
+        precision = int(datetime_precision)
+    except (TypeError, ValueError):
+        return None
+    if precision <= _SPARK_TIMESTAMP_PRECISION:
+        return None
+    return (f"{key} precision {precision}: sub-microsecond digits are "
+            f"truncated (Spark stores microseconds), so values that differ "
+            f"only below the microsecond arrive equal")
+
+
 def _join_warnings(*warnings: str | None) -> str | None:
     """TypeMapping carries one warning; two facts about a column are both
     kept rather than the second overwriting the first."""
@@ -114,12 +138,17 @@ def map_type(data_type: str, *, precision: int | None = None,
              semi_structured: str = "block",
              geospatial: str = "block",
              timestamp_ntz: str = "preserve",
-             collation: str | None = None) -> TypeMapping:
+             collation: str | None = None,
+             datetime_precision: int | None = None) -> TypeMapping:
     """One column's target type and what the mapping costs.
 
     `collation` is INFORMATION_SCHEMA.COLUMNS.COLLATION_NAME. It only means
     anything on a text column; NULL or empty is the default bytewise
     comparison, which Delta shares.
+
+    `datetime_precision` is DATETIME_PRECISION, read for the timestamp
+    types. TIME is carried as STRING, whose text keeps every digit, so it
+    is not consulted there.
     """
     if semi_structured not in SEMI_STRUCTURED_MODES:
         raise ValueError(
@@ -164,20 +193,25 @@ def map_type(data_type: str, *, precision: int | None = None,
         return TypeMapping(resolved, note=note)
 
     if key == "TIMESTAMP_NTZ":
+        truncated = _precision_warning(key, datetime_precision)
         if timestamp_ntz == "preserve":
-            return TypeMapping("TIMESTAMP_NTZ")
+            return TypeMapping("TIMESTAMP_NTZ", warning=truncated)
         return TypeMapping(
             "TIMESTAMP",
-            warning="TIMESTAMP_NTZ -> TIMESTAMP: the AIDP catalog cannot "
-                    "express timestamp_ntz, so the timezone-naive type is "
-                    "downgraded. TIMEZONE SEMANTICS DIFFER -- Spark TIMESTAMP "
-                    "is session-timezone-dependent, so the same value can read "
-                    "back differently depending on the session timezone")
+            warning=_join_warnings(
+                "TIMESTAMP_NTZ -> TIMESTAMP: the AIDP catalog cannot "
+                "express timestamp_ntz, so the timezone-naive type is "
+                "downgraded. TIMEZONE SEMANTICS DIFFER -- Spark TIMESTAMP "
+                "is session-timezone-dependent, so the same value can read "
+                "back differently depending on the session timezone",
+                truncated))
     if key in ("TIMESTAMP_LTZ", "TIMESTAMP_TZ", "TIMESTAMP"):
         return TypeMapping(
             "TIMESTAMP",
-            warning=f"{key} -> Spark TIMESTAMP: timezone semantics differ; "
-                    "Spark TIMESTAMP is session-timezone-dependent")
+            warning=_join_warnings(
+                f"{key} -> Spark TIMESTAMP: timezone semantics differ; "
+                "Spark TIMESTAMP is session-timezone-dependent",
+                _precision_warning(key, datetime_precision)))
 
     if key == "TIME":
         # Spark has no TIME type. STRING preserves the value but changes

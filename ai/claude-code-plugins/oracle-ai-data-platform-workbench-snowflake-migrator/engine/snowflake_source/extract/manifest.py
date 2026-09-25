@@ -81,7 +81,8 @@ def _column_record(col: dict, *, semi_structured: str, geospatial: str,
                  semi_structured=semi_structured,
                  geospatial=geospatial,
                  timestamp_ntz=timestamp_ntz,
-                 collation=col.get("collation"))
+                 collation=col.get("collation"),
+                 datetime_precision=col.get("datetime_precision"))
     enriched = {
         "COLUMN_NAME": col.get("name"),
         "DATA_TYPE": col.get("data_type"),
@@ -89,6 +90,7 @@ def _column_record(col: dict, *, semi_structured: str, geospatial: str,
         "NUMERIC_SCALE": col.get("numeric_scale"),
         "CHARACTER_MAXIMUM_LENGTH": col.get("character_maximum_length"),
         "COLLATION_NAME": col.get("collation"),
+        "DATETIME_PRECISION": col.get("datetime_precision"),
         "IS_NULLABLE": "YES" if col.get("nullable", True) else "NO",
         # Reported on by R22/R23 and carried into the CREATE TABLE. Absent
         # from an older manifest, which the caller records as unknown rather

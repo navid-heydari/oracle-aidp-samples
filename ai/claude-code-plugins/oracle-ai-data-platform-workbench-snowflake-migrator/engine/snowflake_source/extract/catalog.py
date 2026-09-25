@@ -290,7 +290,8 @@ def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
                      semi_structured=semi_structured,
                      geospatial=geospatial,
                      timestamp_ntz=timestamp_ntz,
-                     collation=c.get("COLLATION_NAME"))
+                     collation=c.get("COLLATION_NAME"),
+                     datetime_precision=c.get("DATETIME_PRECISION"))
         if m.blocked:
             blocked_reasons.append(f'{c["COLUMN_NAME"]}: {m.reason}')
         if m.warning:
