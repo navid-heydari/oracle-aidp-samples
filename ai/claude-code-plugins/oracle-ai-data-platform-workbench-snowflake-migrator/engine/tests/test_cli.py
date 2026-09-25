@@ -1264,3 +1264,45 @@ def test_without_the_flag_the_config_auth_holds_and_keypair_is_the_default(
     bare.write_text("snowflake:\n  account: AC\n  user: U\n", encoding="utf-8")
     args = snowmig.build_parser().parse_args(["assess", "--config", str(bare)])
     assert snowmig._snowflake_coords(args)["auth"] == "keypair"
+
+
+# ------------- exit 3 is "resolve with the user", and the docs say which kinds
+#
+# Found on review (contested; kept as a doc-versus-code defect). `ddl` exits
+# 3 -- deliberately -- when a column uses a type the target refuses at
+# CREATE TABLE, and on a default-assessed estate that is TIMESTAMP_NTZ on
+# nearly every table: assess rc 0, no collisions, ddl rc 3. Every stated
+# contract said 3 means a collision: the root --help epilogue ("3 HALT
+# (identifier-case or target-name collision)"), README's exit-code line, and
+# the overview's shared agent rule 8 ("Exit code 3 means an identifier-case
+# or target-name collision. Show the collisions and stop"). An agent
+# following the rule on a default estate went looking for collisions that
+# do not exist, when the remedy is `ddl --timestamp-ntz timestamp`. The code
+# is right -- a refused type is a decision for the user, not an error, and
+# the chained shell needs to tell it from one -- so the docs follow it.
+
+def _plugin_text(rel):
+    root = pathlib.Path(__file__).resolve().parents[2]
+    return " ".join((root / rel).read_text(encoding="utf-8").split())
+
+
+def test_the_help_states_every_kind_of_halt():
+    import snowmig
+    text = " ".join(snowmig.build_parser().format_help().split())
+    line = text[text.index("Exit codes:"):]
+    assert "collision" in line
+    assert "type the target refuses" in line
+
+
+def test_the_readme_and_the_agent_rule_state_the_refused_type_halt():
+    readme = _plugin_text("README.md")
+    line = readme[readme.index("**Exit codes:**"):][:400]
+    assert "type the target refuses" in line and "--timestamp-ntz" in line
+    overview = _plugin_text("skills/snowflake-migrator-overview/SKILL.md")
+    rule = overview[overview.index("**A halt is a halt.**"):][:700]
+    assert "type the target refuses" in rule
+    assert "ddl --timestamp-ntz timestamp" in rule
+    clone = _plugin_text("skills/snowflake-medallion-clone/SKILL.md")
+    phase_b = clone[clone.index("## Phase B"):clone.index("## Phase C")]
+    assert "exit" in phase_b.lower() and "3" in phase_b
+    assert "--timestamp-ntz timestamp" in phase_b

@@ -514,8 +514,14 @@ Use `--out-dir` only when the user wants artifacts kept somewhere they chose
    reported as flagged, with the reason, and resolved at S8 with the user. Do
    not substitute a "close enough" type silently.
 
-8. **A halt is a halt.** Exit code 3 means an identifier-case or target-name
-   collision. Show the collisions and stop; do not pick a winner.
+8. **A halt is a halt.** Exit code 3 means a condition to resolve with the
+   user, never an error to retry and never one to pick a winner on. From
+   `assess` or `plan` it is an identifier-case or target-name collision:
+   show the collisions and stop. From `ddl` it is a column type the target
+   refuses at CREATE TABLE -- on a default-assessed estate, `TIMESTAMP_NTZ`:
+   show the columns stderr and `DDL_PLAN.md` name, and put the remedy
+   (`ddl --timestamp-ntz timestamp`, offline, which changes timezone
+   semantics) to the user as a decision.
 
 9. **Never report success ahead of verification.** AIDP creates are
    asynchronous and settle late or fail silently. "Pending", "still settling"

@@ -438,8 +438,11 @@ first `assess`:
 | `--geospatial block\|string` | `block` | same decision for `GEOGRAPHY`/`GEOMETRY` |
 | `--timestamp-ntz preserve\|timestamp` | `preserve` | the catalog API cannot express `timestamp_ntz`; `timestamp` changes timezone semantics and records the caveat |
 
-**Exit codes:** `0` ok · `1` error · `3` halt (an identifier-case or
-target-name collision — shown, never resolved for you).
+**Exit codes:** `0` ok · `1` error · `3` halt — a condition to resolve
+with you, shown and never resolved for you: an identifier-case or
+target-name collision (`assess`, `plan`), or a column type the target
+refuses at CREATE TABLE (`ddl`; on most estates `TIMESTAMP_NTZ`, remedied
+offline with `ddl --timestamp-ntz timestamp`).
 
 Dev mode needs none of this:
 

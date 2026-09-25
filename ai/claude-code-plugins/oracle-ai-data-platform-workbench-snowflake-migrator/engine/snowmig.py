@@ -36,7 +36,10 @@ schemas and tables are created on AIDP compute by the structure job
 (`run --job snowmig_01_structure`, runbook S10), not through the catalog CRUD
 API. Rows move only when the operator runs `snowmig_02_copy_schema`.
 
-Exit codes: 0 ok | 1 error | 3 HALT (identifier-case or target-name collision)
+Exit codes: 0 ok | 1 error | 3 HALT: a condition to resolve with the user --
+an identifier-case or target-name collision (assess, plan), or a column type
+the target refuses at CREATE TABLE (ddl; usually TIMESTAMP_NTZ, remedy
+`ddl --timestamp-ntz timestamp`)
 """
 from __future__ import annotations
 
@@ -920,7 +923,7 @@ def cmd_ddl(args) -> int:
         print("  Nothing was created. Re-run `ddl --timestamp-ntz timestamp` "
               "(offline), or fix the INPUT and re-run `ddl` -- do not hand "
               "this plan to the structure workflow.", file=sys.stderr)
-        return 3
+        return HALT
     return 0
 
 

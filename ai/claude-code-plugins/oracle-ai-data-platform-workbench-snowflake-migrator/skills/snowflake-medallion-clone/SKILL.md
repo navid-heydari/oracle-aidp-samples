@@ -89,6 +89,13 @@ Show `DDL_PLAN.md`: the SQL, the rule behind each transformation, dropped
 properties, and everything blocked. Statements come out in wave order, so a view
 always follows the tables it reads. Nothing has touched AIDP.
 
+**Exit code 3 is a halt, not a failure:** a column uses a type the target
+refuses at CREATE TABLE, usually `TIMESTAMP_NTZ` on a default-assessed estate.
+stderr and `DDL_PLAN.md` name the columns. The remedy is a decision for the
+user -- `ddl --timestamp-ntz timestamp` (offline) maps them to `TIMESTAMP`,
+which changes timezone semantics -- and until it is made, do not hand this
+plan to Phase C.
+
 ## Phase C — Standard catalog only, and only when explicitly requested
 
 An EXTERNAL catalog needs no tables. A Standard catalog does, and **those tables
