@@ -343,8 +343,10 @@ shape.
 The plan it reads is `ddl_plan.json` **on the workspace**, so upload the
 approved one to `backup-snowflake-migration/plan/` before running. The stage
 runs in `ddl-plan` mode: those types are engine-translated. `manifest` mode
-cannot be used with a connector-built manifest, which records SNOWFLAKE types
-that Delta rejects verbatim.
+refuses a connector-built manifest before creating anything: it records
+SNOWFLAKE types, which Delta rejects or, like `FLOAT` (64-bit in Snowflake,
+32-bit in Spark), accepts with a different meaning. A table another mode
+recorded as created is re-checked by a `ddl-plan` run, not skipped.
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig run \

@@ -19,8 +19,11 @@ Runs on AIDP compute. Three structure sources, chosen with --mode:
   manifest            types come from discovery_manifest.json verbatim. Only
                       valid when the manifest carries SPARK types, i.e. it
                       was built in external-catalog mode (DESCRIBE); a
-                      connector-mode manifest carries SNOWFLAKE types and is
-                      refused here rather than mistranslated.
+                      connector-mode manifest carries SNOWFLAKE types and the
+                      whole run is refused before anything is created. Some
+                      of those types Delta accepts verbatim with another
+                      meaning -- FLOAT is 64-bit in Snowflake and 32-bit in
+                      Spark -- so no per-type check can tell them apart.
 
 Safety: CREATE TABLE IF NOT EXISTS everywhere; nothing is ever dropped or
 replaced here. The target catalog must be INTERNAL — this script REFUSES to
@@ -51,9 +54,12 @@ Writes `structure_report_<schema>.json` per schema, one status per table:
                    wrong columns with matching counts
   not_in_plan      the approved plan carries no columns for it; NOT created
   failed           the CREATE raised; the error is the reason
-Resumable: `created` and `already_existed` are skipped on a re-run (--force
-re-checks them); `type_drift`, `failed` and `not_in_plan` are looked at
-again every run, so fixing the table or the plan is enough.
+Resumable: `created` and `already_existed` are skipped on a re-run with the
+same --mode (--force re-checks them); one recorded under another --mode is
+re-checked, because that mode's layout is not this one's -- a table --mode
+manifest created is not thereby what the ddl plan approved. `type_drift`,
+`failed` and `not_in_plan` are looked at again every run, so fixing the
+table or the plan is enough.
 """
 from __future__ import annotations
 
@@ -364,6 +370,28 @@ def _looks_like_snowflake_types(columns: list[dict]) -> bool:
                for c in columns for t in _SNOWFLAKE_ONLY_TYPES)
 
 
+def _snowflake_typed_manifest(manifest: dict, schemas: list[str]) -> str | None:
+    """Why this manifest's types are SNOWFLAKE types, or None.
+
+    Decided for the manifest, not per table. The prefix list above only
+    catches types Delta rejects; FLOAT, DATE and BOOLEAN pass it, and FLOAT
+    is then created 32-bit where Snowflake's is a double: READINGS(READING
+    FLOAT) was recorded `created` and the copy narrowed every value to ~7
+    digits. Discovery records which mode wrote the manifest, and the
+    connector's raw `data_type` field is never written by DESCRIBE.
+    """
+    mode = (manifest.get("source") or {}).get("mode")
+    if mode and mode != "external-catalog":
+        return f"it was built in {mode} mode"
+    by_name = {s.get("name"): s for s in manifest.get("schemas") or []}
+    for schema in schemas:
+        for table in (by_name.get(schema) or {}).get("tables") or []:
+            if any("data_type" in c for c in table.get("columns") or []):
+                return (f"{schema}.{table['name']} carries the connector's "
+                        f"raw `data_type` field")
+    return None
+
+
 def columns_from_ddl_plan(ddl_plan: dict) -> dict[tuple[str, str], list[dict]]:
     """{(source_schema, table): [{name, type}]} from the engine's ddl_plan.
 
@@ -499,6 +527,18 @@ def main(argv: list[str] | None = None) -> int:
     by_name = {s["name"]: s for s in manifest["schemas"]}
     schemas = args.schema or sorted(by_name)
 
+    if args.mode == "manifest":
+        why = _snowflake_typed_manifest(manifest, schemas)
+        if why:
+            return fail(
+                f"error: --mode manifest needs a manifest of SPARK types, and "
+                f"this one records SNOWFLAKE types ({why}; 00_discover's "
+                f"default connector mode writes them on purpose). Delta "
+                f"rejects some of them and accepts others with a different "
+                f"meaning -- FLOAT would be created 32-bit -- so nothing was "
+                f"created. Use --mode ddl-plan (engine-translated types) or "
+                f"--mode ctas.")
+
     from pyspark.sql import SparkSession
     spark = SparkSession.builder.getOrCreate()
 
@@ -587,6 +627,9 @@ def main(argv: list[str] | None = None) -> int:
         path = _report_path(reports, schema)
         target = f"{args.target_catalog}.{target_schema}"
         report = _load_report(path, schema, target)
+        # Which mode wrote the statuses loaded above, for records that
+        # predate the per-object `mode`.
+        prior_mode = report.get("mode")
         report["target"] = target
         report["mode"] = args.mode
 
@@ -601,11 +644,20 @@ def main(argv: list[str] | None = None) -> int:
             name = table["name"]
             notes: list[str] = []
             prior = report["objects"].get(name, {})
-            if prior.get("status") in ("created", "already_existed") \
-                    and not args.force:
+            done = prior.get("status") in ("created", "already_existed")
+            # Every report this stage writes names its mode; one that does
+            # not was not written by it, and is taken as this run's.
+            recorded_by = prior.get("mode", prior_mode) or args.mode
+            if done and not args.force and recorded_by == args.mode:
                 log(f"skip {schema}.{name}: already {prior['status']}")
                 created_total += 1
                 continue
+            if done and not args.force:
+                # Another mode's `created` checked that mode's layout, not
+                # this one's: a FLOAT table --mode manifest made was skipped
+                # here as done, with the plan saying DOUBLE.
+                log(f"re-check {schema}.{name}: recorded {prior['status']} "
+                    f"by --mode {recorded_by}, not {args.mode}")
             try:
                 if args.dry_run:
                     log(f"DRY RUN: would create "
@@ -646,7 +698,8 @@ def main(argv: list[str] | None = None) -> int:
                     status = create_table_from_columns(
                         spark, columns, args.target_catalog, target_schema,
                         name, notes=notes)
-                report["objects"][name] = {"status": status}
+                report["objects"][name] = {"status": status,
+                                           "mode": args.mode}
                 if notes:
                     # Properties that could NOT be read back. Recorded next
                     # to the status so "created" never implies "and every
