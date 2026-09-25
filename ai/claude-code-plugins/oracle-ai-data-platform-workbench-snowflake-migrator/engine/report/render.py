@@ -19,7 +19,7 @@ __all__ = ["render_stages", "render_preflight", "render_census", "census_scope",
            "render_inventory", "render_ddl_plan", "render_planned_objects",
            "render_soft_clone_summary", "render_catalog", "render_compute",
            "render_summary",
-           "render_smoke", "render_data_options",
+           "render_smoke", "render_data_options", "DATA_OPTIONS_NOTE",
            "architecture_section"]
 
 
@@ -938,12 +938,21 @@ def render_smoke(result: dict) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+# What data_options.json says in its `note`, and what DATA_MOVEMENT_OPTIONS.md
+# opens with. One constant, because the two artifacts of one run disagreed:
+# the markdown named the implemented path while a note hard-coded where the
+# JSON was written said the plugin "implements no transfer path".
+DATA_OPTIONS_NOTE = (
+    "Proposal only. The control-plane CLI moves no bytes. One path is "
+    "implemented by the data plane: in-AIDP INSERT-SELECT from the EXTERNAL "
+    "catalog, run schema by schema by the `snowmig_02_copy_schema` job. The "
+    "other options are not implemented.")
+
+
 def render_data_options(options: list[dict]) -> str:
+    _, headline, rest = DATA_OPTIONS_NOTE.split(". ", 2)
     out = ["# Data-movement options — for you to choose", "",
-           "**The control-plane CLI moves no bytes.** One path is implemented "
-           "by the data plane: in-AIDP INSERT-SELECT from the EXTERNAL catalog, "
-           "run schema by schema by the `snowmig_02_copy_schema` job. The other "
-           "options below are not implemented. They are the realistic ways data "
+           f"**{headline}.** {rest} They are the realistic ways data "
            "could move, with the trade-offs and the open unknowns attached, so "
            "the choice is made deliberately rather than defaulting to whichever "
            "path got built first.", "",

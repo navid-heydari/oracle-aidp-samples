@@ -21,7 +21,8 @@ from plan.build import build_plan
 from plan.data_movement import OPTIONS as DATA_OPTIONS
 from plan.smoke import run_smoke
 from report.render import (
-    render_catalog, render_census, render_compute, render_data_options,
+    DATA_OPTIONS_NOTE, render_catalog, render_census, render_compute,
+    render_data_options,
     render_ddl_plan, render_inventory, render_maintenance,
     render_planned_objects, render_preflight, render_security, render_smoke,
     render_soft_clone_summary, render_stages, render_summary,
@@ -170,8 +171,7 @@ def run_demo(out_dir) -> dict:
     options = list(DATA_OPTIONS)
     _write(out, "data_options.json",
            {"options": options, "implemented": False,
-            "note": "Proposal only. This plugin moves no bytes and implements "
-                    "no transfer path."})
+            "note": DATA_OPTIONS_NOTE})
     _write(out, "DATA_MOVEMENT_OPTIONS.md", render_data_options(options))
     stage(f'data-options: {len(options)} architecture option(s) presented; '
           f'the demo leaves the choice UNDECIDED, exactly as a run does until '
