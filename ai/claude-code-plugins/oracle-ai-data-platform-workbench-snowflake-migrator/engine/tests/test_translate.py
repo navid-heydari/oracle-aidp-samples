@@ -351,10 +351,12 @@ def test_cast_shorthand_refuses_unmappable_types(src, reason_word):
 
 
 def test_cast_shorthand_carries_type_mapper_warnings():
-    r = t("select a::TIMESTAMP, b::TIME from t")
+    # `b::TIME` used to be here too, translated to CAST(b AS STRING) with the
+    # column-level "text is preserved" warning -- wrong for a timestamp
+    # operand. It is refused now; see test_view_casts.py.
+    r = t("select a::TIMESTAMP from t")
     assert r.fully_translated is True
     assert any("timezone semantics differ" in w for w in r.warnings), r.warnings
-    assert any("Spark has no TIME type" in w for w in r.warnings), r.warnings
 
 
 def test_cast_shorthand_uses_the_same_mapping_as_table_ddl():

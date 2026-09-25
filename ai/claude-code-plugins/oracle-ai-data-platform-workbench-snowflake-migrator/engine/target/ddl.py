@@ -615,8 +615,9 @@ def build_create_view(record: dict, target_fqn: str,
     for applied in translated.applied:
         res.rules_applied.append(RuleApplication(
             applied["rule_id"], f'{applied["construct"]}: {applied["detail"]}'))
-    # The type mapper's notes on a `::TIMESTAMP` or `::TIME` cast travel with
-    # the view, the same way a column's mapping warning travels with a table.
+    # The type mapper's notes on a `::TIMESTAMP` cast travel with the view,
+    # the same way a column's mapping warning travels with a table. (They are
+    # also a caveat on the T02 application, so R43 below is not "exact".)
     res.warnings.extend(translated.warnings)
 
     positional = _context_refs(name_map or {},

@@ -52,7 +52,7 @@ plan lists only the references that were actually rewritten.
 | Construct | What happens |
 |---|---|
 | `IFF(` | **Translated** to `IF()` (`T01`) |
-| `::` cast shorthand | **Translated** to `CAST(x AS <mapped type>)` through the type mapper (`T02`); an unmappable type blocks with the mapper's reason |
+| `::` cast shorthand | **Translated** to `CAST(x AS <mapped type>)` through the type mapper (`T02`); an unmappable type blocks with the mapper's reason. `::TIME` blocks (the result depends on the operand's type); a `::TIMESTAMP` cast carries the timezone warning as an `R43` caveat |
 | `ARRAY_CONSTRUCT(` | **Translated** to `array()` (`T03`) |
 | `OBJECT_CONSTRUCT(` | **Translated** to `named_struct()` (`T04`) |
 | `DATEADD(unit, n, col)` | **Translated** per unit (`T05`) when `n` is an integer literal or a column; any other form blocks. Exact for `DATE` operands only, and the plan says so |

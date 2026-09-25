@@ -148,6 +148,21 @@ def _cast(sql: str) -> tuple[str, str | None, list[str]]:
         scale = int(parsed.group(3)) if parsed.group(3) else None
         if name in _NUMERIC_BARE and precision is None:
             precision, scale = 38, 0
+        if name == "TIME":
+            # The mapper's TIME -> STRING is right for a TIME column, whose
+            # text is preserved. For a cast it is not: the usual operand is a
+            # timestamp (`order_ts::time`, time-of-day extraction), and
+            # CAST(ts AS STRING) keeps the whole 'yyyy-MM-dd HH:mm:ss' where
+            # Snowflake returns 'HH:MI:SS'. Which one applies depends on the
+            # operand's type, which a token rule cannot see.
+            problems.append(
+                f"::{written}: Spark has no TIME type. CAST(x AS STRING) "
+                f"returns a TIMESTAMP operand's full date and time where "
+                f"Snowflake returns the time of day, and the operand's type "
+                f"is not visible to a token rule, so the cast is refused "
+                f"(date_format(x, 'HH:mm:ss') is the rewrite for a "
+                f"timestamp operand)")
+            return m.group(0)
         mapped = map_type(name, precision=precision, scale=scale)
         if mapped.blocked:
             problems.append(f"::{written}: {mapped.reason}")
@@ -529,9 +544,16 @@ def translate_sql(sql: str) -> TranslationResult:
         if new_sql != result.sql:
             entry = {"rule_id": rule.rule_id, "construct": rule.construct,
                      "detail": rule.description}
-            if rule.caveat:
-                entry["caveat"] = rule.caveat
+            warnings = list(rest[0]) if rest else []
+            # A rewrite that carries a semantic warning -- `::TIMESTAMP`'s
+            # timezone semantics -- is exact in shape only, so the warning is
+            # a caveat on this application too. R43 counts caveats; without
+            # this it called the view "every one is an exact rewrite" next to
+            # the warning that says otherwise.
+            caveats = ([rule.caveat] if rule.caveat else []) + warnings
+            if caveats:
+                entry["caveat"] = "; ".join(caveats)
             result.applied.append(entry)
             result.sql = new_sql
-            result.warnings.extend(rest[0] if rest else [])
+            result.warnings.extend(warnings)
     return result
