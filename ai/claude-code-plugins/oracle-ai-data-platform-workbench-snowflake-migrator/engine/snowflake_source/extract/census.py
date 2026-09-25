@@ -632,8 +632,15 @@ def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
     if spec.get("sig_col") and row.get(spec["sig_col"]):
         entry["detail"] = str(row[spec["sig_col"]])
     elif spec["source"] == "show":
-        state = row.get("state") or row.get("target_lag") or row.get("mode")
-        entry["detail"] = f"state={state}" if state else ""
+        # Labelled by the field it came from. `state=1 day` for a dynamic
+        # table's target lag and `state=EGRESS` for a network rule's mode
+        # were both wrong under the one label.
+        for field in ("state", "target_lag", "mode"):
+            if row.get(field):
+                entry["detail"] = f"{field}={row[field]}"
+                break
+        else:
+            entry["detail"] = ""
 
     language = None
     unknown_language = False

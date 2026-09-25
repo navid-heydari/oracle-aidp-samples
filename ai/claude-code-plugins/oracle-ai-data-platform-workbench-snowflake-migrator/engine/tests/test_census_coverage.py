@@ -583,3 +583,98 @@ def test_the_per_kind_note_carries_the_same_attribution():
                           secondary_roles=["ACCOUNTADMIN"])
     zero = census["kinds"]["PIPE"]            # nothing visible
     assert "ACCOUNTADMIN" in zero["note"], zero["note"]
+
+
+# ------------- one explanation per kind hid the verdict that mattered
+#
+# Live 2026-09-25, the first estate to hold BOTH an internal and an external
+# stage, and BOTH an inbound and an outbound share. The per-object table
+# showed all four with the right detail. The "Why each kind cannot move"
+# section printed ONE paragraph per kind -- whichever object came first --
+# so the internal stage, whose files have to be unloaded before AIDP can see
+# them, was covered by the external stage's text saying nothing has to be
+# unloaded. And the outbound share, a live contract with a consumer who
+# finds out at cutover, was covered by the inbound share's text.
+#
+# `refine` exists to give objects of one kind different verdicts. A renderer
+# that keeps one per kind throws that work away, silently, in the section a
+# reader goes to for the verdict.
+
+def _two_stages():
+    return _responses(**{"information_schema.stages": [
+        {"STAGE_NAME": "STG_INTERNAL", "STAGE_SCHEMA": "S",
+         "STAGE_TYPE": "Internal Named", "STAGE_URL": None},
+        {"STAGE_NAME": "STG_EXTERNAL", "STAGE_SCHEMA": "S",
+         "STAGE_TYPE": "External Named",
+         "STAGE_URL": "s3://bucket/data/"}]})
+
+
+def test_every_distinct_reason_within_a_kind_is_explained():
+    from report.render import render_census
+    md = render_census(build_census(FakeSql(_two_stages()), ["DB"]))
+    why = md[md.index("## Why each kind cannot move"):]
+    assert "unloaded" in why.lower() or "inside snowflake" in why.lower(), (
+        "the internal stage's verdict is missing")
+    assert "object storage" in why.lower() or "external" in why.lower(), (
+        "the external stage's verdict is missing")
+    assert why.count("**STAGE**") == 2, why[:600]
+
+
+def test_an_outbound_share_gets_its_own_explanation_next_to_the_inbound():
+    from report.render import render_census
+    census = build_census(FakeSql(_responses(**{"show shares": [
+        {"name": "SAMPLE", "kind": "INBOUND", "database_name": "SNOWFLAKE"},
+        {"name": "TO_PARTNER", "kind": "OUTBOUND", "to": "ACME",
+         "database_name": "DB"}]})), ["DB"])
+    md = render_census(census)
+    why = md[md.index("## Why each kind cannot move"):]
+    assert why.count("**SHARE**") == 2, why[:800]
+    assert "consumer" in why.lower() and "provider" in why.lower()
+
+
+def test_one_reason_per_kind_is_still_one_paragraph():
+    """Objects that share a reason must not each print it again."""
+    from report.render import render_census
+    census = build_census(FakeSql(_responses(**{"show tasks": [
+        {"name": "T1", "schema_name": "S", "state": "started"},
+        {"name": "T2", "schema_name": "S", "state": "suspended"}]})), ["DB"])
+    md = render_census(census)
+    why = md[md.index("## Why each kind cannot move"):]
+    assert why.count("**TASK**") == 1
+
+
+def test_a_refined_kind_says_which_case_each_paragraph_is():
+    """Two STAGE paragraphs are only useful if a reader can tell which
+    stage each one is about."""
+    from report.render import render_census
+    md = render_census(build_census(FakeSql(_two_stages()), ["DB"]))
+    why = md[md.index("## Why each kind cannot move"):]
+    assert "STG_INTERNAL" in why or "internal named" in why.lower()
+    assert "STG_EXTERNAL" in why or "external named" in why.lower()
+
+
+# ------------- "state=1 day" is not a state
+#
+# Same run. A dynamic table's detail read `state=1 day` (its target lag)
+# and a network rule's read `state=EGRESS` (its mode). Three different
+# facts share one label, and two of them are wrong under it.
+
+def test_a_target_lag_is_labelled_as_a_target_lag():
+    census = build_census(FakeSql(_responses(**{"show dynamic tables": [
+        {"name": "DT", "schema_name": "S", "target_lag": "1 day"}]})), ["DB"])
+    detail = census["objects"][0]["detail"]
+    assert "target_lag=1 day" in detail, detail
+    assert "state=" not in detail
+
+
+def test_a_mode_is_labelled_as_a_mode():
+    census = build_census(FakeSql(_responses(**{"show network rules": [
+        {"name": "NR", "schema_name": "S", "mode": "EGRESS"}]})), ["DB"])
+    detail = census["objects"][0]["detail"]
+    assert "mode=EGRESS" in detail, detail
+
+
+def test_a_state_is_still_a_state():
+    census = build_census(FakeSql(_responses(**{"show tasks": [
+        {"name": "T", "schema_name": "S", "state": "started"}]})), ["DB"])
+    assert census["objects"][0]["detail"] == "state=started"

@@ -5,6 +5,8 @@ anything that halted or was skipped rather than burying it.
 """
 from __future__ import annotations
 
+import collections
+
 from snowflake_source.extract.census import secondary_roles_active
 from plan.data_movement import MAINTENANCE_TRAPS, architecture_decision
 from plan.smoke import smoke_verdict
@@ -1219,12 +1221,33 @@ def render_census(census: dict) -> str:
         out.append("")
 
         out += ["## Why each kind cannot move, and where it would go", ""]
-        seen: set[str] = set()
+        # One paragraph per DISTINCT VERDICT, not per kind. `refine` gives
+        # objects of one kind different reasons -- an internal stage needs
+        # its files unloaded, an external one does not; an inbound share is
+        # someone else's data, an outbound one is a live consumer contract.
+        # Keeping the first per kind covered the second case with the
+        # first's text, in the section a reader goes to for the verdict.
+        seen: set[tuple[str, str]] = set()
+        variants: dict[str, int] = collections.Counter(
+            (o["kind"], o["reason"]) for o in objects)
+        kinds_with_variants = {k for (k, _r), n in variants.items()
+                               if sum(1 for (k2, _) in variants if k2 == k) > 1}
         for o in objects:
-            if o["kind"] in seen:
+            key = (o["kind"], o["reason"])
+            if key in seen:
                 continue
-            seen.add(o["kind"])
-            out += [f'**{o["kind"]}** — {o["reason"]}', ""]
+            seen.add(key)
+            heading = f'**{o["kind"]}**'
+            if o["kind"] in kinds_with_variants:
+                # Say which objects this paragraph is about, or two STAGE
+                # paragraphs are indistinguishable.
+                members = [m["source_identifier"] for m in objects
+                           if (m["kind"], m["reason"]) == key]
+                shown = ", ".join(f"`{m}`" for m in members[:4])
+                if len(members) > 4:
+                    shown += f" and {len(members) - 4} more"
+                heading += f" ({shown})"
+            out += [f'{heading} — {o["reason"]}', ""]
             if o.get("aidp_path"):
                 out += [f'AIDP path: {o["aidp_path"]}', ""]
 

@@ -10,6 +10,23 @@ first release.
 
 ## [Unreleased]
 
+### Fixed — the census explained one verdict per kind, hiding the sharper one
+
+Live 2026-09-25, the first estate holding both an internal and an external
+stage, and both an inbound and an outbound share. The per-object table showed
+all four correctly, but "Why each kind cannot move" printed one paragraph per
+kind — whichever object came first — so the internal stage (files must be
+unloaded) was covered by the external stage's text (nothing to unload), and
+the outbound share (a live consumer contract) by the inbound one's.
+
+- One paragraph per distinct `(kind, reason)`. When a kind has more than one
+  verdict, each heading names the objects it is about (`**STAGE**
+  (\`DB.S.STG_INTERNAL\`)`), so two STAGE paragraphs are tellable apart.
+  Kinds with one verdict still print once.
+- `detail` is labelled by the field it came from: `target_lag=1 day` for a
+  dynamic table and `mode=EGRESS` for a network rule, where both used to say
+  `state=`.
+
 ### Fixed — the CLI could not run on a Windows machine
 
 Every `read_text()`/`write_text()`/`open()` in the engine, the data-plane
