@@ -1,6 +1,6 @@
 """Read-only Snowflake estate inventory. I/O injected as `run_sql`.
 
-Issues only SHOW / SELECT / GET_DDL. Cannot modify the estate.
+Issues only SHOW / SELECT / GET_DDL / DESCRIBE. Cannot modify the estate.
 
 Things are captured HERE rather than reconstructed later, because they
 cannot be recovered afterwards:
@@ -10,6 +10,10 @@ cannot be recovered afterwards:
   * column DEFAULT and IDENTITY -- the two facts that change what an INSERT
     does after cutover; read here, decided in ddl/plan
   * PK / UNIQUE / FK -- see extract/constraints.py
+  * a structured column's full type -- `VECTOR(FLOAT, 4)`, `MAP(K, V)`,
+    `OBJECT(f T, ...)`, `ARRAY(T)` -- which INFORMATION_SCHEMA reduces to
+    its first word. DESCRIBE TABLE, only for a table that holds one (see
+    `_type_details`), recorded per column as `type_detail`
 
 A per-object failure is recorded in extraction_notes and extraction continues.
 "no objects" and "extraction failed" are different outcomes and must not be
@@ -33,7 +37,7 @@ from typing import Callable
 
 from ..dialect import lexer
 from ..dialect.identifiers import case_form, detect_collisions
-from ..dialect.types import map_type
+from ..dialect.types import map_type, needs_type_detail
 from .constraints import build_constraints
 
 __all__ = ["build_inventory", "SYSTEM_DBS", "ROW_COUNT_MODES", "SHOW_PAGE_SIZE",
@@ -197,7 +201,7 @@ def build_inventory(run_sql: Callable[..., list[dict]],
 
         # Once per database, not once per schema: the three SHOWs are
         # database-scoped. A failure is a note, not an empty estate.
-        constraints = build_constraints(run_sql, db, notes)
+        constraints = build_constraints(run_sql, db, notes, schemas=schemas)
 
         for schema in schemas:
             columns, columns_error = _columns(run_sql, db, schema, notes)
@@ -319,6 +323,36 @@ def _compatibility(blocked_reasons: list[str],
     return "blocked" if blocked_reasons else "supported"
 
 
+def _type_details(run_sql, db: str, schema: str, name: str,
+                  columns: list[dict], notes: list[str]
+                  ) -> tuple[dict[str, str], str | None]:
+    """({column: DESCRIBE type}, error) for one table, or ({}, None) when no
+    column of it needs the read.
+
+    INFORMATION_SCHEMA.COLUMNS answers `VECTOR`, `MAP`, `OBJECT` or `ARRAY`
+    and stops; DESCRIBE TABLE's `type` spells the element types (live
+    2026-09-29, the shapes in tests/test_type_detail.py). One DESCRIBE per
+    table would be a round trip per table on a real estate, so it is issued
+    only when `needs_type_detail` says a column needs it -- a table of
+    NUMBER and VARCHAR costs exactly what it did before. DESCRIBE is a read
+    (conn.READ_ONLY_VERBS); a failure is returned, not raised, so the table
+    is still inventoried and its columns say the detail is UNREAD.
+    """
+    if not any(needs_type_detail(c.get("DATA_TYPE"),
+                                 c.get("DATETIME_PRECISION")) for c in columns):
+        return {}, None
+    try:
+        rows = run_sql(f"describe table {lexer.qualify(db, schema, name)}")
+    except Exception as exc:
+        error = str(exc)[:200] or type(exc).__name__
+        notes.append(f"{db}.{schema}.{name}: DESCRIBE TABLE for the full "
+                     f"column types failed ({error}); structured columns are "
+                     f"mapped as if their element types were unknown")
+        return {}, error
+    return {str(r["name"]): str(r["type"]) for r in rows
+            if r.get("name") is not None and r.get("type")}, None
+
+
 def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
             columns: list[dict], *, row_counts: str, notes: list[str],
             semi_structured: str = "block", geospatial: str = "block",
@@ -330,8 +364,25 @@ def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
     warnings: list[str] = []
     type_notes: list[str] = []
 
+    details, detail_error = ({}, None)
+    if kind == "TABLE":
+        details, detail_error = _type_details(run_sql, db, schema, name,
+                                              columns, notes)
+
     enriched = []
     for c in columns:
+        c = dict(c)
+        if kind == "TABLE" and needs_type_detail(
+                c.get("DATA_TYPE"), c.get("DATETIME_PRECISION")):
+            detail = details.get(str(c.get("COLUMN_NAME")))
+            if detail:
+                c["type_detail"] = detail
+            else:
+                # Never "plain": the column may be a typed VECTOR or OBJECT
+                # nobody read, and the mapper has to be able to say so.
+                c["type_detail_unread"] = (
+                    f"DESCRIBE TABLE failed: {detail_error}" if detail_error
+                    else "DESCRIBE TABLE returned no row for this column")
         m = map_type(c.get("DATA_TYPE"),
                      precision=c.get("NUMERIC_PRECISION"),
                      scale=c.get("NUMERIC_SCALE"),
@@ -340,7 +391,9 @@ def _record(run_sql, db: str, schema: str, kind: str, obj: dict,
                      geospatial=geospatial,
                      timestamp_ntz=timestamp_ntz,
                      collation=c.get("COLLATION_NAME"),
-                     datetime_precision=c.get("DATETIME_PRECISION"))
+                     datetime_precision=c.get("DATETIME_PRECISION"),
+                     type_detail=c.get("type_detail"),
+                     type_detail_unread=c.get("type_detail_unread"))
         if m.blocked:
             blocked_reasons.append(f'{c["COLUMN_NAME"]}: {m.reason}')
         if m.warning:

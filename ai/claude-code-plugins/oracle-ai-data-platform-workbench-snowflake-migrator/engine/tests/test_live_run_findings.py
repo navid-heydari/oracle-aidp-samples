@@ -175,11 +175,11 @@ def test_the_s4_dry_run_after_s3_is_allowed_and_keeps_the_s3_record(
     rc = _catalog(tmp_path, catalogs, "--catalog", "tgt",
                   "--catalog-type", "standard")
     assert rc == 0
-    latest = json.loads((tmp_path / "catalog_result.json").read_text())
+    latest = json.loads((tmp_path / "catalog_result.json").read_text(encoding="utf-8"))
     assert latest["catalog"] == "src" and latest["dry_run"] is False
-    dry = json.loads((tmp_path / "catalog_result_tgt.json").read_text())
+    dry = json.loads((tmp_path / "catalog_result_tgt.json").read_text(encoding="utf-8"))
     assert dry["dry_run"] is True
-    assert (tmp_path / "CATALOG_tgt.md").read_text().startswith(
+    assert (tmp_path / "CATALOG_tgt.md").read_text(encoding="utf-8").startswith(
         "# Target catalog `tgt` — DRY RUN")
 
 
@@ -187,12 +187,12 @@ def test_the_s4_execute_keeps_both_catalogs_on_record(tmp_path, catalogs):
     assert _catalog(tmp_path, catalogs, "--catalog", "src", "--execute") == 0
     assert _catalog(tmp_path, catalogs, "--catalog", "tgt",
                     "--catalog-type", "standard", "--execute") == 0
-    latest = json.loads((tmp_path / "catalog_result.json").read_text())
+    latest = json.loads((tmp_path / "catalog_result.json").read_text(encoding="utf-8"))
     assert [c["catalog"] for c in latest["catalogs_recorded"]] == ["src",
                                                                     "tgt"]
-    src = json.loads((tmp_path / "catalog_result_src.json").read_text())
+    src = json.loads((tmp_path / "catalog_result_src.json").read_text(encoding="utf-8"))
     assert src["catalog_type"] == "EXTERNAL" and src["dry_run"] is False
-    assert (tmp_path / "CATALOG_src.md").read_text().startswith(
+    assert (tmp_path / "CATALOG_src.md").read_text(encoding="utf-8").startswith(
         "# Source catalog `src`")
 
 
@@ -248,7 +248,7 @@ class Job:
         if op == "get_job_run":
             path = self.tmp / f"run_{self.job}.json"
             if self.seen_while_running is None and path.exists():
-                self.seen_while_running = json.loads(path.read_text())
+                self.seen_while_running = json.loads(path.read_text(encoding="utf-8"))
             return {"state": {"status": "SUCCESS"}}
         if op == "list_task_runs":
             return {"items": [{"key": "t1", "startTime": 1}]}
@@ -267,7 +267,7 @@ def test_a_submitted_run_is_recorded_running_before_the_watch_ends(
     assert seen and seen["status"] == "RUNNING" and seen["watching"] is True
     assert seen["run_key"] == "run-1"
     final = json.loads((tmp_path / "run_snowmig_02_copy_sales.json")
-                       .read_text())
+                       .read_text(encoding="utf-8"))
     assert final["status"] == "SUCCESS"
 
 
@@ -278,7 +278,7 @@ def test_a_passing_task_parameter_check_is_said_and_recorded(
                         lambda ocid, **kw: fake)
     snowmig.cmd_run(_run_args(tmp_path))
     assert "task parameters checked: schema=SALES" in capsys.readouterr().out
-    md = (tmp_path / "RUN_snowmig_02_copy_sales.md").read_text()
+    md = (tmp_path / "RUN_snowmig_02_copy_sales.md").read_text(encoding="utf-8")
     assert "| task parameters | checked before submitting — `schema=SALES` |" \
         in md
 

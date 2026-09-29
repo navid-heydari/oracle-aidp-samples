@@ -83,7 +83,9 @@ def _column_record(col: dict, *, semi_structured: str, geospatial: str,
                  geospatial=geospatial,
                  timestamp_ntz=timestamp_ntz,
                  collation=col.get("collation"),
-                 datetime_precision=col.get("datetime_precision"))
+                 datetime_precision=col.get("datetime_precision"),
+                 type_detail=col.get("type_detail"),
+                 type_detail_unread=col.get("type_detail_unread"))
     enriched = {
         "COLUMN_NAME": col.get("name"),
         # ddl sorts on it; absent (an older manifest), the manifest's own
@@ -105,6 +107,13 @@ def _column_record(col: dict, *, semi_structured: str, geospatial: str,
         "COMMENT": col.get("comment"),
         "target_type": m.spark_type,
     }
+    # The full structured type discovery read through GET_DDL, or why it
+    # could not -- carried under the names a live `assess` writes, so the
+    # mapper and the DDL treat both paths alike. Absent from an older
+    # manifest, which then says nothing either way.
+    for key in ("type_detail", "type_detail_unread"):
+        if col.get(key):
+            enriched[key] = col[key]
     return enriched, m
 
 

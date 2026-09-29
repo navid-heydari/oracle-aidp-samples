@@ -22,7 +22,7 @@ description: "Read-only PREVIEW of a Snowflake environment from the operator's m
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig assess \
   [--database DB]... \
   [--row-counts metadata|exact|none] \
-  [--semi-structured block|string] [--geospatial block|string]
+  [--semi-structured block|string] [--geospatial block|string|wkt]
 ```
 
 Every Snowflake coordinate comes from the migration config (`snowmig-config.yaml`, discovered automatically and printed as `config: <path>`). Pass `--account/--user/--auth/...` only to override a field for one run.
@@ -46,14 +46,22 @@ what it will cost first.
 
 ## Semi-structured columns
 
-`VARIANT`, `OBJECT` and `ARRAY` **block their table by default**, because a
-typed struct/map/array target is a design decision to make with the customer,
-not one to guess. If the estate is full of them, offer
-`--semi-structured string` to carry the JSON as text, and be explicit that
-this defers the decision rather than making it — a field inside the string is
-not addressable as a column on the target. `GEOGRAPHY` and
-`GEOMETRY` have their own switch, `--geospatial`, because they are a separate
-decision.
+Untyped `VARIANT`, `OBJECT` and `ARRAY` map to `STRING` by default (the
+config's mapping defaults, `mapping.semi_structured: string`), carrying the
+JSON as text. Be explicit that this defers a design decision rather than
+making it — a field inside the string is not addressable as a column on the
+target. `--semi-structured block` (or `--mapping-defaults off`) blocks their
+tables instead, when a typed struct/map/array target is to be designed with
+the customer. `GEOGRAPHY` and
+`GEOMETRY` have their own switch, `--geospatial` (`string` = GeoJSON text,
+`wkt` = WKT text), because they are a separate decision.
+
+Structured types are not that decision: `VECTOR`, `MAP` and a structured
+`OBJECT`/`ARRAY` map to typed `ARRAY` / `MAP` / `STRUCT` columns once
+`assess` has read their full type (one `DESCRIBE TABLE`, only for tables that
+hold one). Read out their warnings — a VECTOR's dimension is not enforced, a
+numeric MAP key arrives as text — and, for a VECTOR or MAP blocked because
+that read failed, the reason it names.
 
 ## Reading the result
 
@@ -65,8 +73,12 @@ decision.
   alone is a column type with no Delta equivalent
   (`compatibility_status: blocked`, reasons in `blocked_reasons`);
   `blocked (<kind>)` is an object kind the plan refuses whatever its
-  types — a dynamic, external, Iceberg, event or hybrid table, or a
-  secure or materialized view
+  types — an event or hybrid table, or a secure view.
+  `register in place (<kind>)` is an external or Iceberg table: not copied,
+  but registered over OCI Object Storage once its files are moved there
+  (`EXTERNAL_REGISTRATION.md`). `table snapshot (<kind>)` is a dynamic table
+  or materialized view: its contents migrate as a table, and `plan` decides
+  its refresh
 - anything whose column read failed (`compatibility_status: unassessed`,
   `columns_read: failed`, the error in `columns_read_error`). Its types were
   never seen, so it is neither supported nor blocked: say the read failed and
@@ -113,7 +125,9 @@ objects can move" is stated against the whole estate. It counts procedures, UDFs
 materialized and dynamic tables, internal and external stages, pipes,
 sequences, file formats, secrets, network rules, Streamlit apps, notebooks
 and container services, plus the account's shares, roles, network policies,
-applications and compute pools. **None of them migrate**, and no equivalent
+applications, compute pools, and replication and failover groups (one
+`SHOW REPLICATION GROUPS`, split by `type`, so a failover group is counted
+once: it is the account's DR contract and does not follow the migration). **None of them migrate**, and no equivalent
 is generated. An outbound share is a live contract with another account:
 read that row first.
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 import collections
 
 from snowflake_source.extract.census import secondary_roles_active
-from plan.build import object_kind_block
+from plan.build import kind_before_types, object_kind_block, snapshot_kind
 from plan.data_movement import MAINTENANCE_TRAPS, architecture_decision
 from snowflake_source.extract.census import secondary_roles_active
 from plan.smoke import smoke_verdict
@@ -21,7 +21,7 @@ __all__ = ["render_stages", "render_preflight", "render_census", "census_scope",
            "render_soft_clone_summary", "render_catalog", "render_compute",
            "render_summary",
            "render_smoke", "render_data_options", "DATA_OPTIONS_NOTE",
-           "architecture_section"]
+           "architecture_section", "render_generated_jobs"]
 
 
 def _bytes(n) -> str:
@@ -178,13 +178,30 @@ def render_inventory(inv: dict) -> str:
             f'| {_bytes((r.get("source_metadata") or {}).get("bytes"))} '
             f'| {len(r.get("columns") or [])} | {r.get("identifier_case_form")} '
             f'| {_compatibility_cell(r)} |')
+    registered = [r for r in records
+                  if (kind_before_types(r) or ("",))[0] == "register_in_place"]
     kind_blocked = [r for r in records
                     if r.get("compatibility_status") != "blocked"
-                    and object_kind_block(r)]
+                    and object_kind_block(r) and r not in registered
+                    and not snapshot_kind(r)]
+    if registered:
+        out += ["", "`register in place (<kind>)` -- not copied: the files "
+                "are registered as an AIDP table over OCI Object Storage once "
+                "they are moved there; EXTERNAL_REGISTRATION.md has the "
+                "statements and the prerequisites."]
     if kind_blocked:
         out += ["", "`blocked (<kind>)` -- the column types map, but the "
                 "object kind has no plain Delta equivalent, so the plan "
                 "refuses it; PLANNED_OBJECTS.md says what to do instead."]
+    if any(r.get("compatibility_status") not in ("blocked", "unassessed")
+           and snapshot_kind(r) for r in records):
+        out += ["", "`table snapshot (<kind>)` -- a dynamic table or "
+                "materialized view: its current contents migrate as a Delta "
+                "table, and Snowflake's own refresh does not travel. `plan` "
+                "decides, per object, whether a refresh job can be generated "
+                "from its defining query (`refresh generated` / `refresh NOT "
+                "generated: <why>` in PLANNED_OBJECTS.md); `snowmig jobs` "
+                "writes it, unscheduled."]
 
     # Every blank in the Rows column carries its reason. "not counted" and
     # ERROR are different facts, and neither is a zero.
@@ -243,6 +260,12 @@ def render_ddl_plan(ddl: dict) -> str:
         if st.get("omitted_properties"):
             out += ["Properties dropped (no AIDP equivalent): "
                     + ", ".join(f"`{p}`" for p in st["omitted_properties"]), ""]
+        if st.get("carried_properties"):
+            out += ["Carried into the CREATE TABLE: "
+                    + ", ".join(f'`{c["property"]}`'
+                                for c in st["carried_properties"])
+                    + " (structure notebook; `snowmig deploy --execute` "
+                      "cannot carry them, see R13)", ""]
         if st.get("deferred_properties"):
             out += ["Maintenance/layout settings NOT applied: "
                     + ", ".join(f'`{d["property"]}`'
@@ -253,25 +276,50 @@ def render_ddl_plan(ddl: dict) -> str:
         out += ["## Blocked — no DDL generated", ""]
         out += [f'- `{b["source_identifier"]}` — {b["reason"]}' for b in ddl["blocked"]]
 
+    carried = [(s["source_identifier"], c) for s in stmts
+               for c in (s.get("carried_properties") or [])]
+    if carried:
+        out += ["", "## Carried into the CREATE TABLE", "",
+                "Source settings Delta 3.1 on AIDP accepts (live-verified "
+                "2026-09-29) are emitted in the CREATE TABLE above: a plain "
+                "clustering key as `CLUSTER BY`, retention as "
+                "`delta.deletedFileRetentionDuration` / "
+                "`delta.logRetentionDuration` (raised above Delta's 7 / 30 "
+                "day defaults only), change tracking or a stream as "
+                "`delta.enableChangeDataFeed = true`. The structure notebook "
+                "(`01_create_structure`) applies them and reads the "
+                "properties back. **`snowmig deploy --execute` cannot**: the "
+                "catalog API's table body has no clustering or property "
+                "field, so on that path these stay to be applied with "
+                "`ALTER TABLE`. Scheduling `OPTIMIZE` / `VACUUM` is still "
+                "yours.", "",
+                "| Object | Source setting | Value | Carried as |",
+                "|---|---|---|---|"]
+        out += [f'| `{ident}` | `{c["property"]}` | `{c["value"]}` | '
+                f'{c["carried_as"]} |' for ident, c in carried]
+        out.append("")
+
     deferred = [(s["source_identifier"], d) for s in stmts
                 for d in (s.get("deferred_properties") or [])]
     if deferred:
         out += ["", "## Maintenance and layout — decisions, NOT applied", "",
-                "These source settings have a real AIDP equivalent, and this "
-                "version applies **none** of them. They are listed so the "
-                "choice gets made deliberately rather than lost: a clustering "
-                "key that quietly fails to arrive is a performance regression "
-                "on the largest tables in the estate.", "",
+                "These source settings have a real AIDP equivalent that this "
+                "table cannot take as it stands (the reason is in each row). "
+                "They are listed so the choice gets made deliberately rather "
+                "than lost: a clustering key that quietly fails to arrive is "
+                "a performance regression on the largest tables in the "
+                "estate.", "",
                 "The deeper difference is *who runs maintenance*. Snowflake "
                 "maintains layout and reclaims storage in the background, "
                 "un-asked. On AIDP the equivalents exist and are **explicit** "
                 "— they have to be scheduled, and `VACUUM` is what bounds how "
                 "far time travel can reach. See "
                 "`references/maintenance-and-layout.md`.", "",
-                "| Object | Source setting | Value | AIDP equivalent |",
-                "|---|---|---|---|"]
+                "| Object | Source setting | Value | AIDP equivalent | Why not carried |",
+                "|---|---|---|---|---|"]
         out += [f'| `{ident}` | `{d["property"]}` | `{d["value"]}` | '
-                f'{d["aidp_equivalent"]} |' for ident, d in deferred]
+                f'{d["aidp_equivalent"]} | {d.get("reason") or "—"} |'
+                for ident, d in deferred]
         out.append("")
     return "\n".join(out) + "\n"
 
@@ -291,6 +339,8 @@ _CATEGORY_TITLES = {
     "no_definition": "Definition could not be read",
     "unparseable_sql": "SQL could not be parsed",
     "columns_unread": "Columns could not be read",
+    "register_in_place": "Registered in place over OCI Object Storage "
+                         "(not copied; see EXTERNAL_REGISTRATION.md)",
 }
 
 
@@ -301,6 +351,12 @@ def _compatibility_cell(rec: dict) -> str:
     all map read `supported` here while the plan, from the same inventory,
     refused it. The kind comes from the planner's own table.
     """
+    early = kind_before_types(rec)
+    if early:
+        # Decided by the kind before the types, exactly as the planner does.
+        if early[0] == "register_in_place":
+            return f"register in place ({early[1]})"
+        return f"blocked ({early[1]})"
     status = rec.get("compatibility_status")
     if status == "blocked":
         return "blocked"
@@ -308,6 +364,9 @@ def _compatibility_cell(rec: dict) -> str:
         # The column read failed: Cols 0 here is a missing fact, and the
         # plan refuses it under `columns_unread`.
         return "not assessed (columns unread)"
+    snapshot = snapshot_kind(rec)
+    if snapshot:
+        return f"table snapshot ({snapshot})"
     block = object_kind_block(rec)
     if block:
         return f"blocked ({block[0]})"
@@ -379,6 +438,22 @@ def render_planned_objects(plan: dict) -> str:
                     "Schemas the structure job (S10) creates, and `deploy` "
                     f"too: {schemas}", ""]
 
+    secure = plan.get("secure_views_as_views") or []
+    if secure:
+        # Before the object list, on purpose: the operator asked for this,
+        # and whoever approves the plan has to see what it costs.
+        warnings = {w["source_identifier"]: w["warning"]
+                    for w in plan.get("table_kind_warnings") or []}
+        out += ["## SECURITY WARNING — secure views planned as plain views", "",
+                f"`--secure-views as-view` was given, so {len(secure)} Snowflake "
+                "SECURE view(s) are planned as PLAIN views. Their definitions "
+                "become visible, the secure-view optimizer barrier is gone, "
+                "and row-visibility logic keyed to Snowflake roles does not "
+                "carry. Restrict access to each before granting it; see "
+                "SECURITY.md.", ""]
+        out += [f"- `{v}` — {warnings.get(v, '')}" for v in secure]
+        out.append("")
+
     out += ["## Can migrate", "",
             "| Object | Type | Target | Rows | Cols |", "|---|---|---|---:|---:|"]
     for c in plan.get("can_migrate") or []:
@@ -396,6 +471,24 @@ def render_planned_objects(plan: dict) -> str:
                 "meant to persist.", ""]
         out += [f'- `{w["source_identifier"]}` ({w.get("kind")}) — {w["warning"]}'
                 for w in kinds]
+        out.append("")
+
+    # Dynamic tables and materialized views carried as table snapshots. An
+    # older plan.json carries no list and renders unchanged.
+    snaps = plan.get("table_snapshots") or []
+    if snaps:
+        out += ["## Planned as table snapshots", "",
+                "Their current contents migrate as Delta tables, read at copy "
+                "time. Snowflake refreshed them; on AIDP they change only when "
+                "a refresh job runs. `snowmig jobs` generates that job where "
+                "the verdict says `refresh generated`, and creates it MANUAL "
+                "-- the cadence below is recorded, never applied.", ""]
+        for x in snaps:
+            cadence = x.get("cadence") or {}
+            when = (f'intended cadence: {cadence["source"]} {cadence["value"]}'
+                    if cadence else x.get("cadence_note") or "no cadence")
+            out.append(f'- `{x["source_identifier"]}` ({x["snapshot_of"]}) '
+                       f'-> `{x["target"]}` — {x["verdict"]}; {when}')
         out.append("")
 
     # Migrating tables that a pipe or task keeps filling in Snowflake. An
@@ -732,7 +825,8 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
         out += ["## Properties this transport cannot carry", "",
                 "The reviewed DDL declares these. The catalog API body has no "
                 "field for them, so the objects were created without them; the "
-                "plan names the same gap per object (rule R21).", ""]
+                "plan names the same gap per object (rule R21 for NOT NULL, "
+                "R13 for the Delta CLUSTER BY / TBLPROPERTIES).", ""]
         out += [f'- `{p["target_fqn"]}` — {p["property"]}: {p["reason"]}'
                 for p in res["properties_not_applied"]]
         out.append("")
@@ -888,7 +982,9 @@ def render_translation_map(tmap: dict) -> str:
            f'verbatim · **{t.get("views_refused", 0)}** refused · '
            f'**{t.get("views_blocked_by_kind", 0)}** refused by kind · '
            f'**{t.get("views_without_sql", 0)}** with no SQL captured · '
-           f'**{t.get("views_unparseable", 0)}** unparseable.', "",
+           f'**{t.get("views_unparseable", 0)}** unparseable. '
+           f'**{t.get("table_snapshots", 0)}** migrate as a table snapshot '
+           f'(materialized view / dynamic table).', "",
            "Every rule is either an exact rewrite or a refusal: nothing here "
            "is approximated. A refused view is left untouched and listed in "
            "`cannot_migrate` rather than translated into SQL that mostly "
@@ -902,6 +998,16 @@ def render_translation_map(tmap: dict) -> str:
                 "was run over these: " + ", ".join(
                     f'`{v["source_identifier"]}` ({v["kind"]})'
                     for v in kinds) + ".", ""]
+    snaps = tmap.get("table_snapshots") or []
+    if snaps:
+        out += ["Migrate as a table snapshot, as the plan migrates them -- "
+                "their rows are copied as a table, and their defining query "
+                "is translated only for the generated refresh (plan.json, "
+                "GENERATED_JOBS.md), so no dialect rule is counted for them "
+                "here: " + ", ".join(
+                    f'`{v["source_identifier"]}` ({v["kind"]}; '
+                    f'{v.get("refresh") or "refresh verdict not in the plan"})'
+                    for v in snaps) + ".", ""]
 
     out += ["## Types", "", "| Snowflake type | → | Spark type | Status | "
             "Columns | Objects |", "|---|---|---|---|---:|---:|"]
@@ -977,7 +1083,9 @@ def translation_map_section(tmap: dict | None) -> list[str]:
            f'{t.get("views_translated", 0)} translated · '
            f'{t.get("views_verbatim", 0)} verbatim · '
            f'{t.get("views_refused", 0)} refused · '
-           f'{t.get("views_blocked_by_kind", 0)} refused by kind.', "",
+           f'{t.get("views_blocked_by_kind", 0)} refused by kind; '
+           f'{t.get("table_snapshots", 0)} table snapshot(s) '
+           f'(materialized view / dynamic table).', "",
            f"- Dialect rules applied: {_tick(applied)}",
            f"- Dialect rules that refused a view: {_tick(refused)}",
            "- Type mappings: " + (", ".join(
@@ -1002,10 +1110,27 @@ def translation_map_section(tmap: dict | None) -> list[str]:
     return out
 
 
+def _protection_lost(security: dict | None, ident: str) -> list[str]:
+    """What protected `ident` in Snowflake and arrives without it on AIDP,
+    from security.json. Empty when there is no security artifact: absence of
+    the report is not a clean bill, and the summary says nothing either way.
+    """
+    lost: list[str] = []
+    for e in (security or {}).get("exposures") or []:
+        if e.get("object") == ident:
+            where = f' on {e["column"]}' if e.get("column") else ""
+            lost.append(f'{e.get("policy_kind")} {e.get("policy")}{where}')
+    for v in (security or {}).get("secure_views") or []:
+        if v.get("object") == ident:
+            lost.append("SECURE (definition and row-visibility guarantees)")
+    return lost
+
+
 def render_summary(plan: dict, inventory: dict, deployed: dict | None,
                    target: dict | None, *,
                    translation_map: dict | None = None,
-                   resources: dict | None = None) -> str:
+                   resources: dict | None = None,
+                   security: dict | None = None) -> str:
     session = (inventory or {}).get("session", {})
     dbs = ", ".join((inventory or {}).get("databases_in_scope") or []) or "-"
 
@@ -1045,6 +1170,13 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
             note = (failure[0].upper() + failure[1:] + "."
                     + ("" if level == "LOW" else " " + note))
             level = "HIGH"
+        lost = _protection_lost(security, c["source_identifier"])
+        if lost:
+            # SECURITY.md rates each of these HIGH; a summary row reading
+            # LOW for the same object told its reader the opposite.
+            level = "HIGH"
+            note = ("Arrives WITHOUT its Snowflake protection: "
+                    + "; ".join(lost) + " -- see SECURITY.md. " + note)
         rows.append((c["source_identifier"], c["object_type"],
                      "-" if c.get("rows") is None else f'{c["rows"]:,}',
                      level, status, note))
@@ -1352,7 +1484,15 @@ def render_maintenance(maint: dict) -> str:
                 "AIDP defaults.", ""]
     else:
         out += [f"## {len(flagged)} of {len(tables)} table(s) need a "
-                "maintenance decision — **none applied**", "",
+                "maintenance decision", "",
+                "A plain clustering key, retention and change tracking are "
+                "**carried into the CREATE TABLE by `ddl`** (liquid "
+                "`CLUSTER BY`, the Delta retention properties, "
+                "`delta.enableChangeDataFeed`) on the structure-notebook "
+                "path; `snowmig deploy --execute` cannot carry them, and "
+                "`DDL_PLAN.md` names any key that could not be carried. What "
+                "stays yours: **`OPTIMIZE` and `VACUUM` are applied by "
+                "nobody** until you schedule them.", "",
                 "| Table | Cluster key | Auto-cluster | Recluster credits | "
                 "Rows rewritten | Retention (days) |",
                 "|---|---|---|---:|---:|---|"]
@@ -1425,7 +1565,8 @@ _NO_CENSUS_SCOPE = (
     "tasks, streams, materialized and dynamic tables, stages, pipes, sequences, "
     "file formats, alerts, secrets, network rules, Streamlit apps, notebooks "
     "and services, and the account's shares, roles, network policies, "
-    "applications and compute pools, were not examined. Run `assess` with the "
+    "applications, compute pools and replication/failover groups, were not "
+    "examined. Run `assess` with the "
     "census enabled to find out what else is there."
 )
 
@@ -2063,4 +2204,137 @@ def render_catalogs(res: dict) -> str:
     out += ["", f'Types the server reports: {", ".join(seen) or "none"}. '
                 f'An EXTERNAL catalog points at a live source; an INTERNAL '
                 f'one holds managed Delta tables.']
+    return "\n".join(out) + "\n"
+
+
+def _cron_cell(proposal: dict | None, note: str | None) -> str:
+    if proposal and proposal.get("quartzCronExpression"):
+        return (f'`{proposal["quartzCronExpression"]}` (PAUSED, '
+                f'{proposal.get("timezoneId") or "UTC"})')
+    return f"none -- {note}" if note else "none"
+
+
+def render_generated_jobs(res: dict, plan: dict | None = None) -> str:
+    """GENERATED_JOBS.md: what `snowmig jobs` generated, and what it did not.
+
+    Every job is MANUAL. The cadence columns are what Snowflake did, and a
+    PAUSED Quartz proposal where one maps exactly; neither is ever sent.
+    """
+    s = res.get("summary") or {}
+    jobs = res.get("jobs") or []
+    refresh = [j for j in jobs if j.get("kind") == "refresh"]
+    graphs = [j for j in jobs if j.get("kind") == "task_graph"]
+    out = ["# Generated jobs", "",
+           f'**{s.get("refresh_jobs", 0)}** refresh job(s) for table '
+           f'snapshots · **{s.get("task_jobs", 0)}** task-graph job(s) '
+           f'({s.get("tasks_translated", 0)} task(s) translated, '
+           f'**{s.get("task_stubs", 0)}** stub(s)) · '
+           f'**{s.get("refresh_not_generated", 0)}** refresh(es) NOT '
+           f'generated.', "",
+           "Every job is **MANUAL**: no schedule is sent, and nothing runs "
+           "until someone runs it. The cadence Snowflake used is recorded "
+           "here, **not applied**; where it maps exactly onto a Quartz cron, "
+           "that cron is shown as a PAUSED proposal for whoever turns the "
+           "schedule on, after the job's output has been checked against the "
+           "source.", ""]
+    reg = res.get("registration")
+    if not res.get("registered"):
+        out += ["**Not registered.** This run was offline: the notebooks and "
+                "specs are files in this directory. `snowmig jobs --register` "
+                "creates the jobs in AIDP, unscheduled.", ""]
+    elif reg:
+        out += [f'**Registered** in `{reg.get("folder")}`: '
+                f'{len(reg.get("created") or [])} created, '
+                f'{len(reg.get("unconfirmed") or [])} requested but not '
+                f'confirmed, {len(reg.get("name_taken") or [])} name(s) '
+                f'already taken (not adopted), '
+                f'{len(reg.get("failed") or [])} failed. Schedule: '
+                f'{reg.get("schedule")}.', ""]
+        out += [f'- {st["step"]} · {st["outcome"]} · {st["detail"]}'
+                for st in reg.get("steps") or []] + [""]
+    if s.get("tasks_note"):
+        out += [f'> {s["tasks_note"]}', ""]
+
+    out += ["## Refresh jobs", ""]
+    if refresh:
+        out += ["Each notebook is one `INSERT OVERWRITE` of the snapshot from "
+                "its translated defining query: a full refresh, not "
+                "Snowflake's incremental one.", "",
+                "| Job | Source | Target | Intended cadence | Proposed cron "
+                "| Runs after |", "|---|---|---|---|---|---|"]
+        for j in refresh:
+            cadence = j.get("intended_cadence") or {}
+            when = (f'{cadence["source"]} {cadence["value"]}' if cadence
+                    else "none")
+            out.append(
+                f'| `{j["name"]}` | `{j["source_identifier"]}` '
+                f'({j["snapshot_of"]}) | `{j["target"]}` | {when} '
+                f'| {_cron_cell(j.get("proposed_schedule"), j.get("proposed_schedule_note") or j.get("cadence_note"))} '
+                f'| {", ".join(f"`{n}`" for n in j.get("run_after") or []) or "-"} |')
+    else:
+        out.append("None: the plan carries no table snapshot whose refresh "
+                   "could be generated.")
+    out.append("")
+    skipped = res.get("not_generated") or []
+    if skipped:
+        out += ["### Refresh NOT generated", "",
+                "The table snapshot still migrates; only its refresh is "
+                "withheld. Nothing refreshes these tables on AIDP.", ""]
+        out += [f'- `{x["source_identifier"]}` ({x.get("snapshot_of")}) — '
+                f'{x["verdict"]}' for x in skipped] + [""]
+
+    out += ["## Task-graph jobs", ""]
+    if not graphs:
+        out += ["None: no task was read"
+                + (f' ({s["tasks_note"]})' if s.get("tasks_note") else "")
+                + ".", ""]
+    for j in graphs:
+        sched = j.get("intended_schedule") or {}
+        out += [f'### `{j["name"]}` — root `{j["root"]}`', "",
+                f'- Snowflake schedule: {sched.get("value") or "none"}'
+                f' · state in Snowflake: {j.get("source_state") or "?"}'
+                f' · warehouse: {j.get("warehouse") or "?"}',
+                f'- Proposed cron: '
+                f'{_cron_cell(j.get("proposed_schedule"), j.get("proposed_schedule_note"))}']
+        out += [f"- {n}" for n in j.get("notes") or []]
+        out += ["", "| Task | Key | Depends on | Verdict |",
+                "|---|---|---|---|"]
+        out += [f'| `{t["source_identifier"]}` | `{t["task_key"]}` '
+                f'| {", ".join(f"`{d}`" for d in t["depends_on"]) or "-"} '
+                f'| {t["verdict"]} |' for t in j["tasks"]]
+        out.append("")
+
+    loads = (plan or {}).get("loads_that_stop") or []
+    if loads:
+        by_task = {t["source_identifier"]: (j["name"], t)
+                   for j in graphs for t in j["tasks"]}
+        out += ["## Loads that stop at cutover", "",
+                "Migrating tables a pipe or task fills in Snowflake "
+                "(PLANNED_OBJECTS.md), and the generated job that would take "
+                "over each load. A stub does not load anything until its "
+                "body is rewritten; a pipe has no generated job.", ""]
+        for x in loads:
+            hit = by_task.get(x["source_identifier"])
+            if hit:
+                name, task = hit
+                # The verdict, not a bare "translated": it says whether
+                # the body was dialect-translated or carried verbatim.
+                state = (task["verdict"] if task["generated"]
+                         else "STUB -- rewrite the body first")
+                out.append(f'- `{x["table"]}` <- {x["kind"]} '
+                           f'`{x["source_identifier"]}` -> job `{name}`, task '
+                           f'`{task["task_key"]}` ({state})')
+            else:
+                out.append(f'- `{x["table"]}` <- {x["kind"]} '
+                           f'`{x["source_identifier"]}` -> no generated job')
+        out.append("")
+
+    out += ["## Not carried by any generated job", "",
+            "- a schedule: recorded and proposed, never applied;",
+            "- a task's WHEN condition: the job runs unconditionally;",
+            "- a stream's offsets: a body that reads a stream is a stub, and "
+            "the nearest equivalent is the Delta change data feed of the "
+            "migrated base table (`table_changes`), which is not generated;",
+            "- a finalizer task and overlapping execution;",
+            "- an incremental refresh: every refresh is a full overwrite.", ""]
     return "\n".join(out) + "\n"

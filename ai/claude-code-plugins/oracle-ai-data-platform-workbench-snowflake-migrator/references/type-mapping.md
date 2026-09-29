@@ -13,29 +13,73 @@ getting its scale wrong does not raise — it silently changes values.
 | `TEXT`, `VARCHAR(n)`, `CHAR` | `STRING` | Declared length is not enforced by Delta; recorded |
 | `BOOLEAN`, `DATE`, `BINARY` | `BOOLEAN`, `DATE`, `BINARY` | Direct |
 | `FLOAT`, `DOUBLE`, `REAL` | `DOUBLE` | |
-| `TIME` | `STRING` | No Spark TIME type. **Warned**, not silent: ordering, comparison and time arithmetic become string operations |
-| `VARIANT`, `OBJECT`, `ARRAY` | `STRING` (JSON text) by default; **blocked** with `--semi-structured block` | Semi-structured; warned on every affected column. A typed struct/map/array design is a separate decision |
-| `GEOGRAPHY`, `GEOMETRY` | **blocked** by default; `STRING` with `--geospatial string` | No spatial target type |
+| `TIME(p)` | `STRING` | No Spark TIME type. Read as `TO_VARCHAR(.., 'HH24:MI:SS.FFp')`, so every fractional digit arrives. **Warned**, not silent: ordering, comparison and time arithmetic become string operations |
+| `TIMESTAMP_TZ` | `TIMESTAMP` | Also warned that the source's UTC offset is not stored; the instant is exact |
+| `VECTOR(FLOAT, n)` / `VECTOR(INT, n)` | `ARRAY<FLOAT>` / `ARRAY<INT>` | Typed (both 32-bit, as in Snowflake). Warned: Delta does not enforce the dimension `n` |
+| `MAP(K, V)` | `MAP<STRING, v>` | Typed. A `NUMBER` key is carried as its exact decimal text, and warned |
+| `OBJECT(f T, ...)` (structured) | `STRUCT<f: t, ...>` | Typed, nests. An inner type a typed column cannot hold (a timestamp, a `VARIANT`) makes the column the semi-structured case below, with the reason |
+| `ARRAY(T)` (structured) | `ARRAY<t>` | Typed; same fallback |
+| `VECTOR` / `MAP` whose full type was not read | **blocked** | The element type is not in `INFORMATION_SCHEMA`; re-run `assess` (DESCRIBE TABLE) or discovery (GET_DDL) |
+| `VARIANT`, `OBJECT`, `ARRAY` (untyped) | `STRING` (JSON text) by default; **blocked** with `--semi-structured block` | Semi-structured; warned on every affected column. A typed struct/map/array design is a separate decision |
+| `GEOGRAPHY`, `GEOMETRY` | **blocked** by default; GeoJSON `STRING` with `--geospatial string`, WKT `STRING` with `--geospatial wkt` | No spatial target type; WKT drops a `GEOMETRY`'s SRID, and says so |
 | anything else | **blocked** | Unmapped types are never approximated |
+
+Structured types (`VECTOR`, `MAP`, structured `OBJECT`/`ARRAY`) are typed, so
+`--semi-structured` does not apply to them. `INFORMATION_SCHEMA` reports only
+their first word; the full type comes from `DESCRIBE TABLE` in `assess` and
+`GET_DDL` in the in-AIDP discovery, read only for the tables that hold one.
+
+## How each column is read
+
+The mapping above decides the target type; `ddl` also records, per column, how
+the copy reads it from Snowflake and converts it on AIDP (`columns` on every
+table statement in `ddl_plan.json`, rule `R04_EXACT_READ` in `DDL_PLAN.md`).
+The connector's own table read loses digits, fractions and offsets on these
+types and cannot open a table holding `VECTOR`, `MAP` or a structured
+`OBJECT`, so each is read as text in one pushdown and converted on AIDP:
+
+| Source | Read in Snowflake | Converted on AIDP |
+|---|---|---|
+| `NUMBER(p,s)` | `"C"::VARCHAR` | ``CAST(`C` AS DECIMAL(p,s))`` |
+| `FLOAT` | `TO_VARCHAR("C", 'TME')` | ``CAST(`C` AS DOUBLE)`` |
+| `TIME(p)` | `TO_VARCHAR("C", 'HH24:MI:SS.FFp')` | as read |
+| `TIMESTAMP_NTZ` | `TO_VARCHAR("C", 'YYYY-MM-DD HH24:MI:SS.FF9')` | `CAST` to the planned type |
+| `TIMESTAMP_TZ` / `_LTZ` | ISO-8601 text with `TZH:TZM` | `CAST(.. AS TIMESTAMP)` |
+| `VECTOR` | `"C"::ARRAY::VARCHAR` | ``from_json(`C`, 'array<float>')`` |
+| `MAP`, structured `OBJECT` / `ARRAY` | `"C"::VARIANT::VARCHAR` | `from_json` into the planned type |
+| untyped `VARIANT` / `OBJECT` / `ARRAY` | `TO_JSON("C"::VARIANT)` | as read (JSON text, keeping `"1"` and `1` apart) |
+| `GEOGRAPHY` / `GEOMETRY` | `ST_ASWKT("C")` (`wkt`) or `ST_ASGEOJSON("C")::VARCHAR` (`string`) | as read |
+| everything else | `"C"` | as read |
+
+Sub-microsecond digits are still truncated by Spark's microsecond timestamps,
+and warned.
 
 ## Table properties
 
-No table property is emitted as DDL:
-
-- Settings with an AIDP equivalent — `CLUSTER BY`,
-  `DATA_RETENTION_TIME_IN_DAYS`, `CHANGE_TRACKING` — are listed per object in
-  the DDL plan under *"Maintenance and layout — decisions, NOT applied"*, with
-  the equivalent named ([maintenance-and-layout.md](maintenance-and-layout.md)).
-- `MAX_DATA_EXTENSION_TIME_IN_DAYS`, which has no equivalent, is recorded in
-  `omitted_properties`.
+- Carried into the CREATE TABLE (`carried_properties`, rule `R12`): a plain
+  clustering key as `CLUSTER BY`, retention as the Delta retention
+  properties, change tracking or a stream as `delta.enableChangeDataFeed`
+  ([maintenance-and-layout.md](maintenance-and-layout.md)).
+- Deferred with the reason (`deferred_properties`, rule `R11`): a clustering
+  key Delta cannot take, listed per object in the DDL plan under
+  *"Maintenance and layout — decisions, NOT applied"*.
+- Recorded in `omitted_properties`, never emitted:
+  `MAX_DATA_EXTENSION_TIME_IN_DAYS`, which has no equivalent, and the
+  Iceberg, dynamic and secure flags.
 - Tags, masking policies and row-access policies are not carried;
   `snowmig security` reports them in `SECURITY.md`.
 
 ## Constraints
 
 Snowflake `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` are unenforced metadata — only
-`NOT NULL` is enforced. Delta does not enforce them either. They are captured in
-the inventory and reported, not emitted as DDL.
+`NOT NULL` is enforced. They are captured in the inventory and reported, not
+emitted as DDL: AIDP refuses `PRIMARY KEY` in `CREATE TABLE`. `NOT NULL` is
+carried.
+
+Column `DEFAULT` and `IDENTITY` / `AUTOINCREMENT` are read and warned, never
+emitted, for the same reason: AIDP refuses a column default and
+`GENERATED ... AS IDENTITY` in `CREATE TABLE`. After cutover the writer
+supplies both.
 
 ---
 
@@ -68,10 +112,12 @@ reported (`R42_VIEW_REFS_UNRESOLVED` for a bare name,
 
 A view's header column list (`create view V(CUSTOMER, TOTAL) as select
 CUST_ID, SUM(AMT) ...`) renames the body's output columns, so it is carried
-(`R44_VIEW_COLUMN_LIST`): `CREATE VIEW <fqn> (CUSTOMER, TOTAL) AS ...` in the
-SQL, and `SELECT * FROM (<body>) AS named_columns(CUSTOMER, TOTAL)` as the
-catalog API's viewText, which has no column-list field. A list that cannot be
-read blocks the view.
+(`R44_VIEW_COLUMN_LIST`) by aliasing the body: `CREATE VIEW <fqn> AS SELECT *
+FROM (<body>) AS named_columns(CUSTOMER, TOTAL)` in the SQL, and the same
+query as the catalog API's viewText, which has no column-list field. Never as
+a view column list (`CREATE VIEW <fqn> (CUSTOMER, TOTAL) AS ...`): AIDP
+creates such a view, and then every read of it fails
+`INCOMPATIBLE_VIEW_SCHEMA_CHANGE`. A list that cannot be read blocks the view.
 
 | Construct | What happens |
 |---|---|
@@ -100,7 +146,10 @@ read blocks the view.
 `MAX_BY` / `MIN_BY` are **not** blocked — Spark supports them.
 
 Also blocked, regardless of body: **secure views** (row-visibility rules have no
-equivalent) and **materialized views** (rebuild as a table plus a refresh job).
+equivalent). A **materialized view** is not created as a view either: it
+migrates as a table snapshot, and its query is translated only for the
+generated refresh job (`refresh generated` / `refresh NOT generated: <why>` in
+`PLANNED_OBJECTS.md`).
 
 ## Object mapping
 
@@ -131,7 +180,7 @@ that matter.
 | Flag | Config key | Default | The other mode |
 |---|---|---|---|
 | `--semi-structured` | `mapping.semi_structured` | `string`: carry the JSON as text, with a warning on every affected column | `block`: the table is blocked until a typed design exists |
-| `--geospatial` | — | `block`: the table is blocked | `string`: carry the value as text, with no spatial type, index or predicate support |
+| `--geospatial` | `mapping.geospatial` | `block`: the table is blocked | `string`: carry the value as GeoJSON text; `wkt`: as WKT text (`ST_ASWKT`). Either way no spatial type, index or predicate support |
 | `--timestamp-ntz` | `mapping.timestamp_ntz` | `timestamp`: carry `TIMESTAMP_NTZ` as `TIMESTAMP`, with the timezone caveat recorded | `preserve`: keep `TIMESTAMP_NTZ`; `ddl` halts on it (exit 3) |
 
 `--mapping-defaults off` (or `mapping.enabled: false` in the config) restores

@@ -40,6 +40,7 @@ def _responses(**over):
         "show network policies": [],
         "show applications": [],
         "show compute pools": [],
+        "show replication groups": [],
     }
     empty.update(over)
     return empty

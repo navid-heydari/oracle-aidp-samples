@@ -4,6 +4,60 @@ Release notes for the Oracle AI Data Platform (AIDP) Workbench Snowflake
 migrator plugin, newest first. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+- The copy reads each table with one qualified pushdown built from the plan's
+  per-column read/convert spec. NUMBER(38,s), TIME and TIMESTAMP fractions and
+  offsets arrive exact, and VECTOR, MAP and structured OBJECT/ARRAY arrive as
+  typed Spark columns. The connector's table read truncated NUMBER to ~9 digits.
+- `--parallel N` for the copy (default 8), with source counts batched per chunk
+  of 50, and `--verify counts+sums`, which sums the source in Snowflake exactly.
+  A decimal total past 38 digits is reported `sum_not_comparable`.
+- Liquid CLUSTER BY (plain-column keys), retention and change tracking are
+  carried into the reviewed CREATE TABLE. DEFAULT, IDENTITY and PRIMARY KEY
+  warnings name the AIDP refusal.
+- Dynamic tables and materialized views migrate as table snapshots, created,
+  copied and reconciled as tables. `snowmig jobs` generates refresh notebooks
+  for them and MANUAL job specs for Snowflake task graphs; `--register` creates
+  them unscheduled.
+- External and Iceberg tables register in place over OCI Object Storage
+  (`external-registration`), outbound shares get a Delta Sharing plan
+  (`share-plan`), and `plan --secure-views as-view` is an opt-in with a security
+  warning.
+- `demo --estate enterprise` runs the Snowflake-side stages over an emulated
+  estate holding what a trial account cannot (shares, external and Iceberg
+  tables, replication groups, masking at scale).
+
+### Changed
+- Structure creates run 8 at a time by default (measured: ~5 s a table one at a
+  time, ~2 s at 8, ~1.7 s at 16; AIDP's CREATE TABLE is the floor).
+- A plan file over 16 MiB is pushed gzipped (`<name>.gz`), with a pointer under
+  the plain name that the structure, copy and reconcile stages follow and check
+  by sha256. JSON plans compress 49-75x.
+
+### Fixed
+- `ddl` over a large plan no longer runs one regex per planned object for every
+  view: 94 s for a 50,500-object plan, which was on course for hours.
+- `SHOW PRIMARY KEYS / UNIQUE KEYS / IMPORTED KEYS IN DATABASE` stop at 10,000
+  rows. A read at the cap is completed per schema and then per table, so no
+  declared key is dropped. Foreign keys are grouped in one pass.
+- The view phase writes its report on an interval rather than after each view,
+  and a report just written is never re-read.
+- `run` shows a failed task's `errorTrace` (the fetched log is only its head),
+  and names a platform transient such as an HTTP 503 as one.
+- Reconcile marks a table in the target that no structure report records as
+  `structure: unrecorded`, with the re-run that checks it. A planned view no run
+  has recorded is `VIEW_NOT_CREATED_YET`.
+- A plan file that is not valid JSON fails naming the file and the remedy.
+- `run` fetches this run's discovery manifest, from the reports-dir it was
+  provisioned with, and a Windows drive path is refused as a stage parameter.
+- CLUSTER BY keys are written bare (AIDP keeps backticks as part of the name). A
+  view's column list is carried as `SELECT * FROM (...) AS named_columns(...)`
+  (a view column list is unreadable on AIDP).
+- A `cluster by (...)` before the column list in `GET_DDL` is skipped when its
+  columns are read.
+
 ## [0.27.0] — 2026-09-29
 
 ### Added

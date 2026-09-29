@@ -378,6 +378,12 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
         return raw("GET", f"{base}/workspaces/{ws}/taskRuns"
                           f'?jobRunKey={kwargs["run_key"]}'
                           f"&sortBy=timeCreated", page=page)
+    if operation == "get_task_run":
+        # The one read that carries a failed task's `errorTrace`: the job
+        # run's envelope says only "Exception during execution of notebook",
+        # and the task-run list items omit it (live 2026-09-29).
+        return raw("GET", f"{base}/workspaces/{ws}/taskRuns/"
+                          f'{kwargs["task_run_key"]}')
     if operation == "fetch_task_output":
         return raw("POST", f"{base}/workspaces/{ws}/taskRuns/"
                            f'{kwargs["task_run_key"]}/actions/fetchOutput',

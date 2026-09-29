@@ -50,6 +50,22 @@ PROPERTIES_THIS_BODY_CANNOT_CARRY = {
         "the table with the in-AIDP structure notebook (`snowmig provision` "
         "+ 01_create_structure), which emits the reviewed CREATE TABLE "
         "verbatim, if the constraint has to hold."),
+    # The Delta clauses `ddl` carries into the reviewed CREATE TABLE
+    # (statement `delta_features`, rule R13 in DDL_PLAN.md). The table body
+    # is fields + description only: there is no clustering or table-property
+    # field, so on this path they are not applied.
+    "cluster_by": (
+        "the catalog API table body has no clustering field, so the table "
+        "was created WITHOUT liquid clustering. Apply it afterwards with "
+        "ALTER TABLE ... CLUSTER BY, or create the table with the in-AIDP "
+        "structure notebook (`snowmig provision` + 01_create_structure), "
+        "which emits the reviewed CREATE TABLE verbatim (rule R13)."),
+    "tblproperties": (
+        "the catalog API table body has no table-property field, so the "
+        "table was created WITHOUT it. Apply it afterwards with ALTER TABLE "
+        "... SET TBLPROPERTIES, or create the table with the in-AIDP "
+        "structure notebook (`snowmig provision` + 01_create_structure), "
+        "which emits the reviewed CREATE TABLE verbatim (rule R13)."),
 }
 
 # What AIDP calls its two catalog shapes, LIVE-VERIFIED 2026-09-18 by reading

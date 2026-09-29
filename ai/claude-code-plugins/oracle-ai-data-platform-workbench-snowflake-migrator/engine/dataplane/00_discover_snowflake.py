@@ -10,7 +10,11 @@ point -- see the table below before reaching for it.
                         database. This is the mode that scales: a
                         200k-table estate costs a handful of queries, not a
                         DESCRIBE per object. It needs only the credentials
-                        smoke already proved -- no catalog crawl.
+                        smoke already proved -- no catalog crawl. A table
+                        holding a VECTOR / MAP / OBJECT / ARRAY column
+                        costs one more read: its full column types, which
+                        INFORMATION_SCHEMA does not carry, come from
+                        GET_DDL, batched 50 tables to a qualified pushdown.
 
   external-catalog      SHOW SCHEMAS/TABLES + DESCRIBE per object against a
                         registered EXTERNAL catalog. Its cost grows with the
@@ -39,6 +43,7 @@ import argparse
 import datetime
 import json
 import pathlib
+import re
 import sys
 import traceback
 
@@ -181,6 +186,238 @@ def _snowflake_type(col: dict) -> str:
     return base
 
 
+# Columns whose INFORMATION_SCHEMA type hides what the engine's mapper needs:
+# `VECTOR`, `MAP`, `OBJECT`, `ARRAY` carry no element types there (live
+# 2026-09-29), and a TIME/TIMESTAMP with no DATETIME_PRECISION carries no
+# fraction. The SAME rule as `snowflake_source.dialect.types.
+# needs_type_detail`, which this script cannot import (it is uploaded as a
+# standalone file); tests/test_type_detail.py holds the two together.
+_TYPE_DETAIL_BASES = ("VECTOR", "MAP", "OBJECT", "ARRAY", "GEOGRAPHY",
+                      "GEOMETRY")
+_TIME_BASES = ("TIME", "TIMESTAMP", "TIMESTAMP_NTZ", "TIMESTAMP_LTZ",
+               "TIMESTAMP_TZ")
+# GET_DDL calls per pushdown. The live 50-table qualified UNION ALL count
+# answered in 25 s; a pushdown per table costs ~8.5 s each.
+_DDL_CHUNK = 50
+
+
+def _needs_type_detail(data_type, datetime_precision=None) -> bool:
+    base = str(data_type or "").strip().upper().split("(")[0].strip()
+    if base in _TYPE_DETAIL_BASES:
+        return True
+    return base in _TIME_BASES and datetime_precision in (None, "")
+
+
+def _scan_to(text: str, start: int, stop: str) -> int:
+    """Index of the first `stop` character at depth 0 from `start`, outside
+    string literals and quoted identifiers; len(text) when there is none.
+
+    Snowflake's lexing: a backslash escapes inside '...', a doubled quote is
+    a literal quote in either kind.
+    """
+    depth, i, n = 0, start, len(text)
+    while i < n:
+        c = text[i]
+        if c in ("'", '"'):
+            i += 1
+            while i < n:
+                if c == "'" and text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == c:
+                    if text[i:i + 2] == c * 2:
+                        i += 2
+                        continue
+                    break
+                i += 1
+        elif c == "(" and "(" in stop and depth == 0:
+            return i
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            if depth == 0 and ")" in stop:
+                return i
+            depth -= 1
+        elif c in stop and depth == 0:
+            return i
+        i += 1
+    return n
+
+
+_WORD = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+_TYPE_WORDS = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\s+(?:PRECISION|VARYING)\b)?",
+                         re.IGNORECASE)
+_TABLE_CONSTRAINT_WORDS = {"CONSTRAINT", "PRIMARY", "UNIQUE", "FOREIGN"}
+# A clustering clause that precedes the column list:
+# `create or replace TABLE T cluster by (K)(cols...)`, or `LINEAR(K)`.
+_CLUSTER_BY_TAIL = re.compile(r"\bcluster\s+by(?:\s+linear)?\s*$",
+                              re.IGNORECASE)
+
+
+def _column_list_opener(text: str) -> int:
+    """Index of the "(" that opens the column list, or len(text).
+
+    The first top-level "(" is the column list unless it belongs to a
+    `cluster by (...)` written before it -- the order sqlglot's Snowflake
+    dialect accepts, and likely GET_DDL's for a clustered table (not
+    captured live). That group, nested expression keys included, is
+    skipped; the clause written after the list needs nothing.
+    """
+    pos = 0
+    while True:
+        opener = _scan_to(text, pos, "(")
+        if opener >= len(text):
+            return len(text)
+        if not _CLUSTER_BY_TAIL.search(text[pos:opener]):
+            return opener
+        pos = _scan_to(text, opener + 1, ")") + 1
+
+
+def _ddl_column_types(ddl: str) -> dict[str, str]:
+    """{column: declared type} from GET_DDL('TABLE') text.
+
+    Only the type is taken -- its first word(s) and one balanced
+    parenthesised group, `MAP(VARCHAR(16777216), NUMBER(38,0))` -- never the
+    NOT NULL / DEFAULT / COMMENT after it, whose literals may hold commas
+    and parentheses. A table constraint line (`primary key (ID)`) is not a
+    column. A `cluster by (...)` before the column list is skipped. Text it
+    cannot read yields what it could, possibly nothing.
+    """
+    text = ddl or ""
+    opener = _column_list_opener(text)
+    if opener >= len(text):
+        return {}
+    out: dict[str, str] = {}
+    pos = opener + 1
+    while pos < len(text):
+        end = _scan_to(text, pos, ",)")
+        item = text[pos:end].strip()
+        pos = end + 1
+        name, rest = None, ""
+        if item.startswith('"'):
+            close = 1
+            while close < len(item):
+                if item[close] == '"':
+                    if item[close:close + 2] == '""':
+                        close += 2
+                        continue
+                    break
+                close += 1
+            name, rest = item[1:close].replace('""', '"'), item[close + 1:]
+        elif item:
+            m = _WORD.match(item)
+            if m and m.group(0).upper() not in _TABLE_CONSTRAINT_WORDS:
+                name, rest = m.group(0), item[m.end():]
+        rest = rest.lstrip()
+        m = _TYPE_WORDS.match(rest) if name is not None else None
+        if m:
+            type_end = m.end()
+            after = rest[type_end:].lstrip()
+            if after.startswith("("):
+                offset = len(rest) - len(after)
+                type_end = min(_scan_to(rest, offset + 1, ")") + 1, len(rest))
+            out[name] = rest[:type_end].strip()
+        if end >= len(text) or text[end] == ")":
+            break
+    return out
+
+
+def _qualified_literal(database: str, schema: str, table: str) -> str:
+    """'"DB"."SCHEMA"."TABLE"' as a Snowflake string literal, for GET_DDL."""
+    name = ".".join('"' + str(p).replace('"', '""') + '"'
+                    for p in (database, schema, table))
+    return "'" + _sql_literal(name) + "'"
+
+
+def _get_ddl_sql(database: str, batch: list[tuple[str, str]]) -> str:
+    return " union all ".join(
+        f"select '{_sql_literal(schema)}' as SNOWMIG_SCHEMA, "
+        f"'{_sql_literal(table)}' as SNOWMIG_TABLE, "
+        f"get_ddl('table', {_qualified_literal(database, schema, table)}) "
+        f"as SNOWMIG_DDL" for schema, table in batch)
+
+
+def read_type_details(source: SnowflakeSource,
+                      by_object: dict[tuple[str, str], list[dict]],
+                      tables: list[tuple[str, str]]) -> None:
+    """Record `type_detail` on every column that needs it, or say why not.
+
+    There is no DESCRIBE through the connector: its pushdown takes a query.
+    GET_DDL is a SELECT, its CREATE TABLE text spells the same full types
+    DESCRIBE does, and many calls ride one UNION ALL -- fully qualified,
+    because the pushdown session has no current schema and an unqualified
+    name fails live ("Object does not exist"). A chunk that fails is retried
+    table by table, so one unreadable table does not cost the other 49.
+    Where nothing can be read the column carries `type_detail_unread`; the
+    engine's mapper then treats the element types as unknown and says so.
+    """
+    def needing(key):
+        return [c for c in by_object.get(key, [])
+                if _needs_type_detail(c.get("data_type"),
+                                      c.get("datetime_precision"))]
+
+    wanted = [key for key in tables if needing(key)]
+    if not wanted:
+        return
+
+    def mark(key, reason):
+        for col in needing(key):
+            col.setdefault("type_detail_unread", reason)
+
+    try:
+        database = source.database()
+    except Exception:
+        database = None
+    if not database:
+        for key in wanted:
+            mark(key, "no source database is configured to qualify the "
+                      "GET_DDL read with, and an unqualified name fails "
+                      "through the pushdown; element types UNREAD")
+        log(f"type detail: {len(wanted)} table(s) need it and no database "
+            f"is configured to qualify GET_DDL; recorded as UNREAD")
+        return
+
+    def run(batch):
+        rows = _rows(source.pushdown(_get_ddl_sql(database, batch)))
+        return {(str(r.get("SNOWMIG_SCHEMA")), str(r.get("SNOWMIG_TABLE"))):
+                r.get("SNOWMIG_DDL") for r in rows}
+
+    ddls: dict[tuple[str, str], object] = {}
+    for start in range(0, len(wanted), _DDL_CHUNK):
+        batch = wanted[start:start + _DDL_CHUNK]
+        try:
+            ddls.update(run(batch))
+            continue
+        except Exception as exc:
+            if len(batch) == 1:
+                mark(batch[0], f"GET_DDL failed: {str(exc)[:200]}")
+                continue
+        for key in batch:
+            try:
+                ddls.update(run([key]))
+            except Exception as exc:
+                mark(key, f"GET_DDL failed: {str(exc)[:200]}")
+
+    read = 0
+    for key in wanted:
+        if key not in ddls:
+            mark(key, "GET_DDL returned no row for this table")
+            continue
+        types = _ddl_column_types(str(ddls[key] or ""))
+        for col in needing(key):
+            detail = types.get(col["name"])
+            if detail:
+                col["type_detail"] = detail
+                col.pop("type_detail_unread", None)
+                read += 1
+            else:
+                col.setdefault("type_detail_unread",
+                               "the GET_DDL text carried no type for this "
+                               "column that could be read")
+    log(f"type detail: {read} column(s) read through GET_DDL for "
+        f"{len(wanted)} table(s)")
+
+
 def discover_via_connector(source: SnowflakeSource, *,
                            wanted: list[str] | None,
                            exclude: set[str]) -> list[dict]:
@@ -243,6 +480,14 @@ def discover_via_connector(source: SnowflakeSource, *,
              "comment": _plain(col.get("COMMENT")),
              # Read, so a None above is a real "none", never "unknown".
              "facts_recorded": True})
+
+    # Views are not copied, so only a base table's structured columns are
+    # worth the extra read.
+    read_type_details(source, by_object, [
+        (str(rel["TABLE_SCHEMA"]), str(rel["TABLE_NAME"])) for rel in tables
+        if "VIEW" not in str(rel.get("TABLE_TYPE") or "BASE TABLE").upper()
+        and str(rel["TABLE_SCHEMA"]).lower() not in exclude
+        and not (wanted and str(rel["TABLE_SCHEMA"]) not in wanted)])
 
     schemas: dict[str, dict] = {}
     for rel in tables:

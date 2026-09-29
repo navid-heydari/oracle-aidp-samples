@@ -26,10 +26,13 @@ without `execute=True`. Every underlying REST shape is the DOCUMENTED
 from __future__ import annotations
 
 import datetime
+import gzip
+import hashlib
 import json
 import os
 import pathlib
 import re
+import shutil
 import tempfile
 import time
 from typing import Callable
@@ -526,6 +529,55 @@ def _credential_line(source_name: str, remote: str) -> str:
 # these and is not worth a copy per push.
 PLAN_BACKUP_FILES = ("plan.json", "ddl_plan.json")
 
+# A plan file larger than this goes up gzipped as <name>.gz, with a pointer
+# under the plain name that the stages follow (snowmig_source.read_plan_json).
+# Live 2026-09-29, the 50k-table plan: the workspace upload route took 612 s
+# for 64 MB, failed 502 Bad Gateway on ddl_plan.json (274 MB) and
+# inventory.json (293 MB), and the failed overwrite left plan/ddl_plan.json
+# empty. JSON plans compress 49-75x.
+COMPRESS_OVER_BYTES = 16 * 2 ** 20
+PLAN_POINTER_KEY = "snowmig_compressed_to"
+
+
+def _stage_large_uploads(files, staged_dir, *, pointer: bool) -> list[tuple]:
+    """(local path, remote name, detail note, needs) per upload, in order.
+
+    A file over COMPRESS_OVER_BYTES becomes its gzip copy `<name>.gz` and --
+    when `pointer`, for the plan/ folder the stages read -- a pointer under
+    the plain name, listed after the copy and `needs`-ing it, so the plain
+    name never points at something that did not land. A plain copy an
+    earlier, smaller push left there is replaced by the pointer rather than
+    being read as this plan.
+    """
+    out = []
+    for path, name in files:
+        path = pathlib.Path(path)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        if size <= COMPRESS_OVER_BYTES:
+            out.append((path, name, "", None))
+            continue
+        data = path.read_bytes()
+        gz_name = f"{name}.gz"
+        gz = pathlib.Path(staged_dir) / gz_name
+        gz.write_bytes(gzip.compress(data, compresslevel=6))
+        out.append((gz, gz_name,
+                    f" ({size / 2 ** 20:.0f} MB, uploaded gzipped: "
+                    f"{gz.stat().st_size / 2 ** 20:.1f} MB; the workspace "
+                    f"upload route fails on large files)", None))
+        if pointer:
+            ptr = pathlib.Path(staged_dir) / f"{name}.pointer"
+            ptr.write_text(json.dumps({
+                PLAN_POINTER_KEY: gz_name, "format": "gzip", "bytes": size,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "reason": "too large to upload as is; the stages read the "
+                          "plan through this pointer"}, indent=2),
+                encoding="utf-8")
+            out.append((ptr, name, f" (pointer to {gz_name})", gz_name))
+    return out
+
 
 def plan_backup_names(plan_files, *, stamp: str,
                       label: str | None = None) -> list[tuple]:
@@ -542,6 +594,60 @@ def plan_backup_names(plan_files, *, stamp: str,
         suffix = f"_{safe}" if safe else ""
     return [(p, f"{pathlib.Path(p).stem}_{stamp}{suffix}.json")
             for p in plan_files if pathlib.Path(p).name in PLAN_BACKUP_FILES]
+
+
+def _push_plan_folders(call, ws_key: str, step, staged: str,
+                       folders: list[tuple[str, list]]) -> None:
+    """Upload each folder's plan files, then read the folder back once.
+
+    The read-back is the claim -- a 2xx never was one -- gathered once per
+    folder rather than per file (each listing is its own CLI process; the
+    live run spent seven). A file too large to upload goes up gzipped
+    behind a pointer (_stage_large_uploads); a pointer whose copy did not
+    land is not uploaded, and is reported with why.
+    """
+    for folder, files in folders:
+        kind = "backup" if folder == BACKUP_FOLDER else "upload"
+        uploads = _stage_large_uploads(files, staged,
+                                       pointer=folder == PLAN_FOLDER)
+        upload_errors: dict[str, str] = {}
+        for path, name, _note, needs in uploads:
+            if needs and needs in upload_errors:
+                upload_errors[name] = (f"not uploaded: the gzip copy it "
+                                       f"points at, {needs}, did not land")
+                continue
+            try:
+                call("upload_ws_file", workspace=ws_key,
+                     path=f"{folder}/{name}", local_path=str(path))
+            except Exception as exc:
+                upload_errors[name] = str(exc)[:200]
+        if not uploads:
+            continue
+        try:
+            items = call("list_ws_objects", workspace=ws_key,
+                         path=folder).get("items") or []
+            listing_failure = None
+        except Exception as exc:
+            items, listing_failure = [], str(exc)[:200]
+        for _path, name, note, _needs in uploads:
+            remote = f"{folder}/{name}"
+            if name in upload_errors:
+                # The upload itself raised: that is what to report, not the
+                # absence it necessarily causes in the listing.
+                step(kind, "failed", False,
+                     f"{remote}{note}: {upload_errors[name]}")
+                continue
+            if listing_failure is not None:
+                step(kind, "upload_requested", None,
+                     f"{remote}{note}: uploaded, but the folder could not "
+                     f"be listed to confirm it ({listing_failure})")
+                continue
+            found = any(
+                str(i.get("path") or "").endswith("/" + name)
+                or i.get("displayName") == name for i in items)
+            step(kind, "uploaded" if found else "upload_requested", found,
+                 f"{remote}{note}" if found
+                 else f"{remote}{note}: not visible in listing")
 
 
 def _pypi_from_requirements(path: pathlib.Path | None) -> list[str]:
@@ -847,8 +953,12 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
              f"{DIAGNOSE_NOTEBOOK_NAME} (generated, no job) -> "
              f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}")
         for path in plan_files:
+            big = (pathlib.Path(path).is_file()
+                   and pathlib.Path(path).stat().st_size > COMPRESS_OVER_BYTES)
             step("upload", "would upload", None,
-                 f"{path.name} -> {PLAN_FOLDER}/{path.name}")
+                 f"{path.name} -> {PLAN_FOLDER}/{path.name}"
+                 + (".gz (gzipped, over the upload size) + a pointer under "
+                    "the plain name" if big else ""))
         for path, name in plan_backup_names(plan_files, stamp=stamp,
                                             label=plan_label):
             step("backup", "would upload", None,
@@ -1156,47 +1266,13 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     # so a reduced plan pushed later cannot overwrite the full one's copy.
     backups = [(path, name) for path, name in
                plan_backup_names(plan_files, stamp=stamp, label=plan_label)]
-    for folder, files in ((PLAN_FOLDER, [(p, p.name) for p in plan_files]),
-                          (BACKUP_FOLDER, backups)):
-        # Upload the folder's files, THEN read the folder back once. The
-        # read-back is the claim and is unchanged -- a 2xx never was one --
-        # but it is the same evidence gathered once instead of per file.
-        # Each listing is its own CLI process; the live run spent seven.
-        kind = "backup" if folder == BACKUP_FOLDER else "upload"
-        upload_errors: dict[str, str] = {}
-        for path, name in files:
-            try:
-                call("upload_ws_file", workspace=ws_key,
-                     path=f"{folder}/{name}", local_path=str(path))
-            except Exception as exc:
-                upload_errors[name] = str(exc)[:200]
-        if not files:
-            continue
-        try:
-            items = call("list_ws_objects", workspace=ws_key,
-                         path=folder).get("items") or []
-            listing_failure = None
-        except Exception as exc:
-            items, listing_failure = [], str(exc)[:200]
-        for path, name in files:
-            remote = f"{folder}/{name}"
-            if name in upload_errors:
-                # The upload itself raised: that is what to report, not the
-                # absence it necessarily causes in the listing.
-                step(kind, "failed", False,
-                     f"{remote}: {upload_errors[name]}")
-                continue
-            if listing_failure is not None:
-                step(kind, "upload_requested", None,
-                     f"{remote}: uploaded, but the folder could not be "
-                     f"listed to confirm it ({listing_failure})")
-                continue
-            found = any(
-                str(i.get("path") or "").endswith("/" + name)
-                or i.get("displayName") == name for i in items)
-            step(kind, "uploaded" if found else "upload_requested",
-                 found,
-                 remote if found else f"{remote}: not visible in listing")
+    staged = tempfile.mkdtemp(prefix="snowmig_plan_push_")
+    try:
+        _push_plan_folders(call, ws_key, step, staged, [
+            (PLAN_FOLDER, [(p, p.name) for p in plan_files]),
+            (BACKUP_FOLDER, backups)])
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
 
     if credential_object:
         # The derived `snowflake:` block, written to a temp file for the

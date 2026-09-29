@@ -206,7 +206,11 @@ STAGES: tuple[dict, ...] = (
 # CLI commands that are tools, not steps of a migration. Every other command
 # must be a phase above -- a test holds that.
 UTILITY_COMMANDS = ("stages", "demo", "databases", "catalogs", "clean",
-                    "build-notebooks", "init-config", "fetch")
+                    "build-notebooks", "init-config", "fetch",
+                    # Optional reports for objects the plan does not copy,
+                    # and the generated jobs (GENERATED_JOBS.md): they gate
+                    # nothing, so they are not board phases.
+                    "external-registration", "share-plan", "jobs")
 
 _UNKNOWN = "could not be determined"
 

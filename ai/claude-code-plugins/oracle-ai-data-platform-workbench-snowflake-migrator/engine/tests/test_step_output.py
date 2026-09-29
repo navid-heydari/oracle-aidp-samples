@@ -31,7 +31,7 @@ def test_the_helper_writes_a_named_step_file(tmp_path):
     from snowmig_source import write_step_output
     path = write_step_output(str(tmp_path / "report" / "output"),
                              "S06_discover.json", {"step": "S06", "tables": 3})
-    body = json.loads(pathlib.Path(path).read_text())
+    body = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
     assert body["step"] == "S06" and body["tables"] == 3 and body["written_at"]
 
 
@@ -53,7 +53,7 @@ def test_a_write_failure_never_raises(tmp_path):
     ("02_copy_schema", "S11_copy_"),
     ("03_reconcile", "S11_reconcile.json")])
 def test_every_stage_writes_its_step_and_takes_output_dir(script, name):
-    src = (SCRIPTS / f"{script}.py").read_text()
+    src = (SCRIPTS / f"{script}.py").read_text(encoding="utf-8")
     assert "write_step_output(" in src and name in src
     mod = _load(script)
     assert mod.DEFAULT_OUTPUT_DIR == "/Workspace/report/output"
@@ -126,7 +126,7 @@ def test_the_structure_stage_writes_s10_with_its_counts(tmp_path, monkeypatch):
     out = tmp_path / "report" / "output"
     assert mod.main(["--target-catalog", "cat", "--reports-dir", str(reports),
                      "--output-dir", str(out)]) == 0
-    s10 = json.loads((out / "S10_structure.json").read_text())
+    s10 = json.loads((out / "S10_structure.json").read_text(encoding="utf-8"))
     assert s10["step"] == "S10" and s10["schemas"]["S"] == {"created": 1}
     assert s10["failures"] == 0
 
@@ -150,7 +150,7 @@ def test_every_workflow_phase_writes_the_step_its_runbook_names():
     import re
     from report.stages import STAGES
     for spec in (s for s in STAGES if s.get("job")):
-        src = (SCRIPTS / f'{JOB_SCRIPT[spec["job"]]}.py').read_text()
+        src = (SCRIPTS / f'{JOB_SCRIPT[spec["job"]]}.py').read_text(encoding="utf-8")
         written = set(re.findall(r'f?"(S\d\d)_', src))
         expected = {f"S{int(n):02d}" for n in re.findall(r"S(\d+)",
                                                           spec["runbook"])}
@@ -160,5 +160,5 @@ def test_every_workflow_phase_writes_the_step_its_runbook_names():
 def test_the_committed_notebooks_carry_the_step_output():
     root = SCRIPTS.parents[1] / "data-migration-scripts"
     for script in JOB_SCRIPT.values():
-        nb = (root / f"{script}.ipynb").read_text()
+        nb = (root / f"{script}.ipynb").read_text(encoding="utf-8")
         assert "def write_step_output" in nb and "--output-dir" in nb, script

@@ -55,7 +55,7 @@ import re
 import sys
 import tempfile
 
-from plan.build import TargetCollision, build_plan
+from plan.build import SECURE_VIEW_MODES, TargetCollision, build_plan
 from plan.medallion import SCHEMA_STYLES
 from plan.restrictions import InvalidRestriction
 from plan.data_movement import OPTIONS as DATA_OPTIONS
@@ -471,7 +471,7 @@ def _mapping_resolution(args) -> dict:
     block = mapping_block(config, enabled=toggle)
     written = config.get("mapping") or {}
     out = {"enabled": block["enabled"]}
-    for key in ("semi_structured", "timestamp_ntz"):
+    for key in ("semi_structured", "timestamp_ntz", "geospatial"):
         flag = getattr(args, key, None)
         if flag is not None:
             out[key] = {"value": flag, "source": "flag"}
@@ -534,7 +534,7 @@ def _assess_inventory(args) -> dict:
         run_sql, databases,
         row_counts=getattr(args, "row_counts", "metadata"),
         semi_structured=_mapping(args, "semi_structured"),
-        geospatial=getattr(args, "geospatial", "block"),
+        geospatial=_mapping(args, "geospatial"),
         timestamp_ntz=_mapping(args, "timestamp_ntz"))
     inv["mapping_resolution"] = _mapping_resolution(args)
     # The census runs in the same pass so the coverage caveat cannot go
@@ -625,7 +625,7 @@ def cmd_ingest(args) -> int:
     inv = inventory_from_manifest(
         manifest, database=args.database_name,
         semi_structured=_mapping(args, "semi_structured"),
-        geospatial=args.geospatial,
+        geospatial=_mapping(args, "geospatial"),
         timestamp_ntz=_mapping(args, "timestamp_ntz"))
 
     _write(out, "inventory.json", inv)
@@ -885,6 +885,59 @@ def cmd_security(args) -> int:
     return 0
 
 
+def cmd_external_registration(args) -> int:
+    """External and Iceberg tables planned `register_in_place`: the AIDP
+    registration over OCI Object Storage, generated and never executed.
+    Reads Snowflake (SHOW / DESCRIBE / SELECT only) and plan.json."""
+    from target.external_registration import (
+        build_external_registration, render_external_registration)
+    out = pathlib.Path(args.out_dir)
+    reg = build_external_registration(_run_sql_from_args(args),
+                                      _read(out, "inventory.json"),
+                                      _read(out, "plan.json"))
+    _write(out, "external_registration.json", reg)
+    _write(out, "EXTERNAL_REGISTRATION.md", render_external_registration(reg))
+    print(f'  {reg["registrable"]} of {len(reg["tables"])} external/Iceberg '
+          f'table(s) have a generated registration; NOTHING executed and no '
+          f'bytes moved -- the files must be in OCI Object Storage first '
+          f'(EXTERNAL_REGISTRATION.md)')
+    if reg.get("after_rewrite"):
+        print(f'  {reg["after_rewrite"]} Iceberg table(s) are NOT registrable '
+              f'as generated: their register_table CALL names the rewritten '
+              f'root metadata file, which exists only after the metadata '
+              f'path rewrite (or re-write the table)')
+    if reg["not_in_inventory"]:
+        print(f'  {len(reg["not_in_inventory"])} external table(s) listed by '
+              f'SHOW EXTERNAL TABLES are not in the inventory', file=sys.stderr)
+    if reg["unreadable"]:
+        print(f'  {len(reg["unreadable"])} read(s) failed; see '
+              f'EXTERNAL_REGISTRATION.md', file=sys.stderr)
+    return 0
+
+
+def cmd_share_plan(args) -> int:
+    """Outbound shares -> an AIDP Delta Sharing plan. Generated, never
+    executed. Reads Snowflake (SHOW SHARES, DESCRIBE SHARE) and plan.json,
+    plus security.json when present."""
+    from target.share_plan import build_share_plan, render_share_plan
+    out = pathlib.Path(args.out_dir)
+    security = (_read(out, "security.json")
+                if (out / "security.json").is_file() else None)
+    sp = build_share_plan(_run_sql_from_args(args),
+                          _read(out, "inventory.json"),
+                          _read(out, "plan.json"), security=security)
+    _write(out, "share_plan.json", sp)
+    _write(out, "SHARE_PLAN.md", render_share_plan(sp))
+    held = sum(1 for s in sp["shares"] for o in s["objects"]
+               if o["status"].startswith("hold"))
+    print(f'  {sp["outbound"]} outbound share(s) mapped to a Delta Sharing '
+          f'plan; NOTHING executed (SHARE_PLAN.md)')
+    if held:
+        print(f'  {held} shared table(s) HELD: a policy Delta Sharing does '
+              f'not apply, or not checked', file=sys.stderr)
+    return 0
+
+
 def cmd_plan(args) -> int:
     out = pathlib.Path(args.out_dir)
     inv = _read(out, "inventory.json")
@@ -912,7 +965,8 @@ def cmd_plan(args) -> int:
         built = build_plan(inv, deps, restrictions=restrictions,
                            bronze_catalog_prefix=args.bronze_catalog_prefix,
         bronze_schema_style=args.bronze_schema_style,
-                           architecture_choice=choice)
+                           architecture_choice=choice,
+                           secure_views=args.secure_views)
     except TargetCollision as exc:
         print(f"HALT: {exc}", file=sys.stderr)
         return HALT
@@ -942,6 +996,10 @@ def cmd_plan(args) -> int:
           f'({s["tables"]} table, {s["views"]} view); '
           + (f'{scoped_out} left out by restrictions; ' if scoped_out else "")
           + f'{rest} cannot move')
+    if built.get("secure_views_as_views"):
+        print(f'  SECURITY WARNING: {len(built["secure_views_as_views"])} '
+              f'secure view(s) planned as PLAIN views (--secure-views '
+              f'as-view); see PLANNED_OBJECTS.md', file=sys.stderr)
     return 0
 
 
@@ -1332,6 +1390,12 @@ def cmd_run(args) -> int:
     task_check = None
     refreshing = bool(getattr(args, "refresh", False)
                       or getattr(args, "run_key", None))
+    # Stamped before the first submission: a manifest discovery wrote for
+    # THIS run cannot be older than this (see fetch_discovery_manifest).
+    # A --refresh submits nothing, so it has no such time and the
+    # manifest's freshness is not checked against one.
+    run_started = (None if refreshing
+                   else datetime.datetime.now(datetime.timezone.utc))
     if refreshing:
         # Re-read a run that exists; submit, cancel and resubmit nothing.
         from target.jobs import refresh_run
@@ -1459,23 +1523,32 @@ def cmd_run(args) -> int:
         return 0
     verdict = "SUCCESS" if result["ok"] else result["status"]
     print(f"  {slug}: {verdict}")
+    if not result["ok"] and result.get("error_trace"):
+        print(f'  task error: {" ".join(result["error_trace"].split())[:300]}',
+              file=sys.stderr)
+        if result.get("platform_transient"):
+            print(f"  {PLATFORM_TRANSIENT_HINT}", file=sys.stderr)
     if result["ok"] and args.job == "snowmig_00_discover":
         # Runbook S7 starts from this manifest; bring it down now, through
         # the console's own download route, rather than leave the operator
         # to find a way. A failed download does not unmake the discovery:
         # the manifest is safe on the workspace, and `fetch` retries it.
-        from target.provisioning import download_ws_file
+        stage_params = _provisioned_stage_params(out)
+        remote = manifest_remote(stage_params)
         try:
-            got = download_ws_file(call, workspace=args.workspace,
-                                   path=DISCOVERY_MANIFEST_REMOTE,
-                                   dest=out / "discovery_manifest.json")
-            print(f'  manifest fetched -> {got["dest"]} ({got["size"]} '
-                  f'bytes); next: `ingest --manifest {got["dest"]} '
-                  f'--database-name <SOURCE_DB>`')
+            got = fetch_discovery_manifest(
+                call, workspace=args.workspace, out=out,
+                submitted_at=run_started, stage_params=stage_params)
+            if got["fresh"] is False:
+                print(f'  manifest NOT this run\'s: {got["message"]}',
+                      file=sys.stderr)
+            else:
+                print(f'  {got["message"]}; next: `ingest --manifest '
+                      f'{got["dest"]} --database-name <SOURCE_DB>`')
         except Exception as exc:
             print(f"  manifest NOT fetched ({str(exc)[:200]}); it is on the "
-                  f"workspace at {DISCOVERY_MANIFEST_REMOTE}. Run `fetch` to "
-                  f"retry.", file=sys.stderr)
+                  f"workspace at {remote}. Run `fetch` to retry.",
+                  file=sys.stderr)
     return 0 if result["ok"] else 1
 
 
@@ -1561,6 +1634,13 @@ def _check_task_parameters(call, *, workspace: str, job_key: str,
     print(f"  task parameters checked: {shown} -- each read by the "
           f"{stage.key} stage")
     return {"checked": True, "parameters": dict(params)}
+
+
+PLATFORM_TRANSIENT_HINT = (
+    "This is the AIDP job runner losing contact with the cluster (a "
+    "transient service error), not a failure of the stage's own code. The "
+    "stage's reports record what it finished; re-run the same job to resume "
+    "from them, and run reconcile to see what the stopped run left.")
 
 
 def _runs_submitted(result: dict) -> int:
@@ -1671,6 +1751,13 @@ def _render_run(result: dict) -> str:
             seen = "checked before submitting — none on the task"
         lines.append(f"| task parameters | {seen} |")
     lines.append("")
+    if result.get("error_trace"):
+        # The fetched log is only the head of a long notebook's output, so
+        # the cause of a failure is here, from the task run, not below.
+        lines += ["## Task error trace", ""]
+        if result.get("platform_transient"):
+            lines += [PLATFORM_TRANSIENT_HINT, ""]
+        lines += ["```", result["error_trace"], "```", ""]
     if result.get("parameters"):
         lines += ["Parameters:", ""]
         lines += [f'- `{k}` = `{v}`' for k, v in result["parameters"].items()]
@@ -2095,9 +2182,12 @@ def cmd_summary(args) -> int:
     from report.resources import build_resources
     resources = build_resources(out)
     _write(out, "resources.json", resources)
+    security = (_read(out, "security.json")
+                if (out / "security.json").is_file() else None)
     summary = render_summary(built, inv, deployed,
                              dataclasses.asdict(target) if target else None,
-                             translation_map=tmap, resources=resources)
+                             translation_map=tmap, resources=resources,
+                             security=security)
     # Last on purpose: the cost of the run is read after what the run did.
     summary = summary.rstrip() + "\n\n" + "\n".join(tokens_section(tokens))
     _write(out, "SUMMARY.md", summary.rstrip() + "\n")
@@ -2277,6 +2367,84 @@ def _teardown_scoped(args, out, prov, call, ocid, scope: str) -> int:
 DISCOVERY_MANIFEST_REMOTE = ("backup-snowflake-migration/reports/"
                              "discovery_manifest.json")
 
+# How far the cluster's clock may run behind the laptop's before a manifest
+# stamped just after the run was submitted reads as older than it.
+MANIFEST_CLOCK_SKEW = datetime.timedelta(minutes=10)
+
+
+def manifest_remote(stage_params: dict | None) -> str:
+    """Where discovery wrote its manifest: the `reports-dir` the stage was
+    provisioned with (plain or `discover.`-qualified), else the default.
+
+    The fetch after discovery used to read the default folder whatever the
+    stage had been given -- live, a run with reports_r5 downloaded an
+    earlier run's manifest from reports/ and called it this run's.
+    """
+    params = stage_params or {}
+    rd = params.get("discover.reports-dir") or params.get("reports-dir")
+    if not rd:
+        return DISCOVERY_MANIFEST_REMOTE
+    rel = str(rd).strip().lstrip("/")
+    if rel.startswith("Workspace/"):
+        rel = rel[len("Workspace/"):]
+    return f"{rel.rstrip('/')}/discovery_manifest.json"
+
+
+def _provisioned_stage_params(out: pathlib.Path) -> dict:
+    """The stage params the last executed provision applied, if recorded."""
+    try:
+        rec = json.loads((out / "provision_result.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return dict(rec.get("stage_params") or {})
+
+
+def fetch_discovery_manifest(call, *, workspace: str, out: pathlib.Path,
+                             submitted_at: datetime.datetime | None,
+                             stage_params: dict | None, download=None) -> dict:
+    """Bring down THIS run's discovery manifest, or say why it is not.
+
+    Downloaded to a side name first. It becomes `discovery_manifest.json`
+    only when its `generated_at` is not older than the run's submission
+    (allowing for clock skew); an older one is an earlier run's discovery
+    and is kept as `discovery_manifest.STALE.json`, never over the local
+    manifest. No timestamp: saved, and said to be unchecked.
+    """
+    if download is None:
+        from target.provisioning import download_ws_file as download
+    remote = manifest_remote(stage_params)
+    dest = out / "discovery_manifest.json"
+    incoming = out / "discovery_manifest.incoming.json"
+    got = download(call, workspace=workspace, path=remote, dest=incoming)
+    try:
+        stamp = json.loads(incoming.read_text(encoding="utf-8")).get("generated_at")
+        generated = datetime.datetime.fromisoformat(stamp) if stamp else None
+    except (OSError, ValueError, TypeError):
+        generated = None
+    if generated is not None and generated.tzinfo is None:
+        generated = generated.replace(tzinfo=datetime.timezone.utc)
+    if (generated is not None and submitted_at is not None
+            and generated < submitted_at - MANIFEST_CLOCK_SKEW):
+        stale = out / "discovery_manifest.STALE.json"
+        incoming.replace(stale)
+        return {"remote": remote, "dest": str(stale), "size": got.get("size"),
+                "fresh": False,
+                "message": (f"the manifest at {remote} predates this run "
+                            f"(generated {generated.isoformat()}, run "
+                            f"submitted {submitted_at.isoformat()}): it is an "
+                            f"earlier discovery, kept as {stale.name} and NOT "
+                            f"saved as discovery_manifest.json. Check the "
+                            f"stage's reports-dir, then `fetch` again.")}
+    incoming.replace(dest)
+    note = ("; its freshness was not checked (a --refresh submits no run "
+            "to compare it with)" if submitted_at is None and generated is not None
+            else "" if generated is not None else
+            "; its freshness could not be checked (no generated_at in it)")
+    return {"remote": remote, "dest": str(dest), "size": got.get("size"),
+            "fresh": (True if generated is not None and submitted_at is not None
+                      else None),
+            "message": f"manifest fetched -> {dest} ({got.get('size')} bytes){note}"}
+
 
 def cmd_fetch(args) -> int:
     """Download one file from the migration workspace into the out dir.
@@ -2294,7 +2462,9 @@ def cmd_fetch(args) -> int:
             "fetch needs the aiDataPlatform OCID and the workspace key: put "
             "them under `aidp.datalake_ocid` and `aidp.workspace` in the "
             "config, or pass --datalake-ocid and --workspace.")
-    remote = (args.path or DISCOVERY_MANIFEST_REMOTE).lstrip("/")
+    # Default: where discovery was provisioned to write it, not a fixed
+    # folder that may hold an earlier run's manifest.
+    remote = (args.path or manifest_remote(_provisioned_stage_params(out))).lstrip("/")
     if remote.startswith("Workspace/"):
         # The cluster sees the tree under /Workspace; the API wants it
         # relative. Accept the path either way it is copied from a log.
@@ -2334,6 +2504,101 @@ def cmd_publish(args) -> int:
               file=sys.stderr)
         return 1
     return 0
+
+
+def cmd_jobs(args) -> int:
+    """Generated jobs for what Snowflake refreshed or scheduled.
+
+    Offline by default: reads plan.json and inventory.json, writes
+    generated_jobs.json, GENERATED_JOBS.md and one notebook per task under
+    generated_jobs/, and touches nothing. `--register` creates the jobs in
+    AIDP through the provisioning calls `provision` uses -- UNSCHEDULED:
+    the source cadence is recorded, never applied.
+    """
+    from report.render import render_generated_jobs
+    from target.generated_jobs import (JOB_PREFIX, NOTEBOOK_DIR,
+                                       build_generated_jobs,
+                                       register_generated_jobs)
+
+    out = pathlib.Path(args.out_dir)
+    if (getattr(args, "register", False)
+            and not _decisions(args)["allow_new_objects"]):
+        # Held to the config's decisions exactly as an --execute is, and
+        # before anything is written, so a refused run leaves no half-state.
+        raise RefusedToExecute(
+            "the config records decisions.allow_new_objects: false -- this "
+            "migration may not create AIDP objects, and --register creates "
+            "jobs. Nothing was generated or registered; `jobs` without "
+            "--register writes the files offline.")
+    plan = _read(out, "plan.json")
+    inventory = _read(out, "inventory.json")
+    res = build_generated_jobs(plan, inventory)
+
+    folder = out / NOTEBOOK_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    wanted = set()
+    for rel, notebook in sorted(res["notebooks"].items()):
+        path = out / rel
+        path.write_text(json.dumps(notebook, indent=1), encoding="utf-8")
+        wanted.add(path.name)
+    # This generator's own notebooks from an earlier run, for a job this run
+    # no longer generates. Left, they would read as current.
+    for stale in sorted(folder.glob(f"{JOB_PREFIX}*.ipynb")):
+        if stale.name not in wanted:
+            stale.unlink()
+            print(f"  removed stale {stale}")
+
+    payload = {k: v for k, v in res.items() if k != "notebooks"}
+    payload["notebook_files"] = sorted(res["notebooks"])
+    payload["generated_at"] = _now()
+    payload["registered"] = False
+    code = 0
+    if getattr(args, "register", False):
+        coords = _target_coords(args)
+        # From a flag or the config only, as for every later command: never
+        # implicitly from provision_result.json, so a record from another
+        # migration cannot redirect the write (README, Hand-off).
+        workspace, cluster = coords["workspace"], coords["cluster_id"]
+        if not coords["datalake_ocid"] or not workspace or not cluster:
+            raise MissingTarget(
+                "jobs --register needs the aiDataPlatform OCID, the "
+                "workspace key and the cluster key the jobs run on: pass "
+                "--datalake-ocid, --workspace and --cluster-id, or put them "
+                "under `aidp:` in the config (`provision --execute` prints "
+                "the keys in its hand-off block). Nothing was registered.")
+        from target.provisioning import make_provision_call
+        call = make_provision_call(coords["datalake_ocid"],
+                                   run_process=_oci_runner(args))
+        reg = register_generated_jobs(call, workspace=workspace,
+                                      cluster_key=cluster,
+                                      jobs=res["jobs"], notebook_dir=out)
+        payload["registered"] = True
+        payload["registration"] = reg
+        if reg["failed"] or reg["name_taken"] or reg["unconfirmed"]:
+            code = 1
+    _write(out, "generated_jobs.json", payload)
+    _write(out, "GENERATED_JOBS.md", render_generated_jobs(payload, plan))
+    s = payload["summary"]
+    print(f'  jobs: {s["refresh_jobs"]} refresh job(s) for table snapshots, '
+          f'{s["task_jobs"]} task-graph job(s) ({s["tasks_translated"]} '
+          f'translated, {s["task_stubs"]} stub(s)); '
+          f'{s["refresh_not_generated"]} refresh(es) not generated')
+    if s.get("tasks_note"):
+        print(f'  jobs: {s["tasks_note"]}', file=sys.stderr)
+    if not payload["registered"]:
+        print("  jobs: nothing registered -- offline. `jobs --register` "
+              "creates them in AIDP, unscheduled")
+        return code
+    reg = payload["registration"]
+    print(f'  jobs: {len(reg["created"])} created in {reg["folder"]}; '
+          f'schedule {reg["schedule"]}')
+    for name in reg["name_taken"]:
+        print(f"  NOT registered: {name} already exists and was not adopted",
+              file=sys.stderr)
+    for name in reg["failed"] + reg["unconfirmed"]:
+        print(f"  NOT confirmed: {name} (see GENERATED_JOBS.md)",
+              file=sys.stderr)
+    return code
 
 
 def _windows(values) -> list[tuple[str, str]]:
@@ -2710,7 +2975,7 @@ def cmd_demo(args) -> int:
     out-dir is marked emulated so nothing here can be mistaken for a customer
     run.
     """
-    from emulation.runbook import run_demo
+    from emulation.runbook import run_demo, run_enterprise_demo
     # The demo gets its own default out-dir: emulated artifacts sitting next
     # to a real run's is exactly the confusion the marker file exists to
     # prevent. (set_defaults on the subparser cannot override the parent
@@ -2718,7 +2983,8 @@ def cmd_demo(args) -> int:
     out = pathlib.Path(plugin_root() / "snowmig_demo"
                        if args.out_dir == str(default_out_dir())
                        else args.out_dir)
-    result = run_demo(out)
+    enterprise = getattr(args, "estate", "standard") == "enterprise"
+    result = run_enterprise_demo(out) if enterprise else run_demo(out)
     print("  DEV MODE — everything below is EMULATED; nothing real was touched")
     for i, line in enumerate(result["narrative"], 1):
         print(f"  {i:>2}. {line}")
@@ -2817,6 +3083,14 @@ def build_parser() -> argparse.ArgumentParser:
              "estate and an emulated AIDP -- no credentials, no network, "
              "nothing real is touched. Writes every real artifact plus "
              "DEMO.md")
+    dm.add_argument("--estate", choices=["standard", "enterprise"],
+                    default="standard",
+                    help="standard (default): SNOWDEMO, the whole pipeline "
+                         "down to an emulated deploy. enterprise: SNOWENT -- "
+                         "external/Iceberg/hybrid/event tables, shares, "
+                         "policies, containers, replication -- through plan, "
+                         "ddl, external-registration, share-plan and "
+                         "summary, with no AIDP step at all")
     dm.set_defaults(func=cmd_demo)
 
     a = sub.add_parser("assess", parents=[common],
@@ -2853,11 +3127,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "coverage claim then says the estate was not examined")
     a.add_argument("--capture-definitions", action="store_true",
                    help="also capture procedure/UDF bodies into the census "
-                        "artifact (they may contain literals)")
+                        "artifact (they may contain literals). Task bodies "
+                        "and dynamic-table / materialized-view queries are "
+                        "kept regardless, as `source_facts`: `snowmig jobs` "
+                        "generates from them")
     a.add_argument("--geospatial", choices=list(GEOSPATIAL_MODES),
-                   default="block",
-                   help="block (default): GEOGRAPHY/GEOMETRY block their table. "
-                        "string: carry as text, with no spatial type on the target")
+                   default=None,
+                   help="block (default, or `mapping.geospatial` in the "
+                        "config): GEOGRAPHY/GEOMETRY block their table. "
+                        "string: carry as GeoJSON text; wkt: carry as WKT "
+                        "text (ST_ASWKT). Either way there is no spatial "
+                        "type on the target")
     a.set_defaults(func=cmd_assess)
 
     db = sub.add_parser(
@@ -2917,7 +3197,8 @@ def build_parser() -> argparse.ArgumentParser:
                      default=None,
                      help="same meaning and default as on `assess`")
     ing.add_argument("--geospatial", choices=list(GEOSPATIAL_MODES),
-                     default="block", help="same meaning as on `assess`")
+                     default=None,
+                     help="same meaning and default as on `assess`")
     ing.add_argument("--timestamp-ntz", choices=list(TIMESTAMP_NTZ_MODES),
                      default=None,
                      help="same meaning and default as on `assess`")
@@ -2943,6 +3224,21 @@ def build_parser() -> argparse.ArgumentParser:
                     help="skip the grant summary (needs ACCOUNT_USAGE)")
     se.set_defaults(func=cmd_security)
 
+    er = sub.add_parser(
+        "external-registration", parents=[common],
+        help="external and Iceberg tables planned register_in_place: a "
+             "generated AIDP registration over OCI Object Storage (needs "
+             "Snowflake, read-only; executes nothing, moves no bytes)")
+    _add_snowflake_args(er)
+    er.set_defaults(func=cmd_external_registration)
+
+    sp = sub.add_parser(
+        "share-plan", parents=[common],
+        help="outbound shares -> an AIDP Delta Sharing plan (needs "
+             "Snowflake, read-only; executes nothing)")
+    _add_snowflake_args(sp)
+    sp.set_defaults(func=cmd_share_plan)
+
     p = sub.add_parser("plan", parents=[common], help="waves + medallion layout (offline)")
     p.add_argument("--restrictions",
                    help="JSON file of user restrictions (exclude_databases, "
@@ -2953,6 +3249,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "names the target schema DB_SCHEMA so two same-named "
                         "schemas cannot merge; db names it after the Snowflake "
                         "database alone, giving <prefix>.<database>.<table>")
+    p.add_argument("--secure-views", choices=list(SECURE_VIEW_MODES),
+                   default="refuse",
+                   help="refuse (default): a Snowflake SECURE view cannot "
+                        "migrate. as-view: plan it as a PLAIN view -- its "
+                        "definition becomes visible and role-based row "
+                        "filtering does not carry; every report says so")
     p.add_argument("--bronze-catalog-prefix",
                    help="use ONE bronze catalog with this name instead of "
                         "catalog-per-database (default: mirror the source)")
@@ -3281,6 +3583,24 @@ def build_parser() -> argparse.ArgumentParser:
                     help="local file name inside the out dir (default: the "
                          "remote file's name)")
     fe.set_defaults(func=cmd_fetch)
+
+    jb = sub.add_parser(
+        "jobs", parents=[common],
+        help="generate AIDP jobs for what Snowflake refreshed or scheduled: "
+             "a refresh notebook per migrated dynamic table / materialized "
+             "view, one job per task graph (translated SQL bodies, stubs for "
+             "the rest). Offline: writes generated_jobs.json, "
+             "GENERATED_JOBS.md and the notebooks, registers nothing")
+    _add_target_args(jb)
+    jb.add_argument("--config", "--connection-config", dest="config",
+                    help="the ONE migration config: its `aidp:` block "
+                         "supplies the coordinates --register needs")
+    jb.add_argument("--register", action="store_true",
+                    help="also create the jobs in AIDP, UNSCHEDULED, through "
+                         "the provisioning calls: notebooks uploaded and read "
+                         "back, a job never created over a name that exists. "
+                         "The schedule is recorded, not applied")
+    jb.set_defaults(func=cmd_jobs)
 
     pb = sub.add_parser("publish", parents=[common],
                         help="copy the finished report (inputs + outputs) "

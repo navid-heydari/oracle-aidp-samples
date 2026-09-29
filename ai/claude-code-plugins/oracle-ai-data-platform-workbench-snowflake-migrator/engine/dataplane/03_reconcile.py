@@ -6,7 +6,7 @@ Runs on AIDP compute; READS ONLY. Joins three sources of truth —
   * `discovery_manifest.json`  what the external catalog exposed,
   * `structure_report_*.json` / `copy_report_*.json`  what the scripts claim,
   * the TARGET CATALOG itself  what actually exists (SHOW TABLES, and counts
-    with --counts) —
+    with --counts, one batched UNION ALL of three-part names per 50 tables) —
 
 into `reconciliation.json` and `MIGRATION_REPORT.md`: one row per table with
 its structure status, copy status, live existence, and live row count. The
@@ -35,6 +35,12 @@ VIEW_NOT_IN_PLAN, a planned one not created yet (dry run) is
 VIEW_NOT_CREATED_YET, and one no ddl-plan run recorded (--mode ctas or
 manifest, or no structure report) is VIEW_NOT_CREATED_BY_THIS_PATH, with the
 report saying how views do get created.
+
+A dynamic table or materialized view the approved plan migrates as a TABLE
+SNAPSHOT (a TABLE statement with `snapshot_of`) is reconciled as a table --
+structure, copy, existence, count -- wherever the manifest lists it:
+discovery files a materialized view under `views`, and live 2026-09-29 this
+report listed the snapshot as a view nobody created.
 """
 from __future__ import annotations
 
@@ -48,7 +54,7 @@ import sys
 # filesystems (probed 2026-09-16 on a real cluster).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from snowmig_source import (  # noqa: E402
-    write_step_output)
+    read_plan_json, write_step_output)
 
 DEFAULT_REPORTS_DIR = "/Workspace/backup-snowflake-migration/reports"
 # The step's own values also go here, next to the accumulated run report
@@ -153,6 +159,59 @@ def plan_targets(ddl_plan: dict,
     return out
 
 
+def plan_views(ddl_plan: dict, target_catalog: str) -> dict[str, set[str]]:
+    """`{source_schema: {view}}` for the plan's VIEW statements in
+    `target_catalog`: the views 01_create_structure --mode ddl-plan creates.
+    A table snapshot is a TABLE statement, so it is not one of them."""
+    out: dict[str, set[str]] = {}
+    for stmt in ddl_plan.get("statements") or []:
+        source = str(stmt.get("source_identifier") or "").split(".")
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(source) != 3 or len(target) != 3:
+            continue
+        if str(stmt.get("object_type") or "").upper() != "VIEW":
+            continue
+        if target[0].casefold() != target_catalog.casefold():
+            continue
+        out.setdefault(source[1], set()).add(source[2])
+    return out
+
+
+# A table in the target that no structure report records. Live 2026-09-29
+# (50k-table estate): a structure run stopped after an hour had created 16
+# tables after its last report write, and they read as verified structure.
+UNRECORDED_REASON = (
+    "in the target, but no structure report records it: a structure run "
+    "stopped after creating it and before writing its report, or it was "
+    "created outside this migration. Its layout has NOT been checked "
+    "against the plan; re-run 01_create_structure, which checks it and "
+    "records it")
+PLANNED_VIEW_REASON = (
+    "in the approved plan; no structure run has recorded it yet. "
+    "01_create_structure --mode ddl-plan creates the plan's views after "
+    "every table")
+
+
+def plan_snapshots(ddl_plan: dict,
+                   target_catalog: str) -> dict[str, list[str]]:
+    """`{source_schema: [name]}` the plan migrates as a TABLE SNAPSHOT in
+    `target_catalog`: tables here, whatever list the manifest put them in."""
+    out: dict[str, list[str]] = {}
+    for stmt in ddl_plan.get("statements") or []:
+        source = str(stmt.get("source_identifier") or "").split(".")
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(source) != 3 or len(target) != 3 or not stmt.get("snapshot_of"):
+            continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue
+        if target[0].casefold() != target_catalog.casefold():
+            continue
+        names = out.setdefault(source[1], [])
+        if source[2] not in names:
+            names.append(source[2])
+    return out
+
+
 def _target_schema(schema: str, planned: set[str],
                    reports: list[dict]) -> str:
     """The plan's schema; where the plan is silent, the recorded one."""
@@ -236,9 +295,58 @@ def _view_exists(spark, fqn: str, name: str, live: set[str] | None,
         return None
 
 
+# Tables per batched count: one UNION ALL of fully qualified COUNT(*)s.
+# 50 is the size the copy's batched source count was live-verified at
+# (25 s, 2026-09-29).
+COUNT_CHUNK = 50
+
+
+def _target_counts(spark, catalog: str, schema: str,
+                   tables: list[str]) -> dict[str, tuple[int | None, str | None]]:
+    """`{table: (count, None) | (None, error)}`, ONE query per chunk.
+
+    A COUNT(*) per table was a Spark job per table. Each branch is a
+    three-part name tagged with its POSITION, so no table name has to
+    survive being a string literal. One unreadable table fails the whole
+    query and a batch cannot say which, so that chunk falls back to a count
+    per table: the unreadable one keeps its own error, the rest are counted.
+    """
+    out: dict[str, tuple[int | None, str | None]] = {}
+
+    def fqn(table: str) -> str:
+        return f"{q(catalog)}.{q(schema)}.{q(table)}"
+
+    for start in range(0, len(tables), COUNT_CHUNK):
+        chunk = tables[start:start + COUNT_CHUNK]
+        sql = " UNION ALL ".join(
+            f"SELECT {i} AS `i`, COUNT(*) AS `n` FROM {fqn(t)}"
+            for i, t in enumerate(chunk))
+        try:
+            got = {int(r["i"]): int(r["n"]) for r in spark.sql(sql).collect()}
+            if sorted(got) != list(range(len(chunk))):
+                raise RuntimeError(f"the batched count answered {len(got)} "
+                                   f"of {len(chunk)} table(s)")
+            for i, table in enumerate(chunk):
+                out[table] = (got[i], None)
+            continue
+        except Exception as exc:
+            log(f"{schema}: batched count of {len(chunk)} table(s) failed "
+                f"({str(exc)[:120]}); counting them one by one")
+        for table in chunk:
+            try:
+                out[table] = (spark.sql(
+                    f"SELECT COUNT(*) AS n FROM {fqn(table)}"
+                ).collect()[0]["n"], None)
+            except Exception as exc:
+                out[table] = (None, str(exc)[:200])
+    return out
+
+
 def reconcile(spark, *, manifest: dict, target_catalog: str,
               reports: pathlib.Path, counts: bool,
-              planned_targets: dict[str, set[str]] | None = None) -> dict:
+              planned_targets: dict[str, set[str]] | None = None,
+              planned_snapshots: dict[str, list[str]] | None = None,
+              planned_views: dict[str, set[str]] | None = None) -> dict:
     out = {"target_catalog": target_catalog,
            "generated_at": datetime.datetime.now(
                datetime.timezone.utc).isoformat(),
@@ -247,6 +355,14 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
 
     for schema_rec in manifest["schemas"]:
         schema = schema_rec["name"]
+        # The plan's table snapshots are tables: added to the manifest's
+        # tables, and taken out of its views (where a materialized view is).
+        snapshots = list((planned_snapshots or {}).get(schema) or [])
+        listed = {t["name"] for t in schema_rec["tables"]}
+        tables = list(schema_rec["tables"]) + [
+            {"name": n} for n in snapshots if n not in listed]
+        manifest_views = [v for v in schema_rec.get("views") or []
+                          if v["name"] not in snapshots]
         structure, s_other = _for_catalog(
             _load(reports, f"structure_report_{schema.lower()}.json"),
             target_catalog)
@@ -267,9 +383,14 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
             log(f"{schema}: the {kind} report targets {other}, not "
                 f"{target_catalog}.{target_schema} — ignored for this target")
         live = _live_tables(spark, target_catalog, target_schema)
+        live_counts = (_target_counts(
+            spark, target_catalog, target_schema,
+            [t["name"] for t in tables
+             if t["name"].lower() in live])
+            if counts and live is not None else {})
 
         rows = []
-        for table in schema_rec["tables"]:
+        for table in tables:
             name = table["name"]
             s_status = ((structure or {}).get("objects", {})
                         .get(name, {}).get("status", "not_attempted"))
@@ -315,8 +436,8 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                           + str(c_rec.get("reason") or "no reason") + ")")
             elif c_status == "verified":
                 verdict = "MIGRATED_VERIFIED"
-            elif c_status in ("count_mismatch", "sum_mismatch", "type_drift",
-                              "failed"):
+            elif c_status in ("count_mismatch", "sum_mismatch",
+                              "sum_not_comparable", "type_drift", "failed"):
                 verdict = "STRUCTURE_ONLY_COPY_FAILED"
             elif c_status == "skipped_nonempty" and \
                     c_rec.get("source_count") is not None and \
@@ -328,6 +449,9 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                 verdict = "PRESENT_NOT_REVERIFIED"
             else:
                 verdict = "STRUCTURE_ONLY"
+            if (exists and verdict == "STRUCTURE_ONLY"
+                    and name not in (structure or {}).get("objects", {})):
+                s_status, reason = "unrecorded", UNRECORDED_REASON
 
             row = {"table": name, "structure": s_status, "copy": c_status,
                    "exists_in_target": exists, "verdict": verdict,
@@ -335,13 +459,10 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                              or (structure or {}).get("objects", {})
                              .get(name, {}).get("reason")}
             if counts and exists:
-                try:
-                    row["target_count"] = spark.sql(
-                        f"SELECT COUNT(*) AS n FROM {q(target_catalog)}."
-                        f"{q(target_schema)}.{q(name)}").collect()[0]["n"]
-                except Exception as exc:
-                    row["target_count"] = None
-                    row["count_error"] = str(exc)[:200]
+                row["target_count"], error = live_counts.get(
+                    name, (None, "not counted"))
+                if error is not None:
+                    row["count_error"] = error
                 # The live count is compared, not just printed: a verified
                 # table emptied or changed out of band since the copy is a
                 # problem, not a pass. A count that could not be read is
@@ -371,7 +492,7 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
         live_views = None          # read once per schema, only if needed
         s_views = (structure or {}).get("views") or {}
         s_objects = (structure or {}).get("objects") or {}
-        for view in schema_rec.get("views") or []:
+        for view in manifest_views:
             name = view["name"]
             s_rec = s_views.get(name)
             if s_rec is None and str((s_objects.get(name) or {})
@@ -383,6 +504,12 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
             v_reason = s_rec.get("reason")
             if live is None:
                 v_exists, v_verdict = None, "TARGET_UNREADABLE"
+            elif not s_rec and name in (planned_views or {}).get(schema, ()):
+                # Planned, and no run has recorded it: a ddl-plan run that
+                # has not reached its view phase, not a path that never
+                # creates views.
+                v_exists = True if name.lower() in live else None
+                v_verdict, v_reason = "VIEW_NOT_CREATED_YET", PLANNED_VIEW_REASON
             else:
                 v_exists = True if name.lower() in live else None
                 v_verdict = ((_VIEW_VERDICTS.get(s_view)
@@ -419,8 +546,8 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                               "reason": v_reason})
             tally[v_verdict] = tally.get(v_verdict, 0) + 1
 
-        known = ({t["name"].lower() for t in schema_rec["tables"]}
-                 | {v["name"].lower() for v in schema_rec.get("views") or []})
+        known = ({t["name"].lower() for t in tables}
+                 | {v["name"].lower() for v in manifest_views})
         unclaimed = sorted(live - known) if live is not None else []
         out["schemas"].append({
             "schema": schema, "target_schema": target_schema,
@@ -513,7 +640,8 @@ def main(argv: list[str] | None = None) -> int:
                          "target_fqn names the target schema, as in "
                          "01_create_structure")
     ap.add_argument("--counts", action="store_true",
-                    help="also read a live COUNT(*) per existing table, and "
+                    help="also read a live COUNT(*) per existing table (one "
+                         "batched query per 50 tables), and "
                          "flag a verified table whose count has changed since "
                          "the copy verified it (COUNT_DRIFT)")
     args = ap.parse_args(argv)
@@ -527,9 +655,16 @@ def main(argv: list[str] | None = None) -> int:
     ddl_path = (pathlib.Path(args.ddl_plan) if args.ddl_plan
                 else reports.parent / "plan" / "ddl_plan.json")
     planned = None
+    snapshots = None
+    views = None
     if ddl_path.is_file():
-        planned = plan_targets(json.loads(ddl_path.read_text(encoding="utf-8")),
-                               args.target_catalog)
+        try:
+            ddl_plan = read_plan_json(ddl_path)
+        except ValueError as exc:
+            return fail(str(exc))
+        planned = plan_targets(ddl_plan, args.target_catalog)
+        snapshots = plan_snapshots(ddl_plan, args.target_catalog)
+        views = plan_views(ddl_plan, args.target_catalog)
     elif args.ddl_plan:
         return fail(f"error: --ddl-plan {ddl_path} is not there")
 
@@ -538,7 +673,8 @@ def main(argv: list[str] | None = None) -> int:
 
     rec = reconcile(spark, manifest=manifest,
                     target_catalog=args.target_catalog, reports=reports,
-                    counts=args.counts, planned_targets=planned)
+                    counts=args.counts, planned_targets=planned,
+                    planned_snapshots=snapshots, planned_views=views)
     (reports / "reconciliation.json").write_text(json.dumps(rec, indent=2), encoding="utf-8")
     (reports / "MIGRATION_REPORT.md").write_text(render(rec), encoding="utf-8")
     log(f"totals: {rec['totals']}")

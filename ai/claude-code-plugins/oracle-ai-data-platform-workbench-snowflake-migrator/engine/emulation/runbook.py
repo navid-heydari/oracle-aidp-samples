@@ -44,7 +44,8 @@ from target.notebook import build_notebook, notebook_workspace_path
 from .aidp_fake import EmulatedAidp
 from .snowflake_fake import demo_run_sql
 
-__all__ = ["run_demo", "DEMO_STANDARD_CATALOG", "DEMO_EXTERNAL_CATALOG"]
+__all__ = ["run_demo", "run_enterprise_demo", "DEMO_STANDARD_CATALOG",
+           "DEMO_EXTERNAL_CATALOG"]
 
 DEMO_STANDARD_CATALOG = "snowdemo"
 DEMO_EXTERNAL_CATALOG = "snowdemo_ext"
@@ -338,7 +339,8 @@ def run_demo(out_dir) -> dict:
           "individually")
 
     _write(out, "SUMMARY.md",
-           render_summary(built, inv, deployed, dataclasses.asdict(std_target)))
+           render_summary(built, inv, deployed, dataclasses.asdict(std_target),
+                          security=sec))
     board = build_stage_board(out)
     _write(out, "STAGES.md", render_stages(board))
     stage("summary + stages: the per-object roll-up and the board that says "
@@ -351,16 +353,62 @@ def run_demo(out_dir) -> dict:
                          "drift": deployed["derived_type_drift_targets"]}}
 
 
-def _render_demo(narrative: list[str], lessons: list[str]) -> str:
+_STANDARD_BANNER = (
+    "> **No Snowflake account and no AIDP DataLake were contacted.** The",
+    "> estate `SNOWDEMO` and the AIDP behind these artifacts are fakes",
+    "> built into the plugin (`engine/emulation/`). The *code* that ran is",
+    "> the production code — only the two transports were replaced — so",
+    "> every artifact in this directory has exactly the shape a real run",
+    "> produces.",
+)
+
+_STANDARD_PROD = (
+    "- Snowflake is reached read-only over a real connection; the "
+    "transport still refuses every non-read verb, whatever the grant "
+    "allows.",
+    "- AIDP coordinates (DataLake OCID, workspace, cluster, catalog) come "
+    "from the `aidp:` block of the one config file, or a flag for one "
+    "run; every stage announces where each came from, and none is "
+    "assumed.",
+    "- `catalog` and `deploy` are dry runs unless `--execute` is passed, "
+    "and nothing is reported as done until it is read back and compared.",
+    "- The read-back, name-reuse and type-drift checks demonstrated "
+    "here are the same checks a production run applies, and each one "
+    "is regression-tested.",
+)
+
+# The enterprise run has no AIDP step at all, emulated or real, so it says
+# only what it did: the Snowflake-side stages over a fake Snowflake.
+_ENTERPRISE_BANNER = (
+    "> **No Snowflake account and no AIDP DataLake were contacted.** The",
+    "> estate `SNOWENT` is a fake built into the plugin",
+    "> (`engine/emulation/`), and no AIDP -- real or emulated -- was",
+    "> involved at all: this run stops before any AIDP-side step. The *code*",
+    "> that ran is the production code for the Snowflake-side stages, with",
+    "> only the Snowflake transport replaced, so each artifact here has the",
+    "> shape those stages write on a real run.",
+)
+
+_ENTERPRISE_PROD = (
+    "- Snowflake is reached read-only over a real connection; the "
+    "transport still refuses every non-read verb, whatever the grant "
+    "allows.",
+    "- This run executed nothing on AIDP. The external registration, the "
+    "Delta Sharing plan and the secure-view opt-in are generated reports; "
+    "their AIDP-side steps are not live-verified, and each report lists "
+    "the live checks to run first.",
+    "- The Snowflake answers for what a trial account cannot hold (external "
+    "and Iceberg tables, shares, replication and failover groups) follow "
+    "Snowflake's documentation and are not live-verified either.",
+)
+
+
+def _render_demo(narrative: list[str], lessons: list[str], *,
+                 banner=_STANDARD_BANNER, prod=_STANDARD_PROD) -> str:
     lines = [
         "# Dev-mode walkthrough — EVERYTHING HERE IS EMULATED",
         "",
-        "> **No Snowflake account and no AIDP DataLake were contacted.** The",
-        "> estate `SNOWDEMO` and the AIDP behind these artifacts are fakes",
-        "> built into the plugin (`engine/emulation/`). The *code* that ran is",
-        "> the production code — only the two transports were replaced — so",
-        "> every artifact in this directory has exactly the shape a real run",
-        "> produces.",
+        *banner,
         "",
         "Dev mode exists to answer one question cheaply: *what does this",
         "migrator actually do, stage by stage, and what does it refuse to",
@@ -377,22 +425,124 @@ def _render_demo(narrative: list[str], lessons: list[str]) -> str:
         "",
     ]
     lines += [f"- {lesson}" for lesson in lessons]
-    lines += [
-        "",
-        "## What changes in prod",
-        "",
-        "- Snowflake is reached read-only over a real connection; the "
-        "transport still refuses every non-read verb, whatever the grant "
-        "allows.",
-        "- AIDP coordinates (DataLake OCID, workspace, cluster, catalog) come "
-        "from the `aidp:` block of the one config file, or a flag for one "
-        "run; every stage announces where each came from, and none is "
-        "assumed.",
-        "- `catalog` and `deploy` are dry runs unless `--execute` is passed, "
-        "and nothing is reported as done until it is read back and compared.",
-        "- The read-back, name-reuse and type-drift checks demonstrated "
-        "here are the same checks a production run applies, and each one "
-        "is regression-tested.",
-        "",
-    ]
+    lines += ["", "## What changes in prod", "", *prod, ""]
     return "\n".join(lines)
+
+
+def run_enterprise_demo(out_dir) -> dict:
+    """Dev mode over the ENTERPRISE estate (SNOWENT): what a trial cannot hold.
+
+    The same production stages as a real run, up to and including the
+    reports for the objects the plan does not copy (external registration,
+    the Delta Sharing plan) and the summary. It stops there on purpose: no
+    AIDP-side step for these paths is live-verified, so no emulated AIDP is
+    asked to accept one. Every sentence below is computed from the
+    artifacts, so the narrative cannot drift from what the stages wrote.
+    """
+    from snowflake_source.extract.catalog import build_inventory as _inv
+    from target.external_registration import (
+        build_external_registration, render_external_registration)
+    from target.share_plan import build_share_plan, render_share_plan
+    from .snowflake_fake import ENTERPRISE_DB, enterprise_run_sql as run
+
+    out = pathlib.Path(out_dir)
+    narrative: list[str] = []
+    lessons: list[str] = []
+    _write(out, "emulation.json", {
+        "emulated": True, "estate": ENTERPRISE_DB,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "note": "Every artifact in this directory came from the EMULATED "
+                "enterprise estate SNOWENT. No AIDP was involved at all. "
+                "Nothing here describes a real system."})
+
+    inv = _inv(run, [ENTERPRISE_DB], row_counts="metadata",
+               semi_structured="string", geospatial="block",
+               timestamp_ntz="timestamp")
+    inv["census"] = build_census(run, inv["databases_in_scope"],
+                                 role=inv["session"].get("ROLE"))
+    _write(out, "inventory.json", inv)
+    _write(out, "INVENTORY.md", render_inventory(inv))
+    _write(out, "CENSUS.md", render_census(inv["census"]))
+    kinds = inv["census"]["by_kind"]
+    narrative.append(
+        f'assess: {inv["object_count"]} table(s)/view(s); census '
+        f'{inv["census"]["total"]} other object(s) -- '
+        + ", ".join(f"{n} {k.lower().replace('_', ' ')}"
+                    for k, n in sorted(kinds.items()) if n))
+
+    deps = extract_dependencies(run, inv)
+    _write(out, "dependencies.json", deps)
+    maint = build_maintenance(run, inv)
+    _write(out, "maintenance.json", maint)
+    _write(out, "MAINTENANCE.md", render_maintenance(maint))
+    sec = build_security(run, inv)
+    _write(out, "security.json", sec)
+    _write(out, "SECURITY.md", render_security(sec))
+    narrative.append(f'security: {sec["exposure_count"]} policy exposure(s), '
+                     f'{len(sec["secure_views"])} SECURE view(s)')
+
+    built = build_plan(inv, deps)
+    built["census"] = inv["census"]
+    _write(out, "plan.json", built)
+    _write(out, "PLANNED_OBJECTS.md", render_planned_objects(built))
+    by_cat = built["summary"]["cannot_by_category"]
+    narrative.append(
+        f'plan: {built["summary"]["can_migrate"]} can migrate; '
+        + ", ".join(f"{n} {c}" for c, n in sorted(by_cat.items())))
+    ddl = build_ddl_payload(inv, built)
+    _write(out, "ddl_plan.json", ddl)
+    _write(out, "DDL_PLAN.md", render_ddl_plan(ddl))
+
+    reg = build_external_registration(run, inv, built)
+    _write(out, "external_registration.json", reg)
+    _write(out, "EXTERNAL_REGISTRATION.md", render_external_registration(reg))
+    narrative.append(
+        f'external-registration: {reg["registrable"]} of {len(reg["tables"])} '
+        f'external/Iceberg table(s) have a generated registration over OCI '
+        f'Object Storage -- generated, not executed, after the files move; '
+        f'{reg["after_rewrite"]} Iceberg table(s) get a register_table CALL '
+        f'that runs only after their metadata path rewrite')
+    sp = build_share_plan(run, inv, built, security=sec)
+    _write(out, "share_plan.json", sp)
+    _write(out, "SHARE_PLAN.md", render_share_plan(sp))
+    held = [o["source_identifier"] for s in sp["shares"] for o in s["objects"]
+            if o["status"].startswith("hold")]
+    narrative.append(
+        f'share-plan: {sp["outbound"]} outbound share(s) mapped to Delta '
+        f'Sharing; {len(held)} shared table(s) HELD')
+    _write(out, "SUMMARY.md", render_summary(built, inv, None, None,
+                                             security=sec))
+    narrative.append("summary: the per-object roll-up, with every exposure "
+                     "scored HIGH")
+
+    cannot = {c["source_identifier"]: c for c in built["cannot_migrate"]}
+    for ident, c in sorted(cannot.items()):
+        if c["category"] == "register_in_place":
+            lessons.append(f"{ident} is register in place, not copied: "
+                           + c["reason"].split(":", 1)[0] + ".")
+    for ident in ("SNOWENT.OPS.HYB_SESSIONS", "SNOWENT.OPS.APP_EVENTS"):
+        if ident in cannot:
+            lessons.append(f"{ident} is refused by KIND: {cannot[ident]['reason']}.")
+    groups = [o for o in inv["census"]["objects"]
+              if o["kind"] in ("REPLICATION_GROUP", "FAILOVER_GROUP")]
+    for g in groups:
+        lessons.append(f'{g["kind"].replace("_", " ").lower()} '
+                       f'{g["source_identifier"]}: {g["reason"]}')
+    if held:
+        lessons.append("Delta Sharing ships a table as stored, so the shared "
+                       "tables carrying a masking or row-access policy are "
+                       "HELD: " + ", ".join(held) + ".")
+    so = [t["source_identifier"] for t in maint["tables"]
+          if any("Search Optimization" in s["signal"] for s in t["signals"])]
+    if so:
+        lessons.append("Search optimization has no Delta equivalent and is "
+                       "named as a dropped property on " + ", ".join(so) + ".")
+    if sec["secure_views"]:
+        lessons.append("The SECURE view is refused by default; `plan "
+                       "--secure-views as-view` plans it as a plain view, "
+                       "with a SECURITY WARNING in every report.")
+
+    _write(out, "DEMO.md", _render_demo(narrative, lessons,
+                                         banner=_ENTERPRISE_BANNER,
+                                         prod=_ENTERPRISE_PROD))
+    return {"out_dir": str(out), "narrative": narrative, "lessons": lessons}

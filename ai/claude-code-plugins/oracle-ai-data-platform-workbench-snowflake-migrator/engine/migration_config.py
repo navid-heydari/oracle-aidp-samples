@@ -72,6 +72,7 @@ AIDP_FIELDS = ("datalake_ocid", "workspace", "cluster_id", "catalog",
 MAPPING_MODES = {
     "semi_structured": ("block", "string"),
     "timestamp_ntz": ("preserve", "timestamp"),
+    "geospatial": ("block", "string", "wkt"),
 }
 MAPPING_DEFAULTS = {
     # VARIANT/OBJECT/ARRAY carried as JSON text, warned on every column,
@@ -81,6 +82,10 @@ MAPPING_DEFAULTS = {
     # halts `ddl` on any table that has one. `timestamp` is a semantic
     # downgrade (read through the session timezone) and is warned as such.
     "timestamp_ntz": "timestamp",
+    # GEOGRAPHY/GEOMETRY block their table, as they always have: carrying a
+    # geography as text is a decision. `string` carries GeoJSON, `wkt` WKT
+    # (ST_ASWKT, live-verified 2026-09-29).
+    "geospatial": "block",
 }
 
 # Top-level blocks that are neither end's connection settings.
@@ -265,7 +270,8 @@ def snowflake_block(config: dict) -> dict:
 # `mapping.enabled: false` switches the whole config-default logic off: the
 # modes fall back to these -- the pure mapper's refuse-rather-than-guess
 # behaviour -- and the per-field values in `mapping:` are ignored.
-MAPPING_STRICT = {"semi_structured": "block", "timestamp_ntz": "preserve"}
+MAPPING_STRICT = {"semi_structured": "block", "timestamp_ntz": "preserve",
+                  "geospatial": "block"}
 
 
 def mapping_block(config: dict, *, enabled: bool | None = None) -> dict:

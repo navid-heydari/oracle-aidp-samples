@@ -95,8 +95,10 @@ def test_can_migrate_entries_carry_the_risk_bearing_facts():
     plan = build_plan({"inventory": [r]}, {"edges": []})
     c = plan["can_migrate"][0]
     assert c["warnings"] == r["warnings"]
-    assert [d["property"] for d in c["deferred_properties"]] == [
-        "cluster_by", "change_tracking", "retention_time"]
+    # ddl carries change tracking and a 7-day retention into the CREATE
+    # TABLE now; the clustering key names a column this record does not
+    # have, so it is the one that stays a deferred decision.
+    assert [d["property"] for d in c["deferred_properties"]] == ["cluster_by"]
     assert all(d["aidp_equivalent"] for d in c["deferred_properties"])
     assert c["omitted_properties"] == [], "is_secure=false is unset, owner is informational"
 
@@ -354,6 +356,9 @@ def test_target_catalog_note_is_present_even_when_nothing_migrates():
 # CENSUS.md said it never migrates, and the others were flattened silently.
 
 KIND_FLAGS = ("is_dynamic", "is_external", "is_iceberg", "is_event", "is_hybrid")
+# A dynamic table migrates as a table snapshot (test_plan_snapshots.py): its
+# contents are readable. The other kinds are still refused.
+REFUSED_KIND_FLAGS = tuple(f for f in KIND_FLAGS if f != "is_dynamic")
 
 
 def _flagged(ident, flag, value):
@@ -362,14 +367,18 @@ def _flagged(ident, flag, value):
     return r
 
 
-@pytest.mark.parametrize("flag", KIND_FLAGS)
+@pytest.mark.parametrize("flag", REFUSED_KIND_FLAGS)
 @pytest.mark.parametrize("value", ["Y", "true", "TRUE"])
 def test_a_flagged_table_kind_cannot_migrate_with_a_specific_reason(flag, value):
     inv = {"inventory": [_flagged("D.S.T", flag, value), rec("D.S.PLAIN")]}
     plan = build_plan(inv, {"edges": []})
     cannot = {c["source_identifier"]: c for c in plan["cannot_migrate"]}
     assert set(cannot) == {"D.S.T"}
-    assert cannot["D.S.T"]["category"] == "unsupported_object"
+    # External and Iceberg tables are not refused outright any more: their
+    # files are registered in place over OCI Object Storage (C4.3).
+    assert cannot["D.S.T"]["category"] == (
+        "register_in_place" if flag in ("is_external", "is_iceberg")
+        else "unsupported_object")
     assert cannot["D.S.T"]["object_type"] == "TABLE"
     assert flag.removeprefix("is_") in cannot["D.S.T"]["reason"].lower()
     assert [c["source_identifier"] for c in plan["can_migrate"]] == ["D.S.PLAIN"]
@@ -385,13 +394,15 @@ def test_an_unset_kind_flag_leaves_the_table_migratable(flag, value):
     assert [c["source_identifier"] for c in plan["can_migrate"]] == ["D.S.T"]
 
 
-def test_a_dynamic_table_reason_says_why_a_copy_is_not_the_object():
+def test_a_dynamic_table_is_planned_as_a_snapshot_and_says_so():
+    """It was refused as "a snapshot that never refreshes". It is now that
+    snapshot, carried as a table, with the refresh decided and named."""
     plan = build_plan({"inventory": [_flagged("D.S.DT", "is_dynamic", "Y")]},
                       {"edges": []})
-    reason = plan["cannot_migrate"][0]["reason"]
-    assert "refreshed by Snowflake" in reason
-    assert "census" in reason.lower()
-    assert "no equivalent is generated" in reason
+    entry = plan["can_migrate"][0]
+    assert entry["snapshot_of"] == "dynamic table"
+    assert "snapshot" in entry["kind_warning"]
+    assert entry["refresh"]["verdict"].startswith("refresh NOT generated")
 
 
 @pytest.mark.parametrize("kind", ["TRANSIENT", "TEMPORARY", "transient"])

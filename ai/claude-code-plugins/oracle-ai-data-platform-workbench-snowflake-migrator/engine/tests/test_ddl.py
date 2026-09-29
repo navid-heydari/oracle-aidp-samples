@@ -83,21 +83,33 @@ def test_snowflake_properties_scrubbed_and_recorded(prop):
     assert prop in SCRUBBED_PROPERTIES
 
 
-@pytest.mark.parametrize("prop", ["cluster_by", "retention_time", "change_tracking"])
-def test_maintenance_properties_are_deferred_not_dropped(prop):
+@pytest.mark.parametrize("prop,value", [("cluster_by", "LINEAR(A)"),
+                                        ("retention_time", "90"),
+                                        ("change_tracking", "ON")])
+def test_maintenance_properties_are_carried_not_dropped(prop, value):
     """These three DO have AIDP equivalents.
 
     Reporting them as "no Delta equivalent" was wrong, and wrong in the
     direction that costs the customer: a dropped clustering key is a silent
-    performance regression on the largest tables in the estate.
+    performance regression on the largest tables in the estate. Since the
+    live Delta 3.1 probe (2026-09-29) each is CARRIED into the CREATE TABLE
+    (test_delta_features.py); it was "deferred" before that.
     """
     res = build_create_table(
-        record([col("A", "TEXT", "STRING")], source_metadata={prop: "something"}),
+        record([col("A", "TEXT", "STRING")], source_metadata={prop: value}),
         "bronze.S.T")
     assert not any(prop in o for o in res.omitted_properties)
-    assert any(d["property"] == prop for d in res.deferred_properties)
+    assert any(c["property"] == prop for c in res.carried_properties)
     assert prop not in SCRUBBED_PROPERTIES
     assert prop in DEFERRED_EQUIVALENT_PROPERTIES
+
+
+def test_a_value_ddl_cannot_carry_is_still_deferred_not_dropped():
+    res = build_create_table(
+        record([col("A", "TEXT", "STRING")],
+               source_metadata={"cluster_by": "something"}),
+        "bronze.S.T")
+    assert any(d["property"] == "cluster_by" for d in res.deferred_properties)
 
 
 def test_blocked_record_produces_no_sql():
@@ -241,18 +253,20 @@ def test_a_clustering_key_is_deferred_not_declared_equivalent_free():
     assert "CLUSTER BY" in eq or "ZORDER" in eq
 
 
-def test_time_travel_retention_is_deferred_with_its_delta_equivalent():
+def test_time_travel_retention_is_carried_with_its_delta_equivalent():
+    # 7 days: Delta's own defaults already reach that far, so it is carried
+    # by emitting nothing (see test_delta_features.py for longer ones).
     res = build_create_table(_with_props(retention_time=7), "CAT.SC.T")
-    deferred = {d["property"]: d for d in res.deferred_properties}
-    assert "retention_time" in deferred
-    assert "retention" in deferred["retention_time"]["aidp_equivalent"].lower()
+    carried = {c["property"]: c for c in res.carried_properties}
+    assert "retention_time" in carried
+    assert "retention" in carried["retention_time"]["carried_as"].lower()
 
 
 def test_change_tracking_maps_to_change_data_feed():
     res = build_create_table(_with_props(change_tracking="ON"), "CAT.SC.T")
-    deferred = {d["property"]: d for d in res.deferred_properties}
-    assert "change_tracking" in deferred
-    assert "feed" in deferred["change_tracking"]["aidp_equivalent"].lower()
+    carried = {c["property"]: c for c in res.carried_properties}
+    assert "change_tracking" in carried
+    assert "delta.enableChangeDataFeed" in res.sql
 
 
 def test_a_property_with_genuinely_no_equivalent_is_still_omitted():
@@ -270,17 +284,21 @@ def test_unset_maintenance_properties_are_not_reported():
 
 
 def test_the_deferral_is_recorded_as_a_named_rule():
-    res = build_create_table(_with_props(cluster_by="(A)"), "CAT.SC.T")
+    # An expression key cannot be a liquid clustering key: still deferred.
+    res = build_create_table(_with_props(cluster_by="(TO_DATE(A))"), "CAT.SC.T")
     assert any(r.rule_id == "R11_MAINTENANCE_DEFERRED" for r in res.rules_applied)
 
 
-def test_no_maintenance_ddl_is_emitted():
-    # This MVP does not decide the maintenance story, so it must not silently
-    # invent one either -- no OPTIMIZE, no VACUUM, no CLUSTER BY in the DDL.
+def test_no_maintenance_job_is_emitted():
+    # The maintenance CADENCE is the customer's, so no OPTIMIZE, VACUUM or
+    # ZORDER is invented. The table's own layout setting is a different
+    # thing: a plain clustering key is carried as CLUSTER BY, which Delta
+    # 3.1 on AIDP accepted live (2026-09-29).
     res = build_create_table(_with_props(cluster_by="(A)"), "CAT.SC.T")
     up = res.sql.upper()
-    for banned in ("OPTIMIZE", "VACUUM", "CLUSTER BY", "ZORDER", "TBLPROPERTIES"):
+    for banned in ("OPTIMIZE", "VACUUM", "ZORDER"):
         assert banned not in up
+    assert "CLUSTER BY (A)" in res.sql
 
 
 # --- types the TARGET refuses, caught offline -------------------------------

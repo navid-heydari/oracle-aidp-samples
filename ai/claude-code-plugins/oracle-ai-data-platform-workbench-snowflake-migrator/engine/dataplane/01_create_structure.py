@@ -33,7 +33,9 @@ The CREATE returning is not the claim: IF NOT EXISTS is a silent no-op on a
 table that is already there, so every table is DESCRIBEd afterwards and
 compared with the plan, column by column and in order.
 
-In --mode ddl-plan the plan's `NOT NULL`, column COMMENTs and table COMMENT
+In --mode ddl-plan the plan's `NOT NULL`, column COMMENTs, table COMMENT and
+Delta features (`delta_features`: a liquid `CLUSTER BY`, and TBLPROPERTIES
+for retention and the change data feed -- live-verified on AIDP Delta 3.1)
 are applied, not just its names and types: they are in the CREATE TABLE the
 reviewer approved, and each table is read back against that full shape.
 Nullability is read from the table's schema
@@ -59,27 +61,45 @@ manifest created is not thereby what the ddl plan approved. `type_drift`,
 `failed` and `not_in_plan` are looked at again every run, so fixing the
 table or the plan is enough.
 
+--parallel N (default 8) creates and reads back N tables at once; each
+table's record is decided by the same create-and-read-back whatever N is,
+and the report lists them in the manifest's order. Views never run in
+parallel (below).
+
 Views are recorded under a separate `views` key, never in `objects` (the
 table map the copy scope reads). In --mode ddl-plan each planned view is
 created from the plan's own CREATE VIEW SQL after every table exists and
 recorded `created`, `failed` (a failure: exit 1) or `dry_run`; a manifest
 view the plan does not carry is `not_in_plan`. --mode ctas and manifest
 create tables only and record their views `not_created_by_this_path`.
+
+A dynamic table or materialized view the plan migrates as a TABLE SNAPSHOT
+(a TABLE statement with `snapshot_of`) is a table here, whatever list the
+manifest files it under: in-AIDP discovery puts a materialized view under
+`views` (its TABLE_TYPE is not BASE TABLE), and live 2026-09-29 this stage
+built the manifest's `tables` only, so the planned CREATE TABLE never ran
+and the view over it failed TABLE_OR_VIEW_NOT_FOUND. In --mode ddl-plan
+every such statement for the schema is created exactly as a table is (plan
+columns, Delta features, the read-back and type-drift check) -- also when
+the manifest does not list the source at all -- and recorded in `objects`
+with `kind` TABLE and its `snapshot_of`, never among the views.
 """
 from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import pathlib
+import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from snowmig_source import (  # noqa: E402
     SOURCE_MODES, SnowflakeSource, SourceConfigError, load_source_config, q,
-    write_step_output)
+    read_plan_json, write_step_output)
 
 # /Workspace is the live-verified mount of the workspace tree on cluster
 # filesystems (probed 2026-09-16 on a real cluster).
@@ -92,6 +112,37 @@ MANIFEST_NAME = "discovery_manifest.json"
 
 def three(*parts: str) -> str:
     return ".".join(q(p) for p in parts)
+
+
+# Tables created at once. Live 2026-09-29: CREATE TABLE ~4 s a table
+# serially on a warm cluster, ~2 s a table at 8 threads.
+DEFAULT_PARALLEL = 8
+# Tables recorded per batch: the report on disk is rewritten after each.
+STRUCTURE_CHUNK = 50
+# Seconds between report writes in the view phase (and always at its end).
+REPORT_WRITE_INTERVAL = 15.0
+
+
+def _in_parallel(fn, items: list, parallel: int) -> list:
+    """`[fn(item)]` in order, `parallel` at a time (1 = one by one)."""
+    workers = max(1, min(parallel, len(items)))
+    if workers == 1:
+        return [fn(item) for item in items]
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix="snowmig-structure") as pool:
+        return list(pool.map(fn, items))
+
+
+def _view_name(schema: str, table: str) -> str:
+    """A temp view name unique to (schema, table), exact case included.
+
+    Spark resolves view names case-insensitively, so `Orders` and `ORDERS`
+    shared one name -- and with tables created in parallel, one table's
+    CTAS would read the other's source.
+    """
+    digest = hashlib.sha1(f"{schema}\x00{table}".encode("utf-8")).hexdigest()
+    readable = re.sub(r"[^a-z0-9_]", "_", f"{schema}_{table}".lower())[:80]
+    return f"snowmig_src_{readable}_{digest[:12]}"
 
 
 def log(msg: str) -> None:
@@ -113,6 +164,29 @@ def _report_path(reports: pathlib.Path, schema: str) -> pathlib.Path:
     return reports / f"structure_report_{schema.lower()}.json"
 
 
+# Live 2026-09-29: the /Workspace mount served a just-written report
+# incompletely (JSONDecodeError on a file that was valid a minute later).
+REPORT_READ_TRIES = 5
+REPORT_READ_WAIT = 2.0
+
+
+def _read_report_json(path: pathlib.Path) -> dict:
+    """A report's JSON, retried briefly when the read comes back incomplete;
+    still invalid after that is a loud failure that names the file."""
+    import time
+    last = None
+    for attempt in range(REPORT_READ_TRIES):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            last = exc
+            if attempt + 1 < REPORT_READ_TRIES:
+                time.sleep(REPORT_READ_WAIT)
+    raise ValueError(f"{path.name} is not valid JSON after {REPORT_READ_TRIES} "
+                     f"reads ({last}); it was not overwritten -- inspect it "
+                     f"before re-running")
+
+
 def _load_report(path: pathlib.Path, schema: str, target: str) -> dict:
     """The prior report for this schema, but ONLY if it targeted the same place.
 
@@ -124,7 +198,7 @@ def _load_report(path: pathlib.Path, schema: str, target: str) -> dict:
     """
     if not path.exists():
         return {"schema": schema, "objects": {}, "target": target}
-    prior = json.loads(path.read_text(encoding="utf-8"))
+    prior = _read_report_json(path)
     if prior.get("target") and prior["target"] != target:
         log(f"{schema}: the previous report targeted {prior['target']}, not "
             f"{target} — starting a fresh record for this target (the old "
@@ -263,7 +337,7 @@ def create_table_ctas(source: SnowflakeSource, schema: str, name: str,
     fqn = three(target_catalog, target_schema, name)
     if _describe_columns(source.spark, fqn) is not None:
         return "already_existed"
-    view = f"snowmig_src_{schema}_{name}".lower()[:120]
+    view = _view_name(schema, name)
     ref = source.register_temp_view(schema, name, view)
     try:
         source.spark.sql(
@@ -301,6 +375,91 @@ def _column_sql(col: dict) -> str:
     if col.get("description"):
         piece += " COMMENT " + lit(col["description"])
     return piece
+
+
+def _cluster_by_sql(features: dict | None) -> str:
+    """`CLUSTER BY (...)` from a plan statement's `delta_features`, or ''.
+
+    The SAME rendering as `target.ddl.render_cluster_by`, which wrote the SQL
+    the operator approved; a parity test holds the two together.
+    """
+    # Bare names, as the plan wrote them: AIDP's Delta CLUSTER BY keeps
+    # backticks as part of the name (live 2026-09-29).
+    keys = (features or {}).get("cluster_by") or []
+    return ("CLUSTER BY (" + ", ".join(keys) + ")") if keys else ""
+
+
+def _tblproperties_sql(features: dict | None) -> str:
+    """`TBLPROPERTIES (...)`, as `target.ddl.render_tblproperties`."""
+    props = (features or {}).get("tblproperties") or {}
+    return ("TBLPROPERTIES (" + ", ".join(
+        f"{lit(k)} = {lit(v)}" for k, v in props.items()) + ")") if props else ""
+
+
+def _table_properties(spark, fqn: str) -> dict[str, str] | None:
+    """{key: value} from SHOW TBLPROPERTIES, or None when unreadable."""
+    try:
+        rows = spark.sql(f"SHOW TBLPROPERTIES {fqn}").collect()
+    except Exception:
+        return None
+    out = {}
+    for row in rows:
+        try:
+            out[str(row["key"])] = str(row["value"])
+        except Exception:
+            continue
+    return out
+
+
+def _check_features(spark, fqn: str, features: dict | None, existed: bool,
+                    notes: list | None) -> None:
+    """Say what of the plan's Delta features is on the table, and what is not.
+
+    Properties are read back (SHOW TBLPROPERTIES); a missing or different
+    one is a note, never a silent pass. Clustering is not visible to
+    DESCRIBE, so it is recorded as applied-in-the-CREATE rather than
+    verified. A table that was already there did not get this run's CREATE
+    at all, and is not claimed to carry anything it was not seen to carry.
+    """
+    if notes is None or not features:
+        return
+    if existed:
+        notes.append(
+            "the table was already there, so this run's CREATE (with its "
+            "CLUSTER BY / TBLPROPERTIES) did not apply to it; the properties "
+            "below are what it carries, and clustering is UNCHECKED")
+    elif features.get("cluster_by"):
+        notes.append(
+            f"CLUSTER BY ({', '.join(features['cluster_by'])}) was in the "
+            f"CREATE; DESCRIBE does not show clustering, so it is not read "
+            f"back here")
+    wanted = features.get("tblproperties") or {}
+    if not wanted:
+        return
+    found = _table_properties(spark, fqn)
+    if found is None:
+        notes.append("TBLPROPERTIES could not be read back, so "
+                     + ", ".join(wanted) + " are UNCHECKED")
+        return
+    for key, value in wanted.items():
+        if key not in found:
+            notes.append(f"planned {key} = {value}, not found on the table")
+        elif str(found[key]).lower() != str(value).lower():
+            notes.append(f"planned {key} = {value}, found {found[key]}")
+
+
+def features_from_ddl_plan(ddl_plan: dict) -> dict[tuple[str, str], dict]:
+    """{(source_schema, table): delta_features} for every planned TABLE that
+    carries any. Absent from an older plan, which creates as before."""
+    out: dict[tuple[str, str], dict] = {}
+    for stmt in ddl_plan.get("statements") or []:
+        parts = str(stmt.get("source_identifier") or "").split(".")
+        if len(parts) != 3 or not stmt.get("delta_features"):
+            continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue
+        out[(parts[1], parts[2])] = stmt["delta_features"]
+    return out
 
 
 def _existing_tables(spark, catalog: str, schema: str) -> set[str] | None:
@@ -348,6 +507,7 @@ def create_table_from_columns(spark, columns: list[dict],
                               target_catalog: str, target_schema: str,
                               name: str, description: str = "",
                               notes: list | None = None,
+                              features: dict | None = None,
                               exists: bool | None = None) -> str:
     """CREATE TABLE from an explicit column list, then READ IT BACK.
 
@@ -372,8 +532,11 @@ def create_table_from_columns(spark, columns: list[dict],
     before = None if exists is False else _describe_columns(spark, fqn)
     if before is None:
         cols = ", ".join(_column_sql(c) for c in columns)
+        cluster, properties = _cluster_by_sql(features), _tblproperties_sql(features)
         spark.sql(f"CREATE TABLE IF NOT EXISTS {fqn} ({cols}) USING DELTA"
-                  + (f" COMMENT {lit(description)}" if description else ""))
+                  + (f" {cluster}" if cluster else "")
+                  + (f" COMMENT {lit(description)}" if description else "")
+                  + (f" {properties}" if properties else ""))
         after = _describe_columns(spark, fqn)
         if after is None:
             raise RuntimeError("CREATE TABLE returned but the table does not "
@@ -403,6 +566,7 @@ def create_table_from_columns(spark, columns: list[dict],
                 "comment column, so they are UNCHECKED on this table")
     diff = _compare_columns(columns, after, nullable, comments)
     if diff is None:
+        _check_features(spark, fqn, features, before is not None, notes)
         return "created" if before is None else "already_existed"
     if before is None:
         raise TypeDrift(f"created by this run, but it reads back differently "
@@ -574,40 +738,83 @@ def create_planned_views(spark, planned: dict, schemas: list[str],
     one re-run per level of the chain.
     """
     failures = 0
-    for (schema, name), fact in planned.items():
-        if schema not in schemas:
-            continue
-        path = _report_path(reports, schema)
-        target = f'{target_catalog}.{fact["schema"]}'
-        report = _load_report(path, schema, target)
-        report["target"] = target
-        views = report.setdefault("views", {})
-        if views.get(name, {}).get("status") == "created" and not force:
-            log(f"skip view {schema}.{name}: already created")
-            continue
-        try:
-            if not fact["sql"]:
-                raise ValueError("the approved plan carries no CREATE VIEW "
-                                 "SQL for this view")
-            if dry_run:
-                log(f'DRY RUN: would create view {fact["target_fqn"]}')
-                status = "dry_run"
-            else:
-                spark.sql(fact["sql"])
-                status = "created"
-            views[name] = {"status": status, "in_plan": True,
-                           "target_fqn": fact["target_fqn"]}
-            log(f"view {schema}.{name} -> {fact['target_fqn']}: {status}")
-        except Exception as exc:
-            failures += 1
-            views[name] = {"status": "failed", "in_plan": True,
-                           "target_fqn": fact["target_fqn"],
-                           "reason": str(exc)[:400]}
-            log(f"view {schema}.{name}: FAILED — {str(exc)[:200]}")
-        report["updated_at"] = datetime.datetime.now(
-            datetime.timezone.utc).isoformat()
-        path.write_text(json.dumps(report, indent=2))
+    # One read per schema, kept in memory: re-reading the file this loop has
+    # just written is what failed live on the /Workspace mount.
+    loaded: dict[str, dict] = {}
+    # Written every REPORT_WRITE_INTERVAL seconds and once at the end -- in a
+    # `finally`, so a view created before a crash is still on disk -- rather
+    # than after every view: a 20,000-table schema's report is several MB.
+    # A view the report missed is re-issued by the next run, and CREATE VIEW
+    # IF NOT EXISTS makes that a no-op.
+    dirty: set[str] = set()
+    last_write = time.monotonic()
+
+    def flush() -> None:
+        for s in sorted(dirty):
+            loaded[s]["updated_at"] = datetime.datetime.now(
+                datetime.timezone.utc).isoformat()
+            _report_path(reports, s).write_text(
+                json.dumps(loaded[s], indent=2), encoding="utf-8")
+        dirty.clear()
+
+    try:
+        for (schema, name), fact in planned.items():
+            if schema not in schemas:
+                continue
+            path = _report_path(reports, schema)
+            target = f'{target_catalog}.{fact["schema"]}'
+            if schema not in loaded:
+                loaded[schema] = _load_report(path, schema, target)
+            report = loaded[schema]
+            report["target"] = target
+            views = report.setdefault("views", {})
+            if views.get(name, {}).get("status") == "created" and not force:
+                log(f"skip view {schema}.{name}: already created")
+                continue
+            try:
+                if not fact["sql"]:
+                    raise ValueError("the approved plan carries no CREATE VIEW "
+                                     "SQL for this view")
+                if dry_run:
+                    log(f'DRY RUN: would create view {fact["target_fqn"]}')
+                    status = "dry_run"
+                else:
+                    spark.sql(fact["sql"])
+                    status = "created"
+                views[name] = {"status": status, "in_plan": True,
+                               "target_fqn": fact["target_fqn"]}
+                log(f"view {schema}.{name} -> {fact['target_fqn']}: {status}")
+            except Exception as exc:
+                failures += 1
+                views[name] = {"status": "failed", "in_plan": True,
+                               "target_fqn": fact["target_fqn"],
+                               "reason": str(exc)[:400]}
+                log(f"view {schema}.{name}: FAILED — {str(exc)[:200]}")
+            dirty.add(schema)
+            if time.monotonic() - last_write >= REPORT_WRITE_INTERVAL:
+                flush()
+                last_write = time.monotonic()
+    finally:
+        flush()
     return failures
+
+
+def snapshots_from_ddl_plan(ddl_plan: dict) -> dict[tuple[str, str], str]:
+    """{(source_schema, name): snapshot_of} for every TABLE statement that
+    migrates a dynamic table or materialized view as a table snapshot.
+
+    The plan's statement decides that it is a table; the manifest may file
+    the source under `views` (a materialized view) or not list it at all.
+    """
+    out: dict[tuple[str, str], str] = {}
+    for stmt in ddl_plan.get("statements") or []:
+        parts = str(stmt.get("source_identifier") or "").split(".")
+        if len(parts) != 3 or not stmt.get("snapshot_of"):
+            continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue
+        out[(parts[1], parts[2])] = str(stmt["snapshot_of"])
+    return out
 
 
 def views_from_ddl_plan(ddl_plan: dict) -> set[tuple[str, str]]:
@@ -660,17 +867,21 @@ def main(argv: list[str] | None = None) -> int:
                     help="where this step saves its values (report/output in "
                          "the workspace); '' to skip")
     ap.add_argument("--reports-dir", default=DEFAULT_REPORTS_DIR)
-    ap.add_argument("--parallel", type=int, default=4,
-                    help="tables created at a time within a schema, each "
-                         "still read back on its own (ddl-plan and manifest "
-                         "modes; ctas and dry runs are one at a time). "
-                         "1 creates them one by one")
     ap.add_argument("--dry-run", action="store_true",
                     help="print every statement; execute nothing")
     ap.add_argument("--force", action="store_true",
                     help="re-check tables the report already records as "
                          "created or already_existed")
+    ap.add_argument("--parallel", type=int, default=DEFAULT_PARALLEL,
+                    help=f"tables created at once (default "
+                         f"{DEFAULT_PARALLEL}; 1 = one after another). Views "
+                         f"are always created after every table, one at a "
+                         f"time, in the plan's order")
     args = ap.parse_args(argv)
+
+    if args.parallel < 1:
+        return fail(f"error: --parallel {args.parallel}: at least 1 (1 creates "
+                    f"the tables one after another)")
 
     if args.source_catalog and \
             args.source_catalog.lower() == args.target_catalog.lower():
@@ -702,10 +913,12 @@ def main(argv: list[str] | None = None) -> int:
 
     planned_columns: dict = {}
     planned_descriptions: dict = {}
+    planned_features: dict = {}
     view_facts: dict = {}
     planned_schemas: dict = {}
     planned_views: set | None = None
     planned_targets: dict = {}
+    planned_snapshots: dict = {}
     if args.mode == "ddl-plan":
         ddl_path = (pathlib.Path(args.ddl_plan) if args.ddl_plan
                     else reports.parent / "plan" / "ddl_plan.json")
@@ -713,11 +926,16 @@ def main(argv: list[str] | None = None) -> int:
             return fail(f"--mode ddl-plan needs ddl_plan.json; {ddl_path} is "
                         f"not there. Run the migrator's `ddl` stage and let "
                         f"`provision` upload it, or pass --ddl-plan")
-        ddl_plan = json.loads(ddl_path.read_text(encoding="utf-8"))
+        try:
+            ddl_plan = read_plan_json(ddl_path)
+        except ValueError as exc:
+            return fail(str(exc))
         planned_columns = columns_from_ddl_plan(ddl_plan)
         planned_descriptions = descriptions_from_ddl_plan(ddl_plan)
+        planned_features = features_from_ddl_plan(ddl_plan)
         planned_views = views_from_ddl_plan(ddl_plan)
         planned_targets = targets_from_ddl_plan(ddl_plan)
+        planned_snapshots = snapshots_from_ddl_plan(ddl_plan)
         view_facts = planned_view_facts(ddl_plan)
         planned_schemas = planned_schema_targets(ddl_plan)
         # A plan for another catalog is a different migration. Creating its
@@ -818,53 +1036,15 @@ def main(argv: list[str] | None = None) -> int:
                                      target_schema))
         flush = _Flusher(path, report)
 
-        # 1 · decided here, cheaply and in order: skips, and tables the plan
-        # does not carry. Only real creates go on to step 2.
-        work = []
-        for table in record["tables"]:
-            name = table["name"]
-            prior = report["objects"].get(name, {})
-            done = prior.get("status") in ("created", "already_existed")
-            # Every report this stage writes names its mode; one that does
-            # not was not written by it, and is taken as this run's.
-            recorded_by = prior.get("mode", prior_mode) or args.mode
-            if done and not args.force and recorded_by == args.mode:
-                log(f"skip {schema}.{name}: already {prior['status']}")
-                created_total += 1
-                continue
-            if done and not args.force:
-                # Another mode's `created` checked that mode's layout, not
-                # this one's: a FLOAT table --mode manifest made was skipped
-                # here as done, with the plan saying DOUBLE.
-                log(f"re-check {schema}.{name}: recorded {prior['status']} "
-                    f"by --mode {recorded_by}, not {args.mode}")
-            if (args.mode == "ddl-plan" and not args.dry_run
-                    and not planned_columns.get((schema, name))):
-                report["objects"][name] = {
-                    "status": "not_in_plan",
-                    "reason": "the approved ddl_plan carries no "
-                              "columns for this table -- the engine "
-                              "either blocked it or it was outside "
-                              "the plan's scope. NOT created."}
-                flush.maybe()
-                # Counted, not logged one line each: live, a 4-table plan
-                # over a 1000-table estate printed 996 such lines and buried
-                # the four that mattered. The schema's summary line carries
-                # the count, and its report lists every name.
-                not_in_plan_total += 1
-                continue
-            work.append(table)
-
-        def create_one(table: dict) -> tuple[str, dict, str]:
-            """One table's create and read-back: (name, record, outcome).
-            Touches no shared state; the caller applies the record."""
+        def build(table: dict, schema=schema, target_schema=target_schema,
+                  existing=existing) -> tuple[dict, str]:
+            """One table's create-and-read-back: `(record, kind)`, kind one
+            of created / not_in_plan / failure / other. Runs in a worker
+            thread; it never raises, and it never touches the report --
+            the main thread records every outcome in the manifest's order."""
             name = table["name"]
             started = time.monotonic()
             notes: list[str] = []
-            tgt_name = (planned_targets.get((schema, name))
-                        or (target_schema, name))[1]
-            exists = (None if existing is None
-                      else tgt_name.lower() in existing)
             try:
                 if args.dry_run:
                     log(f"DRY RUN: would create "
@@ -876,16 +1056,34 @@ def main(argv: list[str] | None = None) -> int:
                                                args.target_catalog,
                                                target_schema)
                 elif args.mode == "ddl-plan":
+                    columns = planned_columns.get((schema, name))
+                    if not columns:
+                        # Counted, not logged one line each: live, a 4-table
+                        # plan over a 1000-table estate printed 996 such
+                        # lines and buried the four that mattered. The
+                        # schema's summary line carries the count, and its
+                        # report lists every name.
+                        return ({"status": "not_in_plan",
+                                 "reason": "the approved ddl_plan carries no "
+                                           "columns for this table -- the "
+                                           "engine either blocked it or it "
+                                           "was outside the plan's scope. "
+                                           "NOT created."}, "not_in_plan")
                     # The plan names the target TABLE as well as the
                     # schema: a source `ORDERS` planned as `orders` has to
                     # land as `orders`, or the copy addresses a table that
                     # is not there.
+                    tgt_name = (planned_targets.get((schema, name))
+                                or (target_schema, name))[1]
                     status = create_table_from_columns(
-                        spark, planned_columns[(schema, name)],
-                        args.target_catalog, target_schema, tgt_name,
+                        spark, columns, args.target_catalog, target_schema,
+                        tgt_name,
                         description=planned_descriptions.get((schema, name),
                                                              ""),
-                        notes=notes, exists=exists)
+                        notes=notes,
+                        features=planned_features.get((schema, name)),
+                        exists=(None if existing is None
+                                else tgt_name.lower() in existing))
                 else:
                     columns = table.get("columns") or []
                     if _looks_like_snowflake_types(columns):
@@ -896,7 +1094,11 @@ def main(argv: list[str] | None = None) -> int:
                             "translated types) or --mode ctas.")
                     status = create_table_from_columns(
                         spark, columns, args.target_catalog, target_schema,
-                        name, notes=notes, exists=exists)
+                        name, notes=notes,
+                        exists=(None if existing is None
+                                else name.lower() in existing))
+                tgt_name = (planned_targets.get((schema, name))
+                            or (target_schema, name))[1]
                 entry = {"status": status, "mode": args.mode,
                          "target_fqn": f"{args.target_catalog}."
                                        f"{target_schema}.{tgt_name}"}
@@ -916,50 +1118,87 @@ def main(argv: list[str] | None = None) -> int:
                         "NOT compared")
                 elapsed = time.monotonic() - started
                 entry["elapsed_s"] = round(elapsed, 1)
-                # The elapsed time is what shows a create's real cost (live
-                # ~25 s per table, sequentially): the report had none.
+                # The elapsed time is what shows a create's real cost: the
+                # report had none.
                 log(f"{schema}.{name}: {status} ({elapsed:.1f}s)")
-                return name, entry, ("created" if status in
-                                     ("created", "already_existed")
-                                     else "other")
+                return entry, ("created" if status in ("created",
+                                                       "already_existed")
+                               else "other")
             except TypeDrift as exc:
                 # A problem state, not a failure of THIS run: the table is
                 # there, it is not what the plan says, and a positional copy
                 # into it would land rows in the wrong columns with matching
                 # counts. Re-checked on every run until it matches.
                 log(f"{schema}.{name}: TYPE DRIFT — {str(exc)[:200]}")
-                return name, {"status": "type_drift",
-                              "reason": str(exc)[:400]}, "failed"
+                return ({"status": "type_drift", "reason": str(exc)[:400]},
+                        "failure")
             except Exception as exc:
                 log(f"{schema}.{name}: FAILED — {str(exc)[:200]}")
-                return name, {"status": "failed",
-                              "reason": str(exc)[:400]}, "failed"
+                return ({"status": "failed", "reason": str(exc)[:400]},
+                        "failure")
 
-        # 2 · the creates. Each is metastore round trips (a CREATE and its
-        # read-backs), so they run concurrently within the schema -- every
-        # table still verified on its own. CTAS reads Snowflake per table
-        # and a dry run creates nothing: those stay one at a time.
-        workers = (1 if args.mode == "ctas" or args.dry_run
-                   else max(1, args.parallel))
-        if workers > 1 and len(work) > 1:
-            log(f"{schema}: creating {len(work)} table(s), {workers} at a "
-                f"time (--parallel)")
-            pool = ThreadPoolExecutor(max_workers=workers)
-            results = (f.result() for f in as_completed(
-                [pool.submit(create_one, t) for t in work]))
-        else:
-            pool, results = None, (create_one(t) for t in work)
-        try:
-            for name, entry, outcome in results:
-                report["objects"][name] = entry
-                if outcome == "created":
+        # The plan's table snapshots are tables, wherever the manifest put
+        # them: a materialized view is under its `views`, and one the
+        # manifest does not list at all is still in the approved plan.
+        snapshots = {n: label for (s, n), label in planned_snapshots.items()
+                     if s == schema}
+        listed = {t["name"] for t in record["tables"]}
+        tables = list(record["tables"]) + [
+            {"name": n, "columns": []} for n in sorted(snapshots)
+            if n not in listed]
+        if snapshots:
+            log(f"{schema}: {len(snapshots)} table snapshot(s) in the plan "
+                f"created as tables ({', '.join(sorted(snapshots)[:5])}"
+                f"{', ...' if len(snapshots) > 5 else ''})")
+
+        work = []
+        for table in tables:
+            name = table["name"]
+            prior = report["objects"].get(name, {})
+            done = prior.get("status") in ("created", "already_existed")
+            # Every report this stage writes names its mode; one that does
+            # not was not written by it, and is taken as this run's.
+            recorded_by = prior.get("mode", prior_mode) or args.mode
+            if done and not args.force and recorded_by == args.mode:
+                log(f"skip {schema}.{name}: already {prior['status']}")
+                created_total += 1
+                continue
+            if done and not args.force:
+                # Another mode's `created` checked that mode's layout, not
+                # this one's: a FLOAT table --mode manifest made was skipped
+                # here as done, with the plan saying DOUBLE.
+                log(f"re-check {schema}.{name}: recorded {prior['status']} "
+                    f"by --mode {recorded_by}, not {args.mode}")
+            work.append(table)
+
+        # `--parallel` tables at a time, a chunk at a time, so the report on
+        # disk never lags far behind what was created. A dry run creates
+        # nothing and stays one at a time.
+        parallel = 1 if args.dry_run else args.parallel
+        for start in range(0, len(work), STRUCTURE_CHUNK):
+            chunk = work[start:start + STRUCTURE_CHUNK]
+            for table, (entry, kind) in zip(
+                    chunk, _in_parallel(build, chunk, parallel)):
+                if table["name"] in snapshots:
+                    # Said on the record, so the copy and the reconcile
+                    # take it for the table it is, not the view the
+                    # manifest lists.
+                    entry = {**entry, "kind": "TABLE",
+                             "snapshot_of": snapshots[table["name"]]}
+                report["objects"][table["name"]] = entry
+                if kind == "created":
                     created_total += 1
-                elif outcome == "failed":
+                elif kind == "not_in_plan":
+                    not_in_plan_total += 1
+                elif kind == "failure":
                     failures += 1
-                flush.maybe()
-        finally:
-            if pool is not None:
-                pool.shutdown(wait=True)
+            # At most every FLUSH_SECONDS, checked once per chunk, and in
+            # full at the end of the schema. Live, the scale run's 1,000-
+            # table schema rewrote this growing file to /Workspace after
+            # every table -- the 950 outside the plan included -- and that,
+            # not the CREATE, was the per-table cost. Creates are
+            # idempotent, so a crash loses nothing a re-run does not redo.
+            flush.maybe()
         flush.now()
 
         # Views: kept apart from `objects` so the table tally, the resume
@@ -973,7 +1212,8 @@ def main(argv: list[str] | None = None) -> int:
         for stale in [n for n, o in report["objects"].items()
                       if str(o.get("kind") or "").upper() == "VIEW"]:
             prior_views.setdefault(stale, report["objects"].pop(stale))
-        views = [v["name"] for v in record.get("views") or []]
+        views = [v["name"] for v in record.get("views") or []
+                 if v["name"] not in snapshots]
         views += [n for (s, n) in sorted(view_facts)
                   if s == schema and n not in views]
         if views or prior_views:

@@ -262,8 +262,10 @@ def test_disabling_it_restores_the_strict_modes_and_ignores_the_fields():
     blk = mapping_block({"mapping": {"enabled": False,
                                      "semi_structured": "string",
                                      "timestamp_ntz": "timestamp"}})
+    # geospatial joined the block as a third decision (`wkt` is new); its
+    # strict mode is the `block` it always defaulted to.
     assert blk == {"enabled": False, "semi_structured": "block",
-                   "timestamp_ntz": "preserve"}
+                   "timestamp_ntz": "preserve", "geospatial": "block"}
 
 
 def test_the_toggle_must_be_a_boolean():

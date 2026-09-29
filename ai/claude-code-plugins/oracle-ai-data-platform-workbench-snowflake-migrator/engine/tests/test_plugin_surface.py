@@ -113,11 +113,16 @@ def test_plan_skill_documents_the_cannot_migrate_categories():
         assert f"`{category}`" in text, category
     assert "restrictions" in text.lower()
     # `unsupported_object` is not only the two view kinds: plan/build.py
-    # `_TABLE_KIND_BLOCKS` files five SHOW TABLES flags under it too.
+    # `_TABLE_KIND_BLOCKS` files three SHOW TABLES flags under it too. The
+    # external and Iceberg flags moved to `register_in_place`.
     row = next(l for l in text.splitlines()
                if l.startswith("| `unsupported_object` |"))
-    for kind in ("dynamic", "external", "Iceberg", "event", "hybrid"):
+    for kind in ("dynamic", "event", "hybrid"):
         assert kind in row, f"unsupported_object also covers {kind} tables"
+    row = next(l for l in text.splitlines()
+               if l.startswith("| `register_in_place` |"))
+    for kind in ("External", "Iceberg", "not copied", "OCI Object Storage"):
+        assert kind in row, f"register_in_place row must say {kind}"
 
 
 def test_clone_skill_documents_one_catalog_per_run_and_cli_backends():
