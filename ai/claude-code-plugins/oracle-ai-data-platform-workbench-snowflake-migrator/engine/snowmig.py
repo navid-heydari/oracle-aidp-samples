@@ -1181,9 +1181,15 @@ def cmd_run(args) -> int:
             return (f"<stage>.{name}" if len(by_name.get(name, ())) > 1
                     else name)
 
-        task_scoped = ("schema" in parameters) and per_schema
+        # On a per-schema copy job `schema` and `tables` are set on that
+        # job's task, never baked: the job passes its own `schema`, and a
+        # baked copy_schema.tables would narrow EVERY per-schema copy job
+        # through the one shared 02 notebook -- provision refuses it once
+        # there are two copy schemas, so advising it would send the
+        # operator into that second refusal.
+        task_only = {"schema", "tables"} if per_schema else set()
         known = sorted(n for n in parameters if n in declared
-                       and not (task_scoped and n == "schema"))
+                       and n not in task_only)
         unknown = sorted(n for n in parameters if n not in declared)
         scoped = (
             f"`schema` is the task parameter of {args.job}: the job is "
@@ -1191,7 +1197,16 @@ def cmd_run(args) -> int:
             f"over any PARAMS literal, so no --stage-param changes it. To "
             f"copy another schema run that schema's own job "
             f"(snowmig_02_copy_<schema>); a schema with no job is added by "
-            f"re-planning and re-pushing.\n" if task_scoped else "")
+            f"re-planning and re-pushing.\n"
+            if per_schema and "schema" in parameters else "")
+        scoped += (
+            f"`tables` narrows {args.job} only as a task parameter on that "
+            f"job's task: add `tables=<value>` to its task in the console "
+            f"(a task parameter wins over the PARAMS literal). A baked "
+            f"copy_schema.tables would narrow every per-schema copy job "
+            f"through the one shared 02_copy_schema notebook, which "
+            f"provision refuses with two or more copy schemas.\n"
+            if per_schema and "tables" in parameters else "")
         route = (
             "  * re-run `provision --execute --reuse-existing "
             "--refresh-notebooks "

@@ -60,6 +60,27 @@ def test_schema_on_a_copy_job_is_named_as_its_task_parameter(tmp_path):
     assert "snowmig_02_copy_<schema>" in message
 
 
+def test_tables_on_a_copy_job_is_named_as_its_task_parameter(tmp_path):
+    # With two or more copy schemas provision refuses a baked
+    # copy_schema.tables: the one shared 02 notebook would narrow EVERY
+    # per-schema copy job. Advising it here sent the operator straight into
+    # that second refusal. `tables` narrows one copy job only as a task
+    # parameter on that job's task.
+    message = _refusal(tmp_path, "snowmig_02_copy_sales", "tables=ORDERS")
+    assert "--stage-param copy_schema.tables" not in message
+    assert "--stage-param tables" not in message
+    assert "`tables`" in message
+    assert "task parameter" in message
+    assert "snowmig_02_copy_sales" in message
+
+
+def test_tables_next_to_mode_on_a_copy_job_advises_mode_only(tmp_path):
+    message = _refusal(tmp_path, "snowmig_02_copy_sales",
+                       "tables=ORDERS", "mode=overwrite")
+    assert "--stage-param copy_schema.mode=<value>" in message
+    assert "copy_schema.tables=" not in message
+
+
 def test_the_refusal_no_longer_says_parameters_never_reach_a_notebook(
         tmp_path):
     message = _refusal(tmp_path, "snowmig_01_structure", "schema=HR")
