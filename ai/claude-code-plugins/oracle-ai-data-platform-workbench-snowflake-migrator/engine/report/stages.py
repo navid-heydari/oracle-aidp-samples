@@ -41,6 +41,8 @@ __all__ = ["RUNS_ON", "STAGES", "UTILITY_COMMANDS", "build_stage_board", "phase_
 #   alternative_to  another stage that produces the same result; having
 #            done either satisfies both, so the board never stalls on the
 #            path that was not taken
+#   job / job_prefix  the AIDP job a `run` stage starts, or the prefix of a
+#            job per schema; its artifact is then a glob, one file per job
 # Where a phase's work actually executes. Traced from each command's
 # transport: the catalog API is a control-plane call and uses no cluster;
 # `deploy --transport sql` runs on the configured aidp.cluster_id; the
@@ -146,12 +148,17 @@ STAGES: tuple[dict, ...] = (
      "purpose": "create schemas, tables and views in a STANDARD catalog. "
                 "Refuses an EXTERNAL target. Dry-run unless --execute"},
     # Registered by provision and NEVER run by the migrator: moving rows is
-    # the customer's later decision.
+    # the customer's later decision. Once a plan is pushed there is one job
+    # per schema, snowmig_02_copy_<schema> (target.provisioning's
+    # COPY_JOB_PREFIX), and no generic snowmig_02_copy_schema job; each run
+    # writes run_<job>.json, so the stage is every artifact the prefix names.
     {"stage": "copy-workflow", "requires": [['structure-workflow', 'deploy'], ['data-options']], "runs_on": RUNS_ON["migration_cluster"], "command": "run", "job": "snowmig_02_copy_schema",
+     "job_prefix": "snowmig_02_copy_",
      "phase": "target", "runbook": "S11", "needs": "an architecture decision",
      "writes": True, "optional": True,
-     "artifact": "run_snowmig_02_copy_schema.json",
-     "purpose": "copy one schema's rows. Registered, never run by the "
+     "artifact": "run_snowmig_02_copy_*.json",
+     "purpose": "copy one schema's rows, one job per schema "
+                "(snowmig_02_copy_<schema>). Registered, never run by the "
                 "migrator"},
     {"stage": "reconcile-workflow", "requires": [['copy-workflow']], "runs_on": RUNS_ON["migration_cluster"], "command": "run",
      "job": "snowmig_03_reconcile", "phase": "target", "runbook": "S11",
@@ -197,14 +204,30 @@ UTILITY_COMMANDS = ("stages", "demo", "databases", "catalogs", "clean",
 _UNKNOWN = "could not be determined"
 
 
+def _artifact_paths(out_dir: pathlib.Path, name: str) -> list[pathlib.Path]:
+    """The files a stage's artifact names: one, or every match of a glob."""
+    if "*" in name:
+        return sorted(p for p in out_dir.glob(name) if p.is_file())
+    path = out_dir / name
+    return [path] if path.exists() else []
+
+
 def _load(out_dir: pathlib.Path, name: str):
     if "*" in name:
         # One artifact per invocation target (run_<job>.json): the stage has
-        # run if any exists, and each is reported.
-        paths = sorted(out_dir.glob(name))
+        # run if any exists, and each is reported. A record that does not
+        # name its job is named by its file, never left as "?".
+        paths = _artifact_paths(out_dir, name)
         if not paths:
             return None
-        return {"_many": [_load(out_dir, p.name) for p in paths]}
+        many = []
+        for p in paths:
+            run = _load(out_dir, p.name)
+            if isinstance(run, dict) and not run.get("job"):
+                run = {**run, "job": run.get("job_key")
+                       or p.stem.removeprefix("run_")}
+            many.append(run)
+        return {"_many": many}
     path = out_dir / name
     if not path.exists():
         return None
@@ -410,7 +433,7 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
             text += f', {errors} error(s)'
         return (text, bool(bad or unverified or drift or errors))
 
-    if stage == "run":
+    if "_many" in data:
         # The last recorded result per job. A run whose budget ran out is
         # STILL RUNNING, never rounded to either verdict. A status watch_job
         # does not classify (`unrecognised`) is neither done nor running;
@@ -422,15 +445,16 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
                 attention = True
                 continue
             job = run.get("job") or run.get("job_key") or "?"
+            clean = False
             if not run.get("terminal") and run.get("unrecognised"):
                 verdict = f'**UNRECOGNISED STATE {run.get("status") or "?"}**'
             elif not run.get("terminal"):
                 verdict = "STILL RUNNING"
             elif run.get("ok"):
-                verdict = "SUCCESS"
+                verdict, clean = run.get("status") or "SUCCESS", True
             else:
                 verdict = f'**{run.get("status") or "FAILED"}**'
-            attention = attention or verdict != "SUCCESS"
+            attention = attention or not clean
             parts.append(f"{job}: {verdict}")
         return ("; ".join(parts) or "written", attention)
 
@@ -454,7 +478,7 @@ def build_stage_board(out_dir) -> dict:
     rows: list[dict] = []
     next_stage = None
     present = {spec["stage"] for spec in STAGES
-               if (out_dir / spec["artifact"]).exists()}
+               if _artifact_paths(out_dir, spec["artifact"])}
     for spec in STAGES:
         data = _load(out_dir, spec["artifact"])
         twin = spec.get("alternative_to")
@@ -481,7 +505,9 @@ def build_stage_board(out_dir) -> dict:
                      # the second one blocks.
                      "failed": bool(isinstance(data, dict)
                                     and (data.get("ok") is False
-                                         or data.get("failed"))),
+                                         or data.get("failed")
+                                         or any(r.get("ok") is False
+                                                for r in _job_runs(data)))),
                      # A dry run wrote its artifact and created nothing, so
                      # it satisfies no prerequisite.
                      "dry_run": bool(isinstance(data, dict)
@@ -499,6 +525,9 @@ def stage_for(command: str, job: str | None = None) -> str:
         if spec.get("job") is None and command != "run":
             return spec["stage"]
         if job and spec.get("job") == job:
+            return spec["stage"]
+        # A job per schema (snowmig_02_copy_<schema>) is the same stage.
+        if job and spec.get("job_prefix") and job.startswith(spec["job_prefix"]):
             return spec["stage"]
     return command
 
@@ -519,8 +548,9 @@ def _legacy_run_stage(run: dict, out_dir: pathlib.Path) -> str:
     for spec in STAGES:
         if not spec.get("job"):
             continue
-        art = out_dir / spec["artifact"]
-        if art.is_file():
+        for art in _artifact_paths(out_dir, spec["artifact"]):
+            if not art.is_file():
+                continue
             written = datetime.datetime.fromtimestamp(
                 art.stat().st_mtime, datetime.timezone.utc)
             if lo <= written <= hi + datetime.timedelta(seconds=5):
@@ -530,6 +560,15 @@ def _legacy_run_stage(run: dict, out_dir: pathlib.Path) -> str:
 
 # `RETRY ...` as the notebooks print it, after their `[copy] ` log prefix.
 _RETRY_LINE = re.compile(r"^\s*(?:\[[\w-]+\]\s+)?RETRY\s")
+
+
+def _job_runs(art) -> list[dict]:
+    """The job-run records behind a workflow artifact: one, or one per job."""
+    if not isinstance(art, dict):
+        return []
+    many = art.get("_many")
+    runs = many if many is not None else [art]
+    return [r for r in runs if isinstance(r, dict)]
 
 
 def _verdict(code) -> str:
@@ -621,15 +660,22 @@ def phase_report(out_dir) -> dict:
                 "retries": sum(int(r.get("retries") or 0) for r in mine)})
             # A workflow can exit 0 locally with a job that did not succeed.
             art = _load(out_dir, spec["artifact"])
+            jobs = _job_runs(art) if spec.get("job") else []
             # Retries inside an AIDP job are in its own output, one RETRY
             # line each (the copy notebook writes them).
-            if spec.get("job") and isinstance(art, dict):
+            for run in jobs:
                 row["retries"] += sum(
-                    1 for line in str(art.get("output") or "").splitlines()
+                    1 for line in str(run.get("output") or "").splitlines()
                     if _RETRY_LINE.search(line))
-            if spec.get("job") and isinstance(art, dict) and art.get("ok") is False:
-                row["result"] = f'FAIL (job {art.get("status", "?")})'
-        elif (out_dir / spec["artifact"]).exists():
+            bad = [r for r in jobs if r.get("ok") is False]
+            if bad and "_many" in art:
+                # One job per schema: name the ones that did not succeed.
+                row["result"] = "FAIL (" + ", ".join(
+                    f'job {r.get("job")} {r.get("status", "?")}'
+                    for r in bad) + ")"
+            elif bad:
+                row["result"] = f'FAIL (job {bad[0].get("status", "?")})'
+        elif _artifact_paths(out_dir, spec["artifact"]):
             row["result"] = "DONE (not logged)"
         else:
             row["result"] = ("SKIPPED (optional)" if spec.get("optional")

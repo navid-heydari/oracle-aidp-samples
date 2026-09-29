@@ -1041,8 +1041,10 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
             "`DATA_CLONE` → `DONE`, or `BLOCKED`.", "",
             "**`DATA_CLONE` and `DONE` are not reported by this summary.** It "
             "reads only the control-plane deploy result -- structure, not rows; "
-            "whether rows were copied by the in-AIDP job "
-            "`snowmig_02_copy_schema` is reported by `snowmig_03_reconcile` in "
+            "whether rows were copied by the in-AIDP copy jobs "
+            "(`snowmig_02_copy_<schema>`, one per schema of the pushed plan; "
+            "`snowmig_02_copy_schema` before a plan is pushed) is reported by "
+            "`snowmig_03_reconcile` in "
             "`MIGRATION_REPORT.md` / `reconciliation.json`. `SHALLOW_CLONE` "
             "means the object exists in AIDP with its columns; it says nothing "
             "about rows.", ""]
@@ -1116,7 +1118,9 @@ def render_smoke(result: dict) -> str:
 DATA_OPTIONS_NOTE = (
     "Proposal only. The control-plane CLI moves no bytes. One path is "
     "implemented by the data plane: in-AIDP INSERT-SELECT from the EXTERNAL "
-    "catalog, run schema by schema by the `snowmig_02_copy_schema` job. The "
+    "catalog, run schema by schema by the copy jobs "
+    "`snowmig_02_copy_<schema>` (one per schema of the pushed plan; "
+    "`snowmig_02_copy_schema` before a plan is pushed). The "
     "other options are not implemented.")
 
 
@@ -1167,8 +1171,10 @@ def architecture_section(plan: dict) -> list[str]:
     decision = architecture_decision(plan.get("architecture_choice"))
     out = ["## Data-movement architecture", "",
            "**The control-plane CLI moves no bytes.** Rows move only through "
-           "the in-AIDP job `snowmig_02_copy_schema`, when the operator runs "
-           "it; none of the other paths below is implemented.", "",
+           "the in-AIDP copy jobs, `snowmig_02_copy_<schema>` (one per schema "
+           "of the pushed plan; `snowmig_02_copy_schema` before a plan is "
+           "pushed), when the operator runs them; none of the other paths "
+           "below is implemented.", "",
            decision["statement"], ""]
 
     if decision["decided"]:
