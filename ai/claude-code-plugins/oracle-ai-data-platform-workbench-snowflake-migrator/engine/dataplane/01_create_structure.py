@@ -477,7 +477,8 @@ def descriptions_from_ddl_plan(ddl_plan: dict) -> dict[tuple[str, str], str]:
 
 
 def planned_view_facts(ddl_plan: dict) -> dict[tuple[str, str], dict]:
-    """{(source_schema, view): plan facts} for every VIEW the plan carries.
+    """{(source_schema, view): plan facts} for every VIEW the plan carries,
+    in the plan's statement order (wave order: dependencies first).
 
     `targets_from_ddl_plan` is tables only, because it places tables. A view
     needs its own CREATE VIEW SQL and the target the plan approved, so it is
@@ -521,9 +522,14 @@ def create_planned_views(spark, planned: dict, schemas: list[str],
     The outcome goes under the report's `views`, never `objects`: `objects`
     is the TABLE map the copy takes its default scope from, and a view
     recorded there was copied into (live, INSERT INTO a view).
+
+    In the PLAN's order, never sorted: the ddl stage emits statements in
+    wave order, so a view follows every view it reads. Sorted, A_SUMMARY
+    went before the B_DETAIL it reads and failed TABLE_OR_VIEW_NOT_FOUND,
+    one re-run per level of the chain.
     """
     failures = 0
-    for (schema, name), fact in sorted(planned.items()):
+    for (schema, name), fact in planned.items():
         if schema not in schemas:
             continue
         path = _report_path(reports, schema)

@@ -275,3 +275,29 @@ def test_reconcile_exits_zero_when_every_planned_view_was_created(
     capsys.readouterr()
     assert _reconcile(monkeypatch, reports, spark) == 0
     assert "not migrated yet" not in capsys.readouterr().out
+
+
+# --- 01: views are created in the plan's order, not alphabetically -----------
+#
+# build_ddl_payload emits statements in wave order, so a view follows every
+# relation it reads -- views included. 01 collected them into a dict keyed by
+# (schema, view) and created them `sorted()`: A_SUMMARY (which reads
+# B_DETAIL) went first and failed TABLE_OR_VIEW_NOT_FOUND, exit 1, and each
+# extra level of a view-on-view chain needed one more manual re-run.
+
+def test_a_view_on_a_view_is_created_after_the_view_it_reads(
+        monkeypatch, tmp_path):
+    reports = _estate(tmp_path, views=(
+        ("B_DETAIL", "`lake`.`SALES`.`ORDERS`"),
+        ("A_SUMMARY", "`lake`.`SALES`.`B_DETAIL`")))
+    spark = _spark()
+    rc = _structure(monkeypatch, reports, spark)
+    assert rc == 0, "one run creates the whole chain"
+    created = [s.split()[5] for s in spark.statements
+               if s.startswith("CREATE VIEW")]
+    assert created == ["`lake`.`SALES`.`B_DETAIL`",
+                       "`lake`.`SALES`.`A_SUMMARY`"], created
+    views = _report(reports, "structure_report_sales.json")["views"]
+    assert {v: r["status"] for v, r in views.items()} == {
+        "B_DETAIL": "created", "A_SUMMARY": "created"}
+
