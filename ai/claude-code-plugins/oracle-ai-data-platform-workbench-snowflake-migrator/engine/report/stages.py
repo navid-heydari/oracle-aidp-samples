@@ -9,10 +9,14 @@ Two rules it holds to, both learned the hard way elsewhere in this plugin:
   * A stage that could not look is FLAGGED, never shown as clean. "0
     exposures" and "we could not read the policy references" are opposite
     findings and must not render the same.
-  * Four stages write to AIDP, and the board says which: `provision`,
-    `catalog` and `deploy`, each a dry run without `--execute`, and `run`,
-    which has no dry run -- it starts an in-AIDP job that creates tables or
-    copies rows. The one further write is `smoke --write-probe --execute`:
+  * Seven stages write to AIDP, and the board says which (every STAGES
+    entry with `writes: True`): `provision`, `catalog` and `deploy`, each a
+    dry run without `--execute`; `structure-workflow` and `copy-workflow`,
+    the in-AIDP jobs `run` starts, which have no dry run -- one creates the
+    structure, the other (snowmig_02_copy_<schema>) copies rows; `publish`,
+    into the workspace; and `teardown`, destructive (it stops or deletes
+    the migration's clusters), both dry runs without `--execute`. The one
+    further write is `smoke --write-probe --execute`:
     one probe schema, created and removed; `--write-probe` alone is a dry
     run. `notebook --upload` sends nothing -- a dry run without `--execute`,
     refused with it (GAPS.md 13).

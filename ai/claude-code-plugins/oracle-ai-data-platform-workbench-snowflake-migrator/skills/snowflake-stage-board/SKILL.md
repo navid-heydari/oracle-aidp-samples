@@ -21,11 +21,16 @@ and **what it found**.
 
 Then say three things out loud:
 
-1. **Four stages write to AIDP.** `provision`, `catalog` and `deploy` are each a dry
-   run unless `--execute` is passed with all four AIDP coordinates. **`run` has
-   no dry run**: invoking it starts an in-AIDP job — `snowmig_01_structure`
-   creates schemas and tables, `snowmig_02_copy_schema` copies rows — so ask
-   before every `run`. Everything
+1. **Seven stages write to AIDP** — the rows marked **(writes)** on the
+   board. `provision`, `catalog` and `deploy` are each a dry run unless
+   `--execute` is passed with all four AIDP coordinates. Two AIDP workflows
+   write when `run` starts them, and **`run` has no dry run**: invoking it IS
+   the write — `structure-workflow` (`snowmig_01_structure`) creates schemas
+   and tables, `copy-workflow` (`snowmig_02_copy_<schema>`, one job per schema
+   of the pushed plan) copies rows — so ask before every `run`. `publish`
+   copies the finished report into the workspace, and `teardown` is
+   **destructive**: it stops the clusters this migration allocated, or
+   deletes them when asked. Both are dry runs unless `--execute`. Everything
    else is read-only, apart from one narrow opt-in that is itself gated by
    `--execute` (`smoke --write-probe --execute`); `notebook --upload` writes
    nothing (dry run, refused with `--execute`, GAPS.md 13). If someone is

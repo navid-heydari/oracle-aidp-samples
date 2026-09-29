@@ -74,9 +74,14 @@ reconcile), and their reports land in the workspace, not in `--out-dir`.
 
 `stages` is not a pipeline step; it is the read-out of one.
 
-**Four stages write — `provision`, `catalog` and `deploy`, each a dry run
-without `--execute`, and `run`, which has no dry run and starts an in-AIDP
-job when invoked — plus, narrowly and opt-in, `smoke --write-probe
+**Seven stages write — `provision`, `catalog` and `deploy`, each a dry run
+without `--execute`; the two workflows `run` starts, which have no dry run
+(`structure-workflow`, `snowmig_01_structure`, creates the structure;
+`copy-workflow`, `snowmig_02_copy_<schema>`, one job per schema of the
+pushed plan, copies rows); `publish`, which copies the report into the
+workspace; and `teardown`, which is destructive (it stops the clusters this
+migration allocated, or deletes them when asked) — the last two dry runs
+without `--execute`. Plus, narrowly and opt-in, `smoke --write-probe
 --execute`.** The stage board
 says exactly that, lists `provision` and `catalog` in their dependency
 positions, and reads their artifacts (a `create_requested` that never became

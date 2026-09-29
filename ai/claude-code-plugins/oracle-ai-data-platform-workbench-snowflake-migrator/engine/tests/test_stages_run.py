@@ -230,3 +230,57 @@ def test_a_terminal_failure_is_still_a_phase_failure(tmp_path):
     row = next(p for p in phase_report(tmp_path)["phases"]
                if p["stage"] == "structure-workflow")
     assert row["result"] == "FAIL (job FAILED)"
+
+
+# ------------------------------------------- every writer, in every place
+#
+# The fold added `publish` and `teardown` as writing stages and the board's
+# preamble said "Seven stages write", while the stage-board skill (point 1,
+# the sentence the agent is told to say to a nervous user), ARCHITECTURE.md
+# and this module's docstring still said "Four stages write ... Everything
+# else is read-only" -- calling the stage that stops or deletes clusters,
+# and the one that writes into the workspace, read-only.
+
+_COUNT = {3: "Three", 4: "Four", 5: "Five", 6: "Six", 7: "Seven",
+          8: "Eight", 9: "Nine"}
+
+
+def _writers():
+    return [s["stage"] for s in STAGES if s.get("writes")]
+
+
+def _point_one():
+    text = (ROOT / "skills/snowflake-stage-board/SKILL.md").read_text(
+        encoding="utf-8")
+    return text.split("Then say three things out loud:", 1)[1].split(
+        "\n2. ", 1)[0]
+
+
+def _architecture_writers():
+    text = (ROOT / "ARCHITECTURE.md").read_text(encoding="utf-8")
+    start = text.index("stages write")
+    return text[start - 40:text.index("\n\n", start)]
+
+
+def test_the_writer_count_agrees_everywhere(tmp_path):
+    word = _COUNT[len(_writers())]
+    preamble = render_stages(build_stage_board(tmp_path)).split(
+        "| Stage |", 1)[0]
+    assert f"**{word} stages write" in preamble
+    import report.stages as stages_module
+    for where, text in (("SKILL.md point 1", _point_one()),
+                        ("ARCHITECTURE.md", _architecture_writers()),
+                        ("report/stages.py", stages_module.__doc__)):
+        assert f"{word} stages write" in text, where
+        for stale in ("Four stages write", "Three stages write"):
+            assert stale not in text, (where, stale)
+
+
+def test_every_writing_stage_is_named_as_a_writer():
+    for where, text in (("SKILL.md point 1", _point_one()),
+                        ("ARCHITECTURE.md", _architecture_writers())):
+        for stage in _writers():
+            assert f"`{stage}`" in text, (where, stage)
+        assert "destructive" in text, \
+            f"{where}: teardown stops or deletes clusters"
+        assert "snowmig_02_copy_<schema>" in text, where

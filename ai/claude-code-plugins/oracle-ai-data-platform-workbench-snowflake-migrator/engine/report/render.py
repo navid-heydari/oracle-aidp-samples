@@ -1839,7 +1839,7 @@ def render_stages(board: dict) -> str:
            "**and `copy-workflow`** (S11, copies rows — registered, never run "
            "by the migrator). **A workflow has no dry run**: `run` takes no "
            "`--execute`, so invoking it IS the write. **`publish`** copies the finished report into "
-           "the workspace and **`teardown`** stops (or deletes) the clusters "
+           "the workspace and **`teardown`**, destructive, stops (or deletes) the clusters "
            "this migration allocated, both dry runs unless `--execute`. "
            "Every other stage is read-only. The one further write is "
            "`smoke --write-probe --execute`, which creates one probe schema "
