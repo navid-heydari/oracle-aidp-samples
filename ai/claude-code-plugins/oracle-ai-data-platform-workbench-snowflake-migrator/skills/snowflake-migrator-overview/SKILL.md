@@ -261,7 +261,10 @@ with the task still unstarted, it cancels the run and resubmits, up to
 `--cold-start-restarts` times (default **5**; `0` disables). When every
 attempt is spent and the last run is still unstarted, it cancels that one
 too (so it does not hold the job's slot) and exits 1 with **COLD START —
-attempts exhausted**: nothing ran, check the cluster, re-run. The budget
+attempts exhausted**: nothing ran, check the cluster, re-run. If that last
+cancel did not reach a terminal state, the report says **NOT confirmed
+cancelled** instead: the run may still hold the slot or start later, so
+cancel it by hand before re-running. The budget
 measures **pick-up, not work** -- a task that has started is never cancelled
 however long it then runs, because killing it would destroy real progress.
 

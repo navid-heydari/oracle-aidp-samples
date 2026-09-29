@@ -1289,7 +1289,7 @@ def cmd_run(args) -> int:
             # last run was cancelled so it does not hold the job's slot.
             cancelled = exhausted.get("cancel_state") in TERMINAL_STATES
             print(f'  {slug}: COLD START — the cluster did not pick up any of '
-                  f'{len(result.get("restarts") or []) + 1} run(s), each '
+                  f'{_runs_submitted(result)} run(s), each '
                   f'given {args.cold_start_seconds:.0f}s. The last, '
                   f'{exhausted["run"]}, was '
                   + ("cancelled." if cancelled else
@@ -1345,8 +1345,18 @@ def cmd_run(args) -> int:
     return 0 if result["ok"] else 1
 
 
+def _runs_submitted(result: dict) -> int:
+    """How many runs were really submitted. Not `len(restarts) + 1`: a
+    restart whose cancel was not confirmed submitted nothing."""
+    if result.get("submitted_runs"):
+        return len(result["submitted_runs"])
+    return 1 + sum(1 for r in result.get("restarts") or []
+                   if r.get("new_run"))
+
+
 def _render_run(result: dict) -> str:
     """The workflow run as evidence: what ran, what it returned, its log."""
+    from target.jobs import TERMINAL_STATES
     polls = result.get("polls", "?")
     if result.get("status_unreadable"):
         verdict = (f"**STATUS COULD NOT BE READ** — run "
@@ -1359,15 +1369,27 @@ def _render_run(result: dict) -> str:
                    f"has ended.")
     elif not result.get("terminal") and result.get("cold_start_exhausted"):
         ex = result["cold_start_exhausted"]
-        verdict = (f"**COLD START — attempts exhausted.** The cluster did not "
-                   f"pick up any of {len(result.get('restarts') or []) + 1} "
-                   f"run(s); the last, `{ex.get('run')}`, sat "
-                   f"{ex.get('after_seconds'):.0f}s with its task unstarted "
-                   f"and was then cancelled (cancel state "
-                   f"`{ex.get('cancel_state')}`"
-                   + (f", error: {ex.get('cancel_error')}"
-                      if ex.get("cancel_error") else "")
-                   + "). Nothing ran. Check the cluster, then re-run.")
+        error = (f", error: {ex.get('cancel_error')}"
+                 if ex.get("cancel_error") else "")
+        head = (f"**COLD START — attempts exhausted.** The cluster did not "
+                f"pick up any of {_runs_submitted(result)} "
+                f"run(s); the last, `{ex.get('run')}`, sat "
+                f"{ex.get('after_seconds'):.0f}s with its task unstarted ")
+        # The same test the console applies. A cancel that did not reach a
+        # terminal state leaves a run that may still hold the job's only
+        # slot -- or start later, unwatched -- so "nothing ran, re-run" is
+        # only said when the cancel is confirmed.
+        if ex.get("cancel_state") in TERMINAL_STATES:
+            verdict = (head + f"and was then cancelled (cancel state "
+                       f"`{ex.get('cancel_state')}`{error}). Nothing ran. "
+                       f"Check the cluster, then re-run.")
+        else:
+            verdict = (head + f"and was **NOT confirmed cancelled** (state "
+                       f"`{ex.get('cancel_state')}`{error}). It may still "
+                       f"run. Cancel it by hand (`aidp workflow "
+                       f"cancel-job-run {result.get('workspace')} "
+                       f"{ex.get('run')}`) and check the cluster before "
+                       f"re-running.")
     elif not result.get("terminal") and result.get("unrecognised"):
         verdict = (f'**UNRECOGNISED STATE `{result.get("status")}`** — after '
                    f'{polls} poll(s) the run reports a status this plugin '
