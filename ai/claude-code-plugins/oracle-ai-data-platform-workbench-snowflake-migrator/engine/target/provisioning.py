@@ -639,6 +639,12 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     # never stopped or deleted as if it were the migration's.
     existing_mode = warehouse_cluster_mode == "existing"
     warehouse_targets = []
+    # One DISTINCT name per warehouse, the migration cluster's reserved: two
+    # names that fold alike (COMPUTE_WH, COMPUTE) would share one cluster.
+    from sizing.warehouse_map import cluster_base_name, cluster_names
+    distinct = cluster_names(
+        [str(wh.get("name") or wh.get("warehouse") or "").strip()
+         for wh in warehouse_clusters or ()], reserved={cl_name.name})
     for wh in warehouse_clusters or ():
         source_name = str(wh.get("name") or wh.get("warehouse") or "").strip()
         if not source_name:
@@ -657,14 +663,20 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                            f"resized"],
                  "source_size": wh.get("size")})
             continue
-        # Named from the warehouse's BASE name (COMPUTE_WH -> compute).
-        from sizing.warehouse_map import cluster_base_name
-        name = cluster_base_name(source_name)
+        # Named from the warehouse's BASE name (COMPUTE_WH -> compute),
+        # unless that collides with another warehouse's or the migration
+        # cluster's.
+        name = distinct[source_name]
+        base = cluster_base_name(source_name)
+        note = (f"named from the base name of {source_name}"
+                if name == base else
+                f"named from {source_name} in full: its base name `{base}` "
+                f"would collide with another warehouse's or the migration "
+                f"cluster's")
         warehouse_targets.append(
             {"warehouse": source_name, "name": name,
              "renamed": name != source_name, "created": False,
-             "notes": [f"named from the base name of {source_name}"],
-             "source_size": wh.get("size")})
+             "notes": [note], "source_size": wh.get("size")})
 
     out: dict = {
         "dry_run": not execute,

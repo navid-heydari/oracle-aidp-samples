@@ -273,7 +273,10 @@ bin/snowmig provision ... --execute
 
 Creates the workspace (name translated to a charset the API cannot reject),
 the `migration_assets` cluster, **one cluster per Snowflake warehouse with the
-same name** on the AIDP default config, the workspace folder
+same name** on the AIDP default config (its base name, `COMPUTE_WH` ->
+`compute`; two warehouses whose base names fold alike, or one that would take
+the migration cluster's name, keep their full names instead, so no two share
+a cluster), the workspace folder
 `backup-snowflake-migration/` holding the scripts and the plan, and four
 **unscheduled** jobs. `--external-catalog` and `--target-catalog` are names
 being pre-declared for the job parameters, not catalogs that must already
