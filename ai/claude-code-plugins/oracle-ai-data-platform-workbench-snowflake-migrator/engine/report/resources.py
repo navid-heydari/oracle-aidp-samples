@@ -156,13 +156,15 @@ def build_resources(out_dir) -> dict:
         resources.append(_res("workspace", "provision", name=ws.get("name"),
                               key=ws["key"], state="ACTIVE (kept)"))
 
-    clusters = []
-    cl = prov.get("cluster") or {}
-    if cl.get("key"):
-        clusters.append((cl, "migration cluster"))
-    for wc in prov.get("warehouse_clusters") or []:
-        if wc.get("key") and not wc.get("uses_existing"):
-            clusters.append((wc, f'warehouse cluster for {wc.get("warehouse")}'))
+    # Only what the record PROVES this migration created: a cluster it
+    # adopted, or the existing one a warehouse maps to, is not its
+    # allocation and not its bill (target/provenance.py).
+    from target.provenance import CREATED, cluster_records
+    clusters, seen = [], set()
+    for rec in cluster_records(prov):
+        if rec["provenance"] == CREATED and rec["cluster"] not in seen:
+            seen.add(rec["cluster"])
+            clusters.append((rec["record"], rec["role"]))
     observed = {r["key"]: r for r in _ledger(out)
                 if r.get("kind") == "cluster" and r.get("created_at")}
     for c, role in clusters:

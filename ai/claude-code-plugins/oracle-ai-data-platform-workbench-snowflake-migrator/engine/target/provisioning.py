@@ -51,7 +51,7 @@ from .provision_api import (
 __all__ = ["JOB_SPECS", "SCRIPTS_FOLDER", "PLAN_FOLDER", "REPORTS_FOLDER",
            "BACKUP_FOLDER", "PLAN_BACKUP_FILES", "plan_backup_names",
            "COPY_JOB_PREFIX", "plan_copy_schemas", "copy_job_specs",
-           "download_ws_file",
+           "download_ws_file", "carry_forward",
            "ProvisionTransportError",
            "make_provision_call", "provision", "render_provision",
            "source_config_payload",
@@ -577,26 +577,51 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     # carried over: the user asked for same-name clusters on the AIDP default
     # config, and the `compute` stage's proposal stays a proposal until
     # somebody decides on it.
+    #
+    # Provenance is recorded POSITIVELY: `created` is True only on the create
+    # path. teardown and the billing report act on nothing else, so a
+    # cluster adopted here, or the existing one a warehouse maps to, is
+    # never stopped or deleted as if it were the migration's.
+    existing_mode = warehouse_cluster_mode == "existing"
     warehouse_targets = []
     for wh in warehouse_clusters or ():
         source_name = str(wh.get("name") or wh.get("warehouse") or "").strip()
         if not source_name:
+            continue
+        if existing_mode:
+            # `compute.warehouse_clusters: existing` -- every warehouse maps
+            # to one cluster that is already there. Its display name is not
+            # known here, and the warehouse's base name is not it.
+            warehouse_targets.append(
+                {"warehouse": source_name, "name": None,
+                 "existing_cluster": existing_cluster_id,
+                 "key": existing_cluster_id, "uses_existing": True,
+                 "created": False, "renamed": False,
+                 "notes": [f"mapped to the existing cluster "
+                           f"{existing_cluster_id}; not created, not "
+                           f"resized"],
+                 "source_size": wh.get("size")})
             continue
         # Named from the warehouse's BASE name (COMPUTE_WH -> compute).
         from sizing.warehouse_map import cluster_base_name
         name = cluster_base_name(source_name)
         warehouse_targets.append(
             {"warehouse": source_name, "name": name,
-             "renamed": name != source_name,
+             "renamed": name != source_name, "created": False,
              "notes": [f"named from the base name of {source_name}"],
              "source_size": wh.get("size")})
 
     out: dict = {
         "dry_run": not execute,
         "workspace": {"requested": workspace_name, "name": ws_name.name,
-                      "renamed": ws_name.changed, "notes": ws_name.notes},
+                      "renamed": ws_name.changed, "notes": ws_name.notes,
+                      "created": False},
         "cluster": {"requested": cluster_name, "name": cl_name.name,
-                    "renamed": cl_name.changed, "notes": cl_name.notes},
+                    "renamed": cl_name.changed, "notes": cl_name.notes,
+                    "created": False},
+        # The push these records were written by; a `created` flag carries
+        # the run that set it (`created_run`).
+        "run": stamp,
         "warehouse_clusters": warehouse_targets,
         "scripts_folder": SCRIPTS_FOLDER, "plan_folder": PLAN_FOLDER,
         "reports_folder": REPORTS_FOLDER,
@@ -635,6 +660,11 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         step("workspace", "would ensure", None, ws_name.name)
         step("cluster", "would ensure", None, cl_name.name)
         for target in warehouse_targets:
+            if target.get("uses_existing"):
+                step("warehouse-cluster", "would use existing", None,
+                     f'{target["warehouse"]} -> existing cluster '
+                     f'{existing_cluster_id} (not created, not resized)')
+                continue
             step("warehouse-cluster", "would ensure", None,
                  f'{target["warehouse"]} -> {target["name"]} '
                  f'(AIDP default config; source size '
@@ -718,6 +748,8 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         return out
     ws_key = _key(found or {}, ws_name.name)
     out["workspace"]["key"] = ws_key
+    if ws_created:
+        out["workspace"].update(created=True, created_run=stamp)
     if found is None:
         if ws_created and ws_list_error is not None:
             step("halt", "stopped", False,
@@ -786,8 +818,12 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
              if cl_list_error is not None else cl_name.name)
         if found is not None:
             # When the compute clock started, for the billing report.
+            out["cluster"].update(created=True, created_run=stamp)
             out["cluster"]["created_at"] = datetime.datetime.now(
                 datetime.timezone.utc).isoformat()
+        else:
+            # Accepted, key never seen: teardown must say so, not skip it.
+            out["cluster"]["create_requested"] = True
     elif reuse_existing:
         step("cluster", "reused", True, _key(found, cl_name.name))
     else:
@@ -816,11 +852,12 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     # These are the customer's own compute, not the migration's: a failure on
     # one is recorded and the rest continue, and NOTHING here changes the
     # migration cluster the jobs are bound to.
-    if warehouse_cluster_mode == "existing":
+    if existing_mode:
         # `compute.warehouse_clusters: existing` -- every warehouse maps to
-        # one cluster that is already there. Nothing is created or resized.
+        # one cluster that is already there. Nothing is created or resized,
+        # and the record says it was not created here (uses_existing,
+        # created: false), so teardown leaves it alone.
         for target in warehouse_targets:
-            target["key"] = existing_cluster_id
             step("warehouse-cluster", "uses_existing", True,
                  f'{target["warehouse"]} -> existing cluster '
                  f'{existing_cluster_id} (not created, not resized)')
@@ -860,12 +897,17 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
             delays)
         target["key"] = _key(seen or {}, target["name"]) if seen else None
         if seen:
+            target.update(created=True, created_run=stamp,
+                          created_at=datetime.datetime.now(
+                              datetime.timezone.utc).isoformat())
             tail = ""
-        elif seen_error is not None:
-            tail = (" — accepted, but it could not be listed to confirm it; "
-                    f"read_back_failed: {seen_error}")
         else:
-            tail = " — accepted, but it never became visible"
+            # Accepted, key never seen: teardown must say so, not skip it.
+            target["create_requested"] = True
+            tail = (" — accepted, but it could not be listed to confirm it; "
+                    f"read_back_failed: {seen_error}"
+                    if seen_error is not None else
+                    " — accepted, but it never became visible")
         step("warehouse-cluster",
              "created" if seen else "create_requested", seen is not None,
              f'{target["warehouse"]} -> {target["name"]}' + tail)
@@ -1200,6 +1242,45 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     return out
 
 
+def carry_forward(res: dict, prior: dict | None) -> dict:
+    """Carry the provenance an earlier EXECUTED push recorded into this one.
+
+    A re-push into this migration's own workspace (the documented plan push
+    is `--reuse-existing`) finds the workspace and clusters the first push
+    created and records them as `reused`. The earlier record is the proof
+    they were created here, so its `created` flag (and when) is carried
+    onto the same keys. Only from a record of the same workspace key: a
+    record of another workspace proves nothing about this one. Returns
+    `res`, updated in place.
+    """
+    from .provenance import CREATED, cluster_records
+    if (not prior or prior.get("dry_run") is not False
+            or res.get("dry_run") is not False):
+        return res
+    ws = (res.get("workspace") or {}).get("key")
+    prior_ws = prior.get("workspace") or {}
+    if not ws or prior_ws.get("key") != ws:
+        return res
+    if prior_ws.get("created") and not res["workspace"].get("created"):
+        res["workspace"].update(
+            created=True, created_run=prior_ws.get("created_run")
+            or prior.get("run"), created_by_earlier_push=True)
+    owned = {r["cluster"]: r for r in cluster_records(prior)
+             if r["provenance"] == CREATED}
+    for rec in [res.get("cluster") or {}, *(res.get("warehouse_clusters")
+                                            or [])]:
+        earlier = owned.get(rec.get("key"))
+        if earlier is None or rec.get("created") or rec.get("uses_existing"):
+            continue
+        was = earlier["record"]
+        rec.update(created=True,
+                   created_run=was.get("created_run") or prior.get("run"),
+                   created_by_earlier_push=True)
+        if was.get("created_at") and not rec.get("created_at"):
+            rec["created_at"] = was["created_at"]
+    return res
+
+
 def download_ws_file(call: Callable[..., dict], *, workspace: str,
                      path: str, dest: pathlib.Path,
                      opener: Callable | None = None) -> dict:
@@ -1263,9 +1344,13 @@ def render_provision(res: dict) -> str:
         for target in res["warehouse_clusters"]:
             note = ("; ".join(target.get("notes") or [])
                     if target.get("renamed") else "no")
+            cluster = (f'existing cluster `{target.get("existing_cluster")}` '
+                       f'(not created by this migration)'
+                       if target.get("uses_existing")
+                       else f'`{target["name"]}`')
             lines.append(f'| `{target["warehouse"]}` | '
                          f'{target.get("source_size") or "unknown"} | '
-                         f'`{target["name"]}` | {note} |')
+                         f'{cluster} | {note} |')
         lines.append("")
 
     if res.get("credential_objects"):

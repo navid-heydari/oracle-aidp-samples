@@ -1,9 +1,13 @@
 """Terminate the compute a migration allocated -- and nothing else.
 
-Reads provision_result.json, so the only clusters it can reach are the ones
-this migration created: the migration cluster and any warehouse clusters.
-It never lists the workspace and picks clusters by name, which is how a
-teardown takes somebody else's compute with it.
+Reads provision_result.json, and acts only on the clusters that record
+PROVES this migration created (`created: true`, see target/provenance.py):
+the migration cluster and any warehouse clusters provision made. A cluster
+the record names but did not create -- adopted with --reuse-existing, or
+the one `compute.warehouse_clusters: existing` points at -- is listed as
+"not this migration's, left alone" and never stopped or deleted. It never
+lists the workspace and picks clusters by name, which is how a teardown
+takes somebody else's compute with it.
 
 Kept, on purpose: the workspace (scripts, plans, report/output -- the record
 of the run), the catalogs (the migration's output) and the jobs (the
@@ -19,6 +23,8 @@ from __future__ import annotations
 
 import time
 
+from .provenance import CREATED, NOT_CREATED, cluster_records
+
 __all__ = ["ACTIONS", "teardown", "render_teardown"]
 
 ACTIONS = ("stop", "delete")
@@ -28,18 +34,23 @@ KEPT = ["the workspace (scripts, plans, report/output — the run's record)",
         "the jobs (the registered S11 copy scripts)"]
 
 
-def _targets(prov: dict) -> list[dict]:
-    out = []
-    cl = prov.get("cluster") or {}
-    if cl.get("key"):
-        out.append({"cluster": cl["key"], "name": cl.get("name"),
-                    "role": "migration cluster"})
-    for wc in prov.get("warehouse_clusters") or []:
-        # A warehouse mapped to an EXISTING cluster was not created here.
-        if wc.get("key") and not wc.get("uses_existing"):
-            out.append({"cluster": wc["key"], "name": wc.get("name"),
-                        "role": f'warehouse cluster for {wc.get("warehouse")}'})
-    return out
+def _targets(prov: dict) -> tuple[list[dict], list[dict]]:
+    """(targets, left_alone). A target is a cluster the record proves this
+    migration created; everything else it names with a key is left alone
+    and said so, once per key."""
+    records = cluster_records(prov)
+    targets, left, seen = [], [], set()
+    for rec in records:
+        if rec["provenance"] == CREATED and rec["cluster"] not in seen:
+            seen.add(rec["cluster"])
+            targets.append({"cluster": rec["cluster"], "name": rec["name"],
+                            "role": rec["role"]})
+    for rec in records:
+        if rec["provenance"] == NOT_CREATED and rec["cluster"] not in seen:
+            seen.add(rec["cluster"])
+            left.append({"cluster": rec["cluster"], "name": rec["name"],
+                         "role": rec["role"], "why": rec["why"]})
+    return targets, left
 
 
 def _state(call, workspace: str, key: str):
@@ -64,7 +75,8 @@ def teardown(call, prov: dict, *, action: str, execute: bool,
         return {**base, "verified": 0,
                 "note": "provision never ran for real, so this migration "
                         "allocated nothing to terminate"}
-    targets = _targets(prov)
+    targets, left_alone = _targets(prov)
+    base["left_alone"] = left_alone
     if not execute:
         base["steps"] = [{**t, "action": f"would {action}", "verified": None}
                          for t in targets]
@@ -118,6 +130,13 @@ def render_teardown(res: dict) -> str:
         out.append(f'| `{s.get("name")}` (`{s.get("cluster")}`) | '
                    f'{s.get("role")} | {s.get("action")} | {verified} | '
                    f'{s.get("state") or s.get("detail") or "—"} |')
+    if res.get("left_alone"):
+        out += ["", "Not this migration's — left alone (named in "
+                "provision_result.json, but not created by this migration, so "
+                "never stopped or deleted here):", ""]
+        out += [f'- `{s.get("name") or s.get("cluster")}` '
+                f'(`{s.get("cluster")}`), {s.get("role")}: {s.get("why")}'
+                for s in res["left_alone"]]
     out += ["", "Kept:", ""] + [f"- {k}" for k in res.get("kept") or []]
     if res.get("action") == "delete":
         out += ["", "⚠️ `delete` is final: the registered copy jobs now point "

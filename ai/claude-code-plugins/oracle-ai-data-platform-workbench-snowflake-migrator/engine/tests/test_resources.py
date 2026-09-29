@@ -12,9 +12,10 @@ from report.tokens import record_stage_run
 
 PROV = {"dry_run": False,
         "workspace": {"name": "mig_ws", "key": "ws-1"},
-        "cluster": {"name": "migration_assets", "key": "cl-1"},
+        "cluster": {"name": "migration_assets", "key": "cl-1",
+                    "created": True},
         "warehouse_clusters": [{"warehouse": "COMPUTE_WH", "name": "compute",
-                                "key": "wc-1"}],
+                                "key": "wc-1", "created": True}],
         "external_catalog": "src_ext", "target_catalog": "tgt_int",
         "steps": [{"step": "job", "action": "created", "verified": True,
                    "detail": "snowmig_00_discover"},

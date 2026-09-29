@@ -2106,7 +2106,7 @@ def cmd_provision(args) -> int:
     The EXTERNAL catalog is registered by the `catalog` stage, not here.
     """
     from target.provisioning import (
-        make_provision_call, provision, render_provision)
+        carry_forward, make_provision_call, provision, render_provision)
 
     _refuse_by_decision(args, creating=True,
                         warehouse_clusters=bool(args.warehouse_clusters))
@@ -2245,6 +2245,14 @@ def cmd_provision(args) -> int:
         refresh_notebooks=args.refresh_notebooks,
         plan_label=args.plan_label, copy_schemas=copy_schemas,
         inherited_credential=inherited_credential)
+    # Provenance: a re-push into this migration's own workspace finds what
+    # the first push created and records it as reused; the earlier executed
+    # record is the proof it was created here, so teardown still reaches it
+    # (and still leaves alone what this migration never created).
+    earlier = (_read(out, "provision_result.json")
+               if _executed_record_exists(out, "provision_result.json")
+               else None)
+    carry_forward(res, earlier)
     _write(out, "provision_result.json", res)
     _write(out, "PROVISION.md", render_provision(res))
 
