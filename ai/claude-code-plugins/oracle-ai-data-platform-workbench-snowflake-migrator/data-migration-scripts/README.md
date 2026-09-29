@@ -184,8 +184,11 @@ the report), never applied to this one.
 The plugin's `provision` stage uploads these notebooks and wires one AIDP job
 per notebook, pointing each job straight at it — no driver wrapper. This
 run's coordinates are written into the notebook's own `PARAMS` cell at upload
-time, because job `parameters` reach a notebook neither as argv nor as
-environment (probed live).
+time, as defaults. A job TASK's `parameters` override them by the same names
+at run time -- the notebook reads them with
+`oidlUtils.parameters.getParameter` (live-verified) -- which is how each
+per-schema copy job passes its `schema` to the one `02_copy_schema`
+notebook.
 
 To run one by hand, open it in the console and edit the `PARAMS` cell:
 

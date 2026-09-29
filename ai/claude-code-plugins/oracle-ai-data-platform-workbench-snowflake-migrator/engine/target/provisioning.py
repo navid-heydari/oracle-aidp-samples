@@ -78,8 +78,9 @@ REPORTS_FOLDER = f"/Workspace/{_ROOT}/reports"
 BACKUP_FOLDER = f"{_ROOT}/backup"
 
 # One job per NOTEBOOK. The names mirror the stage flags (sans `--`) and are
-# written into the notebook's own PARAMS cell, because job parameters reach a
-# notebook neither as argv nor as environment (probed live).
+# written into the notebook's own PARAMS cell as defaults; a job TASK's
+# `parameters` override them at run time through
+# oidlUtils.parameters.getParameter (live-verified; see stage_notebooks).
 #
 # There is no longer a driver wrapper. Each stage is a single self-contained
 # `.ipynb` -- parameters, helpers and logic in one object -- so the code a
@@ -1227,10 +1228,11 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
             inherited_credential = None
 
     # 5 · stage notebooks + jobs ---------------------------------------------
-    # Job `parameters` reach the notebook neither as argv nor as environment
-    # (probed live), so this run's coordinates are written into each stage
-    # notebook's own PARAMS cell -- visible and editable in the console,
-    # regenerated here when the defaults change.
+    # This run's coordinates are written into each stage notebook's own
+    # PARAMS cell as defaults -- visible and editable in the console,
+    # regenerated here when they change. A job task's `parameters` override
+    # them at run time (oidlUtils.parameters.getParameter, live-verified);
+    # the per-schema copy jobs pass `schema` that way.
     defaults = {"reports-dir": REPORTS_FOLDER, "source-mode": source_mode,
                 "backup-dir": f"/Workspace/{BACKUP_FOLDER}",
                 "output-dir": f"/Workspace/{output_dir}" if output_dir else ""}

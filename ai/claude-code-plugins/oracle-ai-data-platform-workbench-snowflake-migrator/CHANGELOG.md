@@ -81,6 +81,12 @@ first release.
   true/false words `--stage-param` accepts and refuses anything else by name.
 - A choice value outside the stage's choices (`mode=apend`, or 02's
   `overwrite` on 01) is refused in the cell rather than by argparse later.
+- A task parameter NAME spelled the way an operator types it in the console
+  -- `dryRun`, `dryrun` -- was read by no lookup, so `dry-run` kept its
+  default False. The cell now also reads the camelCase and unseparated
+  spellings through getParameter. A name matching no spelling is still not
+  detected (the notebook cannot list its parameters), so this is "an
+  unreadable switch VALUE is refused", not a guarantee about names.
 
 ### Fixed — retries now see HTTP errors `oci raw-request` returns with exit 0
 - `oci raw-request` exits 0 and puts a 429/503 in the response body. The
@@ -95,6 +101,11 @@ first release.
   run was cancelled and 'Nothing ran', even when the cancel was stuck at
   CANCELING or had raised. It now says NOT confirmed cancelled, that the run
   may still hold the job's slot, and gives the cancel command.
+- Only a cancel that read back CANCELED means nothing ran. Any other
+  terminal state (SUCCESS, FAILED, ...) means the task started after the
+  pick-up check and ended before the cancel landed: the console, RUN.md and
+  the stage board now say it RAN and to read its output before any re-run,
+  instead of "Nothing ran, re-run" (twice the rows for an append copy).
 - The console and the record now count the runs actually submitted. A
   restart whose cancel was not confirmed submitted nothing.
 

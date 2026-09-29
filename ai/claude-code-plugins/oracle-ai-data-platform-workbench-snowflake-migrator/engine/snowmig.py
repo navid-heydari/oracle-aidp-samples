@@ -1338,18 +1338,28 @@ def cmd_run(args) -> int:
         if exhausted:
             # Not "still running": the cluster ignored every attempt. The
             # last run was cancelled so it does not hold the job's slot.
-            cancelled = exhausted.get("cancel_state") in TERMINAL_STATES
+            from report.stages import cold_start_outcome
+            outcome = cold_start_outcome(exhausted)
+            if outcome == "cancelled":
+                last = "cancelled."
+            elif outcome == "ended":
+                # Ended on its own before the cancel landed: it RAN.
+                last = (f'NOT cancelled: it ended {exhausted.get("cancel_state")}'
+                        f' on its own before the cancel landed, so it RAN. Read '
+                        f'its output (RUN_{slug}.md) before any re-run -- a '
+                        f're-run of an append copy writes the rows twice.')
+            else:
+                last = (f'NOT confirmed cancelled ({exhausted.get("cancel_state")}'
+                        f'); cancel it by hand (`aidp workflow cancel-job-run '
+                        f'{args.workspace} {exhausted["run"]}`).')
             print(f'  {slug}: COLD START — the cluster did not pick up any of '
-                  f'{_runs_submitted(result)} run(s), each '
+                  f'{_runs_submitted(result)} run(s) in time, each '
                   f'given {args.cold_start_seconds:.0f}s. The last, '
-                  f'{exhausted["run"]}, was '
-                  + ("cancelled." if cancelled else
-                     f'NOT confirmed cancelled ({exhausted.get("cancel_state")}'
-                     f'); cancel it by hand (`aidp workflow cancel-job-run '
-                     f'{args.workspace} {exhausted["run"]}`).')
-                  + " Check the cluster in the console (state, recent "
-                    "restarts), then re-run; raise --cold-start-restarts if "
-                    "it simply needs more attempts.", file=sys.stderr)
+                  f'{exhausted["run"]}, was ' + last
+                  + (" Check the cluster in the console (state, recent "
+                     "restarts), then re-run; raise --cold-start-restarts if "
+                     "it simply needs more attempts." if outcome == "cancelled"
+                     else ""), file=sys.stderr)
             return 1
         if result.get("unrecognised"):
             # Neither a verdict nor "still going": a status this plugin does
@@ -1430,10 +1440,20 @@ def _render_run(result: dict) -> str:
         # terminal state leaves a run that may still hold the job's only
         # slot -- or start later, unwatched -- so "nothing ran, re-run" is
         # only said when the cancel is confirmed.
-        if ex.get("cancel_state") in TERMINAL_STATES:
+        from report.stages import cold_start_outcome
+        outcome = cold_start_outcome(ex)
+        if outcome == "cancelled":
             verdict = (head + f"and was then cancelled (cancel state "
                        f"`{ex.get('cancel_state')}`{error}). Nothing ran. "
                        f"Check the cluster, then re-run.")
+        elif outcome == "ended":
+            # The task started after the pick-up check and ENDED before the
+            # cancel landed: the run did its work (or failed doing it).
+            verdict = (head + f"at the last check, then **ended "
+                       f"`{ex.get('cancel_state')}` on its own before the "
+                       f"cancel landed**{error}. It RAN: read its output "
+                       f"below before any re-run -- a re-run of an append "
+                       f"copy writes the rows twice.")
         else:
             verdict = (head + f"and was **NOT confirmed cancelled** (state "
                        f"`{ex.get('cancel_state')}`{error}). It may still "

@@ -279,6 +279,24 @@ def _load_stage(out_dir: pathlib.Path, spec: dict):
     return {"_many": data["_many"] + missing} if missing else data
 
 
+def cold_start_outcome(exhausted: dict) -> str:
+    """What the last cancel of an exhausted cold start really established.
+
+    "cancelled" only when the run read back CANCELED: then nothing ran. Any
+    other terminal state means the run ended on its own between the pick-up
+    check and the cancel -- it DID run, and "nothing ran, re-run" would
+    repeat its work (twice the rows, for an append copy). A cancel that
+    reached no terminal state leaves a run that may still start.
+    Returns "cancelled", "ended", or "unconfirmed". One reading for the
+    console, RUN.md and the board.
+    """
+    state = str((exhausted or {}).get("cancel_state") or "")
+    if state == "CANCELED":
+        return "cancelled"
+    from target.jobs import TERMINAL_STATES
+    return "ended" if state in TERMINAL_STATES else "unconfirmed"
+
+
 def run_verdict(run: dict) -> tuple[str, str]:
     """(verdict, kind) for one job-run record -- the ONE reading of a run,
     for every workflow row and the phase report alike.
@@ -313,8 +331,17 @@ def run_verdict(run: dict) -> tuple[str, str]:
                 "unknown")
     if not terminal and run.get("cold_start_exhausted"):
         tried = len(run.get("restarts") or []) + 1
-        return (f"**COLD START — none of {tried} run(s) was picked up; "
-                "nothing ran**", "failed")
+        ex = run["cold_start_exhausted"]
+        outcome = cold_start_outcome(ex)
+        if outcome == "cancelled":
+            return (f"**COLD START — none of {tried} run(s) was picked up; "
+                    "nothing ran**", "failed")
+        if outcome == "ended":
+            return (f"**COLD START race — the last run ended "
+                    f"{ex.get('cancel_state')} before the cancel landed; it "
+                    "RAN: check its output before any re-run**", "unknown")
+        return ("**COLD START — last run NOT confirmed cancelled; it may "
+                "still run**", "unknown")
     if not terminal and run.get("unrecognised"):
         return (f"**UNRECOGNISED STATE {status}**", "unknown")
     if not terminal and run.get("cancel_unconfirmed"):
