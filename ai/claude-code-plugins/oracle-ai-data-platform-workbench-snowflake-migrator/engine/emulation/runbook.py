@@ -214,27 +214,41 @@ def run_demo(out_dir) -> dict:
           f'created one uniquely-named schema and removed it again')
 
     # 7b · provisioning, shown as the dry run it defaults to ----------------
-    from target.provisioning import provision, render_provision
-    scripts_dir = (pathlib.Path(__file__).resolve().parents[2]
-                   / "data-migration-scripts")
+    from target.provisioning import (
+        plan_push_inputs, provision, render_provision)
+    from target.stage_notebooks import STAGES, dataplane_dir
+    # The same inputs `snowmig provision` reads from this out dir: the plan
+    # artifacts already written above, and one copy job per schema of the
+    # approved ddl_plan.json. Called without them, the demo showed the
+    # schemaless generic copy job and no plan push or dated backup.
+    plan_files, copy_schemas = plan_push_inputs(out)
     prov = provision(call=None,
                      workspace_name="SNOWDEMO account — Migração",
-                     scripts=sorted(scripts_dir.glob("*.py")),
+                     scripts=[dataplane_dir() / st.source for st in STAGES],
+                     plan_files=plan_files, copy_schemas=copy_schemas,
                      external_catalog=DEMO_EXTERNAL_CATALOG,
                      target_catalog=DEMO_STANDARD_CATALOG, execute=False)
     _write(out, "provision_result.json", prov)
     _write(out, "PROVISION.md", render_provision(prov))
     # Counted from provision's own steps: data-migration-scripts/ holds only
     # generated notebooks now, so counting *.py there said 0 beside a
-    # PROVISION.md listing five uploads.
-    uploads = sum(1 for st in prov["steps"] if st.get("step") == "upload")
-    jobs = sum(1 for st in prov["steps"] if st.get("step") == "job")
+    # PROVISION.md listing five uploads. A notebook upload is a generated
+    # one; the plan files and their dated backups are counted apart.
+    uploads = [st for st in prov["steps"] if st.get("step") == "upload"]
+    notebooks = sum(1 for st in uploads if "(generated" in st["detail"])
+    plans = len(uploads) - notebooks
+    backups = sum(1 for st in prov["steps"] if st.get("step") == "backup")
+    jobs = [st["detail"] for st in prov["steps"] if st.get("step") == "job"]
+    copies = [j for j in (c["job"] for c in prov["copy_jobs"]) if j in jobs]
     stage(f'provision (dry run): would ensure workspace '
           f'`{prov["workspace"]["name"]}` (name translated from '
           f'"{prov["workspace"]["requested"]}"), the migration_assets '
           f'cluster, the backup-snowflake-migration/ folder with '
-          f'{uploads} notebook(s) uploaded, and {jobs} jobs — '
-          f'nothing created without --execute')
+          f'{notebooks} notebook(s) uploaded, {plans} plan file(s) pushed '
+          f'and {backups} dated backup(s), and {len(jobs)} jobs'
+          + (f', one copy job per planned schema: {", ".join(copies)}'
+             if copies else '')
+          + ' — nothing created without --execute')
     lessons.append(
         "The workspace name was TRANSLATED before any create "
         "(accents/spaces/dashes → the simplest safe charset): a name the API "

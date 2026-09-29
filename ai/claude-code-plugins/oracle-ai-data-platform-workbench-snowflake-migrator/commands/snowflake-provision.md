@@ -1,5 +1,5 @@
 ---
-description: Provision the AIDP migration environment - workspace (name auto-translated), migration-assets cluster, cluster libraries, the backup-snowflake-migration/ folder with scripts and plan, and four parametrised migration jobs. Dry-run by default; --execute only after showing the plan.
+description: Provision the AIDP migration environment - workspace (name auto-translated), migration-assets cluster, cluster libraries, the backup-snowflake-migration/ folder with scripts and plan, and the migration jobs (discover, structure, reconcile, and one copy job per schema of the approved plan, passing schema as a task parameter). Dry-run by default; --execute only after showing the plan.
 ---
 
 # `/snowflake-provision`

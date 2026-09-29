@@ -1,6 +1,6 @@
 ---
 name: snowflake-provision-environment
-description: Provision the migration environment inside AIDP for the prod flow - the workspace (name auto-translated to the simplest safe charset), the migration-assets compute cluster, optional cluster libraries from requirements-aidp.txt, the backup-snowflake-migration/ workspace folder holding the data-migration scripts and the plan artifacts, and four parametrised jobs (discover, structure, copy-schema, reconcile). Use when the user wants to set up AIDP for the migration, upload the migration scripts, create the migration workspace or cluster, or wire the migration jobs. Dry-run by default.
+description: Provision the migration environment inside AIDP for the prod flow - the workspace (name auto-translated to the simplest safe charset), the migration-assets compute cluster, optional cluster libraries from requirements-aidp.txt, the backup-snowflake-migration/ workspace folder holding the data-migration scripts and the plan artifacts, and the migration jobs (discover, structure, reconcile, plus one copy job per schema of the approved plan, each passing its schema as a task parameter). Use when the user wants to set up AIDP for the migration, upload the migration scripts, create the migration workspace or cluster, or wire the migration jobs. Dry-run by default.
 ---
 
 # Provision the migration environment
@@ -44,11 +44,18 @@ re-run with `--execute`.
    `scripts/`, and whatever plan artifacts exist in `--out-dir`
    (`plan.json`, `ddl_plan.json`, `SUMMARY.md`, …) into `plan/`, each upload
    read back before it is called done.
-5. **Four jobs** — `snowmig_00_discover` → `03_reconcile`. Each runs one
-   **self-contained stage notebook** whose own `PARAMS` cell carries the
-   arguments, because job parameters reach a notebook neither as argv nor as
-   environment (established live). No schedule: running one is always the
-   user's call, and the PARAMS cell is editable in the console.
+5. **3 + N jobs** — `snowmig_00_discover`, `snowmig_01_structure`,
+   `snowmig_03_reconcile`, and one `snowmig_02_copy_<schema>` per schema of
+   the approved `ddl_plan.json` (the schemaless `snowmig_02_copy_schema`
+   only before a plan is pushed). Each runs one **self-contained stage
+   notebook** whose own `PARAMS` cell carries the default arguments. A job
+   TASK's `parameters` win over those defaults by the same name: every
+   stage notebook reads them with `oidlUtils.parameters.getParameter`
+   (live-verified), and that is how each per-schema copy job passes its
+   `schema` to the ONE shared `02_copy_schema` notebook. A run-level
+   `run --param` is still refused: that run parameters reach a task is not
+   verified. No schedule: running one is always the user's call, and the
+   PARAMS cell is editable in the console.
 
    `--stage-param NAME=VALUE` (repeatable) writes a value into the PARAMS
    cell of every stage that declares NAME — the stage flag without `--`,
@@ -59,7 +66,12 @@ re-run with `--execute`.
    different things to 01 and 02 — as is a name no stage declares; a
    switch takes `true`/`false`, and with
    `--reuse-existing` it needs `--refresh-notebooks`, because a notebook
-   already on the workspace is otherwise kept as it is.
+   already on the workspace is otherwise kept as it is. Next to per-schema
+   copy jobs, `schema` and `copy_schema.schema` are refused (each job's
+   task parameter wins, so the value would change nothing the copy does;
+   `structure.schema=` narrows 01 only), and so is a `tables` with two or
+   more copy schemas: the one shared notebook would narrow every
+   per-schema copy job to those names.
 
    A job is a **workflow**: logged, re-runnable, and its task output is
    exportable as evidence. Run one with `snowmig.py run --job <name>`, never
