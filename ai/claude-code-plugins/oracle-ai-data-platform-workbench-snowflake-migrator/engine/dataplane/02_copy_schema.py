@@ -676,8 +676,16 @@ def main(argv: list[str] | None = None) -> int:
         # found already there WITH the planned layout counts; one it recorded
         # as `type_drift` never does -- the copy below is a positional INSERT
         # INTO ... SELECT *, and that layout is not the plan's.
+        # Tables only: a VIEW the structure step created (an older report
+        # records views in `objects`), or any name the manifest does not
+        # list as a table, is never an INSERT target -- live, the copy
+        # scoped "7 table(s) ... (the manifest lists 4)" and wrote into
+        # the schema's views.
+        manifest_tables = {t["name"] for t in record["tables"]}
         created = [n for n, rec in (objects or {}).items()
-                   if rec.get("status") in _STRUCTURE_PRESENT]
+                   if rec.get("status") in _STRUCTURE_PRESENT
+                   and str(rec.get("kind") or "").upper() != "VIEW"
+                   and n in manifest_tables]
         if created:
             names = created
             log(f"scope: {len(names)} table(s) the structure step created for "

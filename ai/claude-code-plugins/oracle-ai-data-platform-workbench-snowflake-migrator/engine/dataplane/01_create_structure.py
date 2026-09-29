@@ -60,6 +60,13 @@ re-checked, because that mode's layout is not this one's -- a table --mode
 manifest created is not thereby what the ddl plan approved. `type_drift`,
 `failed` and `not_in_plan` are looked at again every run, so fixing the
 table or the plan is enough.
+
+Views are recorded under a separate `views` key, never in `objects` (the
+table map the copy scope reads). In --mode ddl-plan each planned view is
+created from the plan's own CREATE VIEW SQL after every table exists and
+recorded `created`, `failed` (a failure: exit 1) or `dry_run`; a manifest
+view the plan does not carry is `not_in_plan`. --mode ctas and manifest
+create tables only and record their views `not_created_by_this_path`.
 """
 from __future__ import annotations
 
@@ -509,7 +516,12 @@ def create_planned_views(spark, planned: dict, schemas: list[str],
                          dry_run: bool, force: bool) -> int:
     """Every planned view, from the plan's own CREATE VIEW SQL, AFTER every
     table exists: a view in one schema reads tables in others (ANALYTICS
-    sorts first and reads COMMERCE). Returns the failure count."""
+    sorts first and reads COMMERCE). Returns the failure count.
+
+    The outcome goes under the report's `views`, never `objects`: `objects`
+    is the TABLE map the copy takes its default scope from, and a view
+    recorded there was copied into (live, INSERT INTO a view).
+    """
     failures = 0
     for (schema, name), fact in sorted(planned.items()):
         if schema not in schemas:
@@ -518,8 +530,8 @@ def create_planned_views(spark, planned: dict, schemas: list[str],
         target = f'{target_catalog}.{fact["schema"]}'
         report = _load_report(path, schema, target)
         report["target"] = target
-        if report["objects"].get(name, {}).get("status") == "created" \
-                and not force:
+        views = report.setdefault("views", {})
+        if views.get(name, {}).get("status") == "created" and not force:
             log(f"skip view {schema}.{name}: already created")
             continue
         try:
@@ -532,14 +544,14 @@ def create_planned_views(spark, planned: dict, schemas: list[str],
             else:
                 spark.sql(fact["sql"])
                 status = "created"
-            report["objects"][name] = {"status": status, "kind": "VIEW",
-                                       "target_fqn": fact["target_fqn"]}
+            views[name] = {"status": status, "in_plan": True,
+                           "target_fqn": fact["target_fqn"]}
             log(f"view {schema}.{name} -> {fact['target_fqn']}: {status}")
         except Exception as exc:
             failures += 1
-            report["objects"][name] = {"status": "failed", "kind": "VIEW",
-                                       "target_fqn": fact["target_fqn"],
-                                       "reason": str(exc)[:400]}
+            views[name] = {"status": "failed", "in_plan": True,
+                           "target_fqn": fact["target_fqn"],
+                           "reason": str(exc)[:400]}
             log(f"view {schema}.{name}: FAILED — {str(exc)[:200]}")
         report["updated_at"] = datetime.datetime.now(
             datetime.timezone.utc).isoformat()
@@ -557,14 +569,18 @@ def views_from_ddl_plan(ddl_plan: dict) -> set[tuple[str, str]]:
     return out
 
 
-# This stage creates TABLES. The plan's CREATE VIEW statements are qualified
-# with the plan-time target and their bodies would need re-qualifying for a
-# run-time --target-catalog, so views are the catalog path's job (`snowmig
-# deploy --execute`). They are still LISTED here, so a view the plan promised
-# can never be absent from every report with exit 0.
-VIEW_NOT_CREATED = ("views are not created by this stage (tables only); "
-                    "create them with `snowmig deploy --execute` and verify "
+# In --mode ddl-plan the plan's views are created from its own CREATE VIEW
+# SQL (create_planned_views). --mode ctas and --mode manifest have no plan
+# and create TABLES only, so their views are the catalog path's job
+# (`snowmig deploy --execute`). Every manifest view is still LISTED, so a
+# view can never be absent from every report with exit 0.
+VIEW_NOT_CREATED = ("views are not created by --mode ctas or --mode "
+                    "manifest (tables only); create them with --mode "
+                    "ddl-plan or `snowmig deploy --execute` and verify "
                     "them against the source")
+VIEW_NOT_IN_PLAN = ("the approved ddl_plan carries no CREATE VIEW for this "
+                    "view -- the engine either blocked it or it was outside "
+                    "the plan's scope. NOT created.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -666,8 +682,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"one the plan names.")
         log(f"ddl plan: {len(planned_columns)} table(s) with engine-"
             f"translated types, from {ddl_path}"
-            + (f"; {len(planned_views)} view(s) it carries are NOT created "
-               f"by this stage" if planned_views else ""))
+            + (f"; {len(view_facts)} view(s) it carries are created from "
+               f"its own CREATE VIEW SQL after every table" if view_facts
+               else ""))
 
     source = None
     if args.mode == "ctas":
@@ -841,22 +858,50 @@ def main(argv: list[str] | None = None) -> int:
                 datetime.timezone.utc).isoformat()
             path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-        # Views: listed, never created here. Kept apart from `objects` so
-        # the table tally, the resume logic and the copy scope stay table-only.
+        # Views: kept apart from `objects` so the table tally, the resume
+        # logic and the copy scope stay table-only. In --mode ddl-plan the
+        # planned ones are created after every table (create_planned_views
+        # records each outcome here); every other manifest view is listed
+        # with why it was not created.
+        prior_views = dict(report.get("views") or {})
+        # A report written while views were still recorded in `objects`:
+        # moved, or the copy keeps taking them for tables.
+        for stale in [n for n, o in report["objects"].items()
+                      if str(o.get("kind") or "").upper() == "VIEW"]:
+            prior_views.setdefault(stale, report["objects"].pop(stale))
         views = [v["name"] for v in record.get("views") or []]
-        if views:
+        views += [n for (s, n) in sorted(view_facts)
+                  if s == schema and n not in views]
+        if views or prior_views:
             report["views"] = {}
+            unplanned = []
             for view in views:
-                entry = {"status": "not_created_by_this_path",
-                         "reason": VIEW_NOT_CREATED}
-                if planned_views is not None:
-                    entry["in_plan"] = (schema, view) in planned_views
+                if args.mode != "ddl-plan":
+                    entry = {"status": "not_created_by_this_path",
+                             "reason": VIEW_NOT_CREATED}
+                elif (schema, view) in view_facts:
+                    # Its outcome is written when it is created, below; a
+                    # `created` one from an earlier run is kept for resume.
+                    entry = dict(prior_views.get(view)
+                                 or {"status": "not_attempted"})
+                    entry["in_plan"] = True
+                else:
+                    entry = {"status": "not_in_plan", "reason": VIEW_NOT_IN_PLAN,
+                             "in_plan": (schema, view) in (planned_views
+                                                           or set())}
+                    unplanned.append(view)
                 report["views"][view] = entry
             path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-            log(f"{schema}: {len(views)} view(s) in the manifest are NOT "
-                f"created by this stage ({', '.join(views[:5])}"
-                f"{', ...' if len(views) > 5 else ''}); use `snowmig deploy "
-                f"--execute` for views")
+            if args.mode != "ddl-plan" and views:
+                log(f"{schema}: {len(views)} view(s) in the manifest are NOT "
+                    f"created by --mode {args.mode} ({', '.join(views[:5])}"
+                    f"{', ...' if len(views) > 5 else ''}); use --mode "
+                    f"ddl-plan or `snowmig deploy --execute` for views")
+            elif unplanned:
+                log(f"{schema}: {len(unplanned)} view(s) in the manifest are "
+                    f"not in the approved plan and are NOT created "
+                    f"({', '.join(unplanned[:5])}"
+                    f"{', ...' if len(unplanned) > 5 else ''})")
 
         counts = {}
         for obj in report["objects"].values():
