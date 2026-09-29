@@ -185,10 +185,13 @@ def pipeline_status(board: dict) -> dict:
     # purpose, because "did not look" must not read as "looked and found
     # nothing" -- and treating that flag as "did not run" would block the
     # documented ingest path forever. Attention is a review marker; it is
-    # reported, and it does not stop the pipeline.
+    # reported, and it does not stop the pipeline. An unreadable artifact
+    # is neither: nothing it says can be relied on, so -- as for a twin --
+    # it unblocks nothing.
     done = {r["stage"] for r in rows
             if r["status"] in ("DONE", "SATISFIED")
-            and not r.get("dry_run") and not r.get("failed")}
+            and not r.get("dry_run") and not r.get("failed")
+            and not r.get("unreadable")}
     unblocked, blocked = [], {}
     for r in rows:
         if r["stage"] in done:

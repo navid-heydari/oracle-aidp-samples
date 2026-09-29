@@ -66,7 +66,26 @@ def test_an_unrecognised_or_unreadable_workflow_satisfies_nothing(tmp_path):
             "unrecognised": True, "status": "WEIRD"})
     assert _rows(build_stage_board(tmp_path))["deploy"]["status"] != "SATISFIED"
     (tmp_path / "run_snowmig_01_structure.json").write_text("{not json")
-    assert _rows(build_stage_board(tmp_path))["deploy"]["status"] != "SATISFIED"
+    board = build_stage_board(tmp_path)
+    assert _rows(board)["deploy"]["status"] != "SATISFIED"
+    # Not satisfied on the board, and not "done" for unblocking either: an
+    # artifact nothing can be read from unblocks nothing. It left teardown
+    # unblocked while an absent one kept it blocked.
+    status = pipeline_status(board)
+    assert "structure-workflow or deploy" in status["blocked"]["teardown"]
+    assert "structure-workflow or deploy" in status["blocked"]["copy-workflow"]
+
+
+def test_an_unreadable_copy_run_does_not_unblock_reconcile(tmp_path):
+    # One schema's copy ran; another's artifact is unreadable. The copy
+    # phase is not established, so reconcile stays blocked on it.
+    _write(tmp_path, "run_snowmig_02_copy_sales.json",
+           {"job": "snowmig_02_copy_sales", "terminal": True, "ok": True,
+            "status": "SUCCESS"})
+    (tmp_path / "run_snowmig_02_copy_hr.json").write_text("{not json")
+    status = pipeline_status(build_stage_board(tmp_path))
+    assert "reconcile-workflow" not in status["unblocked"]
+    assert status["blocked"]["reconcile-workflow"] == ["copy-workflow"]
 
 
 def test_a_twin_that_did_its_work_still_satisfies(tmp_path):
