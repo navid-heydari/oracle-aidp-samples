@@ -125,11 +125,17 @@ the stage that records it and is a problem verdict in `MIGRATION_REPORT.md`.
 | `failed` | the CREATE raised; the error is the reason | **yes** |
 | `dry_run` | `--dry-run`; nothing was issued | no |
 
-Views sit under a separate `views` key, every one `not_created_by_this_path`
-(with `in_plan` when the plan was read): these jobs create **tables only**;
-create views with `snowmig deploy --execute` and verify them against the
-source. They are listed so a view the plan promised is never absent from
-every report with exit 0.
+Views sit under a separate `views` key, never in `objects` (the table map
+the copy takes its default scope from). In `ddl-plan` mode each planned view
+is created from the plan's own CREATE VIEW SQL after every table exists, and
+recorded `created`, `failed` (**a problem**: exit 1, the error is the reason)
+or `dry_run`; a manifest view the plan does not carry is `not_in_plan`
+(`in_plan: false`) and NOT created. `ctas` and `manifest` mode create tables
+only and record every view `not_created_by_this_path`; create those with
+`snowmig deploy --execute` and verify them against the source. Every
+manifest view is listed, so none is ever absent from every report with
+exit 0. The copy never writes into a view: its default scope is the
+`objects` the manifest lists as tables.
 
 **`copy_report_<schema>.json`** (`tables`, one per table)
 
@@ -157,7 +163,11 @@ live catalog)
 | `PRESENT_NOT_REVERIFIED` | rows were already there at the source's count; sums not re-checked | no |
 | `STRUCTURE_ONLY` | table present, no copy yet | no |
 | `NOT_MIGRATED` | never attempted, or intentionally not in the plan | no |
-| `VIEW_NOT_CREATED_BY_THIS_PATH` | a manifest view; the job path creates tables only | no |
+| `VIEW_CREATED` | a view the structure job created from the approved plan | no |
+| `VIEW_NOT_IN_PLAN` | a manifest view the approved plan does not carry; NOT created | no |
+| `VIEW_NOT_CREATED_YET` | a planned view not created yet (`--dry-run`) | no |
+| `VIEW_NOT_CREATED_BY_THIS_PATH` | a manifest view no `ddl-plan` structure run recorded (`ctas` / `manifest` mode create tables only) | no |
+| `VIEW_FAILED` | the structure job's CREATE VIEW raised; the error is the reason | **yes** |
 | `MISSING_DESPITE_REPORT` | a report says created or verified; the catalog lacks it | **yes** |
 | `STRUCTURE_FAILED` | the CREATE raised | **yes** |
 | `STRUCTURE_TYPE_DRIFT` | the table's layout is not the plan's — outranks a verified copy, since counts match when rows land in the wrong columns | **yes** |

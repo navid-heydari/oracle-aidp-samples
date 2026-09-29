@@ -10,6 +10,25 @@ first release.
 
 ## [Unreleased]
 
+### Fixed — views the structure stage creates are no longer copied into, and are reported for what happened
+- `01_create_structure --mode ddl-plan` records each planned view under `views` (`created` / `failed` / `dry_run`, `not_in_plan` for a manifest view the plan lacks) and no longer in `objects`. It stops saying views are "NOT created by this stage".
+- `02_copy_schema`'s default scope is tables only: never a `kind: VIEW` entry, never a name the manifest does not list as a table. Before this, a live run issued INSERT INTO the schema's views and exited 1.
+- `03_reconcile` reports `VIEW_CREATED`, `VIEW_FAILED` (a problem verdict, exit 1), `VIEW_NOT_IN_PLAN` and `VIEW_NOT_CREATED_YET` from the structure report, where it used to hard-code `VIEW_NOT_CREATED_BY_THIS_PATH`.
+
+### Fixed — structure stage creates views in the plan's dependency order
+- `01_create_structure` created the plan's views in alphabetical order. A view reading a view whose name sorts later (A_SUMMARY over B_DETAIL) failed `TABLE_OR_VIEW_NOT_FOUND` and the S10 job exited 1, needing one manual re-run per level of the chain.
+- Views are now created in the order the ddl plan emits them (wave order), still after every table.
+
+### Fixed — a failed structure run writes its own S10_structure.json
+- `01_create_structure` returned before writing its step output whenever it failed. After a TYPE DRIFT re-run that exited 1, `report/output` still held the previous run's S10 (`failures: 0`, `created: 1`, old `written_at`).
+- S10 is now written by every run that gets through the schemas. It includes the failure count, a new `outcome` (`ok` / `failed` / `created_nothing`) and, for a plan that does not overlap the schema, the error.
+
+### Fixed — view reference rewriting reads table positions the way the lineage scanner does
+- A column after `EXTRACT(... FROM`, `TRIM(... FROM`, `SUBSTRING(... FROM` or `IS [NOT] DISTINCT FROM` is no longer reported as an object "not part of this migration" whose CREATE VIEW "will fail".
+- Every item of a FROM list is qualified: in `from ORDERS o, CUSTOMERS c`, CUSTOMERS used to stay bare with no warning.
+- A quoted in-migration reference (`"COMMERCE"."Orders"`) is rewritten, and an unquoted `COMMERCE.orders` no longer resolves to it.
+- The unresolved-reference rule is now `R45_VIEW_REFS_UNRESOLVED`. It used to share `R44` with `R44_VIEW_COLUMN_LIST`.
+
 ### Fixed — token-summary tests skip cleanly where symlinks are not permitted
 - Two tests in `tests/test_phases.py` point a fake `~/.claude/projects` at their transcripts with a symlink. On Windows without Developer Mode or admin rights, creating the symlink raises WinError 1314, so the tests failed because of the machine, not the code.
 - They now skip and give the reason, so the full suite can be green on such a machine.
