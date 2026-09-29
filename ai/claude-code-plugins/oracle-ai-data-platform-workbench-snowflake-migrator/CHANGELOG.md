@@ -10,6 +10,55 @@ first release.
 
 ## [Unreleased]
 
+### Fixed — a workflow switch typo no longer turns a dry run into a write
+- The stage notebooks' PARAMS cell read any switch task parameter other than
+  true/yes/on/1 as False, so `dry-run=y` (or `ture`) on a job task dropped a
+  baked `--dry-run` and ran 01/02 for real. The cell now accepts only the
+  true/false words `--stage-param` accepts and refuses anything else by name.
+- A choice value outside the stage's choices (`mode=apend`, or 02's
+  `overwrite` on 01) is refused in the cell rather than by argparse later.
+
+### Fixed — retries now see HTTP errors `oci raw-request` returns with exit 0
+- `oci raw-request` exits 0 and puts a 429/503 in the response body. The
+  body was parsed only after the retry layer returned, so on oci_raw a single
+  throttle or 503 on list_clusters, create_job, run_job, list_catalogs or a
+  SQL statement failed the stage on the first attempt, and `retry:` had no
+  effect. The body is now parsed inside the retried attempt in all three
+  transports. A write answered 5xx is still sent only once.
+
+### Fixed — RUN_<job>.md no longer calls an unconfirmed cold-start cancel 'cancelled'
+- When every cold-start attempt was spent, the record always said the last
+  run was cancelled and 'Nothing ran', even when the cancel was stuck at
+  CANCELING or had raised. It now says NOT confirmed cancelled, that the run
+  may still hold the job's slot, and gives the cancel command.
+- The console and the record now count the runs actually submitted. A
+  restart whose cancel was not confirmed submitted nothing.
+
+### Fixed — `run --param` advice and `--stage-param` for per-schema copy jobs
+- For `snowmig_02_copy_<schema>` jobs the refusal suggested an unqualified
+  `--stage-param mode=`, which provision then refuses, and suggested baking a
+  `schema` that the job's task parameter overrides. It now suggests
+  `copy_schema.<name>` and names `schema` as the job's task parameter.
+- provision refuses `schema` / `copy_schema.schema` next to per-schema copy
+  jobs, and a `tables` that would narrow all of them.
+- The help and docs now say that job task parameters (read with
+  getParameter) win over PARAMS, and that provision creates 3 + N jobs.
+
+### Fixed — the Snowflake connect no longer retries an invalid account as a network blip
+- Errnos 251001 (invalid account identifier, raised before any socket), 253003
+  and 290400 were retried as transient. Pasting the account URL into `account:`
+  cost 14 s, printed three RETRY lines and was recorded as network flakiness.
+  Only timeout / retryable / failed-to-request errnos are retried now, and a
+  NonRetryableTlsError never is.
+- 251001 now gets a hint: `account` is the identifier, not the URL.
+
+### Fixed — the demo's provision step matches the real provision
+- The no-credentials demo called provision without the plan it had just
+  written. It showed the schemaless `snowmig_02_copy_schema` job and no
+  per-schema copy jobs, no plan push and no dated backups. The demo and
+  `snowmig provision` now read their inputs through one helper, so the
+  demo's PROVISION.md has the same shape as a real run's.
+
 ### Fixed — findings of the 2026-09-29 end-to-end run on a fresh workspace
 
 - **Cold start: one retry was not enough.** The first run was cancelled at
