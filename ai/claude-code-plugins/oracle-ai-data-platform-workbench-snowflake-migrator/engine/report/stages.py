@@ -27,7 +27,7 @@ import re
 from plan.smoke import smoke_verdict
 
 __all__ = ["RUNS_ON", "STAGES", "UTILITY_COMMANDS", "build_stage_board", "phase_report",
-           "stage_for"]
+           "run_verdict", "stage_for"]
 
 # THE ordered pipeline. Every other view of a run -- the board, the phase
 # report, the diagram, the token roll-up, "what can run now" -- reads this,
@@ -239,6 +239,47 @@ def _load(out_dir: pathlib.Path, name: str):
         return {"_unreadable": True}
 
 
+def run_verdict(run: dict) -> tuple[str, str]:
+    """(verdict, kind) for one job-run record -- the ONE reading of a run,
+    for every workflow row and the phase report alike.
+
+    Checked in the order cmd_run and RUN.md check them, so the three never
+    disagree: a status that could not be read, the cold-start attempts
+    exhausted (nothing ran), a state this plugin does not classify, a
+    cancel that never confirmed (nothing was resubmitted), a poll budget
+    that ran out with the job going (STILL RUNNING, never rounded to a
+    verdict), then the terminal status. Only a restart that actually
+    resubmitted (`new_run` set) is counted as one.
+
+    kind is success, failed, running or unknown. A record written before
+    `terminal` existed is read as terminal.
+    """
+    status = run.get("status") or _UNKNOWN
+    terminal = run.get("terminal", True)
+    resubmitted = sum(1 for r in run.get("restarts") or []
+                      if isinstance(r, dict) and r.get("new_run"))
+    after = (f" after {resubmitted} cold-start restart(s)"
+             if resubmitted else "")
+    if run.get("status_unreadable"):
+        return ("**STATUS UNREADABLE** — the run was submitted and may still "
+                "be going; check it in the console before starting another",
+                "unknown")
+    if not terminal and run.get("cold_start_exhausted"):
+        tried = len(run.get("restarts") or []) + 1
+        return (f"**COLD START — none of {tried} run(s) was picked up; "
+                "nothing ran**", "failed")
+    if not terminal and run.get("unrecognised"):
+        return (f"**UNRECOGNISED STATE {status}**", "unknown")
+    if not terminal and run.get("cancel_unconfirmed"):
+        return ("**cold start suspected; cancel unconfirmed — nothing was "
+                "resubmitted**" + after, "unknown")
+    if not terminal:
+        return ("STILL RUNNING" + after, "running")
+    if run.get("ok"):
+        return ((run.get("status") or "SUCCESS") + after, "success")
+    return (f'**{run.get("status") or "FAILED"}**' + after, "failed")
+
+
 def _finding(stage: str, data: dict) -> tuple[str, bool]:
     """(what it found, needs attention)."""
     if data.get("_unreadable"):
@@ -434,28 +475,17 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
         return (text, bool(bad or unverified or drift or errors))
 
     if "_many" in data:
-        # The last recorded result per job. A run whose budget ran out is
-        # STILL RUNNING, never rounded to either verdict. A status watch_job
-        # does not classify (`unrecognised`) is neither done nor running;
-        # cmd_run says so and exits 1, and the board must not round it up.
+        # The last recorded result per job (one job per schema).
         parts, attention = [], False
         for run in data.get("_many") or []:
             if run.get("_unreadable"):
                 parts.append("a run artifact is unreadable")
                 attention = True
                 continue
-            job = run.get("job") or run.get("job_key") or "?"
-            clean = False
-            if not run.get("terminal") and run.get("unrecognised"):
-                verdict = f'**UNRECOGNISED STATE {run.get("status") or "?"}**'
-            elif not run.get("terminal"):
-                verdict = "STILL RUNNING"
-            elif run.get("ok"):
-                verdict, clean = run.get("status") or "SUCCESS", True
-            else:
-                verdict = f'**{run.get("status") or "FAILED"}**'
-            attention = attention or not clean
-            parts.append(f"{job}: {verdict}")
+            verdict, kind = run_verdict(run)
+            attention = attention or kind != "success"
+            parts.append(f'{run.get("job") or run.get("job_key") or "?"}: '
+                         f'{verdict}')
         return ("; ".join(parts) or "written", attention)
 
     if stage == "data-options":
@@ -464,11 +494,8 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
                  "options presented; none chosen"), False)
 
     if "run_key" in data or stage.endswith("-workflow"):
-        status = data.get("status") or _UNKNOWN
-        restarts = len(data.get("restarts") or [])
-        text = f"job run {status}" + (
-            f" after {restarts} cold-start restart(s)" if restarts else "")
-        return (text, not data.get("ok"))
+        verdict, kind = run_verdict(data)
+        return (f"job run {verdict}", kind != "success")
 
     return ("written", False)
 
@@ -582,18 +609,38 @@ def _verdict(code) -> str:
     return {0: "PASS", 3: "HALT"}.get(int(code), "FAIL")
 
 
-def _job_failure(art) -> str | None:
-    """FAIL (...) when a workflow artifact's job answered ok: false, else
-    None. Applies whether or not the run was logged: a job that did not do
-    its work is a failure either way."""
-    bad = [r for r in _job_runs(art) if r.get("ok") is False]
-    if not bad:
+def _job_result(art) -> str | None:
+    """The phase-report result a workflow artifact decides, else None.
+
+    FAIL when a job did not do its work, UNKNOWN when its state is not
+    established (unreadable, unrecognised, cancel unconfirmed), STILL
+    RUNNING when the poll budget ran out with it going -- the same reading
+    as the board (run_verdict). Applies whether or not the run was logged.
+    A workflow's exit code is not the finer statement: cmd_run exits 0 for
+    a run still going and 1 for one it cannot classify."""
+    runs = _job_runs(art)
+    if not runs:
         return None
-    if "_many" in art:
-        # One job per schema: name the ones that did not succeed.
-        return "FAIL (" + ", ".join(
-            f'job {r.get("job")} {r.get("status", "?")}' for r in bad) + ")"
-    return f'FAIL (job {bad[0].get("status", "?")})'
+    many = "_many" in art
+    graded = []
+    for run in runs:
+        if run.get("_unreadable"):
+            graded.append((run, "artifact unreadable", "unknown"))
+            continue
+        verdict, kind = run_verdict(run)
+        # "STILL RUNNING (job STILL RUNNING)" says nothing: name the status.
+        graded.append((run, (str(run.get("status") or _UNKNOWN)
+                             if kind == "running"
+                             else verdict.replace("**", "")), kind))
+    for kind, head in (("failed", "FAIL"), ("unknown", "UNKNOWN"),
+                       ("running", "STILL RUNNING")):
+        hits = [(r, v) for r, v, k in graded if k == kind]
+        if hits:
+            # One job per schema: name the ones behind the verdict.
+            return f"{head} (" + ", ".join(
+                (f'job {r.get("job") or "?"} {v}' if many else f"job {v}")
+                for r, v in hits) + ")"
+    return None
 
 
 def _phase_summary(rows: list[dict]) -> list[dict]:
@@ -601,7 +648,8 @@ def _phase_summary(rows: list[dict]) -> list[dict]:
 
     A phase FAILS if any of its stages' last run failed or halted; it is
     UNKNOWN if any stage's outcome was not established (a crash or an
-    interrupt logs no exit code) -- never PASS; it is NOT_RUN while any
+    interrupt logs no exit code) -- never PASS; STILL RUNNING while a job
+    it started is still going; it is NOT_RUN while any
     required stage in it has not run; SKIPPED when every stage in it is
     optional and none ran; otherwise it PASSES."""
     out = []
@@ -612,12 +660,15 @@ def _phase_summary(rows: list[dict]) -> list[dict]:
         passed = sum(1 for x in res if x == "PASS" or x.startswith("DONE"))
         failed = sum(1 for x in res if x.startswith(("FAIL", "HALT")))
         unknown = sum(1 for x in res if x.startswith("UNKNOWN"))
+        running = sum(1 for x in res if x.startswith("STILL RUNNING"))
         not_run = [r["stage"] for r in mine if r["result"] == "NOT_RUN"]
         skipped = sum(1 for x in res if x.startswith("SKIPPED"))
         if failed:
             verdict = "FAIL"
         elif unknown:
             verdict = "UNKNOWN"
+        elif running:
+            verdict = "STILL RUNNING"
         elif not_run:
             verdict = "NOT_RUN" if not passed else "PARTIAL"
         elif not passed and skipped == len(mine):
@@ -626,7 +677,8 @@ def _phase_summary(rows: list[dict]) -> list[dict]:
             verdict = "PASS"
         out.append({
             "phase": phase, "stages": len(mine), "passed": passed,
-            "failed": failed, "unknown": unknown, "not_run": len(not_run),
+            "failed": failed, "unknown": unknown, "running": running,
+            "not_run": len(not_run),
             "skipped": skipped,
             "duration_seconds": round(sum(r["duration_seconds"] or 0
                                           for r in mine), 1),
@@ -680,7 +732,7 @@ def phase_report(out_dir) -> dict:
                "duration_seconds": None, "retries": 0}
         # A workflow can exit 0 locally with a job that did not succeed.
         art = _load(out_dir, spec["artifact"]) if spec.get("job") else None
-        job_failure = _job_failure(art)
+        job_result = _job_result(art)
         if mine:
             last = mine[-1]
             lo, hi = _ts(last.get("started_at")), _ts(last.get("ended_at"))
@@ -697,10 +749,10 @@ def phase_report(out_dir) -> dict:
                 row["retries"] += sum(
                     1 for line in str(run.get("output") or "").splitlines()
                     if _RETRY_LINE.search(line))
-            if job_failure:
-                row["result"] = job_failure
+            if job_result:
+                row["result"] = job_result
         elif _artifact_paths(out_dir, spec["artifact"]):
-            row["result"] = job_failure or "DONE (not logged)"
+            row["result"] = job_result or "DONE (not logged)"
         else:
             row["result"] = ("SKIPPED (optional)" if spec.get("optional")
                              else "NOT_RUN")

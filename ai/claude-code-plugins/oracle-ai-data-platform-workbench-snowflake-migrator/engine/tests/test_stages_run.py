@@ -76,7 +76,10 @@ def test_a_failed_or_unfinished_job_run_needs_attention(tmp_path):
     assert rows["structure-workflow"]["attention"] is True
     assert "FAILED" in rows["structure-workflow"]["found"]
     assert rows["copy-workflow"]["attention"] is True
-    assert "RUNNING" in rows["copy-workflow"]["found"]
+    # A run whose poll budget ran out is STILL RUNNING -- cmd_run exits 0
+    # and says "not failed, not done" -- never a bare status that reads
+    # like a verdict.
+    assert "STILL RUNNING" in rows["copy-workflow"]["found"]
 
 
 def test_the_stage_board_skill_names_run_as_a_writer():
@@ -104,8 +107,126 @@ def test_an_unrecognised_run_state_is_not_rounded_up_to_still_running(tmp_path):
             "unrecognised": True, "status": "X"})
     row = next(r for r in build_stage_board(tmp_path)["stages"]
                if r["stage"] == "copy-workflow")
-    # The point stands: the state is reported as written, never rounded up
-    # to "still running" for a run that may never finish.
     assert "STILL RUNNING" not in row["found"]
-    assert "X" in row["found"]
+    assert "UNRECOGNISED STATE X" in row["found"]
     assert row["attention"] is True
+
+
+# ------------------------------------------------ one verdict for a job run
+#
+# After the fold no stage was named `run`, so the per-job branch above that
+# said STILL RUNNING and UNRECOGNISED STATE was unreachable. Every workflow
+# row took a generic branch -- "job run <status>" plus "after N cold-start
+# restart(s)" -- that ignored terminal, unrecognised, cancel_unconfirmed,
+# cold_start_exhausted and status_unreadable, and counted restarts whose
+# new_run was None. So RUN.md said "Nothing ran" or "nothing was
+# resubmitted" while the board said "job run RUNNING after 5 cold-start
+# restart(s)", and the phase report turned a healthy run whose poll budget
+# ran out (cmd_run exits 0) into "FAIL (job RUNNING)" with the target phase
+# FAIL.
+
+from report.stages import phase_report  # noqa: E402
+from report.tokens import record_stage_run  # noqa: E402
+
+_UNSTARTED = {"abandoned_run": None, "cancel_state": "CANCELING",
+              "cancel_error": None, "new_run": None, "kept_run": "r-1",
+              "after_seconds": 120.0}
+
+
+def _structure(tmp_path, **record):
+    base = {"job": "snowmig_01_structure", "run_key": "r-1",
+            "terminal": False, "ok": False, "status": "RUNNING",
+            "restarts": [], "unrecognised": False,
+            "status_unreadable": False, "cold_start_exhausted": None,
+            "cancel_unconfirmed": False}
+    _write(tmp_path, "run_snowmig_01_structure.json", {**base, **record})
+    return next(r for r in build_stage_board(tmp_path)["stages"]
+                if r["stage"] == "structure-workflow")
+
+
+def _resubmitted(n):
+    return [{"abandoned_run": f"r-{i}", "cancel_state": "CANCELED",
+             "cancel_error": None, "new_run": f"r-{i + 1}",
+             "after_seconds": 120.0} for i in range(n)]
+
+
+def test_cold_start_exhausted_says_nothing_ran_not_running(tmp_path):
+    row = _structure(tmp_path, restarts=_resubmitted(5),
+                     cold_start_exhausted={"run": "r-5",
+                                           "after_seconds": 120.0,
+                                           "cancel_state": "CANCELED",
+                                           "cancel_error": None})
+    assert "COLD START" in row["found"] and "nothing ran" in row["found"]
+    assert "RUNNING" not in row["found"]
+    assert "cold-start restart(s)" not in row["found"]
+    assert row["attention"] is True and row["failed"] is True
+
+
+def test_cancel_unconfirmed_is_not_a_restart_and_not_running(tmp_path):
+    row = _structure(tmp_path, restarts=[_UNSTARTED] * 5,
+                     cancel_unconfirmed=True)
+    assert "cancel unconfirmed" in row["found"]
+    assert "nothing was resubmitted" in row["found"]
+    assert "RUNNING" not in row["found"]
+    assert "cold-start restart(s)" not in row["found"], \
+        "an attempt whose cancel failed resubmitted nothing"
+    assert row["attention"] is True
+
+
+def test_only_resubmitted_restarts_are_counted(tmp_path):
+    row = _structure(tmp_path, terminal=True, ok=True, status="SUCCESS",
+                     restarts=_resubmitted(2) + [_UNSTARTED])
+    assert "after 2 cold-start restart(s)" in row["found"], row["found"]
+    assert row["attention"] is False
+
+
+def test_an_unreadable_status_is_not_a_verdict(tmp_path):
+    row = _structure(tmp_path, status="UNREADABLE", status_unreadable=True)
+    assert "STATUS UNREADABLE" in row["found"]
+    assert "STILL RUNNING" not in row["found"]
+    assert row["attention"] is True
+
+
+def test_the_single_job_row_says_still_running_and_unrecognised(tmp_path):
+    assert "STILL RUNNING" in _structure(tmp_path)["found"]
+    row = _structure(tmp_path, status="WEIRD", unrecognised=True)
+    assert "UNRECOGNISED STATE WEIRD" in row["found"]
+    assert "STILL RUNNING" not in row["found"]
+
+
+def test_a_run_still_going_is_not_a_phase_failure(tmp_path):
+    record_stage_run(tmp_path, "structure-workflow",
+                     "2026-09-24T10:00:00+00:00", "2026-09-24T10:10:00+00:00",
+                     0, None, job="snowmig_01_structure")
+    _structure(tmp_path)
+    rep = phase_report(tmp_path)
+    row = next(p for p in rep["phases"] if p["stage"] == "structure-workflow")
+    assert not row["result"].startswith("FAIL"), row["result"]
+    assert row["result"].startswith("STILL RUNNING"), row["result"]
+    target = next(p for p in rep["phase_summary"] if p["phase"] == "target")
+    assert target["verdict"] != "FAIL"
+    assert target["passed"] == 0, "a run still going has not passed"
+    assert target["verdict"] == "STILL RUNNING"
+
+
+def test_an_unrecognised_state_in_the_phase_report_is_unknown(tmp_path):
+    # cmd_run exits 1 here, and that exit is "neither done nor running",
+    # not a failure the job reported.
+    record_stage_run(tmp_path, "structure-workflow",
+                     "2026-09-24T10:00:00+00:00", "2026-09-24T10:10:00+00:00",
+                     1, None, job="snowmig_01_structure")
+    _structure(tmp_path, status="WEIRD", unrecognised=True)
+    row = next(p for p in phase_report(tmp_path)["phases"]
+               if p["stage"] == "structure-workflow")
+    assert row["result"].startswith("UNKNOWN"), row["result"]
+    assert "UNRECOGNISED STATE WEIRD" in row["result"]
+
+
+def test_a_terminal_failure_is_still_a_phase_failure(tmp_path):
+    record_stage_run(tmp_path, "structure-workflow",
+                     "2026-09-24T10:00:00+00:00", "2026-09-24T10:10:00+00:00",
+                     1, None, job="snowmig_01_structure")
+    _structure(tmp_path, terminal=True, status="FAILED")
+    row = next(p for p in phase_report(tmp_path)["phases"]
+               if p["stage"] == "structure-workflow")
+    assert row["result"] == "FAIL (job FAILED)"

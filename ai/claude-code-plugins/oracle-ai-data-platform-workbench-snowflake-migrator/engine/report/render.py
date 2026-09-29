@@ -1907,7 +1907,10 @@ def render_phase_report(rep: dict) -> str:
            "failed. A stage that did not run is listed, never omitted, and the "
            "last run of a stage decides its verdict (earlier failures are "
            "counted). A run logged with no exit code crashed or was "
-           "interrupted: it is UNKNOWN, and so is its phase -- never PASS.", "",
+           "interrupted: it is UNKNOWN, and so is its phase -- never PASS. A "
+           "workflow is read from its job record, as RUN.md reads it: a job "
+           "still going is STILL RUNNING, one in a state this plugin does "
+           "not classify is UNKNOWN, neither is a FAIL or a PASS.", "",
            "## Phases at a glance", "",
            "| Phase | Verdict | Stages | Passed | Failed | Not run | Duration "
            "| Retries | Resources | Runbook steps |",
