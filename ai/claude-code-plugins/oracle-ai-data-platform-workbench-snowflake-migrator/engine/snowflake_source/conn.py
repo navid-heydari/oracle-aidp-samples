@@ -178,6 +178,9 @@ def build_connect_kwargs(auth: str, *, account: str, user: str | None = None,
 # message for that is a 404 on a URL, which reads like a tool failure.
 _CONNECT_HINTS = {
     "250001": "the account/host could not be reached at all",
+    "251001": "`account` must be the account identifier, not the URL "
+              "(e.g. ORG-ACCOUNT, without https:// or "
+              ".snowflakecomputing.com)",
     "290404": "the account/host could not be reached at all",
     "390100": "the user or the password/key was rejected",
     "390190": "this account has no SAML IdP, so `auth: externalbrowser` "
@@ -188,11 +191,15 @@ _CONNECT_HINTS = {
               "this role",
 }
 
-# Driver errnos that mean "could not reach it this time": connection
-# refused/reset, timeout, retryable HTTP. Auth and object errors are absent
-# on purpose -- repeating them only delays the message.
-_NETWORK_ERRNOS = {"250003", "251001", "251011", "251012", "253003",
-                   "290400"}
+# Driver errnos that mean "could not reach it this time", by the driver's
+# own names (snowflake.connector.errorcode): ER_CONNECTION_TIMEOUT 251011,
+# ER_RETRYABLE_CODE 251012, ER_FAILED_TO_REQUEST 250003. Auth, config and
+# object errors are absent on purpose -- repeating them only delays the
+# message. That excludes 251001 (ER_NO_ACCOUNT_NAME: an invalid account
+# identifier, raised locally before any socket), 253003 (a stage upload)
+# and 290400 (HTTP 400), which all used to be here. Literals, not imports:
+# this module is imported where the driver is not installed.
+_NETWORK_ERRNOS = {"250003", "251011", "251012"}
 
 _CONNECT_ADVICE = (
     "Check `account`/`host`, `user`, `role`, `warehouse` and `database` in the "
@@ -221,6 +228,13 @@ def connect(**kwargs):
         # Only a failure to REACH Snowflake is repeated. A rejected user,
         # password, role or warehouse is permanent and fails on the first try.
         code = str(getattr(exc, "errno", "") or "")
+        # A TLS failure the driver itself marks as unable to succeed on a
+        # retry carries 250003 too (a certificate, a hostname, a protocol
+        # floor); it is not a blip.
+        tls = getattr(snowflake.connector.errors, "NonRetryableTlsError",
+                      None)
+        if tls is not None and isinstance(exc, tls):
+            return False
         return code in _NETWORK_ERRNOS
 
     try:
