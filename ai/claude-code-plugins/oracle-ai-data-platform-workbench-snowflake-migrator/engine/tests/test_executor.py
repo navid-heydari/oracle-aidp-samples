@@ -241,7 +241,7 @@ def test_a_2xx_status_is_accepted():
 
 
 def test_nested_data_items_is_unwrapped_to_rows():
-    # The real shape of every AIDP collection response. Without unwacmeng,
+    # The real shape of every AIDP collection response. Without unwrapping,
     # three schemas were reported as "1 schema(s) visible".
     rows = parse_cli_json(json.dumps({"data": {"items": [
         {"key": "lake.bronze"}, {"key": "lake.default"}, {"key": "lake.scd"}]}}))

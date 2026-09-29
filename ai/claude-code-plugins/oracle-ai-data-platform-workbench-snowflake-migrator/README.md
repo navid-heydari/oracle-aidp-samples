@@ -1,10 +1,5 @@
 # Oracle AI Data Platform — Snowflake Migrator (Claude Code plugin)
 
-> ⚠️ **Before sharing or publishing this plugin, work through
-> [CLEANUP-BEFORE-PUBLISH.md](CLEANUP-BEFORE-PUBLISH.md).** It carries
-> customer-confidential context and a developer's test-account details that must
-> come out first.
-
 Investigate a Snowflake estate and migrate it onto Oracle AI Data Platform
 (AIDP): inventory → what can and cannot move → medallion layout → the target
 catalog, registered EXTERNAL against the live Snowflake source → the AIDP
@@ -657,8 +652,6 @@ gated end-to-end tests run against a real account.
 
 ## Docs
 
-- [docs/specs/2026-09-09-mvp1-design.md](docs/specs/2026-09-09-mvp1-design.md) — design
 - [references/type-mapping.md](references/type-mapping.md) — the type table
 - [ASSUMPTIONS.md](ASSUMPTIONS.md) — everything this rests on, and what breaks if each is wrong
 - [references/data-movement-options.md](references/data-movement-options.md) — the ways bytes could move; one is implemented by the data plane (`snowmig_02_copy_schema`, in-AIDP INSERT-SELECT), the rest are options
-- [CLEANUP-BEFORE-PUBLISH.md](CLEANUP-BEFORE-PUBLISH.md) — **do this before sharing**

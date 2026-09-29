@@ -85,13 +85,10 @@ says what happens if it is wrong. Reviewed 2026-09-16.
 | D9 | The maintenance statements will execute through THIS plugin's backend | **Unverified.** `OPTIMIZE`/`VACUUM`/`CLUSTER BY` are confirmed on AIDP by the sibling plugin's path; this plugin has never run them. Item M8 in `ACTION-ITEMS.md` |
 | D8 | `DROP SCHEMA` is permitted at the destination | Used only by `smoke --write-probe --execute`, on exactly one per-run uniquely-named schema (`snowmig_permission_probe_<8 hex>`), never `CASCADE`, and only on the schema that run itself created. The no-`DROP` rule is a **source** guarantee and does not extend to AIDP |
 
-## E. Assumptions about the engagement
+## E. Assumptions about scope and the data-movement decision
 
 | # | Assumption | If wrong |
 |---|---|---|
-| E1 | The goal is the plugin, not a migrated customer | Stated explicitly. Acme supplies the shape of the requirement |
-| E2 | Migration Assessment is the current phase | Only Preparation and Executive Demo carry `[DONE]`. Unconfirmed |
-| E3 | Acme's region is unresolved | Three answers exist: the deck's diagram says Ashburn, a note says Oregon, and the test account is Ohio. **No cost or transfer estimate should be produced until this is settled** |
 | E4 | Data movement is a later phase | See `references/data-movement-options.md`. Five options are presented; none is implemented |
 | E5 | The architecture choice belongs to the customer | The options are surfaced in **every** plan and summary, and no default is applied. If the user expresses no preference, `A2` (federate first) is offered as a stated *recommendation*, never as a silent default |
 | E6 | The eventual architecture may be none of the ones listed | `A6_CUSTOMER_DEFINED` is the open slot. A customer design is recorded verbatim and **never mapped** to `A1`–`A5`, and this plugin makes no assessment of it — so none of the trade-offs or unknowns listed against the others transfer to it |
@@ -101,5 +98,4 @@ says what happens if it is wrong. Reviewed 2026-09-16.
 
 1. **The 0.16.0 default path is now partly executed.** EXTERNAL catalog registration (B2a) and the notebook upload/run are both **live-verified** as of 2026-09-19: the EXTERNAL/SNOWFLAKE catalog was created and read back, and the four stage notebooks uploaded as `NOTEBOOK` objects. Per-stage status is kept in GAPS.md "What is actually proven"; its sentence: **What has run live:** the discovery job (`snowmig_00_discover`) ran to SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`) ran on a cluster from the approved plan, a healthy 23-minute run left alone by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`) and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the authors**. Still unproven beyond that: scale past one schema, the EXTERNAL crawler (B16), the `NUMBER(p,s)` round trip (item 2).
 2. **`NUMBER(p,s)` has never been through an unload round trip.** It survives the Python connector; the Parquet-and-Delta path is untested and is the assumption that invalidates the most if wrong.
-3. **Acme's actual region is unknown** (E3).
-4. **The test estate proves nothing about scale** (A6).
+3. **The test estate proves nothing about scale** (A6).
