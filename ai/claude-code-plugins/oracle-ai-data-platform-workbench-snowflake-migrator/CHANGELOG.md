@@ -30,6 +30,10 @@ first release.
 - An unrecognised or unreadable state is UNKNOWN. An unconfirmed cancel says nothing was resubmitted. Exhausted cold-start attempts say nothing ran.
 - Only cold-start restarts that actually resubmitted a run are counted. The board no longer claims "5 cold-start restart(s)" when RUN.md says nothing ran.
 
+### Fixed — a job still going is RUNNING, its alternative waits, and a partial copy is PARTIAL
+- A structure run whose poll budget ran out read DONE and `failed`, and the board offered `deploy` — the other way to create the same objects — as the next step, a second write while the job may still be creating them. The run is now RUNNING (not failed); its alternative is PENDING on it and is neither next nor unblocked.
+- One schema's copy SUCCESS read as the copy done. `copy-workflow` now checks against the jobs provision registered (`copy_jobs`): a registered job with no run makes it PARTIAL, names the job, and keeps reconcile blocked. The phase report agrees.
+
 ### Fixed — a dry-run, failed or unreadable stage no longer satisfies its alternative
 - structure-workflow and deploy (and assess and ingest) are alternatives: doing either satisfies both. The board satisfied one as soon as the other's artifact existed, so dry runs and failed jobs counted phases as complete and unblocked copy and teardown.
 - A stage is now satisfied only when its alternative really ran, did not fail, was not a dry run and its artifact could be read. Otherwise the board says "not satisfied" and why.
