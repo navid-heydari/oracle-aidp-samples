@@ -159,7 +159,10 @@ def test_views_are_created_from_the_plan_after_every_table(run):
 def test_the_report_records_views_and_the_target_it_used(run):
     _, _, reports = run(_plan())
     rep = json.loads((reports / "structure_report_analytics.json").read_text())
-    assert rep["objects"]["VW_ORDERS"]["status"] == "created"
+    # Under `views`, not `objects`: `objects` is the table map the copy
+    # takes its scope from, and a view recorded there was copied into.
+    assert rep["views"]["VW_ORDERS"]["status"] == "created"
+    assert "VW_ORDERS" not in rep["objects"]
     assert rep["target"] == "target_cat.src_db_analytics"
     com = json.loads((reports / "structure_report_commerce.json").read_text())
     assert com["objects"]["ORDERS"]["target_fqn"] == f"{P}.orders"
@@ -176,5 +179,5 @@ def test_a_view_that_fails_is_a_failure_not_a_silent_skip(run):
     plan["statements"][2]["sql"] = None
     code, _, reports = run(plan)
     rep = json.loads((reports / "structure_report_analytics.json").read_text())
-    assert rep["objects"]["VW_ORDERS"]["status"] == "failed"
+    assert rep["views"]["VW_ORDERS"]["status"] == "failed"
     assert code == 1
