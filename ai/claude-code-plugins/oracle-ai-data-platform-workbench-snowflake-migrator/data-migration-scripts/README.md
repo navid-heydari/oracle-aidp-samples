@@ -168,6 +168,7 @@ live catalog)
 | `VIEW_NOT_CREATED_YET` | a planned view not created yet (`--dry-run`) | no |
 | `VIEW_NOT_CREATED_BY_THIS_PATH` | a manifest view no `ddl-plan` structure run recorded (`ctas` / `manifest` mode create tables only) | no |
 | `VIEW_FAILED` | the structure job's CREATE VIEW raised; the error is the reason | **yes** |
+| `VIEW_MISSING_DESPITE_REPORT` | the structure report records the view created, but the target does not have it (looked for with SHOW TABLES, SHOW VIEWS, then DESCRIBE) | **yes** |
 | `MISSING_DESPITE_REPORT` | a report says created or verified; the catalog lacks it | **yes** |
 | `STRUCTURE_FAILED` | the CREATE raised | **yes** |
 | `STRUCTURE_TYPE_DRIFT` | the table's layout is not the plan's — outranks a verified copy, since counts match when rows land in the wrong columns | **yes** |

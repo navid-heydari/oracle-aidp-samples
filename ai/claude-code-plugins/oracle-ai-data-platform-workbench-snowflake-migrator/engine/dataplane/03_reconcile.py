@@ -61,7 +61,8 @@ MANIFEST_NAME = "discovery_manifest.json"
 # normal state of most of the estate for most of the project -- exiting
 # non-zero on it would make every partial run look broken, which is how a
 # real signal gets ignored.
-PROBLEM_VERDICTS = ("MISSING_DESPITE_REPORT", "STRUCTURE_FAILED",
+PROBLEM_VERDICTS = ("MISSING_DESPITE_REPORT", "VIEW_MISSING_DESPITE_REPORT",
+                    "STRUCTURE_FAILED",
                     "STRUCTURE_TYPE_DRIFT", "STRUCTURE_ONLY_COPY_FAILED",
                     "COUNT_DRIFT", "TARGET_UNREADABLE", "VIEW_FAILED")
 
@@ -197,6 +198,44 @@ def _live_tables(spark, catalog: str, schema: str) -> set[str] | None:
     return out
 
 
+def _live_views(spark, catalog: str, schema: str) -> set[str] | None:
+    """Lower-cased view names from SHOW VIEWS; None when it could not be
+    read (not every catalog supports it)."""
+    try:
+        rows = spark.sql(f"SHOW VIEWS IN {q(catalog)}.{q(schema)}").collect()
+    except Exception:
+        return None
+    out = set()
+    for r in rows:
+        d = {k.lower(): v for k, v in r.asDict().items()}
+        out.add(str(d.get("viewname") or d.get("tablename")
+                    or d.get("name") or "").lower())
+    return out
+
+
+def _view_exists(spark, fqn: str, name: str, live: set[str] | None,
+                 views: set[str] | None) -> bool | None:
+    """Whether the view is in the target -- LOOKED FOR, not taken from the
+    structure report. True/False, or None when it could not be established.
+
+    SHOW TABLES lists views on some catalogs; SHOW VIEWS on others; failing
+    both, the view itself is described. A not-found answer is "no"; any
+    other error is "could not look".
+    """
+    if live is not None and name in live:
+        return True
+    if views is not None:
+        return name in views
+    try:
+        spark.sql(f"DESCRIBE TABLE {fqn}").collect()
+        return True
+    except Exception as exc:
+        text = str(exc).lower()
+        if any(marker.lower() in text for marker in _NOT_FOUND):
+            return False
+        return None
+
+
 def reconcile(spark, *, manifest: dict, target_catalog: str,
               reports: pathlib.Path, counts: bool,
               planned_targets: dict[str, set[str]] | None = None) -> dict:
@@ -322,6 +361,7 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
         # here looks for views specifically, so "not listed" is None (could
         # not look), never "no".
         view_rows = []
+        live_views = None          # read once per schema, only if needed
         s_views = (structure or {}).get("views") or {}
         s_objects = (structure or {}).get("objects") or {}
         for view in schema_rec.get("views") or []:
@@ -333,6 +373,7 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                 s_rec = s_objects[name]
             s_rec = s_rec or {}
             s_view = s_rec.get("status", "not_attempted")
+            v_reason = s_rec.get("reason")
             if live is None:
                 v_exists, v_verdict = None, "TARGET_UNREADABLE"
             else:
@@ -340,10 +381,35 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                 v_verdict = ((_VIEW_VERDICTS.get(s_view)
                               if s_rec or s_view != "not_attempted" else None)
                              or "VIEW_NOT_CREATED_BY_THIS_PATH")
+            if v_verdict == "VIEW_CREATED":
+                # The structure report says created; the target has to
+                # agree. A view dropped since, or created somewhere else,
+                # used to read VIEW_CREATED and exit 0 on 01's word alone.
+                t_fqn = str(s_rec.get("target_fqn") or "")
+                written = t_fqn.rsplit(".", 1)[-1] if t_fqn else name
+                t_name = written.lower()     # listings are compared folded
+                if live_views is None and not (t_name in (live or set())):
+                    live_views = _live_views(spark, target_catalog,
+                                             target_schema)
+                v_exists = _view_exists(
+                    spark, f"{q(target_catalog)}.{q(target_schema)}."
+                           f"{q(written)}", t_name, live, live_views)
+                if v_exists is False:
+                    v_verdict = "VIEW_MISSING_DESPITE_REPORT"
+                    v_reason = ("the structure report records it created, "
+                                "but the target does not have it: dropped "
+                                "since, or created elsewhere. Re-run "
+                                "01_create_structure")
+                elif v_exists is None:
+                    v_verdict = "TARGET_UNREADABLE"
+                    v_reason = ("the structure report records it created, "
+                                "but whether the target has it could not be "
+                                "read (SHOW TABLES, SHOW VIEWS and DESCRIBE "
+                                "all failed)")
             view_rows.append({"view": name, "structure": s_view,
                               "exists_in_target": v_exists,
                               "verdict": v_verdict,
-                              "reason": s_rec.get("reason")})
+                              "reason": v_reason})
             tally[v_verdict] = tally.get(v_verdict, 0) + 1
 
         known = ({t["name"].lower() for t in schema_rec["tables"]}

@@ -300,3 +300,88 @@ def test_a_view_on_a_view_is_created_after_the_view_it_reads(
     views = _report(reports, "structure_report_sales.json")["views"]
     assert {v: r["status"] for v, r in views.items()} == {
         "B_DETAIL": "created", "A_SUMMARY": "created"}
+
+
+# --- 03: a view the report calls created is LOOKED FOR in the target --------
+#
+# 03 decided VIEW_CREATED from 01's record alone. A view dropped since, or
+# created somewhere else, still read VIEW_CREATED, was not counted as pending,
+# and the run exited 0. Tables have MISSING_DESPITE_REPORT for exactly this.
+
+def _one_view_estate(tmp_path):
+    return _estate(tmp_path, views=(("V_ORDERS", "`lake`.`SALES`.`ORDERS`"),))
+
+
+def test_a_created_view_that_is_gone_is_missing_despite_report(
+        monkeypatch, tmp_path, capsys):
+    reports = _one_view_estate(tmp_path)
+    spark = _spark()
+    assert _structure(monkeypatch, reports, spark) == 0
+    spark.catalog.pop("`lake`.`SALES`.`V_ORDERS`")      # dropped since
+    capsys.readouterr()
+    assert _reconcile(monkeypatch, reports, spark) == 1
+    view = _report(reports, "reconciliation.json")["schemas"][0]["views"][0]
+    assert view["verdict"] == "VIEW_MISSING_DESPITE_REPORT"
+    assert view["exists_in_target"] is False
+    assert "VIEW_MISSING_DESPITE_REPORT" in \
+        _load("03_reconcile").PROBLEM_VERDICTS
+
+
+def test_a_created_view_that_is_there_is_verified(monkeypatch, tmp_path):
+    reports = _one_view_estate(tmp_path)
+    spark = _spark()
+    assert _structure(monkeypatch, reports, spark) == 0
+    assert _reconcile(monkeypatch, reports, spark) == 0
+    view = _report(reports, "reconciliation.json")["schemas"][0]["views"][0]
+    assert view["verdict"] == "VIEW_CREATED"
+    assert view["exists_in_target"] is True
+
+
+class _NoViewListing(_ViewSpark):
+    """A catalog whose SHOW TABLES omits views and has no SHOW VIEWS: only
+    DESCRIBE can find one, and it answers with `describe_error`."""
+
+    describe_error = None
+
+    def sql(self, statement):
+        low = " ".join(statement.split()).lower()
+        if low.startswith("show views"):
+            raise RuntimeError("SHOW VIEWS is not supported")
+        if low.startswith("show tables in"):
+            df = super().sql(statement)
+            df._rows = [r for r in df._rows
+                       if not r["tableName"].startswith("V_")]
+            return df
+        if low.startswith("describe table") and self.describe_error:
+            raise RuntimeError(self.describe_error)
+        if low.startswith("describe table"):
+            return super().sql("DESCRIBE " + statement.split(None, 2)[2])
+        return super().sql(statement)
+
+
+def _no_listing_spark():
+    spark = _NoViewListing({"`ext`.`SALES`.`ORDERS`": list(_SRC_TYPES)})
+    spark.counts = {"`ext`.`SALES`.`ORDERS`": 5}
+    return spark
+
+
+def test_a_view_only_describe_can_find_is_still_verified(
+        monkeypatch, tmp_path):
+    reports = _one_view_estate(tmp_path)
+    spark = _no_listing_spark()
+    assert _structure(monkeypatch, reports, spark) == 0
+    assert _reconcile(monkeypatch, reports, spark) == 0
+    view = _report(reports, "reconciliation.json")["schemas"][0]["views"][0]
+    assert view["verdict"] == "VIEW_CREATED"
+
+
+def test_a_view_nobody_could_look_for_is_unreadable_not_created(
+        monkeypatch, tmp_path):
+    reports = _one_view_estate(tmp_path)
+    spark = _no_listing_spark()
+    assert _structure(monkeypatch, reports, spark) == 0
+    spark.describe_error = "PERMISSION_DENIED: cannot describe"
+    assert _reconcile(monkeypatch, reports, spark) == 1
+    view = _report(reports, "reconciliation.json")["schemas"][0]["views"][0]
+    assert view["verdict"] == "TARGET_UNREADABLE"
+    assert view["exists_in_target"] is None
