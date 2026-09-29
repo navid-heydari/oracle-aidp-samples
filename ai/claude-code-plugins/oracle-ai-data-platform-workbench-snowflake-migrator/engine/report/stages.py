@@ -30,7 +30,8 @@ import re
 
 from plan.smoke import smoke_verdict
 
-__all__ = ["RUNS_ON", "STAGES", "UTILITY_COMMANDS", "build_stage_board", "phase_report",
+__all__ = ["RUNS_ON", "STAGES", "UTILITY_COMMANDS", "RUN_CASES", "run_case",
+           "build_stage_board", "phase_report",
            "run_verdict", "stage_for"]
 
 # THE ordered pipeline. Every other view of a run -- the board, the phase
@@ -297,6 +298,33 @@ def cold_start_outcome(exhausted: dict) -> str:
     return "ended" if state in TERMINAL_STATES else "unconfirmed"
 
 
+# Every way a job-run record can read, in the ONE order they are checked.
+RUN_CASES = ("unreadable", "cold_start_exhausted", "unrecognised",
+             "cancel_unconfirmed", "still_running", "success", "failed")
+
+
+def run_case(run: dict) -> str:
+    """Which of RUN_CASES a job-run record is. The single decision behind
+    the console's exit branches (cmd_run), RUN.md (_render_run) and the
+    board (run_verdict): each words the case its own way, none re-decides
+    it. Three hand-kept copies of this order are how round 3's verdicts
+    became dead code on the board without a test noticing.
+
+    A record written before `terminal` existed is read as terminal.
+    """
+    if run.get("status_unreadable"):
+        return "unreadable"
+    if not run.get("terminal", True):
+        if run.get("cold_start_exhausted"):
+            return "cold_start_exhausted"
+        if run.get("unrecognised"):
+            return "unrecognised"
+        if run.get("cancel_unconfirmed"):
+            return "cancel_unconfirmed"
+        return "still_running"
+    return "success" if run.get("ok") else "failed"
+
+
 def run_verdict(run: dict) -> tuple[str, str]:
     """(verdict, kind) for one job-run record -- the ONE reading of a run,
     for every workflow row and the phase report alike.
@@ -320,16 +348,16 @@ def run_verdict(run: dict) -> tuple[str, str]:
                     "pending")
         return ("NOT RUN — registered, no run recorded", "pending")
     status = run.get("status") or _UNKNOWN
-    terminal = run.get("terminal", True)
     resubmitted = sum(1 for r in run.get("restarts") or []
                       if isinstance(r, dict) and r.get("new_run"))
     after = (f" after {resubmitted} cold-start restart(s)"
              if resubmitted else "")
-    if run.get("status_unreadable"):
+    case = run_case(run)
+    if case == "unreadable":
         return ("**STATUS UNREADABLE** — the run was submitted and may still "
                 "be going; check it in the console before starting another",
                 "unknown")
-    if not terminal and run.get("cold_start_exhausted"):
+    if case == "cold_start_exhausted":
         tried = len(run.get("restarts") or []) + 1
         ex = run["cold_start_exhausted"]
         outcome = cold_start_outcome(ex)
@@ -342,14 +370,14 @@ def run_verdict(run: dict) -> tuple[str, str]:
                     "RAN: check its output before any re-run**", "unknown")
         return ("**COLD START — last run NOT confirmed cancelled; it may "
                 "still run**", "unknown")
-    if not terminal and run.get("unrecognised"):
+    if case == "unrecognised":
         return (f"**UNRECOGNISED STATE {status}**", "unknown")
-    if not terminal and run.get("cancel_unconfirmed"):
+    if case == "cancel_unconfirmed":
         return ("**cold start suspected; cancel unconfirmed — nothing was "
                 "resubmitted**" + after, "unknown")
-    if not terminal:
+    if case == "still_running":
         return ("STILL RUNNING" + after, "running")
-    if run.get("ok"):
+    if case == "success":
         return ((run.get("status") or "SUCCESS") + after, "success")
     return (f'**{run.get("status") or "FAILED"}**' + after, "failed")
 

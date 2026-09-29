@@ -1327,15 +1327,18 @@ def cmd_run(args) -> int:
         return 1
     _record(result)
 
-    if result.get("status_unreadable"):
+    from report.stages import run_case
+    case = run_case(result)
+    if case == "unreadable":
         print(f'  {slug}: run {result["run_key"]} was submitted, but its '
               f'status could not be read ({result.get("status_error")}). It '
               f'may still be running: check it in the console, and do not '
               f'start another run until it has ended.', file=sys.stderr)
         return 1
-    if not result["terminal"]:
+    if case in ("cold_start_exhausted", "unrecognised", "cancel_unconfirmed",
+                "still_running"):
         exhausted = result.get("cold_start_exhausted")
-        if exhausted:
+        if case == "cold_start_exhausted":
             # Not "still running": the cluster ignored every attempt. The
             # last run was cancelled so it does not hold the job's slot.
             from report.stages import cold_start_outcome
@@ -1361,7 +1364,7 @@ def cmd_run(args) -> int:
                      "it simply needs more attempts." if outcome == "cancelled"
                      else ""), file=sys.stderr)
             return 1
-        if result.get("unrecognised"):
+        if case == "unrecognised":
             # Neither a verdict nor "still going": a status this plugin does
             # not classify. Saying STILL RUNNING here would round it up.
             print(f'  {slug}: UNRECOGNISED STATE {result["status"]} after '
@@ -1370,7 +1373,7 @@ def cmd_run(args) -> int:
                   f'in the console and report the status so it can be '
                   f'classified.')
             return 1
-        if result.get("cancel_unconfirmed"):
+        if case == "cancel_unconfirmed":
             # The watchdog fired but the cancel never reached a terminal
             # state, so nothing was resubmitted: the slot is still held by a
             # run the cluster may never pick up. That is not "still running"
@@ -1417,9 +1420,10 @@ def _runs_submitted(result: dict) -> int:
 
 def _render_run(result: dict) -> str:
     """The workflow run as evidence: what ran, what it returned, its log."""
-    from target.jobs import TERMINAL_STATES
+    from report.stages import run_case
     polls = result.get("polls", "?")
-    if result.get("status_unreadable"):
+    case = run_case(result)
+    if case == "unreadable":
         verdict = (f"**STATUS COULD NOT BE READ** — run "
                    f"`{result.get('run_key')}` was submitted, but its status "
                    f"could not be read"
@@ -1428,7 +1432,7 @@ def _render_run(result: dict) -> str:
                    f"running. This is neither success nor failure: check it "
                    f"in the console, and do not start another run until it "
                    f"has ended.")
-    elif not result.get("terminal") and result.get("cold_start_exhausted"):
+    elif case == "cold_start_exhausted":
         ex = result["cold_start_exhausted"]
         error = (f", error: {ex.get('cancel_error')}"
                  if ex.get("cancel_error") else "")
@@ -1461,12 +1465,12 @@ def _render_run(result: dict) -> str:
                        f"cancel-job-run {result.get('workspace')} "
                        f"{ex.get('run')}`) and check the cluster before "
                        f"re-running.")
-    elif not result.get("terminal") and result.get("unrecognised"):
+    elif case == "unrecognised":
         verdict = (f'**UNRECOGNISED STATE `{result.get("status")}`** — after '
                    f'{polls} poll(s) the run reports a status this plugin '
                    f'classifies as neither running nor ended. This is neither '
                    f'success nor failure; check the run in the console.')
-    elif not result.get("terminal") and result.get("cancel_unconfirmed"):
+    elif case == "cancel_unconfirmed":
         verdict = (f"**STILL RUNNING — cold start suspected; cancel "
                    f"unconfirmed.** The cluster had not picked up run "
                    f"`{result.get('run_key')}`, the cancel did not reach a "
@@ -1474,12 +1478,12 @@ def _render_run(result: dict) -> str:
                    f"and the poll budget ({polls} poll(s)) ran out with it "
                    f"still `{result.get('status')}`. Cancel it by hand and "
                    f"re-run; this is neither success nor failure.")
-    elif not result.get("terminal"):
+    elif case == "still_running":
         verdict = (f"**STILL RUNNING** — the poll budget ({polls} poll(s)) "
                    f"ran out with the job still `{result.get('status')}`. "
                    f"This is neither success nor failure; re-check the run "
                    f"key.")
-    elif result.get("ok"):
+    elif case == "success":
         verdict = "**SUCCESS**"
     else:
         verdict = f'**{result.get("status")}** — {result.get("message") or "no message"}'
