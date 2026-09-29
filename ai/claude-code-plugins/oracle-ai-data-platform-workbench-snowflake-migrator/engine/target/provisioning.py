@@ -592,6 +592,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               refresh_notebooks: bool = False,
               plan_label: str | None = None,
               copy_schemas=(),
+              delete_stale_copy_jobs: bool = False,
               prior: dict | None = None,
               datalake_ocid: str | None = None,
               now: datetime.datetime | None = None) -> dict:
@@ -787,6 +788,8 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         # Copy jobs on the workspace that the present plan does not name
         # (a schema reduced out of it): still runnable, so reported.
         "stale_copy_jobs": [],
+        # Stale copy jobs this push deleted, on --delete-stale-copy-jobs.
+        "deleted_copy_jobs": [],
         "steps": [],
     }
 
@@ -1339,6 +1342,40 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
             step("job", "failed", False, f'{spec["name"]}: {str(exc)[:200]}')
             _outcome(spec, "failed, not registered")
 
+    def _delete_stale(job: dict, name: str, why: str) -> None:
+        """Delete one copy job the plan no longer names, and READ IT BACK:
+        only a job gone from the listing is recorded deleted. Asked for
+        explicitly (--delete-stale-copy-jobs); never done by default."""
+        key = job.get("key") or job.get("id")
+        if not key:
+            step("job", "stale", False,
+                 f"{name}: {why}; the listing carries no job key, so it was "
+                 f"NOT deleted -- delete it in the console")
+            return
+        try:
+            call("delete_job", workspace=ws_key, job_key=str(key))
+        except Exception as exc:
+            step("job", "stale", False,
+                 f"{name}: {why}; the delete was refused "
+                 f"({str(exc)[:160]}) -- it is still runnable")
+            return
+        try:
+            listed = call("list_jobs", workspace=ws_key).get("items") or []
+        except Exception as exc:
+            step("job", "stale_delete_requested", None,
+                 f"{name}: {why}; delete sent and accepted, but the listing "
+                 f"could not be read back ({str(exc)[:120]}) -- check the "
+                 f"console")
+            return
+        if _match(listed, name) is None:
+            out["deleted_copy_jobs"].append(name)
+            step("job", "stale_deleted", True,
+                 f"{name}: {why}; deleted, and gone from the listing")
+        else:
+            step("job", "stale_delete_requested", None,
+                 f"{name}: {why}; delete sent, but it is still listed -- "
+                 f"check the console")
+
     # Notebooks uploaded (or kept) and read back by this run. A per-schema
     # copy job shares the 02 notebook, so it only needs that one to be here.
     notebooks_ready: set[str] = set()
@@ -1415,7 +1452,12 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         notebooks_ready.add(spec["notebook"])
         kept_by_notebook[spec["notebook"]] = kept
         if spec["name"] in no_job:
-            if _match(existing, spec["name"]) is not None:
+            superseded = _match(existing, spec["name"])
+            if superseded is not None and delete_stale_copy_jobs:
+                _delete_stale(superseded, spec["name"],
+                              "superseded by the per-schema copy jobs; it "
+                              "has no schema, so running it could only fail")
+            elif superseded is not None:
                 # There, from an earlier push without a plan: it has no
                 # schema, so running it can only fail. Said, not hidden.
                 step("job", "exists_superseded", None,
@@ -1436,17 +1478,24 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     # copy data the approved plan excludes, or nothing at all. Nothing is
     # deleted behind the operator's back; it is a failed step until it is
     # removed in the console.
-    planned = {spec["name"] for spec in job_specs}
-    generic = {spec["name"] for spec in JOB_SPECS}
+    # Compared case-insensitively, like _match: a listing that spells a
+    # planned job in another case is still that job.
+    planned = {spec["name"].lower() for spec in job_specs}
+    generic = {spec["name"].lower() for spec in JOB_SPECS}
     for job in existing:
         name = str(job.get("displayName") or job.get("name") or "")
         if (name.lower().startswith(COPY_JOB_PREFIX)
-                and name not in planned and name not in generic):
+                and name.lower() not in planned
+                and name.lower() not in generic):
             out["stale_copy_jobs"].append(name)
+            if delete_stale_copy_jobs:
+                _delete_stale(job, name, "its schema is not in this plan")
+                continue
             step("job", "stale", False,
                  f"{name} is on the workspace but its schema is not in this "
                  f"plan (reduced out, or renamed); it is still runnable. "
-                 f"Delete it in the console, or re-plan to include the "
+                 f"Delete it in the console, re-run provision with "
+                 f"--delete-stale-copy-jobs, or re-plan to include the "
                  f"schema")
 
     # 6 · the environment diagnosis, beside the stages, with NO job --------
@@ -1786,13 +1835,23 @@ def render_provision(res: dict) -> str:
                   for j in res["copy_jobs"]]
         lines.append("")
 
-    if res.get("stale_copy_jobs"):
+    deleted = set(res.get("deleted_copy_jobs") or [])
+    still = [n for n in res.get("stale_copy_jobs") or [] if n not in deleted]
+    if deleted:
+        lines += [
+            "## Copy jobs NOT in this plan — deleted (--delete-stale-copy-jobs)",
+            "", "Registered by an earlier push for a schema the present plan "
+            "does not name; deleted by this push and read back gone:", ""]
+        lines += [f"- `{name}`" for name in sorted(deleted)]
+        lines.append("")
+    if still:
         lines += [
             "## Copy jobs NOT in this plan (still on the workspace)", "",
             "Registered by an earlier push for a schema the present plan "
             "does not name. They are still runnable; delete them in the "
-            "console (or re-plan to include the schema):", ""]
-        lines += [f"- `{name}`" for name in res["stale_copy_jobs"]]
+            "console, re-run provision with --delete-stale-copy-jobs, or "
+            "re-plan to include the schema:", ""]
+        lines += [f"- `{name}`" for name in still]
         lines.append("")
 
     if res.get("notebooks_kept"):

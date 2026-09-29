@@ -470,8 +470,16 @@ listed task parameters name another schema is refused, not adopted.
 `PROVISION.md` lists them (schema → job → this push's outcome for it). A
 schema reduced out of the plan gets no new job; a copy job an earlier push
 registered for it is still on the workspace and runnable, so the push
-reports it as `stale` (and exits 1) until it is deleted in the console.
-Re-push after re-planning to add a schema.
+reports it as `stale` (and exits 1) until it is deleted -- in the console,
+or by re-pushing with `--delete-stale-copy-jobs`, which deletes it (and the
+schemaless generic job) and records a job deleted only once it is gone from
+the listing. Re-push after re-planning to add a schema.
+
+Before a copy job runs, `run` reads the job's task parameters and refuses a
+name that no spelling of a stage parameter matches (`dryRn=true` would
+leave `dry-run` False: a real write) or a value the stage refuses
+(`mode=apend`) -- before a job start-up is paid for. A job definition that
+cannot be read is said, and does not block.
 
 ### S12 — Propose the warehouse-equivalent clusters
 

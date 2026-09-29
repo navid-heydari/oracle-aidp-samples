@@ -31,6 +31,7 @@ import pathlib
 import re
 
 __all__ = ["DIAGNOSE_NOTEBOOK_NAME", "DIAGNOSE_SOURCE_NAME", "STAGES",
+           "param_spellings",
            "StageSpec", "build_diagnose_notebook", "build_stage_notebook",
            "check_stage_params", "dataplane_dir", "declared_stage_params",
            "write_stage_notebooks"]
@@ -280,6 +281,20 @@ def _for_stage(stage: StageSpec, overrides: dict[str, object]
             qualified[flag] = value
     out.update(qualified)
     return out
+
+
+def param_spellings(name: str) -> list[str]:
+    """Every spelling of a stage parameter a workflow may carry, in lookup
+    order: dry-run, dry_run, dryRun, dryrun and the upper-case forms. The
+    generated PARAMS cell reads these (its `_spellings` is this function,
+    restated as notebook text -- a test pins the two); `run` checks a job's
+    task parameters against them before submitting."""
+    parts = name.split("-")
+    snake = "_".join(parts)
+    camel = parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:])
+    flat = "".join(parts)
+    return list(dict.fromkeys((name, snake, camel, flat, name.upper(),
+                               snake.upper(), flat.upper())))
 
 
 def declared_stage_params() -> dict[str, list[str]]:

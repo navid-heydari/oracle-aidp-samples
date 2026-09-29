@@ -364,6 +364,17 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
         # on the next poll. Used by the cold-start watchdog in jobs.py to let
         # go of a run the cluster never picked up.
         return aidp_cli("workflow", "cancel-job-run", ws, kwargs["run_key"])
+    if operation == "delete_job":
+        # Live-verified (2026-09-29): answers 204 and the job leaves the
+        # listing. Used only for copy jobs the approved plan no longer names,
+        # and only when the operator asked (provision
+        # --delete-stale-copy-jobs).
+        return aidp_cli("workflow", "delete-job", ws, kwargs["job_key"])
+    if operation == "get_job":
+        # The job definition, tasks and their `parameters` included (the
+        # aidp CLI's `workflow get-job`). Read by `run` to check task
+        # parameter names before a run is paid for.
+        return raw("GET", f'{base}/workspaces/{ws}/jobs/{kwargs["job_key"]}')
     if operation == "list_task_runs":
         # `sortBy` is REQUIRED: without it the call fails "Invalid SortBy:
         # null" (live).

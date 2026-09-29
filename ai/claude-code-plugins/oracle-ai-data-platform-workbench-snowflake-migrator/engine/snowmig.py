@@ -1331,6 +1331,8 @@ def cmd_run(args) -> int:
             datetime.timezone.utc).isoformat()
     else:
         result = None
+        _check_task_parameters(call, workspace=args.workspace,
+                               job_key=job_key, job=args.job)
     try:
         if result is None:
             result = watch_job(call, workspace=args.workspace, job_key=job_key,
@@ -1441,6 +1443,65 @@ def cmd_run(args) -> int:
                   f"workspace at {DISCOVERY_MANIFEST_REMOTE}. Run `fetch` to "
                   f"retry.", file=sys.stderr)
     return 0 if result["ok"] else 1
+
+
+def _check_task_parameters(call, *, workspace: str, job_key: str,
+                           job: str | None) -> None:
+    """Refuse a run whose job TASK parameters no stage would read, BEFORE a
+    run is paid for (a job run costs minutes of start-up).
+
+    A task parameter reaches the notebook by name. A name matching none of
+    a declared parameter's spellings (param_spellings) is read by nothing:
+    `dryRn=true` leaves `dry-run` at its default False -- a real write. A
+    value the stage would refuse (`mode=apend`) fails inside the notebook
+    after the start-up. Both are refused here with what was meant. When the
+    job definition cannot be read, or carries no task parameters, nothing
+    is refused and that is said: not checked is not "checked and fine".
+    """
+    import difflib
+    from target.provisioning import COPY_JOB_PREFIX, _listed_task_parameters
+    from target.stage_notebooks import (STAGES, check_stage_params,
+                                        param_spellings)
+    stage = next((s for s in STAGES if job and s.job == job), None)
+    if stage is None and job and job.lower().startswith(COPY_JOB_PREFIX):
+        stage = next(s for s in STAGES if s.key == "copy_schema")
+    if stage is None:
+        return
+    try:
+        params = _listed_task_parameters(
+            call("get_job", workspace=workspace, job_key=job_key) or {})
+    except Exception as exc:
+        print(f"  task parameters NOT checked: the job definition could not "
+              f"be read ({str(exc)[:160]})", file=sys.stderr)
+        return
+    if not params:
+        return
+    canonical = {sp: name for name in stage.params
+                 for sp in param_spellings(name)}
+    unknown, bad = [], []
+    for name, value in params.items():
+        if name not in canonical:
+            near = difflib.get_close_matches(
+                name.lower().replace("_", "-"), list(stage.params), n=1)
+            unknown.append(f"`{name}`" + (f" (did you mean `{near[0]}`?)"
+                                          if near else ""))
+            continue
+        try:
+            check_stage_params({f"{stage.key}.{canonical[name]}": value})
+        except ValueError as exc:
+            bad.append(f"`{name}={value}`: {str(exc)[:200]}")
+    if unknown or bad:
+        raise MissingTarget(
+            f"job {job} carries task parameter(s) its notebook would not "
+            f"read as meant, so NO run was submitted:\n"
+            + "".join(f"  * {u} is not a parameter of the {stage.key} stage "
+                      f"-- no lookup reads it, so the stage would run on its "
+                      f"default\n" for u in unknown)
+            + "".join(f"  * {b}\n" for b in bad)
+            + f"Parameters this stage reads: "
+              f"{', '.join(sorted(stage.params))}. Fix the job's task "
+              f"parameters in the console (or re-run provision), then run "
+              f"again.")
 
 
 def _runs_submitted(result: dict) -> int:
@@ -2384,6 +2445,7 @@ def cmd_provision(args) -> int:
         output_dir=_reporting(args)["workspace_dir"],
         refresh_notebooks=args.refresh_notebooks,
         plan_label=args.plan_label, copy_schemas=copy_schemas,
+        delete_stale_copy_jobs=getattr(args, "delete_stale_copy_jobs", False),
         prior=earlier, datalake_ocid=ocid)
     if res.get("inherited_from"):
         print(f"  re-push into this migration's workspace "
@@ -2852,6 +2914,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "on the workspace is kept, because its PARAMS cell "
                          "(schema, mode, verify) is edited in the console and "
                          "an overwrite would discard that silently")
+    pv.add_argument("--delete-stale-copy-jobs", action="store_true",
+                    help="delete the copy jobs an earlier plan registered for "
+                         "schemas this plan no longer names (and the "
+                         "schemaless generic copy job, once per-schema jobs "
+                         "exist). Each delete is read back. OFF by default: "
+                         "without it they are reported as stale and left "
+                         "for the console")
     pv.add_argument("--plan-label", default=None,
                     help="a word appended to the dated backup of plan.json "
                          "and ddl_plan.json in backup-snowflake-migration/"
