@@ -1889,6 +1889,11 @@ def cmd_teardown(args) -> int:
     _write(out, "teardown_result.json", res)
     _write(out, "TEARDOWN.md", render_teardown(res))
     targets = [s for s in res["steps"] if s.get("cluster")]
+    for s in res["steps"]:
+        if not s.get("cluster"):
+            # A create this migration asked for whose key was never seen.
+            print(f'  teardown: {s.get("name")}: {s.get("detail")}',
+                  file=sys.stderr)
     if res.get("unknown"):
         # Could not tell is not "nothing to do".
         print(f'  teardown: {res["note"]}', file=sys.stderr)
@@ -1897,9 +1902,11 @@ def cmd_teardown(args) -> int:
         print(f"  teardown: dry run — would {action} {len(targets)} "
               f"cluster(s); nothing changed")
         return 0
-    print(f'  teardown: {res["verified"]}/{len(targets)} cluster(s) '
+    # Every step counts, a cluster without a key included: could not
+    # identify is not "nothing to do".
+    print(f'  teardown: {res["verified"]}/{len(res["steps"])} cluster(s) '
           f'{action} verified')
-    return 0 if res["verified"] == len(targets) else 1
+    return 0 if res["verified"] == len(res["steps"]) else 1
 
 
 # What `fetch` brings down when no --path is given, and what `run` fetches

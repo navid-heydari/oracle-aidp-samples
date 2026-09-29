@@ -477,7 +477,9 @@ the warehouses to -- is listed in `TEARDOWN.md` as not this migration's and
 left alone. Clusters an earlier push created stay in the record
 (`earlier_allocations`) however later pushes are run, and an executed record
 that names no workspace makes teardown exit 1 ("cannot tell what was
-allocated"), never "nothing to terminate". `stop` (default, `teardown.action` in the config) is reversible and
+allocated"), never "nothing to terminate". A cluster whose create was
+accepted but whose key was never seen is a failed step (exit 1) telling you
+to look it up by name in the console; teardown never picks one by name. `stop` (default, `teardown.action` in the config) is reversible and
 leaves the registered copy jobs working; `--action delete` is final and must
 be asked for. The workspace, the catalogs and the jobs are kept: they are the
 migration's output and its record.

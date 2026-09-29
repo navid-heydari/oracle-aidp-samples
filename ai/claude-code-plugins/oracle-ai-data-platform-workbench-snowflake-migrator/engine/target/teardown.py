@@ -24,7 +24,7 @@ from __future__ import annotations
 import datetime
 import time
 
-from .provenance import CREATED, NOT_CREATED, cluster_records
+from .provenance import CREATED, NOT_CREATED, REQUESTED, cluster_records
 
 __all__ = ["ACTIONS", "RELEASED_ACTIONS", "STOPPED_STATES", "teardown",
            "render_teardown"]
@@ -46,11 +46,13 @@ KEPT = ["the workspace (scripts, plans, report/output — the run's record)",
         "the jobs (the registered S11 copy scripts)"]
 
 
-def _targets(prov: dict) -> tuple[list[dict], list[dict]]:
-    """(targets, left_alone). A target is a cluster the record proves this
-    migration created -- including those an earlier push created, each in
-    its own workspace; everything else it names with a key is left alone
-    and said so, once per key."""
+def _targets(prov: dict) -> tuple[list[dict], list[dict], list[dict]]:
+    """(targets, left_alone, unkeyed). A target is a cluster the record
+    proves this migration created -- including those an earlier push
+    created, each in its own workspace; everything else it names with a key
+    is left alone and said so, once per key. `unkeyed` are creates this
+    migration asked for and never saw listed: failed steps, never looked up
+    by name."""
     records = cluster_records(prov)
     targets, left, seen = [], [], set()
     for rec in records:
@@ -67,7 +69,22 @@ def _targets(prov: dict) -> tuple[list[dict], list[dict]]:
             seen.add(at)
             left.append({"cluster": rec["cluster"], "name": rec["name"],
                          "role": rec["role"], "why": rec["why"]})
-    return targets, left
+    unkeyed, named = [], set()
+    for rec in records:
+        at = (rec["workspace"], rec["name"])
+        if rec["provenance"] == REQUESTED and at not in named:
+            named.add(at)
+            unkeyed.append({
+                "cluster": None, "name": rec["name"], "role": rec["role"],
+                "workspace": rec["workspace"], "action": "key_unknown",
+                "verified": False,
+                "detail": f'requested by this migration (the create was '
+                          f'accepted), but its key was never recorded. Look '
+                          f'it up by name `{rec["name"]}` in workspace '
+                          f'{rec["workspace"]} in the console and confirm '
+                          f'it is this migration\'s before terminating it; '
+                          f'teardown never picks a cluster by name'})
+    return targets, left, unkeyed
 
 
 def _state(call, workspace: str, key: str):
@@ -100,9 +117,9 @@ def teardown(call, prov: dict, *, action: str, execute: bool,
         return {**base, "verified": 0,
                 "note": "provision never ran for real, so this migration "
                         "allocated nothing to terminate"}
-    targets, left_alone = _targets(prov)
+    targets, left_alone, unkeyed = _targets(prov)
     base["left_alone"] = left_alone
-    if not workspace and not targets:
+    if not workspace and not targets and not unkeyed:
         # An EXECUTED record naming no workspace is not evidence of an empty
         # migration: its push halted before a key was recorded, and it
         # cannot show what an earlier push allocated.
@@ -115,7 +132,7 @@ def teardown(call, prov: dict, *, action: str, execute: bool,
                         "environment."}
     if not execute:
         base["steps"] = [{**t, "action": f"would {action}", "verified": None}
-                         for t in targets]
+                         for t in targets] + unkeyed
         return {**base, "verified": 0, "note": ""}
 
     for t in targets:
@@ -161,6 +178,8 @@ def teardown(call, prov: dict, *, action: str, execute: bool,
             step.update(action="failed", verified=False,
                         detail=str(exc)[:200])
         base["steps"].append(step)
+    # Counted, so the run cannot report full success over them.
+    base["steps"] += unkeyed
     return {**base, "note": "", "at": _now(),
             "verified": sum(1 for s in base["steps"] if s["verified"])}
 
@@ -176,7 +195,9 @@ def render_teardown(res: dict) -> str:
             "|---|---|---|---|---|"]
     for s in res.get("steps") or []:
         verified = {True: "yes", False: "**no**", None: "—"}[s.get("verified")]
-        out.append(f'| `{s.get("name")}` (`{s.get("cluster")}`) | '
+        key = (f'`{s.get("cluster")}`' if s.get("cluster")
+               else "key never recorded")
+        out.append(f'| `{s.get("name")}` ({key}) | '
                    f'{s.get("role")} | {s.get("action")} | {verified} | '
                    f'{s.get("state") or s.get("detail") or "—"} |')
     if res.get("left_alone"):
