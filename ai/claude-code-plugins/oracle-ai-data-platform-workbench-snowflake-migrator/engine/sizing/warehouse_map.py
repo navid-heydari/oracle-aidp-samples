@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 
 __all__ = ["CREDITS_PER_HOUR", "NODES_PER_SIZE", "cluster_base_name",
-           "propose_cluster", "propose_all"]
+           "cluster_names", "propose_cluster", "propose_all"]
 
 _WH_SUFFIX = re.compile(r"[_\-]?(WH|WAREHOUSE)$", re.IGNORECASE)
 
@@ -29,6 +29,38 @@ def cluster_base_name(warehouse_name: str) -> str:
     from target.naming import translate_name
     base = _WH_SUFFIX.sub("", str(warehouse_name).strip()) or str(warehouse_name)
     return translate_name(base, kind="cluster").name
+
+
+def cluster_names(warehouse_names, *, reserved=()) -> dict[str, str]:
+    """{warehouse: cluster name}, one DISTINCT name per warehouse.
+
+    The base name (COMPUTE_WH -> compute) folds suffix and case, so two
+    warehouses can land on one name -- COMPUTE_WH and COMPUTE -- and would
+    then share one cluster. A base name shared by two warehouses, or equal
+    to a `reserved` name (the migration cluster's), falls back to the full
+    translated warehouse name (compute_wh); one that still collides gets a
+    numbered suffix. Assigned in sorted order, so the input order never
+    decides which warehouse keeps which name.
+    """
+    from target.naming import translate_name
+    names = sorted({str(w).strip() for w in warehouse_names
+                    if str(w or "").strip()})
+    base = {w: cluster_base_name(w) for w in names}
+    counts: dict[str, int] = {}
+    for n in base.values():
+        counts[n] = counts.get(n, 0) + 1
+    used = set(reserved)
+    out = {}
+    for w in names:
+        name = base[w]
+        if counts[name] > 1 or name in used:
+            name = translate_name(w, kind="cluster").name
+        candidate, n = name, 2
+        while candidate in used:
+            candidate, n = f"{name}_{n}", n + 1
+        used.add(candidate)
+        out[w] = candidate
+    return out
 
 # Documented Snowflake series: each size doubles.
 NODES_PER_SIZE = {
@@ -47,7 +79,8 @@ _SHAPE_FAMILY = "VM.Standard.E5.Flex (or the tenancy's current standard flex fam
 
 
 def propose_cluster(warehouse: dict, *, mode: str = "new",
-                    existing_cluster_id: str | None = None) -> dict:
+                    existing_cluster_id: str | None = None,
+                    cluster_name: str | None = None) -> dict:
     """Propose a standard-sized Spark cluster for one warehouse.
 
     mode `new` proposes creating a cluster named from the warehouse's base
@@ -66,17 +99,20 @@ def propose_cluster(warehouse: dict, *, mode: str = "new",
     max_clusters = max(1, int(warehouse.get("max_cluster_count") or 1))
 
     existing = mode == "existing"
+    base = cluster_base_name(warehouse.get("name") or "")
+    name = cluster_name or base
     action_note = (
         f" Uses the EXISTING cluster {existing_cluster_id}; it is not resized, "
         f"so the sizing above is advisory." if existing else
-        f" Proposed as a NEW cluster named "
-        f"`{cluster_base_name(warehouse.get('name') or '')}`.")
+        f" Proposed as a NEW cluster named `{name}`"
+        + (f" (its base name `{base}` would collide with another "
+           f"warehouse's or the migration cluster's, so it keeps more of "
+           f"its own name)." if name != base else "."))
     return {
         "name": warehouse.get("name"),
         "blocked": False,
         "cluster_action": "use_existing" if existing else "create",
-        "target_cluster": (existing_cluster_id if existing
-                           else cluster_base_name(warehouse.get("name") or "")),
+        "target_cluster": existing_cluster_id if existing else name,
         "source_size": size,
         "source_nodes": nodes,
         "source_vcpu_equivalent": vcpu,
@@ -100,11 +136,18 @@ def propose_cluster(warehouse: dict, *, mode: str = "new",
 
 def propose_all(warehouses: list[dict], *,
                 credit_price_usd: float | None = None, mode: str = "new",
-                existing_cluster_id: str | None = None) -> dict:
+                existing_cluster_id: str | None = None,
+                reserved=("migration_assets",)) -> dict:
     proposals, blocked = [], []
+    # Distinct names across the whole set, so N proposals are N clusters;
+    # `reserved` is the migration cluster's default name.
+    names = cluster_names([wh.get("name") or "" for wh in warehouses],
+                          reserved=reserved)
     for wh in warehouses:
         p = propose_cluster(wh, mode=mode,
-                            existing_cluster_id=existing_cluster_id)
+                            existing_cluster_id=existing_cluster_id,
+                            cluster_name=names.get(
+                                str(wh.get("name") or "").strip()))
         (blocked if p.get("blocked") else proposals).append(p)
 
     observed = [w.get("observed_credits") for w in warehouses
@@ -152,5 +195,6 @@ def propose_all(warehouses: list[dict], *,
         "blocked": blocked,
         "cluster_mode": mode,
         "existing_cluster_id": existing_cluster_id,
-        "clusters_to_create": (0 if mode == "existing" else len(proposals)),
+        "clusters_to_create": (0 if mode == "existing" else len(
+            {p["target_cluster"] for p in proposals})),
     }

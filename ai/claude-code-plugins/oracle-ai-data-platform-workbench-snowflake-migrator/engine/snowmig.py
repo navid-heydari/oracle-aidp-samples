@@ -1884,17 +1884,32 @@ def cmd_teardown(args) -> int:
         raise MissingTarget("teardown --execute needs --datalake-ocid (or "
                             "aidp.datalake_ocid in the config)")
     call = make_provision_call(ocid) if args.execute else None
-    res = teardown(call, prov, action=action, execute=args.execute)
+    res = teardown(call, prov, action=action, execute=args.execute,
+                   datalake_ocid=ocid)
     _write(out, "teardown_result.json", res)
     _write(out, "TEARDOWN.md", render_teardown(res))
-    targets = [s for s in res["steps"] if s.get("cluster")]
+    targets = [s for s in res["steps"]
+               if str(s.get("action")).startswith("would ")]
+    for s in res["steps"]:
+        if s.get("action") in ("key_unknown", "provenance_unknown"):
+            # A create this migration asked for whose key was never seen, or
+            # a cluster a pre-provenance record cannot place: never touched.
+            print(f'  teardown: {s.get("name")} '
+                  f'({s.get("cluster") or "key never recorded"}): '
+                  f'{s.get("detail")}', file=sys.stderr)
+    if res.get("unknown"):
+        # Could not tell is not "nothing to do".
+        print(f'  teardown: {res["note"]}', file=sys.stderr)
+        return 1
     if res["dry_run"]:
         print(f"  teardown: dry run — would {action} {len(targets)} "
               f"cluster(s); nothing changed")
         return 0
-    print(f'  teardown: {res["verified"]}/{len(targets)} cluster(s) '
+    # Every step counts, a cluster without a key included: could not
+    # identify is not "nothing to do".
+    print(f'  teardown: {res["verified"]}/{len(res["steps"])} cluster(s) '
           f'{action} verified')
-    return 0 if res["verified"] == len(targets) else 1
+    return 0 if res["verified"] == len(res["steps"]) else 1
 
 
 # What `fetch` brings down when no --path is given, and what `run` fetches
@@ -2114,7 +2129,7 @@ def cmd_provision(args) -> int:
     The EXTERNAL catalog is registered by the `catalog` stage, not here.
     """
     from target.provisioning import (
-        make_provision_call, provision, render_provision)
+        carry_forward, make_provision_call, provision, render_provision)
 
     _refuse_by_decision(args, creating=True,
                         warehouse_clusters=bool(args.warehouse_clusters))
@@ -2207,27 +2222,17 @@ def cmd_provision(args) -> int:
     # A re-push into THIS migration's own workspace (the plan, after S7/S9)
     # inherits the coordinates the first push baked in, so the notebooks it
     # adds -- the per-schema copy workflows -- carry the same catalogs and
-    # the same credential path as the stages already there. Only from the
-    # record of the same workspace; a flag still wins.
-    inherited_credential = None
-    prior = (_read(out, "provision_result.json")
-             if args.reuse_existing
-             and (out / "provision_result.json").is_file() else None)
-    if prior and not prior.get("dry_run") and (
-            (prior.get("workspace") or {}).get("requested")
-            == args.workspace_name):
-        external_catalog = external_catalog or prior.get("external_catalog")
-        target_catalog = target_catalog or prior.get("target_catalog")
-        if not args.source_config and prior.get("credential_objects"):
-            inherited_credential = prior["credential_objects"][0]
-        print(f"  re-push into this migration's workspace "
-              f"{prior['workspace'].get('name')}: catalogs and credential "
-              f"path taken from provision_result.json where no flag gave "
-              f"them")
+    # the same credential path as the stages already there. provision()
+    # decides that from the earlier EXECUTED record: same aiDataPlatform,
+    # same workspace key (known only once it is listed), and the inherited
+    # credential looked for before it is used; a flag still wins.
+    earlier = (_read(out, "provision_result.json")
+               if _executed_record_exists(out, "provision_result.json")
+               else None)
+    ocid = args.datalake_ocid or aidp.get("datalake_ocid")
 
     call = None
     if args.execute:
-        ocid = args.datalake_ocid or aidp.get("datalake_ocid")
         if not ocid:
             raise MissingTarget(
                 "--execute needs the aiDataPlatform OCID: put it under "
@@ -2252,19 +2257,55 @@ def cmd_provision(args) -> int:
         output_dir=_reporting(args)["workspace_dir"],
         refresh_notebooks=args.refresh_notebooks,
         plan_label=args.plan_label, copy_schemas=copy_schemas,
-        inherited_credential=inherited_credential)
+        prior=earlier, datalake_ocid=ocid)
+    if res.get("inherited_from"):
+        print(f"  re-push into this migration's workspace "
+              f"{res['workspace'].get('name')}: catalogs and credential "
+              f"path taken from provision_result.json where no flag gave "
+              f"them" + (" (provisional: an executed run confirms the "
+                         "workspace key and looks for the credential first)"
+                         if res["inherited_from"].get("provisional") else ""))
+    # No executed push drops what an earlier one allocated. A re-push finds
+    # what the first push created and records it as reused; the earlier
+    # executed record is the proof it was created here, and whatever this
+    # push does not record itself (the plan push carries no
+    # --warehouse-clusters) is kept as `earlier_allocations`, so teardown
+    # still reaches it -- and still leaves alone what this migration never
+    # created.
+    if (not res["dry_run"] and not res["workspace"].get("key") and earlier
+            and (earlier.get("workspace") or {}).get("key")):
+        # Halted before any key was recorded (name_taken without
+        # --reuse-existing): the earlier record is the only one that names
+        # what was created, and PROVISION.md is what the halt tells the
+        # operator to read. Kept; this run goes beside it.
+        _write(out, "provision_result.halted.json", res)
+        _write(out, "PROVISION_HALTED.md", render_provision(res))
+        print(f"  provision halted before recording a workspace key; the "
+              f"earlier executed record (workspace "
+              f"{earlier['workspace'].get('name')}) was kept in "
+              f"provision_result.json and PROVISION.md, and this run was "
+              f"written to provision_result.halted.json / "
+              f"PROVISION_HALTED.md", file=sys.stderr)
+        return 1
+    carry_forward(res, earlier)
     _write(out, "provision_result.json", res)
     _write(out, "PROVISION.md", render_provision(res))
 
     for obj in res.get("credential_objects") or []:
         # Said out loud, dry run or not: this is the one object this plugin
-        # places anywhere that holds a secret.
+        # places anywhere that holds a secret. Executed, the list holds only
+        # what was read back on the workspace.
         print(f"  CREDENTIAL ON THE WORKSPACE MOUNT: {obj} "
               f"{'would hold' if res['dry_run'] else 'holds'} the Snowflake "
               f"connection block, credential included -- readable by every "
               f"member of workspace {res['workspace']['name']} and every "
               f"cluster in it via /Workspace. Remove it when the migration "
               f"is done.", file=sys.stderr)
+    for obj in res.get("credential_unconfirmed") or []:
+        print(f"  CREDENTIAL MAY BE ON THE WORKSPACE MOUNT: {obj} -- its "
+              f"upload could not be read back. Check workspace "
+              f"{res['workspace']['name']} and remove it if it is there.",
+              file=sys.stderr)
 
     failed = [s for s in res["steps"] if s["verified"] is False]
     if res["dry_run"]:
@@ -2621,12 +2662,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "Snowflake connector fallback")
     pv.add_argument("--source-mode", choices=["connector",
                                               "external-catalog"],
-                    default="connector",
+                    default=None,
                     help="how the in-AIDP scripts READ Snowflake. connector "
                          "(default) reads it directly from the cluster and "
                          "needs no catalog crawl — the path proven live; "
                          "external-catalog uses three-part names and needs a "
-                         "successful crawl")
+                         "successful crawl. A --reuse-existing re-push keeps "
+                         "the mode the earlier push recorded")
     pv.add_argument("--source-config",
                     help="the Snowflake connection config to place on the "
                          "workspace mount for connector mode. It carries the "

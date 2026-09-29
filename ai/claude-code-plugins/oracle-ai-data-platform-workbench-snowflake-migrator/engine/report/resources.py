@@ -3,9 +3,11 @@
 Read from the run's own artifacts, so it can list only what THIS migration
 created:
 
-  provision_result.json   workspace, migration cluster, warehouse clusters,
+  provision_result.json   workspace, the clusters it proves it created,
                           jobs, uploaded files, and the two catalog names
-  resources.jsonl         every catalog the `catalog` stage created (its
+                          (job parameters: listed apart, never billed)
+  resources.jsonl         every catalog the `catalog` stage created or
+                          reused, only `created` being an allocation (its
                           result file is overwritten on each run, so it
                           cannot be the record)
   deploy / structure      schemas and tables the structure step verified
@@ -55,7 +57,9 @@ BILLING = {
                   "copied"),
 }
 
-_STOPPED = {"STOPPED", "INACTIVE", "TERMINATED"}
+# The same stopped set teardown uses, DELETED included: a cluster teardown
+# verified gone is not billing.
+from target.teardown import RELEASED_ACTIONS, STOPPED_STATES as _STOPPED
 
 
 def _phase(stage: str) -> str:
@@ -128,6 +132,7 @@ def build_resources(out_dir) -> dict:
     prov = _load(out, "provision_result.json") or {}
     if not prov or prov.get("dry_run"):
         return {"resources": [], "accruing_now": [], "compute": [],
+                "not_allocated": [], "provenance_unknown": [],
                 "snowflake_usage": _snowflake_usage(out),
                 "note": "provision never ran for real, so this migration "
                         "allocated nothing in AIDP"}
@@ -140,13 +145,19 @@ def build_resources(out_dir) -> dict:
     teardown = _load(out, "teardown_result.json") or {}
     released = {}
     if teardown and not teardown.get("dry_run"):
-        ends = [r["ended_at"] for r in runs
-                if r["stage"] == "teardown" and r.get("exit_code") == 0]
+        # The run that wrote teardown_result.json, WHATEVER its exit code:
+        # teardown exits 1 when any one target is unverified, and the ones
+        # it did verify are released all the same.
+        ends = [r["ended_at"] for r in runs if r["stage"] == "teardown"]
         for step in teardown.get("steps") or []:
-            if step.get("verified") and step.get("cluster"):
+            action = step.get("action")
+            if (step.get("verified") and step.get("cluster")
+                    and action in RELEASED_ACTIONS):
                 released[step["cluster"]] = {
-                    "state": step.get("state") or step.get("action"),
-                    "at": ends[-1] if ends else None,
+                    "state": (RELEASED_ACTIONS[action]
+                              or str(step.get("state") or "STOPPED")),
+                    "at": (step.get("at") or teardown.get("at")
+                           or (ends[-1] if ends else None)),
                     "action": teardown.get("action")}
 
     shape = _cluster_shape()
@@ -156,13 +167,16 @@ def build_resources(out_dir) -> dict:
         resources.append(_res("workspace", "provision", name=ws.get("name"),
                               key=ws["key"], state="ACTIVE (kept)"))
 
-    clusters = []
-    cl = prov.get("cluster") or {}
-    if cl.get("key"):
-        clusters.append((cl, "migration cluster"))
-    for wc in prov.get("warehouse_clusters") or []:
-        if wc.get("key") and not wc.get("uses_existing"):
-            clusters.append((wc, f'warehouse cluster for {wc.get("warehouse")}'))
+    # Only what the record PROVES this migration created: a cluster it
+    # adopted, or the existing one a warehouse maps to, is not its
+    # allocation and not its bill (target/provenance.py).
+    from target.provenance import (CREATED, NOT_CREATED, UNKNOWN,
+                                   cluster_records)
+    clusters, seen = [], set()
+    for rec in cluster_records(prov):
+        if rec["provenance"] == CREATED and rec["cluster"] not in seen:
+            seen.add(rec["cluster"])
+            clusters.append((rec["record"], rec["role"]))
     observed = {r["key"]: r for r in _ledger(out)
                 if r.get("kind") == "cluster" and r.get("created_at")}
     for c, role in clusters:
@@ -179,8 +193,10 @@ def build_resources(out_dir) -> dict:
             start = created_at
             source = "approximate (end of first provision run)"
         hours = None
-        if start:
-            end = _ts(rel["at"]) if rel and rel.get("at") else \
+        if start and not (rel and not rel.get("at")):
+            # Released at an unrecorded time: the window is unknown, and
+            # "until now" would bill a stopped cluster for nothing.
+            end = _ts(rel["at"]) if rel else \
                 datetime.datetime.now(datetime.timezone.utc)
             hours = round((end - _ts(start)).total_seconds() / 3600, 2)
         resources.append(_res(
@@ -208,22 +224,54 @@ def build_resources(out_dir) -> dict:
                               name="backup-snowflake-migration/", key=None,
                               count=len(files), state="kept"))
 
+    # A catalog is this migration's allocation only on evidence that it
+    # CREATED it: a ledger row, or an executed catalog_result, with action
+    # `created`. provision's two catalog names are job parameters (it
+    # creates no catalog), and a `reused` catalog existed before; both are
+    # listed apart, never billed here.
     cats: dict[str, dict] = {}
+    others: dict[str, dict] = {}
     for name, ctype in ((prov.get("external_catalog"), "EXTERNAL"),
                         (prov.get("target_catalog"), "INTERNAL")):
         if name:
-            cats[name] = {"type": ctype, "stage": "catalog"}
+            others[name] = {"type": ctype,
+                            "why": "named in the job parameters by "
+                                   "provision, not verified to exist"}
+    evidence = []
     last = _load(out, "catalog_result.json") or {}
     if last.get("catalog") and not last.get("dry_run"):
-        cats[last["catalog"]] = {"type": last.get("catalog_type") or "?",
-                                 "stage": "catalog"}
+        evidence.append((last["catalog"], last.get("catalog_type") or "?",
+                         "catalog", last.get("action")))
     for rec in _ledger(out):
         if rec.get("kind") == "catalog" and rec.get("name"):
-            cats[rec["name"]] = {"type": rec.get("type") or "?",
-                                 "stage": rec.get("stage", "catalog")}
+            evidence.append((rec["name"], rec.get("type") or "?",
+                             rec.get("stage", "catalog"), rec.get("action")))
+    for name, ctype, stage, action in evidence:
+        if action == "created":
+            cats[name] = {"type": ctype, "stage": stage}
+        elif action == "reused" and name not in cats:
+            others[name] = {"type": ctype,
+                            "why": "existed before this migration (the "
+                                   "catalog stage reused it)"}
     for name, c in sorted(cats.items()):
         resources.append(_res("catalog", c["stage"], name=name, key=name,
                               type=c["type"], state="ACTIVE (kept)"))
+    not_allocated = [{"kind": "catalog", "name": name, "type": c["type"],
+                      "why": c["why"]}
+                     for name, c in sorted(others.items()) if name not in cats]
+    # Neither billed nor "not allocated": a record written before
+    # provenance cannot tell (target/provenance.py).
+    unknown = []
+    for rec in cluster_records(prov):
+        if rec["provenance"] == UNKNOWN and rec["cluster"] not in seen:
+            seen.add(rec["cluster"])
+            unknown.append({"kind": "cluster", "name": rec["name"],
+                            "key": rec["cluster"], "why": rec["why"]})
+    for rec in cluster_records(prov):
+        if rec["provenance"] == NOT_CREATED and rec["cluster"] not in seen:
+            seen.add(rec["cluster"])
+            not_allocated.append({"kind": "cluster", "name": rec["name"],
+                                  "key": rec["cluster"], "why": rec["why"]})
 
     deployed = _load(out, "deploy_result.json") or {}
     structure = _load(out, "run_snowmig_01_structure.json") or {}
@@ -241,6 +289,7 @@ def build_resources(out_dir) -> dict:
                 if (r["kind"] == "cluster" and r["state"] not in _STOPPED)
                 or r["billing"] == "storage for data held"]
     return {"resources": resources, "accruing_now": accruing,
+            "not_allocated": not_allocated, "provenance_unknown": unknown,
             "shape": shape, "snowflake_usage": _snowflake_usage(out),
             "note": ""}
 
@@ -294,6 +343,13 @@ def render_resources_section(res: dict) -> list[str]:
                        f'{r["billing_driver"]} |')
         out.append("")
         for r in (x for x in res["resources"] if x["kind"] == "cluster"):
+            if (r.get("running_hours") is None and r["state"] in _STOPPED
+                    and r.get("created_at")):
+                out.append(
+                    f'- **Compute exposure — `{r["name"]}`**: ran from '
+                    f'{r["created_at"]} (source: {r.get("created_at_source")}) '
+                    f'until teardown left it {r["state"]}, at a time the '
+                    f'record does not carry; running hours unknown.')
             if r.get("running_hours") is not None:
                 lo, hi = r["ocpu_hours"]
                 end = r.get("released_at") or "now (still running)"
@@ -303,6 +359,19 @@ def render_resources_section(res: dict) -> list[str]:
                     f'to {end}, **{r["running_hours"]} h**, '
                     f'shape {r["shape"]} ⇒ **{lo}–{hi} OCPU-hours** '
                     f'(workers autoscale between the bounds).')
+        others = res.get("not_allocated") or []
+        if others:
+            out += ["", "**Named or used, but not allocated by this "
+                    "migration** (not billed here): " + "; ".join(
+                        f'`{r.get("name") or r.get("key")}` {r["kind"]} — '
+                        f'{r["why"]}' for r in others)]
+        unknown = res.get("provenance_unknown") or []
+        if unknown:
+            out += ["", "**Provenance unknown** (named in a record written "
+                    "before provenance; not billed here, confirm in the "
+                    "console): " + "; ".join(
+                        f'`{r.get("name") or r.get("key")}` '
+                        f'(`{r.get("key")}`) {r["kind"]}' for r in unknown)]
         accruing = res.get("accruing_now") or []
         out += ["", "**Still accruing now:** " + (
             "; ".join(f'{_label(r)} — {r["billing"]}' for r in accruing)

@@ -261,7 +261,7 @@ def test_a_download_is_written_only_when_the_size_matches(tmp_path):
     call = lambda op, **kw: {"parUrl": "https://par/x", "size": 3}  # noqa
     res = download_ws_file(call, workspace="ws", path="a/b.json",
                            dest=tmp_path / "b.json",
-                           opener=lambda url: _Resp(b"abc"))
+                           opener=lambda url, **kw: _Resp(b"abc"))
     assert res["size"] == 3 and (tmp_path / "b.json").read_bytes() == b"abc"
     assert "par" not in json.dumps(res), "the PAR URL is never returned"
 
@@ -271,5 +271,5 @@ def test_a_short_download_is_an_error_and_writes_nothing(tmp_path):
     with pytest.raises(ProvisionTransportError, match="9"):
         download_ws_file(call, workspace="ws", path="a/b.json",
                          dest=tmp_path / "b.json",
-                         opener=lambda url: _Resp(b"abc"))
+                         opener=lambda url, **kw: _Resp(b"abc"))
     assert not (tmp_path / "b.json").exists()

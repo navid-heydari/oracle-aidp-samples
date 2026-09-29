@@ -51,7 +51,7 @@ from .provision_api import (
 __all__ = ["JOB_SPECS", "SCRIPTS_FOLDER", "PLAN_FOLDER", "REPORTS_FOLDER",
            "BACKUP_FOLDER", "PLAN_BACKUP_FILES", "plan_backup_names",
            "COPY_JOB_PREFIX", "plan_copy_schemas", "copy_job_specs",
-           "download_ws_file",
+           "DOWNLOAD_TIMEOUT", "download_ws_file", "carry_forward",
            "ProvisionTransportError",
            "make_provision_call", "provision", "render_provision",
            "source_config_payload",
@@ -145,20 +145,43 @@ def copy_job_specs(schemas) -> list[dict]:
     name. Two schemas that translate to the same name (`A-B` and `A_B`)
     would share a job and a notebook, so that is refused rather than
     resolved by guessing which one wins.
+
+    A name equal to a stage job's -- a schema named SCHEMA would get
+    `snowmig_02_copy_schema`, the generic parameterless copy job -- is
+    disambiguated to `snowmig_02_copy_schema_<slug>`, so the plan's job is
+    never skipped as "the generic one" nor adopted from it.
     """
+    stage_jobs = {spec["name"] for spec in JOB_SPECS}
     specs, seen = [], {}
     for schema in schemas:
         slug = translate_name(schema, kind="schema").name
-        if slug in seen:
+        name = f"{COPY_JOB_PREFIX}{slug}"
+        if name in stage_jobs:
+            name = f"{COPY_JOB_PREFIX}schema_{slug}"
+        if name in seen:
             raise ValueError(
-                f"schemas {seen[slug]!r} and {schema!r} both translate to "
-                f"{slug!r}, so their copy jobs would collide. Scope one of "
-                f"them out with --restrictions and run it as its own wave.")
-        seen[slug] = schema
-        specs.append({"name": f"{COPY_JOB_PREFIX}{slug}",
+                f"schemas {seen[name]!r} and {schema!r} both give the copy "
+                f"job name {name!r}, so their copy jobs would collide. Scope "
+                f"one of them out with --restrictions and run it as its own "
+                f"wave.")
+        seen[name] = schema
+        specs.append({"name": name,
                       "notebook": COPY_STAGE_NOTEBOOK,
                       "task_parameters": {"schema": schema}})
     return specs
+
+
+def _listed_task_parameters(job: dict) -> dict | None:
+    """The task parameters a job listing carries, when it carries them
+    (None when it does not: the listing may be a summary)."""
+    tasks = job.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return None
+    params = (tasks[0] or {}).get("parameters")
+    if not isinstance(params, list):
+        return None
+    return {str(p.get("name")): str(p.get("value")) for p in params
+            if isinstance(p, dict)}
 
 
 def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
@@ -488,6 +511,31 @@ def _pypi_from_requirements(path: pathlib.Path | None) -> list[str]:
     return out
 
 
+def _current_credential(prior: dict) -> str | None:
+    """The credential path the earlier record's notebooks were pointed at:
+    its own request, else the newest object it tracks that no later
+    --source-config superseded. Still to be LOOKED FOR before use."""
+    superseded = set(prior.get("credential_superseded") or [])
+    for obj in (prior.get("credential_requested"),
+                *(prior.get("credential_objects") or []),
+                *(prior.get("credential_unconfirmed") or [])):
+        if obj and obj not in superseded:
+            return obj
+    return None
+
+
+def _inherited(prior: dict, *, external_catalog, target_catalog,
+               source_mode, credential_given: bool):
+    """(external_catalog, target_catalog, source_mode, credential path)
+    after inheriting from `prior` wherever no argument gave a value. The
+    source mode travels with the catalogs: external-catalog notebooks
+    regenerated as connector, with no source-config, fail every stage."""
+    return (external_catalog or prior.get("external_catalog"),
+            target_catalog or prior.get("target_catalog"),
+            source_mode or prior.get("source_mode"),
+            None if credential_given else _current_credential(prior))
+
+
 def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               cluster_name: str = "migration-assets",
               scripts: list[pathlib.Path],
@@ -497,7 +545,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               maven: list[str] = (),
               external_catalog: str | None = None,
               target_catalog: str | None = None,
-              source_mode: str = "connector",
+              source_mode: str | None = "connector",
               source_config: pathlib.Path | None = None,
               warehouse_clusters: list[dict] = (),
               execute: bool = False,
@@ -510,7 +558,8 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               refresh_notebooks: bool = False,
               plan_label: str | None = None,
               copy_schemas=(),
-              inherited_credential: str | None = None,
+              prior: dict | None = None,
+              datalake_ocid: str | None = None,
               now: datetime.datetime | None = None) -> dict:
     """Provision this migration's own environment inside AIDP.
 
@@ -535,6 +584,16 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     rejects it), or values that would land only on a notebook this run
     keeps are refused with a ValueError, never dropped -- a scope flag that
     silently does nothing reads as applied.
+
+    `prior` is the earlier EXECUTED record of this out dir. A
+    `reuse_existing` re-push into the workspace it records inherits the
+    catalogs, the source mode (`source_mode=None`) and the credential path
+    it baked in, where no argument gives them -- only when it names the same aiDataPlatform (`datalake_ocid`)
+    and, once listed, the same workspace KEY; a name alone is not the same
+    workspace. An inherited credential path is listed on the workspace
+    before it is baked into a notebook or announced. A credential object is
+    recorded in `credential_objects` only once its upload is read back;
+    one that may or may not have landed is `credential_unconfirmed`.
     """
     stamp = (now or datetime.datetime.now(datetime.timezone.utc)
              ).strftime("%Y%m%dT%H%M%SZ")
@@ -573,30 +632,86 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         credential_object = f"{PLAN_FOLDER}/{source_config.stem}.json"
         plan_files = [p for p in plan_files
                       if pathlib.Path(p).resolve() != source_config.resolve()]
+    # What a re-push may inherit, and from which record. In a dry run the
+    # workspace key is unknown, so the preview inherits provisionally; an
+    # executed run confirms the key before using any of it.
+    inherit_from = None
+    if (reuse_existing and prior and prior.get("dry_run") is False
+            and (prior.get("workspace") or {}).get("requested")
+            == workspace_name
+            and not (datalake_ocid and prior.get("datalake_ocid")
+                     and prior["datalake_ocid"] != datalake_ocid)):
+        inherit_from = prior
+    inherited_credential = None
+    if inherit_from is not None and not execute:
+        (external_catalog, target_catalog, source_mode,
+         inherited_credential) = _inherited(
+            inherit_from, external_catalog=external_catalog,
+            target_catalog=target_catalog, source_mode=source_mode,
+            credential_given=credential_object is not None)
+    # `connector` only when nothing -- flag or inheritance -- gave a mode.
+    requested_mode, source_mode = source_mode, source_mode or "connector"
     # One cluster per Snowflake warehouse, named after it. Sizing is NOT
     # carried over: the user asked for same-name clusters on the AIDP default
     # config, and the `compute` stage's proposal stays a proposal until
     # somebody decides on it.
+    #
+    # Provenance is recorded POSITIVELY: `created` is True only on the create
+    # path. teardown and the billing report act on nothing else, so a
+    # cluster adopted here, or the existing one a warehouse maps to, is
+    # never stopped or deleted as if it were the migration's.
+    existing_mode = warehouse_cluster_mode == "existing"
     warehouse_targets = []
+    # One DISTINCT name per warehouse, the migration cluster's reserved: two
+    # names that fold alike (COMPUTE_WH, COMPUTE) would share one cluster.
+    from sizing.warehouse_map import cluster_base_name, cluster_names
+    distinct = cluster_names(
+        [str(wh.get("name") or wh.get("warehouse") or "").strip()
+         for wh in warehouse_clusters or ()], reserved={cl_name.name})
     for wh in warehouse_clusters or ():
         source_name = str(wh.get("name") or wh.get("warehouse") or "").strip()
         if not source_name:
             continue
-        # Named from the warehouse's BASE name (COMPUTE_WH -> compute).
-        from sizing.warehouse_map import cluster_base_name
-        name = cluster_base_name(source_name)
+        if existing_mode:
+            # `compute.warehouse_clusters: existing` -- every warehouse maps
+            # to one cluster that is already there. Its display name is not
+            # known here, and the warehouse's base name is not it.
+            warehouse_targets.append(
+                {"warehouse": source_name, "name": None,
+                 "existing_cluster": existing_cluster_id,
+                 "key": existing_cluster_id, "uses_existing": True,
+                 "created": False, "renamed": False,
+                 "notes": [f"mapped to the existing cluster "
+                           f"{existing_cluster_id}; not created, not "
+                           f"resized"],
+                 "source_size": wh.get("size")})
+            continue
+        # Named from the warehouse's BASE name (COMPUTE_WH -> compute),
+        # unless that collides with another warehouse's or the migration
+        # cluster's.
+        name = distinct[source_name]
+        base = cluster_base_name(source_name)
+        note = (f"named from the base name of {source_name}"
+                if name == base else
+                f"named from {source_name} in full: its base name `{base}` "
+                f"would collide with another warehouse's or the migration "
+                f"cluster's")
         warehouse_targets.append(
             {"warehouse": source_name, "name": name,
-             "renamed": name != source_name,
-             "notes": [f"named from the base name of {source_name}"],
-             "source_size": wh.get("size")})
+             "renamed": name != source_name, "created": False,
+             "notes": [note], "source_size": wh.get("size")})
 
     out: dict = {
         "dry_run": not execute,
         "workspace": {"requested": workspace_name, "name": ws_name.name,
-                      "renamed": ws_name.changed, "notes": ws_name.notes},
+                      "renamed": ws_name.changed, "notes": ws_name.notes,
+                      "created": False},
         "cluster": {"requested": cluster_name, "name": cl_name.name,
-                    "renamed": cl_name.changed, "notes": cl_name.notes},
+                    "renamed": cl_name.changed, "notes": cl_name.notes,
+                    "created": False},
+        # The push these records were written by; a `created` flag carries
+        # the run that set it (`created_run`).
+        "run": stamp,
         "warehouse_clusters": warehouse_targets,
         "scripts_folder": SCRIPTS_FOLDER, "plan_folder": PLAN_FOLDER,
         "reports_folder": REPORTS_FOLDER,
@@ -608,9 +723,16 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         # in one place and the operator knows what to remove afterwards.
         # A re-push that inherited the path records it too: the object is
         # still on the workspace, and the next push inherits from here.
-        "credential_objects": ([credential_object] if credential_object
+        # In a dry run, what would hold it; executed, only what was read
+        # back on the workspace (an upload that raised or was not seen is
+        # `credential_unconfirmed`: it may have landed).
+        "credential_objects": ([] if execute else
+                               [credential_object] if credential_object
                                else [inherited_credential]
                                if inherited_credential else []),
+        "credential_requested": credential_object,
+        "credential_unconfirmed": [],
+        "datalake_ocid": datalake_ocid,
         # Stage notebooks left as found on the workspace (reuse_existing
         # without refresh_notebooks), so PROVISION.md can list them.
         "notebooks_kept": [],
@@ -618,13 +740,25 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         # what this run wrote into PARAMS beyond the derived coordinates.
         "stage_params": dict(stage_params),
         # One copy job per schema of the approved plan (runbook S11), as
-        # {schema, job, notebook}; registered here, never run by provision.
+        # {schema, job, notebook, status}; registered here, never run by
+        # provision. `status` is this run's OUTCOME for the job -- "would
+        # register" in a dry run, "not registered" until a create or reuse
+        # says otherwise -- so a halt is never reported as a registration.
         "copy_jobs": [{"schema": sp["task_parameters"]["schema"],
                        "job": sp["name"],
-                       "notebook": f'{SCRIPTS_FOLDER}/{sp["notebook"]}'}
+                       "notebook": f'{SCRIPTS_FOLDER}/{sp["notebook"]}',
+                       "status": ("not registered" if execute
+                                  else "would register")}
                       for sp in job_specs if sp.get("task_parameters")],
+        # Copy jobs on the workspace that the present plan does not name
+        # (a schema reduced out of it): still runnable, so reported.
+        "stale_copy_jobs": [],
         "steps": [],
     }
+
+    if inherit_from is not None and not execute:
+        out["inherited_from"] = {"run": inherit_from.get("run"),
+                                 "provisional": True}
 
     def step(name: str, action: str, verified: bool | None,
              detail: str = "") -> None:
@@ -635,6 +769,11 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         step("workspace", "would ensure", None, ws_name.name)
         step("cluster", "would ensure", None, cl_name.name)
         for target in warehouse_targets:
+            if target.get("uses_existing"):
+                step("warehouse-cluster", "would use existing", None,
+                     f'{target["warehouse"]} -> existing cluster '
+                     f'{existing_cluster_id} (not created, not resized)')
+                continue
             step("warehouse-cluster", "would ensure", None,
                  f'{target["warehouse"]} -> {target["name"]} '
                  f'(AIDP default config; source size '
@@ -674,6 +813,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
 
     if call is None:
         raise ValueError("execute=True requires a transport callable")
+    credential_ready = False
 
     # 1 · workspace: look, create if absent, poll until visible AND ACTIVE --
     found = _match(call("list_workspaces").get("items") or [], ws_name.name)
@@ -718,6 +858,28 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         return out
     ws_key = _key(found or {}, ws_name.name)
     out["workspace"]["key"] = ws_key
+    if ws_created:
+        out["workspace"].update(created=True, created_run=stamp)
+    if inherit_from is not None and found is not None:
+        was = (inherit_from.get("workspace") or {}).get("key")
+        if was == ws_key:
+            (external_catalog, target_catalog, source_mode,
+             inherited_credential) = _inherited(
+                inherit_from, external_catalog=external_catalog,
+                target_catalog=target_catalog, source_mode=requested_mode,
+                credential_given=credential_object is not None)
+            source_mode = source_mode or "connector"
+            out.update(external_catalog=external_catalog,
+                       target_catalog=target_catalog,
+                       source_mode=source_mode,
+                       inherited_from={"run": inherit_from.get("run"),
+                                       "workspace": ws_key})
+        else:
+            step("inherit", "skipped", None,
+                 f"the earlier record names workspace key {was}, this "
+                 f"workspace is {ws_key}: a different workspace under the "
+                 f"same name, so no catalog or credential path was "
+                 f"inherited")
     if found is None:
         if ws_created and ws_list_error is not None:
             step("halt", "stopped", False,
@@ -786,8 +948,12 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
              if cl_list_error is not None else cl_name.name)
         if found is not None:
             # When the compute clock started, for the billing report.
+            out["cluster"].update(created=True, created_run=stamp)
             out["cluster"]["created_at"] = datetime.datetime.now(
                 datetime.timezone.utc).isoformat()
+        else:
+            # Accepted, key never seen: teardown must say so, not skip it.
+            out["cluster"]["create_requested"] = True
     elif reuse_existing:
         step("cluster", "reused", True, _key(found, cl_name.name))
     else:
@@ -816,11 +982,12 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     # These are the customer's own compute, not the migration's: a failure on
     # one is recorded and the rest continue, and NOTHING here changes the
     # migration cluster the jobs are bound to.
-    if warehouse_cluster_mode == "existing":
+    if existing_mode:
         # `compute.warehouse_clusters: existing` -- every warehouse maps to
-        # one cluster that is already there. Nothing is created or resized.
+        # one cluster that is already there. Nothing is created or resized,
+        # and the record says it was not created here (uses_existing,
+        # created: false), so teardown leaves it alone.
         for target in warehouse_targets:
-            target["key"] = existing_cluster_id
             step("warehouse-cluster", "uses_existing", True,
                  f'{target["warehouse"]} -> existing cluster '
                  f'{existing_cluster_id} (not created, not resized)')
@@ -860,12 +1027,17 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
             delays)
         target["key"] = _key(seen or {}, target["name"]) if seen else None
         if seen:
+            target.update(created=True, created_run=stamp,
+                          created_at=datetime.datetime.now(
+                              datetime.timezone.utc).isoformat())
             tail = ""
-        elif seen_error is not None:
-            tail = (" — accepted, but it could not be listed to confirm it; "
-                    f"read_back_failed: {seen_error}")
         else:
-            tail = " — accepted, but it never became visible"
+            # Accepted, key never seen: teardown must say so, not skip it.
+            target["create_requested"] = True
+            tail = (" — accepted, but it could not be listed to confirm it; "
+                    f"read_back_failed: {seen_error}"
+                    if seen_error is not None else
+                    " — accepted, but it never became visible")
         step("warehouse-cluster",
              "created" if seen else "create_requested", seen is not None,
              f'{target["warehouse"]} -> {target["name"]}' + tail)
@@ -979,14 +1151,47 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                      _credential_line(source_config.name, credential_object)
                      + ("" if found else "; not visible in listing"))
             except Exception as exc:
+                found = False
                 step("upload", "failed", False,
                      f"{credential_object}: {str(exc)[:200]} (it carries "
                      f"the credential; check whether it landed)")
+            credential_ready = found
+            out["credential_objects" if found
+                else "credential_unconfirmed"].append(credential_object)
         finally:
             try:
                 os.unlink(local)
             except OSError:
                 pass
+    elif inherited_credential:
+        # Named by the earlier record is not "on the workspace": its upload
+        # may have failed, or the object been removed since. Looked for
+        # before it is baked into a notebook or announced as holding it.
+        name = inherited_credential.rsplit("/", 1)[-1]
+        try:
+            items = call("list_ws_objects", workspace=ws_key,
+                         path=PLAN_FOLDER).get("items") or []
+            present = any(str(i.get("path") or "").endswith("/" + name)
+                          or i.get("displayName") == name for i in items)
+            why = f"is not in the listing of {PLAN_FOLDER}"
+        except Exception as exc:
+            present = False
+            why = f"could not be looked for ({str(exc)[:160]})"
+        if present:
+            out["credential_objects"].append(inherited_credential)
+            step("credential", "inherited", True,
+                 f"{inherited_credential}: placed by an earlier push of this "
+                 f"migration and still on the workspace; not re-uploaded. It "
+                 f"CARRIES THE SNOWFLAKE CREDENTIAL; remove it when the "
+                 f"migration is done")
+        else:
+            out.setdefault("credential_missing", []).append(
+                inherited_credential)
+            step("credential", "missing", False,
+                 f"{inherited_credential}: named by the earlier record, but "
+                 f"it {why}, so no notebook was pointed at it. Re-run with "
+                 f"--source-config <the migration config> to place it")
+            inherited_credential = None
 
     # 5 · stage notebooks + jobs ---------------------------------------------
     # Job `parameters` reach the notebook neither as argv nor as environment
@@ -1006,9 +1211,10 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         defaults["source-catalog"] = external_catalog
     if target_catalog:
         defaults["target-catalog"] = target_catalog
-    if credential_object:
+    if credential_object and credential_ready:
         # The scripts read the credential from the derived copy ON THE MOUNT,
         # so the path they receive is the /Workspace one, not the local one.
+        # Only once it was read back there: a path to nothing is not baked.
         defaults["source-config"] = f"/Workspace/{credential_object}"
     elif inherited_credential:
         # A re-push that did not re-upload it: the copy an earlier push of
@@ -1042,22 +1248,43 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         except Exception as exc:
             listing_error = exc
 
+    copy_status = {j["job"]: j for j in out["copy_jobs"]}
+
+    def _outcome(spec: dict, status: str) -> None:
+        if spec["name"] in copy_status:
+            copy_status[spec["name"]]["status"] = status
+
     def _create_job(spec: dict, *, kept: bool = False) -> None:
         notebook_path = f'{SCRIPTS_FOLDER}/{spec["notebook"]}'
-        if _match(existing, spec["name"]) is not None:
+        found_job = _match(existing, spec["name"])
+        if found_job is not None:
             overwritten = (
                 "OVERWRITTEN from this run's flags; console edits to its "
                 "PARAMS cell are gone")
+            wanted = spec.get("task_parameters")
+            listed = _listed_task_parameters(found_job) if wanted else None
+            if wanted and listed is not None and any(
+                    listed.get(k) != str(v) for k, v in wanted.items()):
+                # A job of this name that runs something else is not this
+                # plan's workflow, whatever its name says.
+                step("job", "name_taken", False,
+                     f'{spec["name"]} already exists with task parameters '
+                     f'{listed}, not {wanted}; it was NOT adopted. Delete or '
+                     f'rename it in the console, then re-push.')
+                _outcome(spec, "name taken, not registered")
+                return
             if reuse_existing:
                 step("job", "reused", True,
                      f'{spec["name"]} (stage notebook '
                      f'{"kept" if kept else overwritten})')
+                _outcome(spec, "reused")
             else:
                 step("job", "name_taken", False,
                      f'{spec["name"]} already exists and was NOT adopted; '
                      f'its stage notebook was {overwritten}, but the job '
                      f'itself is not this migration\'s. Rename or '
                      f'--reuse-existing.')
+                _outcome(spec, "name taken, not registered")
             return
         body = build_job_body(spec["name"], notebook_path=notebook_path,
                               cluster_key=cluster_key,
@@ -1071,12 +1298,16 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                  found is not None,
                  f'{spec["name"]}: read_back_failed: {job_list_error}'
                  if job_list_error is not None else spec["name"])
+            _outcome(spec, "created" if found else
+                     "create requested, not confirmed")
         except Exception as exc:
             step("job", "failed", False, f'{spec["name"]}: {str(exc)[:200]}')
+            _outcome(spec, "failed, not registered")
 
     # Notebooks uploaded (or kept) and read back by this run. A per-schema
     # copy job shares the 02 notebook, so it only needs that one to be here.
     notebooks_ready: set[str] = set()
+    kept_by_notebook: dict[str, bool] = {}
     for spec in job_specs:
         if spec.get("task_parameters"):
             if spec["notebook"] not in notebooks_ready:
@@ -1085,7 +1316,8 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                      f'on the workspace (see its step above), so the job was '
                      f'NOT created rather than pointed at nothing')
                 continue
-            _create_job(spec)
+            _create_job(spec, kept=kept_by_notebook.get(spec["notebook"],
+                                                        False))
             continue
         stage = stages_by_notebook.get(spec["notebook"])
         if stage is None:
@@ -1146,12 +1378,41 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                 continue
 
         notebooks_ready.add(spec["notebook"])
+        kept_by_notebook[spec["notebook"]] = kept
         if spec["name"] in no_job:
-            step("job", "not_created", None,
-                 f'{spec["name"]}: superseded by the per-schema copy jobs '
-                 f'below, which run this same notebook with a schema')
+            if _match(existing, spec["name"]) is not None:
+                # There, from an earlier push without a plan: it has no
+                # schema, so running it can only fail. Said, not hidden.
+                step("job", "exists_superseded", None,
+                     f'{spec["name"]}: on the workspace from an earlier push, '
+                     f'superseded by the per-schema copy jobs below; it has '
+                     f'no schema, so running it can only fail -- delete it '
+                     f'in the console')
+            else:
+                step("job", "not_created", None,
+                     f'{spec["name"]}: superseded by the per-schema copy '
+                     f'jobs below, which run this same notebook with a '
+                     f'schema')
             continue
         _create_job(spec, kept=kept)
+
+    # A copy job an earlier plan registered, for a schema this plan no
+    # longer names, is still on the workspace and still runnable: it would
+    # copy data the approved plan excludes, or nothing at all. Nothing is
+    # deleted behind the operator's back; it is a failed step until it is
+    # removed in the console.
+    planned = {spec["name"] for spec in job_specs}
+    generic = {spec["name"] for spec in JOB_SPECS}
+    for job in existing:
+        name = str(job.get("displayName") or job.get("name") or "")
+        if (name.lower().startswith(COPY_JOB_PREFIX)
+                and name not in planned and name not in generic):
+            out["stale_copy_jobs"].append(name)
+            step("job", "stale", False,
+                 f"{name} is on the workspace but its schema is not in this "
+                 f"plan (reduced out, or renamed); it is still runnable. "
+                 f"Delete it in the console, or re-plan to include the "
+                 f"schema")
 
     # 6 · the environment diagnosis, beside the stages, with NO job --------
     # README step 8 has the operator open it from scripts/ before the jobs;
@@ -1200,14 +1461,146 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     return out
 
 
+def carry_forward(res: dict, prior: dict | None) -> dict:
+    """Carry what an earlier EXECUTED push recorded into this one, so no
+    executed push ever drops an allocation from the record teardown reads.
+
+    Provenance: a re-push into this migration's own workspace (the
+    documented plan push is `--reuse-existing`) finds the workspace and
+    clusters the first push created and records them as `reused`. The
+    earlier record is the proof they were created here, so its `created`
+    flag (and when) is carried onto the same keys -- only from a record of
+    the same workspace key; a record of another workspace proves nothing
+    about this one. A cluster whose provenance the earlier record cannot
+    tell (it predates provenance) stays unknown here
+    (`provenance_unknown: true`): this push finding it proves no more.
+
+    Allocations: every cluster the earlier record proves this migration
+    created, and that this push does not record itself --
+    the plan push carries no --warehouse-clusters, a push may go to
+    another workspace -- is kept under `earlier_allocations`, each with its
+    own workspace key. Credential objects are kept the same way (see
+    _carry_credentials). A record of another aiDataPlatform is never "the
+    same workspace", whatever its key. Returns `res`, updated in place.
+    """
+    from .provenance import CREATED, REQUESTED, UNKNOWN, cluster_records
+    if (not prior or prior.get("dry_run") is not False
+            or res.get("dry_run") is not False):
+        return res
+    ws = (res.get("workspace") or {}).get("key")
+    prior_ws = prior.get("workspace") or {}
+    same_ws = bool(ws) and prior_ws.get("key") == ws
+    if (same_ws and res.get("datalake_ocid") and prior.get("datalake_ocid")
+            and res["datalake_ocid"] != prior["datalake_ocid"]):
+        same_ws = False          # a key is only unique within one platform
+    if same_ws and prior_ws.get("created") and not res["workspace"].get(
+            "created"):
+        res["workspace"].update(
+            created=True, created_run=prior_ws.get("created_run")
+            or prior.get("run"), created_by_earlier_push=True)
+    _carry_credentials(res, prior, same_ws)
+    records = cluster_records(prior)
+    owned = {r["cluster"]: r for r in records if r["provenance"] == CREATED}
+    unknown = {r["cluster"] for r in records if r["provenance"] == UNKNOWN}
+    here = [res.get("cluster") or {}, *(res.get("warehouse_clusters") or [])]
+    for rec in here:
+        earlier = owned.get(rec.get("key")) if same_ws else None
+        if rec.get("created") or rec.get("uses_existing"):
+            continue
+        if earlier is None:
+            if same_ws and rec.get("key") in unknown:
+                rec["provenance_unknown"] = True
+            continue
+        was = earlier["record"]
+        rec.update(created=True,
+                   created_run=was.get("created_run") or prior.get("run"),
+                   created_by_earlier_push=True)
+        if was.get("created_at") and not rec.get("created_at"):
+            rec["created_at"] = was["created_at"]
+    recorded = {(ws, rec.get("key")) for rec in here
+                if same_ws and rec.get("key")
+                and (rec.get("created") or rec.get("provenance_unknown"))}
+    kept, seen = [], set()
+    for r in records:
+        # A create that was accepted and never listed is carried too, by
+        # name: teardown keeps saying it cannot identify it until someone
+        # does, rather than a later push forgetting it was ever asked for.
+        at = (r["workspace"], r["cluster"] or f'name:{r["name"]}')
+        if (r["provenance"] not in (CREATED, REQUESTED, UNKNOWN)
+                or at in recorded or at in seen):
+            continue
+        seen.add(at)
+        was = r["record"]
+        entry = {"kind": "cluster", "key": r["cluster"], "name": r["name"],
+                 "role": r["role"], "workspace": r["workspace"],
+                 "created": r["provenance"] == CREATED,
+                 "created_run": was.get("created_run") or prior.get("run")}
+        if r["provenance"] == REQUESTED:
+            entry["create_requested"] = True
+        if r["provenance"] == UNKNOWN:
+            entry["provenance_unknown"] = True
+        if was.get("created_at"):
+            entry["created_at"] = was["created_at"]
+        if prior.get("datalake_ocid"):
+            entry["datalake_ocid"] = prior["datalake_ocid"]
+        kept.append(entry)
+    if kept:
+        res["earlier_allocations"] = kept
+    return res
+
+
+def _carry_credentials(res: dict, prior: dict, same_ws: bool) -> None:
+    """Every credential placement stays tracked. Objects the earlier record
+    tracked on the same workspace are kept in `credential_objects` (one
+    this push's --source-config replaces is flagged in
+    `credential_superseded`: it still holds the previous credential);
+    objects on another workspace go to `earlier_credential_objects`."""
+    missing = set(res.get("credential_missing") or [])
+    earlier = [dict(e) for e in prior.get("earlier_credential_objects") or []]
+    if not same_ws:
+        where = (prior.get("workspace") or {}).get("key")
+        for obj in [*(prior.get("credential_objects") or []),
+                    *(prior.get("credential_unconfirmed") or [])]:
+            earlier.append({"workspace": where, "path": obj})
+    else:
+        mine = res.setdefault("credential_objects", [])
+        unsure = res.setdefault("credential_unconfirmed", [])
+        superseded = [o for o in prior.get("credential_superseded") or []]
+        requested = res.get("credential_requested")
+        for obj in prior.get("credential_objects") or []:
+            if obj in mine or obj in missing or obj in unsure:
+                continue
+            mine.append(obj)
+            if requested and obj != requested and obj not in superseded:
+                superseded.append(obj)
+        for obj in prior.get("credential_unconfirmed") or []:
+            if obj not in mine and obj not in missing and obj not in unsure:
+                unsure.append(obj)
+        superseded = [o for o in superseded if o in mine or o in unsure]
+        if superseded:
+            res["credential_superseded"] = superseded
+    if earlier:
+        res["earlier_credential_objects"] = earlier
+
+
+# Seconds one GET of a pre-authenticated download URL may take. The process
+# default socket timeout is None, so without it a stalled object-storage GET
+# held `fetch` -- and `run` after a successful discovery -- open for ever.
+DOWNLOAD_TIMEOUT = 120
+
+
 def download_ws_file(call: Callable[..., dict], *, workspace: str,
                      path: str, dest: pathlib.Path,
-                     opener: Callable | None = None) -> dict:
+                     opener: Callable | None = None,
+                     timeout: float = DOWNLOAD_TIMEOUT,
+                     sleep: Callable[[float], None] | None = None) -> dict:
     """Bring one workspace file down to `dest`; returns {path, dest, size}.
 
     Two steps, the console's own: ask for a pre-authenticated URL, then GET
     it. The URL grants read access to the object for as long as it lives,
-    so it is never printed, logged or returned. The byte count is checked
+    so it is never printed, logged or returned -- nor carried by an error or
+    a retry line. The GET is bounded by `timeout` and retried by the read
+    rule (a transient error or a timeout). The byte count is checked
     against the size the server reported: a short read is an error, not a
     smaller file.
     """
@@ -1219,8 +1612,20 @@ def download_ws_file(call: Callable[..., dict], *, workspace: str,
         raise ProvisionTransportError(
             f"download {path}: the server returned no download URL "
             f"(fields: {sorted(k for k in meta if not k.startswith('_'))})")
-    with (opener or urllib.request.urlopen)(url) as resp:
-        data = resp.read()
+
+    def get() -> bytes:
+        try:
+            with (opener or urllib.request.urlopen)(url,
+                                                     timeout=timeout) as resp:
+                return resp.read()
+        except Exception as exc:
+            text = str(exc).replace(url, "<pre-authenticated URL>")
+            # `from None`: the original exception may carry the URL.
+            raise ProvisionTransportError(
+                f"download {path}: GET failed: {text[:200]}") from None
+
+    data = retry_call(get, label=f"download {path}",
+                      retryable=is_retryable(read=True), sleep=sleep)
     expected = meta.get("size")
     if expected is not None and int(expected) != len(data):
         raise ProvisionTransportError(
@@ -1263,9 +1668,26 @@ def render_provision(res: dict) -> str:
         for target in res["warehouse_clusters"]:
             note = ("; ".join(target.get("notes") or [])
                     if target.get("renamed") else "no")
+            cluster = (f'existing cluster `{target.get("existing_cluster")}` '
+                       f'(not created by this migration)'
+                       if target.get("uses_existing")
+                       else f'`{target["name"]}`')
             lines.append(f'| `{target["warehouse"]}` | '
                          f'{target.get("source_size") or "unknown"} | '
-                         f'`{target["name"]}` | {note} |')
+                         f'{cluster} | {note} |')
+        lines.append("")
+
+    if res.get("earlier_allocations"):
+        lines += [
+            "## Allocated by an earlier push (still this migration's)", "",
+            "Created by an earlier executed push of this migration and not "
+            "recorded again by this one, so they are carried here: "
+            "`teardown` still reaches them.", "",
+            "| Cluster | Key | Role | Workspace | Created by push |",
+            "|---|---|---|---|---|"]
+        lines += [f'| `{a.get("name")}` | `{a.get("key")}` | {a.get("role")} '
+                  f'| `{a.get("workspace")}` | {a.get("created_run") or "?"} |'
+                  for a in res["earlier_allocations"]]
         lines.append("")
 
     if res.get("credential_objects"):
@@ -1278,24 +1700,64 @@ def render_provision(res: dict) -> str:
             "is readable by **every member of this workspace and every "
             "cluster in it** via `/Workspace`, for as long as it stays "
             "there:", ""]
-        lines += [f"- `{obj}`" for obj in res["credential_objects"]]
+        superseded = set(res.get("credential_superseded") or [])
+        lines += [f"- `{obj}`" + (" -- superseded by this push's "
+                                  "`--source-config`; it still holds the "
+                                  "previous credential; remove it"
+                                  if obj in superseded else "")
+                  for obj in res["credential_objects"]]
         lines += ["",
                   "Remove it from the workspace once the migration is done, "
                   "and rotate the Snowflake credential if anyone who must "
                   "not hold it can read this workspace.", ""]
+    if res.get("credential_unconfirmed"):
+        lines += ["## Credential placement NOT confirmed", "",
+                  "An upload of the Snowflake credential was attempted and "
+                  "could not be read back. It may or may not be on the "
+                  "workspace; check, and remove it if it is:", ""]
+        lines += [f"- `{obj}`" for obj in res["credential_unconfirmed"]]
+        lines.append("")
+    if res.get("earlier_credential_objects"):
+        lines += ["## Credential placed by an earlier push on another "
+                  "workspace", "",
+                  "Still tracked here so it is not forgotten; remove it "
+                  "there once the migration is done:", ""]
+        lines += [f'- `{e.get("path")}` in workspace `{e.get("workspace")}`'
+                  for e in res["earlier_credential_objects"]]
+        lines.append("")
 
     if res.get("copy_jobs"):
+        statuses = {j.get("status") for j in res["copy_jobs"]}
+        if res["dry_run"]:
+            verdict = ("**Would be registered** by `--execute`, and never "
+                       "run by it")
+        elif statuses <= {"created", "reused"}:
+            verdict = "**Registered, never run**"
+        else:
+            verdict = ("**NOT all registered** -- see the Status column; "
+                       "none is ever run by provision")
         lines += [
             "## Per-schema copy workflows (runbook S11)", "",
             f'{len(res["copy_jobs"])} job(s), one per schema of the approved '
             "`ddl_plan.json`, each with ONE task running the SAME "
             "`02_copy_schema` notebook and passing `schema` as a task "
             "parameter, which the notebook reads at run time "
-            "(`oidlUtils.parameters.getParameter`). **Registered, never "
-            "run**: moving rows is the customer's decision.", "",
-            "| Schema (task parameter) | Job | Notebook |", "|---|---|---|"]
-        lines += [f'| `{j["schema"]}` | `{j["job"]}` | `{j["notebook"]}` |'
+            f"(`oidlUtils.parameters.getParameter`). {verdict}: moving rows "
+            "is the customer's decision.", "",
+            "| Schema (task parameter) | Job | Notebook | Status |",
+            "|---|---|---|---|"]
+        lines += [f'| `{j["schema"]}` | `{j["job"]}` | `{j["notebook"]}` | '
+                  f'{j.get("status") or "—"} |'
                   for j in res["copy_jobs"]]
+        lines.append("")
+
+    if res.get("stale_copy_jobs"):
+        lines += [
+            "## Copy jobs NOT in this plan (still on the workspace)", "",
+            "Registered by an earlier push for a schema the present plan "
+            "does not name. They are still runnable; delete them in the "
+            "console (or re-plan to include the schema):", ""]
+        lines += [f"- `{name}`" for name in res["stale_copy_jobs"]]
         lines.append("")
 
     if res.get("notebooks_kept"):

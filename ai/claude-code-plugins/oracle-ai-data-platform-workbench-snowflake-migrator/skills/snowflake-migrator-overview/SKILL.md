@@ -446,8 +446,15 @@ stage notebook reads workflow parameters over its PARAMS literals at run
 time — `oidlUtils.parameters.getParameter(name)`, resolved by the AIDP
 runtime and never imported, then the environment a task parameter is
 exported to. One script; each schema its own job, run history and evidence.
-`PROVISION.md` lists them (schema → job). A schema reduced out of the plan
-gets no job; re-push after re-planning to add it.
+A schema whose job name would be a stage job's (a schema named `SCHEMA`
+would get the generic `snowmig_02_copy_schema`) gets
+`snowmig_02_copy_schema_<schema>` instead, and a job of the right name whose
+listed task parameters name another schema is refused, not adopted.
+`PROVISION.md` lists them (schema → job → this push's outcome for it). A
+schema reduced out of the plan gets no new job; a copy job an earlier push
+registered for it is still on the workspace and runnable, so the push
+reports it as `stale` (and exits 1) until it is deleted in the console.
+Re-push after re-planning to add a schema.
 
 ### S12 — Propose the warehouse-equivalent clusters
 
@@ -465,8 +472,23 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig teardown            # dry run: lists the clust
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig teardown --execute  # stop them, read back
 ```
 
-Only clusters recorded in `provision_result.json` are touched, never one found
-by name. `stop` (default, `teardown.action` in the config) is reversible and
+Only clusters `provision_result.json` proves this migration **created**
+(`created: true`, written on the create path and carried forward by a
+re-push into the same workspace) are touched, never one found by name. A
+cluster the record names but did not create -- adopted with
+`--reuse-existing`, or the one `compute.warehouse_clusters: existing` maps
+the warehouses to -- is listed in `TEARDOWN.md` as not this migration's and
+left alone. A record written before provenance was recorded (no `created`
+field) proves it only by a `created` step; any other keyed cluster there --
+the documented re-push records the migration's own cluster as `reused` --
+is `provenance_unknown`: not touched, a failed step (exit 1) asking you to
+confirm in the console, and listed apart, unbilled, in the billing report.
+Clusters an earlier push created stay in the record
+(`earlier_allocations`) however later pushes are run, and an executed record
+that names no workspace makes teardown exit 1 ("cannot tell what was
+allocated"), never "nothing to terminate". A cluster whose create was
+accepted but whose key was never seen is a failed step (exit 1) telling you
+to look it up by name in the console; teardown never picks one by name. `stop` (default, `teardown.action` in the config) is reversible and
 leaves the registered copy jobs working; `--action delete` is final and must
 be asked for. The workspace, the catalogs and the jobs are kept: they are the
 migration's output and its record.

@@ -223,6 +223,23 @@ bin/snowmig provision --execute --reuse-existing --workspace-name <the S1 name> 
   --plan-label FULL        # REDUCED after an S9 scope reduction
 ```
 
+Where no flag gives them, the push keeps the catalogs, the `--source-mode`
+and the credential path the step-6 push recorded (same aiDataPlatform and
+workspace key only), so a `--refresh-notebooks` re-push does not flip an
+external-catalog migration to connector mode.
+
+A push never drops what an earlier push allocated: the clusters step 6
+created stay in `provision_result.json` (under `earlier_allocations` when
+this push does not record them itself, as the plan push does not), so
+`teardown` still reaches them. A record written before provenance was
+recorded (no `created` field) proves a cluster only by its `created` step;
+any other keyed cluster in it is `provenance_unknown`, which teardown never
+touches and reports as a failed step (exit 1) to confirm in the console. A
+push that halts before recording a
+workspace -- a name collision without `--reuse-existing` -- is written to
+`provision_result.halted.json` / `PROVISION_HALTED.md`, and the earlier
+record is kept.
+
 ### 5. Prove both ends reach each other
 
 ```bash
@@ -260,7 +277,10 @@ bin/snowmig provision ... --execute
 
 Creates the workspace (name translated to a charset the API cannot reject),
 the `migration_assets` cluster, **one cluster per Snowflake warehouse with the
-same name** on the AIDP default config, the workspace folder
+same name** on the AIDP default config (its base name, `COMPUTE_WH` ->
+`compute`; two warehouses whose base names fold alike, or one that would take
+the migration cluster's name, keep their full names instead, so no two share
+a cluster), the workspace folder
 `backup-snowflake-migration/` holding the scripts and the plan, and four
 **unscheduled** jobs. `--external-catalog` and `--target-catalog` are names
 being pre-declared for the job parameters, not catalogs that must already
@@ -295,7 +315,13 @@ can reach Snowflake themselves. **It carries the credential**, which is why
 it is uploaded only when you pass it explicitly; the `aidp:` block is not
 copied, and a config whose secret is a `*_path` is refused before anything
 is uploaded, because that path does not exist on the cluster. The copy is
-JSON, so the scripts need no PyYAML to read it.
+JSON, so the scripts need no PyYAML to read it. It is recorded as holding
+the credential only once it is read back on the workspace. A
+`--reuse-existing` re-push inherits its path only into the same
+aiDataPlatform and workspace key, and only after finding the object there;
+a re-push with a different `--source-config` keeps the old object on the
+record, flagged as still holding the previous credential, until you
+remove it.
 
 ### 7. Register the source as an EXTERNAL catalog, then create the INTERNAL target (S3, S4)
 

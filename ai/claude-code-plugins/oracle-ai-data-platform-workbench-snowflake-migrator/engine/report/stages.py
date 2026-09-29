@@ -243,21 +243,26 @@ def _load(out_dir: pathlib.Path, name: str):
         return {"_unreadable": True}
 
 
-def _expected_jobs(out_dir: pathlib.Path, spec: dict) -> list[str] | None:
+def _expected_jobs(out_dir: pathlib.Path, spec: dict) -> dict[str, str] | None:
     """The jobs a per-job stage must have run, from what provision REGISTERED.
 
     For the copy stage that is `copy_jobs` in provision_result.json -- one job
     per schema of the approved plan. Without it the run files that happen to
     exist were the whole answer, so one schema's SUCCESS read as the copy
-    done while the others had never run. None when there is no such record.
+    done while the others had never run. {job: registration status} (empty
+    status for a record written before it was kept); None when there is no
+    such record.
     """
     if not spec.get("job_prefix"):
         return None
     record = _load(out_dir, "provision_result.json")
-    if not isinstance(record, dict) or record.get("_unreadable"):
+    # A dry run registered nothing, so it sets no expectation.
+    if (not isinstance(record, dict) or record.get("_unreadable")
+            or record.get("dry_run")):
         return None
-    jobs = [str(j.get("job")) for j in record.get("copy_jobs") or []
-            if isinstance(j, dict) and j.get("job")]
+    jobs = {str(j.get("job")): str(j.get("status") or "")
+            for j in record.get("copy_jobs") or []
+            if isinstance(j, dict) and j.get("job")}
     return jobs or None
 
 
@@ -269,8 +274,8 @@ def _load_stage(out_dir: pathlib.Path, spec: dict):
     if not expected or not isinstance(data, dict) or "_many" not in data:
         return data
     seen = {r.get("job") for r in data["_many"] if isinstance(r, dict)}
-    missing = [{"job": job, "_not_run": True} for job in expected
-               if job not in seen]
+    missing = [{"job": job, "_not_run": True, "registration": status}
+               for job, status in expected.items() if job not in seen]
     return {"_many": data["_many"] + missing} if missing else data
 
 
@@ -291,6 +296,10 @@ def run_verdict(run: dict) -> tuple[str, str]:
     read as terminal.
     """
     if run.get("_not_run"):
+        reg = run.get("registration") or ""
+        if "not registered" in reg:
+            return (f"NOT RUN — **{reg}**: provision could not register it",
+                    "pending")
         return ("NOT RUN — registered, no run recorded", "pending")
     status = run.get("status") or _UNKNOWN
     terminal = run.get("terminal", True)

@@ -14,12 +14,15 @@ import pytest
 from migration_config import ConfigError, teardown_block
 from target.teardown import teardown
 
+# `created: true` is the provenance teardown acts on (see
+# test_teardown_provenance.py); a key alone proves nothing.
 PROV = {"dry_run": False,
         "workspace": {"key": "ws"},
-        "cluster": {"name": "migration_assets", "key": "mc"},
+        "cluster": {"name": "migration_assets", "key": "mc", "created": True},
         "warehouse_clusters": [{"warehouse": "COMPUTE_WH", "name": "compute",
-                                "key": "wc"},
-                               {"warehouse": "X_WH", "name": "x", "key": None}]}
+                                "key": "wc", "created": True},
+                               {"warehouse": "X_WH", "name": "x", "key": None,
+                                "created": False}]}
 
 
 class Fake:

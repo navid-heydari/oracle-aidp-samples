@@ -10,6 +10,71 @@ first release.
 
 ## [Unreleased]
 
+### Fixed — teardown acts only on clusters this migration created
+- `provision_result.json` now records provenance positively. `created: true` is written only on the create path, and a re-push into the same workspace carries it forward.
+- `teardown` no longer stops or deletes the pre-existing cluster that `compute.warehouse_clusters: existing` points at, or clusters adopted with `--reuse-existing`. TEARDOWN.md lists them as "not this migration's, left alone".
+- The billing report lists only clusters the migration created.
+- Existing mode no longer records the warehouse base name as the existing cluster's name.
+
+### Fixed — an executed push never drops what an earlier push allocated
+- A push that halts before recording a workspace (a name collision without `--reuse-existing`) is written to `provision_result.halted.json` / `PROVISION_HALTED.md`. The earlier record is kept.
+- The README plan push (no `--warehouse-clusters`) keeps the warehouse clusters of step 6 under `earlier_allocations`, so `teardown` still stops them.
+- `teardown` on an executed record that names no workspace now exits 1 with "cannot tell what the migration allocated". It no longer reports "nothing to terminate".
+
+### Fixed — every credential placement stays tracked; inherited credential paths are checked
+- A credential object is recorded only once its upload is read back. A failed or unseen upload is reported as "may be on the workspace" and is not baked into the notebooks.
+- A re-push with a different `--source-config` keeps the old object on the record, flagged "still holds the previous credential; remove it".
+- A `--reuse-existing` re-push inherits catalogs and the credential path only from the same aiDataPlatform and workspace key. It looks for the object on the workspace before using or announcing it.
+- `teardown` refuses to look for clusters recorded on another aiDataPlatform.
+
+### Fixed — the billing report reads teardown's verified releases
+- Clusters verified deleted by `teardown --action delete` are no longer listed as "Still accruing now". They show as DELETED.
+- After a partial teardown (exit 1), a cluster verified STOPPED is released at the time teardown stamped on its step. It is no longer shown as running "to now (still running)".
+- Teardown and the report share one stopped-state set.
+
+### Fixed — PROVISION.md reports the copy jobs that are really on the workspace
+- A copy job left from an earlier plan (a schema reduced out by S9) is reported as `stale`, fails the push, and gets its own PROVISION.md section until it is deleted. The generic job, when present, is `exists_superseded` instead of "not created".
+- Each `copy_jobs` entry carries this push's outcome. "Registered, never run" is no longer printed after a halt, a dry run or a failed upload.
+- A reused per-schema job no longer claims its kept 02 notebook was overwritten.
+
+### Fixed — teardown no longer ignores a cluster whose key was never recorded
+- A cluster whose create was accepted but never listed is now a failed teardown step. It tells you to look the cluster up by name in the console. It is never picked by name.
+- It counts toward the result, so `teardown --execute` exits 1 instead of reporting "1/1 verified".
+- Later pushes keep the request on the record.
+
+### Fixed — TEARDOWN.md says a cluster is gone only when teardown saw it go
+- The dry run, a refused delete, and an unverified delete no longer claim the copy jobs "now point at a cluster that no longer exists". The warning names only clusters verified deleted.
+- A failed read-back after an accepted delete or stop is recorded as `delete_requested` / `stop_requested` with the error, not as `failed`.
+
+### Fixed — catalogs are billed to the migration only when it created them
+- The resources report no longer lists `provision`'s job-parameter catalog names, or catalogs the catalog stage reused, as allocated and accruing storage.
+- They appear under "Named or used, but not allocated by this migration", with the reason.
+
+### Fixed — a re-push keeps the migration's source mode
+- A `--reuse-existing` re-push now inherits `--source-mode` together with the catalogs.
+- A `--refresh-notebooks` re-push no longer regenerates an external-catalog migration's notebooks in connector mode with no source-config, which failed every stage.
+- An explicit `--source-mode` still wins. `connector` applies only when nothing gives a mode.
+
+### Fixed — each Snowflake warehouse gets its own cluster name
+- Warehouses whose base names fold alike (`COMPUTE_WH`, `COMPUTE`) no longer share one cluster. They keep their full names (`compute_wh`), then a numbered suffix if needed.
+- Provision no longer reports the cluster it just created as "not this migration's".
+- A warehouse whose base name equals the migration cluster's is renamed the same way. The proposal counts distinct clusters.
+
+### Fixed — a schema's copy job never takes a stage job's name
+- A schema named `SCHEMA` now gets `snowmig_02_copy_schema_schema`. Previously it got the generic parameterless `snowmig_02_copy_schema`, which the dry run hid and the plan re-push adopted.
+- A reused copy job whose listed task parameters name a different schema is refused, not adopted.
+
+### Fixed — the PAR download in `fetch` and `run` is bounded and retried
+- The object-storage GET behind `fetch`, and the automatic manifest fetch after a successful discovery, now has a 120 s timeout. A stalled GET no longer hangs the command.
+- Transient failures and timeouts are retried by the read rule.
+- Neither retry lines nor errors ever carry the pre-authenticated URL.
+
+### Fixed — teardown never reads a pre-provenance record as "not this migration's"
+
+- Records written before `created` existed made the documented `--reuse-existing` re-push's own cluster (step `reused`) show as "left alone". Teardown then printed `0/0 ... verified` and exited 0 while the cluster ran on.
+- Any keyed cluster in such a record without a `created` step is now `provenance_unknown`. Teardown never touches it, and it is a failed step (exit 1) asking you to confirm in the console.
+- The billing report lists these clusters apart and does not bill them. A later push keeps them unknown. A legacy `uses_existing` mapping is still left alone.
+
 ### Fixed — views the structure stage creates are no longer copied into, and are reported for what happened
 - `01_create_structure --mode ddl-plan` records each planned view under `views` (`created` / `failed` / `dry_run`, `not_in_plan` for a manifest view the plan lacks) and no longer in `objects`. It stops saying views are "NOT created by this stage".
 - `02_copy_schema`'s default scope is tables only: never a `kind: VIEW` entry, never a name the manifest does not list as a table. Before this, a live run issued INSERT INTO the schema's views and exited 1.
