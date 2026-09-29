@@ -123,3 +123,31 @@ def test_the_phase_report_agrees_that_a_partial_copy_is_partial(tmp_path):
     assert "snowmig_02_copy_hr" in row["result"]
     target = next(p for p in rep["phase_summary"] if p["phase"] == "target")
     assert target["verdict"] != "PASS"
+
+
+def test_a_dry_run_provision_record_expects_no_copy_runs(tmp_path):
+    _write(tmp_path, "provision_result.json", {"dry_run": True, "copy_jobs": [
+        {"schema": "SALES", "job": "snowmig_02_copy_sales",
+         "status": "would register"},
+        {"schema": "HR", "job": "snowmig_02_copy_hr",
+         "status": "would register"}]})
+    _write(tmp_path, "run_snowmig_02_copy_sales.json",
+           {"job": "snowmig_02_copy_sales", "status": "SUCCESS",
+            "terminal": True, "ok": True})
+    assert _row(build_stage_board(tmp_path),
+                "copy-workflow")["status"] == "DONE"
+
+
+def test_a_copy_job_provision_could_not_register_says_so(tmp_path):
+    _write(tmp_path, "provision_result.json", {"dry_run": False, "copy_jobs": [
+        {"schema": "SALES", "job": "snowmig_02_copy_sales",
+         "status": "created"},
+        {"schema": "HR", "job": "snowmig_02_copy_hr",
+         "status": "failed, not registered"}]})
+    _write(tmp_path, "run_snowmig_02_copy_sales.json",
+           {"job": "snowmig_02_copy_sales", "status": "SUCCESS",
+            "terminal": True, "ok": True})
+    row = _row(build_stage_board(tmp_path), "copy-workflow")
+    assert row["status"] == "PARTIAL"
+    assert "failed, not registered" in row["found"]
+    assert "registered, no run recorded" not in row["found"]
