@@ -73,8 +73,13 @@ def publish_stage_output(call, workspace: str, out_dir, folder: str) -> dict:
             if r.get("allocated_by") == stage],
         "resources_accruing_now": phases.get("resources", {}).get(
             "accruing_now") or [],
-        "tokens_measured": bool(tokens.get("measured")),
-        "tokens_note": None if tokens.get("measured") else tokens.get("reason"),
+        # Per run: a report can be measured while THIS stage's session had
+        # no transcript read -- its tokens are then None, not zero.
+        "tokens_measured": bool(tokens.get("measured")
+                                and this_run.get("measured", True)),
+        "tokens_note": (tokens.get("reason") if not tokens.get("measured")
+                        else this_run.get("unmeasured_reason")),
+        "tokens_partial": bool(tokens.get("partial")),
     }
     name = snapshot_name(len(runs), stage, snapshot["runbook"])
 

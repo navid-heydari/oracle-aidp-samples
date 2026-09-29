@@ -116,9 +116,14 @@ def test_the_stage_board_reads_the_demo_run_as_complete(demo):
                if s["status"] == "NOT_RUN"]
     # Nor are the in-AIDP workflows or the token roll-up: an emulation runs
     # no AIDP job and no agent session. (`ingest` is satisfied by `assess`.)
-    assert not_run == ["preflight", "discover-workflow",
+    # `structure-workflow` is NOT satisfied by the demo's `deploy`: that
+    # deploy has a failed object on purpose, and a twin that failed does
+    # not stand in for the other path.
+    assert not_run == ["preflight", "discover-workflow", "structure-workflow",
                        "copy-workflow", "reconcile-workflow", "publish",
                        "tokens", "teardown"], not_run
+    row = next(s for s in board["stages"] if s["stage"] == "structure-workflow")
+    assert row["found"].startswith("not satisfied: `deploy`")
     assert board["next_stage"] is None, \
         "an optional stage must not be proposed as next"
 
