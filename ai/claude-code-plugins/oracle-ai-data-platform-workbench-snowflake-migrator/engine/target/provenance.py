@@ -63,7 +63,8 @@ def cluster_records(prov: dict) -> list[dict]:
     {cluster, name, role, workspace, provenance, why, record}.
 
     `cluster` is the key (None for a create that was accepted but never
-    listed). Nothing here is looked up by name."""
+    listed). `role` of an earlier push's allocation is the role it was
+    recorded with. Nothing here is looked up by name."""
     workspace = (prov.get("workspace") or {}).get("key")
     out = []
 
@@ -83,4 +84,9 @@ def cluster_records(prov: dict) -> list[dict]:
         detail = f'{wc.get("warehouse")} -> {wc.get("name")}'
         add(wc, f'warehouse cluster for {wc.get("warehouse")}',
             lambda d=detail: _legacy(prov, "warehouse-cluster", d))
+    # What earlier pushes allocated and this one did not re-record (see
+    # provisioning.carry_forward), each with its own workspace key.
+    for rec in prov.get("earlier_allocations") or []:
+        if rec.get("kind", "cluster") == "cluster":
+            add(rec, str(rec.get("role") or "cluster"), lambda: None)
     return out

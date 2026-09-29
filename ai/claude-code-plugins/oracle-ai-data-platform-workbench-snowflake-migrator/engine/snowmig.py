@@ -1888,6 +1888,10 @@ def cmd_teardown(args) -> int:
     _write(out, "teardown_result.json", res)
     _write(out, "TEARDOWN.md", render_teardown(res))
     targets = [s for s in res["steps"] if s.get("cluster")]
+    if res.get("unknown"):
+        # Could not tell is not "nothing to do".
+        print(f'  teardown: {res["note"]}', file=sys.stderr)
+        return 1
     if res["dry_run"]:
         print(f"  teardown: dry run — would {action} {len(targets)} "
               f"cluster(s); nothing changed")
@@ -2245,13 +2249,31 @@ def cmd_provision(args) -> int:
         refresh_notebooks=args.refresh_notebooks,
         plan_label=args.plan_label, copy_schemas=copy_schemas,
         inherited_credential=inherited_credential)
-    # Provenance: a re-push into this migration's own workspace finds what
-    # the first push created and records it as reused; the earlier executed
-    # record is the proof it was created here, so teardown still reaches it
-    # (and still leaves alone what this migration never created).
+    # No executed push drops what an earlier one allocated. A re-push finds
+    # what the first push created and records it as reused; the earlier
+    # executed record is the proof it was created here, and whatever this
+    # push does not record itself (the plan push carries no
+    # --warehouse-clusters) is kept as `earlier_allocations`, so teardown
+    # still reaches it -- and still leaves alone what this migration never
+    # created.
     earlier = (_read(out, "provision_result.json")
                if _executed_record_exists(out, "provision_result.json")
                else None)
+    if (not res["dry_run"] and not res["workspace"].get("key") and earlier
+            and (earlier.get("workspace") or {}).get("key")):
+        # Halted before any key was recorded (name_taken without
+        # --reuse-existing): the earlier record is the only one that names
+        # what was created, and PROVISION.md is what the halt tells the
+        # operator to read. Kept; this run goes beside it.
+        _write(out, "provision_result.halted.json", res)
+        _write(out, "PROVISION_HALTED.md", render_provision(res))
+        print(f"  provision halted before recording a workspace key; the "
+              f"earlier executed record (workspace "
+              f"{earlier['workspace'].get('name')}) was kept in "
+              f"provision_result.json and PROVISION.md, and this run was "
+              f"written to provision_result.halted.json / "
+              f"PROVISION_HALTED.md", file=sys.stderr)
+        return 1
     carry_forward(res, earlier)
     _write(out, "provision_result.json", res)
     _write(out, "PROVISION.md", render_provision(res))

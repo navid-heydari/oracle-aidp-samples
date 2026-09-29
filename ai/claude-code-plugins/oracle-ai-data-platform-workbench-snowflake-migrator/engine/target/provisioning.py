@@ -1243,15 +1243,22 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
 
 
 def carry_forward(res: dict, prior: dict | None) -> dict:
-    """Carry the provenance an earlier EXECUTED push recorded into this one.
+    """Carry what an earlier EXECUTED push recorded into this one, so no
+    executed push ever drops an allocation from the record teardown reads.
 
-    A re-push into this migration's own workspace (the documented plan push
-    is `--reuse-existing`) finds the workspace and clusters the first push
-    created and records them as `reused`. The earlier record is the proof
-    they were created here, so its `created` flag (and when) is carried
-    onto the same keys. Only from a record of the same workspace key: a
-    record of another workspace proves nothing about this one. Returns
-    `res`, updated in place.
+    Provenance: a re-push into this migration's own workspace (the
+    documented plan push is `--reuse-existing`) finds the workspace and
+    clusters the first push created and records them as `reused`. The
+    earlier record is the proof they were created here, so its `created`
+    flag (and when) is carried onto the same keys -- only from a record of
+    the same workspace key; a record of another workspace proves nothing
+    about this one.
+
+    Allocations: every cluster the earlier record proves this migration
+    created, and that this push does not record itself --
+    the plan push carries no --warehouse-clusters, a push may go to
+    another workspace -- is kept under `earlier_allocations`, each with its
+    own workspace key. Returns `res`, updated in place.
     """
     from .provenance import CREATED, cluster_records
     if (not prior or prior.get("dry_run") is not False
@@ -1259,17 +1266,17 @@ def carry_forward(res: dict, prior: dict | None) -> dict:
         return res
     ws = (res.get("workspace") or {}).get("key")
     prior_ws = prior.get("workspace") or {}
-    if not ws or prior_ws.get("key") != ws:
-        return res
-    if prior_ws.get("created") and not res["workspace"].get("created"):
+    same_ws = bool(ws) and prior_ws.get("key") == ws
+    if same_ws and prior_ws.get("created") and not res["workspace"].get(
+            "created"):
         res["workspace"].update(
             created=True, created_run=prior_ws.get("created_run")
             or prior.get("run"), created_by_earlier_push=True)
-    owned = {r["cluster"]: r for r in cluster_records(prior)
-             if r["provenance"] == CREATED}
-    for rec in [res.get("cluster") or {}, *(res.get("warehouse_clusters")
-                                            or [])]:
-        earlier = owned.get(rec.get("key"))
+    records = cluster_records(prior)
+    owned = {r["cluster"]: r for r in records if r["provenance"] == CREATED}
+    here = [res.get("cluster") or {}, *(res.get("warehouse_clusters") or [])]
+    for rec in here:
+        earlier = owned.get(rec.get("key")) if same_ws else None
         if earlier is None or rec.get("created") or rec.get("uses_existing"):
             continue
         was = earlier["record"]
@@ -1278,6 +1285,24 @@ def carry_forward(res: dict, prior: dict | None) -> dict:
                    created_by_earlier_push=True)
         if was.get("created_at") and not rec.get("created_at"):
             rec["created_at"] = was["created_at"]
+    recorded = {(ws, rec.get("key")) for rec in here
+                if rec.get("key") and rec.get("created")}
+    kept, seen = [], set()
+    for r in records:
+        at = (r["workspace"], r["cluster"])
+        if r["provenance"] != CREATED or at in recorded or at in seen:
+            continue
+        seen.add(at)
+        was = r["record"]
+        entry = {"kind": "cluster", "key": r["cluster"], "name": r["name"],
+                 "role": r["role"], "workspace": r["workspace"],
+                 "created": True,
+                 "created_run": was.get("created_run") or prior.get("run")}
+        if was.get("created_at"):
+            entry["created_at"] = was["created_at"]
+        kept.append(entry)
+    if kept:
+        res["earlier_allocations"] = kept
     return res
 
 
@@ -1351,6 +1376,19 @@ def render_provision(res: dict) -> str:
             lines.append(f'| `{target["warehouse"]}` | '
                          f'{target.get("source_size") or "unknown"} | '
                          f'{cluster} | {note} |')
+        lines.append("")
+
+    if res.get("earlier_allocations"):
+        lines += [
+            "## Allocated by an earlier push (still this migration's)", "",
+            "Created by an earlier executed push of this migration and not "
+            "recorded again by this one, so they are carried here: "
+            "`teardown` still reaches them.", "",
+            "| Cluster | Key | Role | Workspace | Created by push |",
+            "|---|---|---|---|---|"]
+        lines += [f'| `{a.get("name")}` | `{a.get("key")}` | {a.get("role")} '
+                  f'| `{a.get("workspace")}` | {a.get("created_run") or "?"} |'
+                  for a in res["earlier_allocations"]]
         lines.append("")
 
     if res.get("credential_objects"):

@@ -223,6 +223,14 @@ bin/snowmig provision --execute --reuse-existing --workspace-name <the S1 name> 
   --plan-label FULL        # REDUCED after an S9 scope reduction
 ```
 
+A push never drops what an earlier push allocated: the clusters step 6
+created stay in `provision_result.json` (under `earlier_allocations` when
+this push does not record them itself, as the plan push does not), so
+`teardown` still reaches them. A push that halts before recording a
+workspace -- a name collision without `--reuse-existing` -- is written to
+`provision_result.halted.json` / `PROVISION_HALTED.md`, and the earlier
+record is kept.
+
 ### 5. Prove both ends reach each other
 
 ```bash

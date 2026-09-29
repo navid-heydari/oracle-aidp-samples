@@ -36,18 +36,22 @@ KEPT = ["the workspace (scripts, plans, report/output — the run's record)",
 
 def _targets(prov: dict) -> tuple[list[dict], list[dict]]:
     """(targets, left_alone). A target is a cluster the record proves this
-    migration created; everything else it names with a key is left alone
+    migration created -- including those an earlier push created, each in
+    its own workspace; everything else it names with a key is left alone
     and said so, once per key."""
     records = cluster_records(prov)
     targets, left, seen = [], [], set()
     for rec in records:
-        if rec["provenance"] == CREATED and rec["cluster"] not in seen:
-            seen.add(rec["cluster"])
+        at = (rec["workspace"], rec["cluster"])
+        if rec["provenance"] == CREATED and at not in seen:
+            seen.add(at)
             targets.append({"cluster": rec["cluster"], "name": rec["name"],
-                            "role": rec["role"]})
+                            "role": rec["role"],
+                            "workspace": rec["workspace"]})
     for rec in records:
-        if rec["provenance"] == NOT_CREATED and rec["cluster"] not in seen:
-            seen.add(rec["cluster"])
+        at = (rec["workspace"], rec["cluster"])
+        if rec["provenance"] == NOT_CREATED and at not in seen:
+            seen.add(at)
             left.append({"cluster": rec["cluster"], "name": rec["name"],
                          "role": rec["role"], "why": rec["why"]})
     return targets, left
@@ -71,12 +75,23 @@ def teardown(call, prov: dict, *, action: str, execute: bool,
     workspace = (prov.get("workspace") or {}).get("key")
     base = {"dry_run": not execute, "action": action, "workspace": workspace,
             "kept": KEPT, "steps": []}
-    if prov.get("dry_run") or not workspace:
+    if prov.get("dry_run"):
         return {**base, "verified": 0,
                 "note": "provision never ran for real, so this migration "
                         "allocated nothing to terminate"}
     targets, left_alone = _targets(prov)
     base["left_alone"] = left_alone
+    if not workspace and not targets:
+        # An EXECUTED record naming no workspace is not evidence of an empty
+        # migration: its push halted before a key was recorded, and it
+        # cannot show what an earlier push allocated.
+        return {**base, "verified": 0, "unknown": True,
+                "note": "the executed provision record names no workspace "
+                        "key (its push halted before one was recorded), so "
+                        "this teardown cannot tell what the migration "
+                        "allocated; nothing was touched. Check the console "
+                        "and PROVISION.md of the push that created the "
+                        "environment."}
     if not execute:
         base["steps"] = [{**t, "action": f"would {action}", "verified": None}
                          for t in targets]
@@ -84,8 +99,9 @@ def teardown(call, prov: dict, *, action: str, execute: bool,
 
     for t in targets:
         step = dict(t)
+        where = t.get("workspace") or workspace
         try:
-            before = _state(call, workspace, t["cluster"])
+            before = _state(call, where, t["cluster"])
             if action == "stop" and before in _STOPPED:
                 step.update(action="already_stopped", verified=True,
                             state=before)
@@ -95,12 +111,12 @@ def teardown(call, prov: dict, *, action: str, execute: bool,
                 step.update(action="already_gone", verified=True, state=None)
                 base["steps"].append(step)
                 continue
-            call(f"{action}_cluster", workspace=workspace, cluster=t["cluster"])
+            call(f"{action}_cluster", workspace=where, cluster=t["cluster"])
             state = before
             done = False
             for wait in (0.0, *delays):
                 time.sleep(wait)
-                state = _state(call, workspace, t["cluster"])
+                state = _state(call, where, t["cluster"])
                 done = (state is None) if action == "delete" \
                     else (state in _STOPPED)
                 if done:

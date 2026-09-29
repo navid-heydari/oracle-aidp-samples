@@ -471,7 +471,10 @@ re-push into the same workspace) are touched, never one found by name. A
 cluster the record names but did not create -- adopted with
 `--reuse-existing`, or the one `compute.warehouse_clusters: existing` maps
 the warehouses to -- is listed in `TEARDOWN.md` as not this migration's and
-left alone. `stop` (default, `teardown.action` in the config) is reversible and
+left alone. Clusters an earlier push created stay in the record
+(`earlier_allocations`) however later pushes are run, and an executed record
+that names no workspace makes teardown exit 1 ("cannot tell what was
+allocated"), never "nothing to terminate". `stop` (default, `teardown.action` in the config) is reversible and
 leaves the registered copy jobs working; `--action delete` is final and must
 be asked for. The workspace, the catalogs and the jobs are kept: they are the
 migration's output and its record.
