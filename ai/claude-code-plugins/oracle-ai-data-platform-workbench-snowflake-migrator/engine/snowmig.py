@@ -1298,14 +1298,48 @@ def cmd_run(args) -> int:
         _write(out, f"run_{slug}.json", result)
         _write(out, f"RUN_{slug}.md", _render_run(result))
 
+    refreshing = bool(getattr(args, "refresh", False)
+                      or getattr(args, "run_key", None))
+    if refreshing:
+        # Re-read a run that exists; submit, cancel and resubmit nothing.
+        from target.jobs import refresh_run
+        prior_path = out / f"run_{slug}.json"
+        prior = (_read(out, f"run_{slug}.json")
+                 if prior_path.is_file() else {}) or {}
+        run_key = args.run_key or prior.get("run_key")
+        if not run_key:
+            raise MissingTarget(
+                f"--refresh needs a run: no run_{slug}.json records one. Pass "
+                f"--run-key <key> (a run started from the console has no "
+                f"local record; its key is in the console's run list).")
+        print(f"  refresh: run {run_key} (nothing is submitted, cancelled or "
+              f"resubmitted)")
+        result = refresh_run(call, workspace=args.workspace, run_key=run_key,
+                             poll_seconds=args.poll_seconds,
+                             max_polls=args.max_polls, on_poll=_on_poll)
+        seen = result.pop("job_key_seen", None)
+        if seen and job_key and str(seen) != str(job_key):
+            raise MissingTarget(
+                f"run {run_key} belongs to job {seen}, not {args.job or ''} "
+                f"({job_key}); its record was NOT written, so one job's run "
+                f"is never filed under another's.")
+        if prior.get("run_key") == run_key:
+            # The same run: its cold-start history is still its evidence.
+            result["restarts"] = prior.get("restarts") or []
+            submitted.extend(prior.get("submitted_runs") or [])
+        result["refreshed_at"] = datetime.datetime.now(
+            datetime.timezone.utc).isoformat()
+    else:
+        result = None
     try:
-        result = watch_job(call, workspace=args.workspace, job_key=job_key,
-                           parameters=parameters or None,
-                           poll_seconds=args.poll_seconds,
-                           max_polls=args.max_polls, on_poll=_on_poll,
-                           cold_start_seconds=args.cold_start_seconds,
-                           cold_start_restarts=args.cold_start_restarts,
-                           on_restart=_on_restart, on_submit=_on_submit)
+        if result is None:
+            result = watch_job(call, workspace=args.workspace, job_key=job_key,
+                               parameters=parameters or None,
+                               poll_seconds=args.poll_seconds,
+                               max_polls=args.max_polls, on_poll=_on_poll,
+                               cold_start_seconds=args.cold_start_seconds,
+                               cold_start_restarts=args.cold_start_restarts,
+                               on_restart=_on_restart, on_submit=_on_submit)
     except Exception as exc:
         if not submitted:
             # Nothing reached AIDP, so the transport's own message is true.
@@ -2847,6 +2881,17 @@ def build_parser() -> argparse.ArgumentParser:
                          "stage values with `provision --stage-param` or on "
                          "the job's task. Scope and mode are INPUTS -- "
                          "never edit a script to change them")
+    rn.add_argument("--refresh", action="store_true",
+                    help="re-read the run already recorded in "
+                         "run_<job>.json from AIDP -- status, then output "
+                         "-- and rewrite its record. Submits, cancels and "
+                         "resubmits NOTHING. For a record that went stale "
+                         "(the poll budget ran out while the job went on)")
+    rn.add_argument("--run-key", default=None,
+                    help="with --refresh (implied): the run to read, e.g. one "
+                         "started from the console, which has no local "
+                         "record. Refused if AIDP says it belongs to another "
+                         "job")
     rn.add_argument("--poll-seconds", type=float, default=30.0,
                     help="seconds between polls (default: 30)")
     rn.add_argument("--max-polls", type=int, default=40,

@@ -230,6 +230,20 @@ that could not be read (a 503, an expired session) is **STATUS COULD NOT BE
 READ**, exit 1, with the run key in `RUN_*.md`: the run was submitted and may
 still be going, so check it in the console before starting another.
 
+**A STILL RUNNING record goes stale; refresh it, never re-run.** When the
+budget runs out the job keeps going on AIDP, but `run_<job>.json` keeps
+saying STILL RUNNING, and the stage board holds everything behind it. Bring
+the record up to date from AIDP -- nothing is submitted, cancelled or
+resubmitted:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig run --job snowmig_01_structure --refresh
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig run --job snowmig_02_copy_sales --run-key <key>  # started from the console
+```
+
+`--run-key` records a run started from the console, which has no local
+record; a run AIDP says belongs to another job is refused.
+
 #### The first run on a new workspace often is never picked up
 
 **A cluster sometimes ignores a job run outright, and characteristically it

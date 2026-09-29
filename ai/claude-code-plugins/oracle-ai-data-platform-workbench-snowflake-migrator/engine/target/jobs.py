@@ -30,7 +30,7 @@ __all__ = ["TERMINAL_STATES", "ACTIVE_STATES", "SUCCESS_STATES",
            "JobRunCollision",
            "in_flight_runs", "run_job", "job_run_status",
            "fetch_task_output", "extract_notebook_text", "watch_job",
-           "task_started", "cancel_run", "COLD_START_SECONDS",
+           "task_started", "cancel_run", "refresh_run", "COLD_START_SECONDS",
            "COLD_START_RESTARTS"]
 
 TERMINAL_STATES = ("SUCCESS", "FAILED", "CANCELED", "TIMED_OUT",
@@ -425,3 +425,59 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
             "cancel_unconfirmed": bool(restarts)
                                   and restarts[-1].get("new_run") is None,
             "ok": terminal and status in SUCCESS_STATES}
+
+
+def refresh_run(call: Callable[..., dict], *, workspace: str, run_key: str,
+                poll_seconds: float = 30.0, max_polls: int = 40,
+                on_poll: Callable[[str, int], None] | None = None,
+                sleep: Callable[[float], None] = time.sleep) -> dict:
+    """Re-read a run that already exists -- NEVER submit, cancel or resubmit.
+
+    For a local record that went stale: the poll budget ran out while the
+    job went on (live 2026-09-29, S10 read STILL RUNNING and ended SUCCESS),
+    or the run was started from the console and has no record at all. Polls
+    the run to a terminal state within the budget, like watch_job, then
+    brings back its output. The result has watch_job's shape, plus
+    `job_key_seen` -- the job the run belongs to, per AIDP -- so a caller
+    can refuse to file one job's run under another's record.
+    """
+    status, message, status_error = "UNKNOWN", "", None
+    terminal, job_key_seen, attempt = False, None, 0
+    for attempt in range(1, max(1, max_polls) + 1):
+        if attempt > 1:
+            sleep(poll_seconds)
+        try:
+            payload = call("get_job_run", workspace=workspace, key=run_key)
+            state = payload.get("state") or {}
+            status = str(state.get("status") or payload.get("status")
+                         or "UNKNOWN")
+            message = str(state.get("stateMessage") or "")
+            job_key_seen = payload.get("jobKey") or job_key_seen
+            status_error = None
+        except Exception as exc:
+            status_error = str(exc)[:300]
+            status, message = UNREADABLE, status_error
+        if on_poll:
+            on_poll(status, attempt)
+        if status_error is not None:
+            if _PERMANENT_STATUS_ERROR.search(status_error):
+                break
+            continue
+        if status in TERMINAL_STATES:
+            terminal = True
+            break
+    output = ""
+    try:
+        output = fetch_task_output(call, workspace=workspace, run_key=run_key)
+    except Exception as exc:
+        output = f"(output unavailable: {str(exc)[:200]})"
+    return {"run_key": run_key, "status": status, "message": message,
+            "output": output, "terminal": terminal, "restarts": [],
+            "polls": attempt,
+            "unrecognised": ((not terminal) and status not in ACTIVE_STATES
+                             and status != UNREADABLE),
+            "status_unreadable": status == UNREADABLE,
+            "status_error": status_error,
+            "cold_start_exhausted": None, "cancel_unconfirmed": False,
+            "ok": terminal and status in SUCCESS_STATES,
+            "job_key_seen": job_key_seen}
