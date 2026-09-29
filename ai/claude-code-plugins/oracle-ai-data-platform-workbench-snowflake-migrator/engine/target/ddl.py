@@ -465,17 +465,12 @@ def build_create_table(record: dict, target_fqn: str) -> RewriteResult:
 
 
 # A one- or two-part name can only be read as a table where nothing else can
-# appear: directly after FROM or JOIN. Strings and comments are blanked first,
-# so text that merely looks like a reference is never rewritten.
-# The quote may be a double quote (as written in Snowflake) or a backtick:
-# the dialect pass runs BEFORE this one and has already rewritten quoted
-# identifiers to Spark backticks, so matching only `"` misses them.
-_TABLE_REF = re.compile(
-    r'(?i)\b(from|join)(\s+)'
-    r'(?:(["`]?)([A-Za-z_][\w$]*)\3\s*\.\s*)?'
-    r'(["`]?)([A-Za-z_][\w$]*)\5'
-    r'(?![\w$."`])')
-_NOT_A_TABLE = {"lateral", "select", "table", "unnest", "values"}
+# appear: an item of a FROM list, or after JOIN (see _relation_spans).
+# Strings and comments are blanked first, so text that merely looks like a
+# reference is never rewritten. The quote may be a double quote (as written
+# in Snowflake) or a backtick: the dialect pass runs BEFORE this one and has
+# already rewritten quoted identifiers to Spark backticks, so matching only
+# `"` misses them.
 
 
 def _code_mask(sql: str) -> str:
@@ -484,6 +479,143 @@ def _code_mask(sql: str) -> str:
         "".join("\n" if c == "\n" else " " for c in text)
         if kind in ("string", "comment") else text
         for kind, text in lexer.segments(sql))
+
+
+# One part of a relation name as a view body may spell it: unquoted, or
+# quoted with Snowflake's double quote or (after the dialect pass) Spark's
+# backtick.
+_REL_PART = r'[A-Za-z_][\w$]*|"(?:[^"]|"")+"|`(?:[^`]|``)+`'
+_REL_NAME = re.compile(rf"(?:{_REL_PART})(?:\s*\.\s*(?:{_REL_PART})){{0,2}}")
+_REL_PARTS = re.compile(_REL_PART)
+_REL_KEYWORD = re.compile(r"\b(FROM|JOIN)\b", re.IGNORECASE)
+_REL_ALIAS = re.compile(rf"\s*(?:AS\s+)?({_REL_PART})", re.IGNORECASE)
+_WORD_BEFORE = re.compile(r"([A-Za-z_][\w$]*)\s*$")
+_WORD_AFTER = re.compile(r"\s*([A-Za-z_][\w$]*)")
+# Functions whose argument list carries a FROM that is not a FROM clause:
+# `EXTRACT(YEAR FROM o.D)`, `TRIM(BOTH ' ' FROM c.X)`, `SUBSTRING(s FROM 2)`.
+_FROM_IN_ARGS = {"EXTRACT", "TRIM", "SUBSTRING", "SUBSTR", "OVERLAY"}
+# Words that end a FROM item, so they are never read as its alias -- or open
+# one that is not a named relation (TABLE(...), VALUES, LATERAL).
+_NOT_A_RELATION = {
+    "TABLE", "VALUES", "UNNEST", "IDENTIFIER", "LATERAL", "SELECT", "FROM",
+    "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS",
+    "NATURAL", "ON", "USING", "GROUP", "ORDER", "HAVING", "QUALIFY", "LIMIT",
+    "OFFSET", "FETCH", "UNION", "EXCEPT", "MINUS", "INTERSECT", "WINDOW",
+    "AT", "BEFORE", "CHANGES", "SAMPLE", "TABLESAMPLE", "PIVOT", "UNPIVOT",
+    "MATCH_RECOGNIZE", "ASOF"}
+
+
+def _relation_spans(sql: str) -> list[tuple[int, int, list[tuple[str, str]]]]:
+    """Every named relation a view body reads: (start, end, parts).
+
+    `parts` is [(quote, name)] -- quote is `"`, a backtick or "" for an
+    unquoted part, and name is the part without its quotes. The same reading
+    as the lineage scanner (extract/dependencies.py), so the plan's rewrite
+    and its warnings agree with the edges its waves were built from:
+      * every item of a FROM list is read, not only the first -- `from
+        ORDERS o, CUSTOMERS c` has two, and the second used to stay bare;
+      * a FROM that is not a FROM clause is skipped: `IS DISTINCT FROM x`,
+        `EXTRACT(YEAR FROM x)` / `TRIM(... FROM x)` / `SUBSTRING(s FROM n)`,
+        and NTH_VALUE's `FROM FIRST` / `FROM LAST`; their operand is a
+        column, which read as a table "not part of this migration";
+      * a subquery is skipped (its own FROMs are found by the scan), and a
+        name followed by `(` is a table function, not a relation.
+    A CTE name is returned like any other; callers decide with `_is_cte`.
+    """
+    try:
+        code = lexer.code_only(sql)     # keywords/parens/commas: code only
+        mask = _code_mask(sql)          # names: identifiers kept, as written
+    except lexer.UnterminatedLiteral:
+        return []
+
+    keywords = list(_REL_KEYWORD.finditer(code))
+    starts = {kw.start() for kw in keywords}
+    enclosing: dict[int, int | None] = {}
+    opener: dict[int, int] = {}                 # `)` index -> its `(`
+    stack: list[int] = []
+    for i, ch in enumerate(code):
+        if i in starts:
+            enclosing[i] = stack[-1] if stack else None
+        if ch == "(":
+            stack.append(i)
+        elif ch == ")" and stack:
+            opener[i] = stack.pop()
+
+    def word_before(i: int) -> str:
+        m = _WORD_BEFORE.search(code[max(0, i - 200):i])
+        return m.group(1).upper() if m else ""
+
+    def not_a_clause(kw: re.Match) -> bool:
+        if kw.group(1).upper() != "FROM":
+            return False
+        if word_before(kw.start()) == "DISTINCT":
+            return True
+        opened = enclosing.get(kw.start())
+        if opened is not None and word_before(opened) in _FROM_IN_ARGS:
+            return True
+        before = code[:kw.start()].rstrip()
+        after = _WORD_AFTER.match(code, kw.end())
+        return (before.endswith(")") and after is not None
+                and after.group(1).upper() in ("FIRST", "LAST")
+                and word_before(opener.get(len(before) - 1, 0)) == "NTH_VALUE")
+
+    spans: list[tuple[int, int, list[tuple[str, str]]]] = []
+
+    def skip_blank(pos: int) -> int:
+        while pos < len(mask) and mask[pos].isspace():
+            pos += 1
+        return pos
+
+    def take(pos: int) -> int | None:
+        """Read one FROM item at `pos`; the index after it (and its alias),
+        or None when what stands there is not a relation."""
+        pos = skip_blank(pos)
+        if pos >= len(mask):
+            return None
+        if code[pos] == "(":
+            depth = 0
+            for j in range(pos, len(code)):
+                if code[j] == "(":
+                    depth += 1
+                elif code[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        pos = j + 1
+                        break
+            else:
+                return None
+        else:
+            m = _REL_NAME.match(mask, pos)
+            if m is None:
+                return None
+            raw = _REL_PARTS.findall(m.group(0))
+            if len(raw) == 1 and raw[0][0] not in '"`' \
+                    and raw[0].upper() in _NOT_A_RELATION:
+                return None
+            if mask[skip_blank(m.end()):skip_blank(m.end()) + 1] == "(":
+                return None                         # a table function
+            parts = [(p[0], p[1:-1].replace(p[0] * 2, p[0]))
+                     if p[0] in '"`' else ("", p) for p in raw]
+            spans.append((m.start(), m.end(), parts))
+            pos = m.end()
+        alias = _REL_ALIAS.match(mask, pos)
+        if alias and alias.group(1).upper() not in _NOT_A_RELATION:
+            pos = alias.end()
+        return pos
+
+    for kw in keywords:
+        if not_a_clause(kw):
+            continue
+        pos = take(kw.end())
+        # Only a FROM carries a comma list; a JOIN names one relation.
+        while pos is not None and kw.group(1).upper() == "FROM":
+            pos = skip_blank(pos)
+            if pos >= len(mask) or code[pos] != ",":
+                break
+            pos = take(pos + 1)
+    # In text order: a subquery's own FROMs are found after the outer list's
+    # later items, and callers apply edits back to front.
+    return sorted(spans)
 
 
 def _rewrite_positional_refs(sql: str, name_map: dict[str, str], db: str,
@@ -495,23 +627,25 @@ def _rewrite_positional_refs(sql: str, name_map: dict[str, str], db: str,
     not guessed. Nothing crosses that boundary: a bare ORDERS in ANALYTICS
     never becomes COMMERCE.ORDERS. Returns (sql, rewrites, unresolved).
     """
+    # Keyed by the source's EXACT spelling: a quoted part keeps its case in
+    # Snowflake, so "Orders" and ORDERS are two objects. Upper-casing the
+    # keys while looking a quoted part up in its exact case meant a quoted
+    # in-migration name never matched, and was blamed on the scope.
     two_part: dict[tuple[str, str], str] = {}
     bare: dict[str, str] = {}
     for src, tgt in name_map.items():
         parts = src.split(".", 2)
         if len(parts) != 3 or parts[0].upper() != db.upper():
             continue
-        two_part[(parts[1].upper(), parts[2].upper())] = tgt
+        two_part[(parts[1], parts[2])] = tgt
         if parts[1].upper() == schema.upper():
-            bare[parts[2].upper()] = tgt
+            bare[parts[2]] = tgt
 
-    def resolve(q_schema, part_schema, q_name, part_name):
+    def key(part: tuple[str, str]) -> str:
         # A quoted part keeps its exact case; unquoted folds to upper, as in
         # Snowflake.
-        s_key = part_schema if q_schema else (part_schema or "").upper()
-        n_key = part_name if q_name else part_name.upper()
-        return (two_part.get((s_key, n_key)) if part_schema
-                else bare.get(n_key))
+        quote, name = part
+        return name if quote else name.upper()
 
     edits, rewrites, unresolved = [], [], []
     # A CTE is not a table. This pass runs after the 3-part rewrite, which
@@ -519,21 +653,20 @@ def _rewrite_positional_refs(sql: str, name_map: dict[str, str], db: str,
     # AS (...)` would be re-pointed at the base table and the view would
     # silently lose the CTE's filter.
     ctes = lexer.cte_scopes(sql)
-    for m in _TABLE_REF.finditer(_code_mask(sql)):
-        q_schema, part_schema, q_name, part_name = m.group(3, 4, 5, 6)
-        if not part_schema and part_name.lower() in _NOT_A_TABLE:
+    for start, end, parts in _relation_spans(sql):
+        if len(parts) > 2:
             continue
-        if not part_schema and _is_cte(sql, m.start(5), m.end(), ctes):
+        if len(parts) == 1 and _is_cte(sql, start, end, ctes):
             continue
-        written = sql[m.start(3) if part_schema else m.start(5):m.end()]
-        target = resolve(q_schema, part_schema, q_name, part_name)
+        written = sql[start:end]
+        target = (two_part.get((key(parts[0]), key(parts[1])))
+                  if len(parts) == 2 else bare.get(key(parts[0])))
         if target is None:
             unresolved.append(written)
             continue
         replacement = ".".join(p if re.match(r"^[a-z_][a-z0-9_]*$", p)
                                else _q(p) for p in target.split("."))
-        start = m.start(3) if part_schema else m.start(5)
-        edits.append((start, m.end(), replacement))
+        edits.append((start, end, replacement))
         rewrites.append(f"{written} -> {target}")
     for start, end, text in reversed(edits):
         sql = sql[:start] + text + sql[end:]
@@ -550,11 +683,6 @@ def _ref_part_pattern(part: str) -> str:
     backticked = re.escape("`" + part.replace("`", "``") + "`")
     double_quoted = re.escape('"' + part.replace('"', '""') + '"')
     return f"(?:(?-i:{backticked}|{double_quoted})|{re.escape(part)})"
-
-
-# A bare or two-part name may only be read as a table where nothing else
-# can appear. FROM and JOIN are those places in a view body.
-_TABLE_POSITION = r"(?i)\b(from|join)(\s+)"
 
 
 def _context_refs(name_map: dict[str, str], db: str, schema: str
@@ -601,6 +729,7 @@ def _rewrite_view_refs(body: str, name_map: dict[str, str],
         "".join("\n" if c == "\n" else " " for c in text)
         if kind in ("string", "comment") else text
         for kind, text in lexer.segments(body))
+    relations = {(start, end) for start, end, _ in _relation_spans(body)}
     edits: list[tuple[int, int, str]] = []
     changed: list[str] = []
     # Longest first, and the fully-qualified map before the positional one:
@@ -616,16 +745,16 @@ def _rewrite_view_refs(body: str, name_map: dict[str, str],
             continue
         ref = (r"\s*\.\s*".join(_ref_part_pattern(p) for p in src.split("."))
                + r'(?![\w`"$])')
-        if after_keyword:
-            # The keyword is matched so the span is unambiguous, and put back
-            # verbatim so spacing and case are untouched.
-            pattern = _TABLE_POSITION + ref
-        else:
-            pattern = r'(?<![\w`"$.])' + ref
-        hits = [(m.span(), (m.group(1) + m.group(2)) if after_keyword else "")
+        pattern = r'(?<![\w`"$.])' + ref
+        # A one- or two-part name only where a relation stands: a whole item
+        # of a FROM list or a JOIN (see _relation_spans), never the column
+        # in `EXTRACT(YEAR FROM o.D)` or `IS DISTINCT FROM c.S`.
+        hits = [(m.span(), "")
                 for m in re.finditer(pattern, mask, re.IGNORECASE)
-                if not (after_keyword and "." not in src
-                        and _is_cte(body, m.end(2), m.end(), ctes))]
+                if not after_keyword
+                or (m.span() in relations
+                    and not ("." not in src
+                             and _is_cte(body, m.start(), m.end(), ctes)))]
         if not hits:
             continue
         # A target part the Spark parser would not read as one word (a hyphen
@@ -661,20 +790,19 @@ def _cte_key(text: str) -> str:
 
 def _unqualified_refs(sql: str) -> set[str]:
     """Bare names still sitting where only a table can go -- other than the
-    view's own CTE names, which the target resolves from the WITH clause."""
+    view's own CTE names, which the target resolves from the WITH clause.
+
+    Every item of a FROM list counts (`from ORDERS o, CUSTOMERS c`), and a
+    FROM inside an expression (`EXTRACT(YEAR FROM D)`) does not.
+    """
     ctes = lexer.cte_scopes(sql)
-    mask = "".join(
-        "".join("\n" if c == "\n" else " " for c in text)
-        if kind in ("string", "comment") else text
-        for kind, text in lexer.segments(sql))
     out = set()
-    for m in re.finditer(_TABLE_POSITION + r'([\w$]+)(?![\w`"$.])', mask):
-        name = m.group(3)
-        if name.lower() in ("lateral", "select", "unnest", "values", "table"):
+    for start, end, parts in _relation_spans(sql):
+        if len(parts) != 1 or parts[0][0]:
             continue
-        if _is_cte(sql, m.start(3), m.end(3), ctes):
+        if _is_cte(sql, start, end, ctes):
             continue
-        out.add(name)
+        out.add(sql[start:end])
     return out
 
 
@@ -759,7 +887,8 @@ def build_create_view(record: dict, target_fqn: str,
     changed += positional
     if unresolved:
         res.rules_applied.append(RuleApplication(
-            "R44_VIEW_REFS_UNRESOLVED",
+            # R45, not R44: R44 is the view's column list, below.
+            "R45_VIEW_REFS_UNRESOLVED",
             "left as written, outside the migration and with no target name: "
             + ", ".join(unresolved)))
         res.warnings.append(

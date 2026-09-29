@@ -1200,10 +1200,12 @@ def test_the_structure_report_lists_manifest_views_it_did_not_create(
     rc = _load("01_create_structure").main(
         ["--target-catalog", "lake", "--schema", "SALES",
          "--reports-dir", str(reports)])
-    assert rc == 0, "a view this path does not create is not a failure"
+    assert rc == 0, "a view the plan does not carry is not a failure"
     report = _report(reports, "structure_report_sales.json")
     assert list(report["objects"]) == ["ORDERS"], "objects stays table-only"
-    assert report["views"]["V_ORDERS"]["status"] == "not_created_by_this_path"
+    # --mode ddl-plan creates the plan's views; this one is not in the plan.
+    assert report["views"]["V_ORDERS"]["status"] == "not_in_plan"
+    assert report["views"]["V_ORDERS"]["in_plan"] is False
     assert not any("VIEW" in s.upper() for s in spark.statements)
     assert "V_ORDERS" in capsys.readouterr().out
 

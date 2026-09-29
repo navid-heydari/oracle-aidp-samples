@@ -346,6 +346,22 @@ def _session(tmp_path, out):
     return tmp_path / "p"
 
 
+def _link_projects(home, projects):
+    """Point <home>/.claude/projects at the fake transcripts by symlink.
+
+    Creating a symlink needs a privilege Windows grants only to admins or in
+    Developer Mode (WinError 1314 otherwise). That is the test box, not the
+    code under test, so the test is skipped with the reason rather than
+    reported as a failure of the token roll-up."""
+    (home / ".claude").mkdir(parents=True)
+    try:
+        (home / ".claude" / "projects").symlink_to(
+            projects, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        import pytest
+        pytest.skip(f"symlinks are not permitted here: {exc}")
+
+
 def test_the_summary_ends_with_tokens_by_phase_and_a_grand_total(
         tmp_path, monkeypatch):
     import snowmig
@@ -355,8 +371,7 @@ def test_the_summary_ends_with_tokens_by_phase_and_a_grand_total(
     projects = _session(tmp_path, out)
     monkeypatch.setattr("report.tokens.pathlib.Path.home",
                         lambda: projects.parent / "home")
-    (projects.parent / "home" / ".claude").mkdir(parents=True)
-    (projects.parent / "home" / ".claude" / "projects").symlink_to(projects)
+    _link_projects(projects.parent / "home", projects)
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s")
     assert snowmig.main(["summary", "--out-dir", str(out)]) == 0
     md = (out / "SUMMARY.md").read_text()
@@ -373,8 +388,7 @@ def test_the_summary_honours_exclude_windows(tmp_path, monkeypatch):
     projects = _session(tmp_path, out)
     monkeypatch.setattr("report.tokens.pathlib.Path.home",
                         lambda: projects.parent / "home")
-    (projects.parent / "home" / ".claude").mkdir(parents=True)
-    (projects.parent / "home" / ".claude" / "projects").symlink_to(projects)
+    _link_projects(projects.parent / "home", projects)
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s")
     assert snowmig.main(["summary", "--out-dir", str(out), "--exclude-window",
                          "2026-09-24T10:20:00Z/2026-09-24T10:40:00Z"]) == 0

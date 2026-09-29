@@ -27,9 +27,14 @@ resolves them.
 "Could not look" never renders as zero: an unreadable schema is marked
 UNREADABLE, distinct from empty.
 
-Views are listed per schema, never omitted: the job path creates tables
-only, so every manifest view carries VIEW_NOT_CREATED_BY_THIS_PATH (not a
-problem verdict) and the report says how views do get created.
+Views are listed per schema, never omitted, with what the structure report
+records for them: 01_create_structure --mode ddl-plan creates the plan's
+views, so a view it created is VIEW_CREATED and one whose CREATE failed is
+VIEW_FAILED (a problem verdict); a manifest view the plan does not carry is
+VIEW_NOT_IN_PLAN, a planned one not created yet (dry run) is
+VIEW_NOT_CREATED_YET, and one no ddl-plan run recorded (--mode ctas or
+manifest, or no structure report) is VIEW_NOT_CREATED_BY_THIS_PATH, with the
+report saying how views do get created.
 """
 from __future__ import annotations
 
@@ -58,7 +63,15 @@ MANIFEST_NAME = "discovery_manifest.json"
 # real signal gets ignored.
 PROBLEM_VERDICTS = ("MISSING_DESPITE_REPORT", "STRUCTURE_FAILED",
                     "STRUCTURE_TYPE_DRIFT", "STRUCTURE_ONLY_COPY_FAILED",
-                    "COUNT_DRIFT", "TARGET_UNREADABLE")
+                    "COUNT_DRIFT", "TARGET_UNREADABLE", "VIEW_FAILED")
+
+# A view's structure status -> its verdict. Anything else (no record, or
+# `not_created_by_this_path` from --mode ctas / manifest) is
+# VIEW_NOT_CREATED_BY_THIS_PATH.
+_VIEW_VERDICTS = {"created": "VIEW_CREATED", "failed": "VIEW_FAILED",
+                  "not_in_plan": "VIEW_NOT_IN_PLAN",
+                  "dry_run": "VIEW_NOT_CREATED_YET",
+                  "not_attempted": "VIEW_NOT_CREATED_YET"}
 
 
 def q(identifier: str) -> str:
@@ -301,23 +314,36 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
             rows.append(row)
             tally[verdict] = tally.get(verdict, 0) + 1
 
-        # Views: the job path creates tables only, so every manifest view is
-        # listed rather than silently absent. SHOW TABLES lists views on some
-        # catalogs and not others, and nothing here looks for views
-        # specifically, so "not listed" is None (could not look), never "no".
+        # Views: every manifest view is listed rather than silently absent,
+        # with what 01 recorded for it. This used to read a hard-coded
+        # VIEW_NOT_CREATED_BY_THIS_PATH, so a view 01 had FAILED to create
+        # came out under "No table is in a problem state", exit 0. SHOW
+        # TABLES lists views on some catalogs and not others, and nothing
+        # here looks for views specifically, so "not listed" is None (could
+        # not look), never "no".
         view_rows = []
+        s_views = (structure or {}).get("views") or {}
+        s_objects = (structure or {}).get("objects") or {}
         for view in schema_rec.get("views") or []:
             name = view["name"]
-            s_view = ((structure or {}).get("views", {})
-                      .get(name, {}).get("status", "not_attempted"))
+            s_rec = s_views.get(name)
+            if s_rec is None and str((s_objects.get(name) or {})
+                                     .get("kind") or "").upper() == "VIEW":
+                # A report written while views were recorded in `objects`.
+                s_rec = s_objects[name]
+            s_rec = s_rec or {}
+            s_view = s_rec.get("status", "not_attempted")
             if live is None:
                 v_exists, v_verdict = None, "TARGET_UNREADABLE"
             else:
                 v_exists = True if name.lower() in live else None
-                v_verdict = "VIEW_NOT_CREATED_BY_THIS_PATH"
+                v_verdict = ((_VIEW_VERDICTS.get(s_view)
+                              if s_rec or s_view != "not_attempted" else None)
+                             or "VIEW_NOT_CREATED_BY_THIS_PATH")
             view_rows.append({"view": name, "structure": s_view,
                               "exists_in_target": v_exists,
-                              "verdict": v_verdict})
+                              "verdict": v_verdict,
+                              "reason": s_rec.get("reason")})
             tally[v_verdict] = tally.get(v_verdict, 0) + 1
 
         known = ({t["name"].lower() for t in schema_rec["tables"]}
@@ -374,17 +400,25 @@ def render(rec: dict) -> str:
             lines.append(f'| {t["table"]}{count} | {t["structure"]} | '
                          f'{t["copy"]} | {exists} | {t["verdict"]} | {reason} |')
         if s.get("views"):
-            lines += ["", "### Views (not created by the job path)", "",
-                      "The jobs create tables only; create views with "
-                      "`snowmig deploy --execute` (catalog API) and verify "
-                      "them against the source. \"Listed\" is what SHOW "
-                      "TABLES returned; `?` means it was not looked for.", "",
-                      "| View | Structure | Listed in target | Verdict |",
-                      "|---|---|---|---|"]
+            how = ("01_create_structure --mode ddl-plan creates the views "
+                   "the approved plan carries, after every table.")
+            if any(v["verdict"] == "VIEW_NOT_CREATED_BY_THIS_PATH"
+                   for v in s["views"]):
+                how += (" No ddl-plan run recorded the views marked "
+                        "VIEW_NOT_CREATED_BY_THIS_PATH (--mode ctas and "
+                        "manifest create tables only); create them with "
+                        "that stage or `snowmig deploy --execute` (catalog "
+                        "API) and verify them against the source.")
+            lines += ["", "### Views", "",
+                      how + " \"Listed\" is what SHOW TABLES returned; `?` "
+                      "means it was not looked for.", "",
+                      "| View | Structure | Listed in target | Verdict | Why |",
+                      "|---|---|---|---|---|"]
             for v in s["views"]:
                 listed = {True: "yes", None: "?"}.get(v["exists_in_target"], "?")
+                reason = (v.get("reason") or "").replace("|", "\\|")[:120]
                 lines.append(f'| {v["view"]} | {v["structure"]} | {listed} | '
-                             f'{v["verdict"]} |')
+                             f'{v["verdict"]} | {reason} |')
         if s["in_target_but_not_in_manifest"]:
             lines += ["", f'⚠️ In the target but in no report: '
                           f'{", ".join(s["in_target_but_not_in_manifest"])} — '
@@ -445,6 +479,7 @@ def main(argv: list[str] | None = None) -> int:
                   if k not in PROBLEM_VERDICTS
                   and k not in ("MIGRATED_VERIFIED",
                                 "PRESENT_NOT_REVERIFIED",
+                                "VIEW_CREATED", "VIEW_NOT_IN_PLAN",
                                 "VIEW_NOT_CREATED_BY_THIS_PATH"))
     if pending:
         log(f"{pending} table(s) not migrated yet — expected while the "

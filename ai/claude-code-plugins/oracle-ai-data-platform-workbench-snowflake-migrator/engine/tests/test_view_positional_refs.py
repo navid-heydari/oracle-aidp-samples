@@ -56,7 +56,8 @@ def test_a_bare_name_is_not_guessed_into_another_schema():
     res = _build("select * from ORDERS")
     assert "from ORDERS" in res.sql
     assert any("ORDERS" in w and "unresolved" in w.lower() for w in res.warnings)
-    assert "R44_VIEW_REFS_UNRESOLVED" in [r.rule_id for r in res.rules_applied]
+    # R45: the id R44 is the view column list's.
+    assert "R45_VIEW_REFS_UNRESOLVED" in [r.rule_id for r in res.rules_applied]
 
 
 def test_a_column_named_like_a_table_is_left_alone():
