@@ -2185,16 +2185,12 @@ def cmd_provision(args) -> int:
 
     # Whatever plan artifacts exist travel with the scripts, so the migration
     # plan lives NEXT TO the runs it drives, inside AIDP.
-    plan_files = [out / n for n in
-                  ("inventory.json", "plan.json", "ddl_plan.json",
-                   "PLANNED_OBJECTS.md", "DDL_PLAN.md", "SUMMARY.md")
-                  if (out / n).is_file()]
     # Runbook S11: one copy workflow per schema of the APPROVED plan -- the
     # ddl_plan.json this push places in plan/. No plan yet, no copy jobs:
-    # the schemas are read from the plan, never typed by hand.
-    from target.provisioning import plan_copy_schemas
-    copy_schemas = (plan_copy_schemas(_read(out, "ddl_plan.json"))
-                    if (out / "ddl_plan.json").is_file() else [])
+    # the schemas are read from the plan, never typed by hand. The demo
+    # reads its inputs through the same helper.
+    from target.provisioning import plan_push_inputs
+    plan_files, copy_schemas = plan_push_inputs(out)
 
     # In connector mode the in-AIDP scripts need the connection config on the
     # mount. It carries the credential, so it is uploaded ONLY when the user

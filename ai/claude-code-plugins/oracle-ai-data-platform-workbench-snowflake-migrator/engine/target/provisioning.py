@@ -51,6 +51,7 @@ from .provision_api import (
 __all__ = ["JOB_SPECS", "SCRIPTS_FOLDER", "PLAN_FOLDER", "REPORTS_FOLDER",
            "BACKUP_FOLDER", "PLAN_BACKUP_FILES", "plan_backup_names",
            "COPY_JOB_PREFIX", "plan_copy_schemas", "copy_job_specs",
+           "PLAN_PUSH_FILES", "plan_push_inputs",
            "download_ws_file",
            "ProvisionTransportError",
            "make_provision_call", "provision", "render_provision",
@@ -135,6 +136,27 @@ def plan_copy_schemas(ddl_plan: dict) -> list[str]:
             continue
         out.add(source[1])
     return sorted(out)
+
+
+# The plan artifacts a push carries into plan/, whichever of them exist.
+PLAN_PUSH_FILES = ("inventory.json", "plan.json", "ddl_plan.json",
+                   "PLANNED_OBJECTS.md", "DDL_PLAN.md", "SUMMARY.md")
+
+
+def plan_push_inputs(out_dir) -> tuple[list[pathlib.Path], list[str]]:
+    """(plan files, copy schemas) that a provision push of `out_dir` takes.
+
+    Whatever plan artifacts exist travel with the scripts, and the copy
+    schemas are read from the APPROVED ddl_plan.json among them -- no plan
+    yet, no copy jobs. One reading for `snowmig provision` and the demo, so
+    the demo cannot drift back to the pre-plan shape it once showed.
+    """
+    out = pathlib.Path(out_dir)
+    files = [out / n for n in PLAN_PUSH_FILES if (out / n).is_file()]
+    ddl = out / "ddl_plan.json"
+    schemas = (plan_copy_schemas(json.loads(ddl.read_text(encoding="utf-8")))
+               if ddl.is_file() else [])
+    return files, schemas
 
 
 def copy_job_specs(schemas) -> list[dict]:
