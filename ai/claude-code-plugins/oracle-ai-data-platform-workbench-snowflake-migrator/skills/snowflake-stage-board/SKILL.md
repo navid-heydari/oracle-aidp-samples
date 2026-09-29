@@ -78,8 +78,11 @@ tokens spent after the previous stage ended. Local files only; nothing is
 sent anywhere. Say what the numbers are: **the engine calls no model — these
 are the tokens the agent spent driving it.** Tokens outside the run are
 excluded and counted, not folded in; `--since <ISO time>` credits setup
-work to the first stage. A stage run outside a Claude Code session is
-reported as *not measured*, never as zero.
+work to the first stage. A stage whose own session transcript was not read
+— run outside a Claude Code session, or under a session whose transcript is
+gone — is reported as *not measured*, never as zero, and the report then
+says **Partial: N stage run(s) not measured**: say so when you quote a
+total.
 
 ## Publish the finished report into the workspace
 

@@ -22,8 +22,10 @@ Two halves:
     spent them on something that is not this migration, and folding them in
     would overstate its cost.
 
-A stage run by hand, outside any agent session, is reported as not measured,
-never as zero.
+A stage run by hand, outside any agent session, or under a session whose
+transcript was not found, is reported as not measured, never as zero -- per
+run: one transcript found does not make every other run a measured zero. A
+report with any such run is flagged `partial`.
 """
 from __future__ import annotations
 
@@ -180,7 +182,13 @@ def _add(bucket: dict, row: dict) -> None:
 def attribute(runs: list[dict], usage: list[dict], *, since: str | None = None,
               in_flight: dict | None = None,
               exclude: list[tuple[str, str]] | None = None) -> dict:
-    """Assign every usage row to the stage whose window holds it."""
+    """Assign every usage row to the stage whose window holds it.
+
+    A run carrying `measured: False` had no transcript read for its
+    session: its window still bounds its neighbours, but it gets no numbers
+    (`tokens: None`), stays out of every total, and whatever the read
+    transcripts spent inside its window is counted apart
+    (`excluded.during_unmeasured_runs`) rather than credited to it."""
     ordered = sorted((dict(r) for r in runs), key=lambda r: r["started_at"])
     if in_flight:
         ordered.append({**in_flight, "phase": phase_of(in_flight["stage"]),
@@ -189,8 +197,9 @@ def attribute(runs: list[dict], usage: list[dict], *, since: str | None = None,
         return {"runs": [], "by_stage": {}, "by_phase": {}, "totals": _empty(),
                 "excluded": {"before_first_stage": _empty(),
                              "after_last_stage": _empty(),
-                             "excluded_windows": _empty()},
-                "by_model": {}}
+                             "excluded_windows": _empty(),
+                             "during_unmeasured_runs": _empty()},
+                "by_model": {}, "unmeasured_runs": 0, "partial": False}
 
     windows = []
     start = _parse_ts(since) if since else _parse_ts(ordered[0]["started_at"])
@@ -198,9 +207,11 @@ def attribute(runs: list[dict], usage: list[dict], *, since: str | None = None,
         end = _parse_ts(run["ended_at"])
         windows.append((start, end, run))
         run["tokens"] = _empty()
+        run["measured"] = run.get("measured", True) is not False
         start = end
 
     before, after, carved = _empty(), _empty(), _empty()
+    unmeasured = _empty()
     cuts = [(_parse_ts(a), _parse_ts(b)) for a, b in (exclude or [])]
     by_model: dict[str, dict] = collections.defaultdict(_empty)
     first_start, last_end = windows[0][0], windows[-1][1]
@@ -219,6 +230,9 @@ def attribute(runs: list[dict], usage: list[dict], *, since: str | None = None,
             # at the previous end, so a token on a boundary is counted once.
             inside = (lo <= row["ts"] <= hi) if i == 0 else (lo < row["ts"] <= hi)
             if inside:
+                if not run["measured"]:
+                    _add(unmeasured, row)
+                    break
                 _add(run["tokens"], row)
                 _add(by_model[row["model"] or "unknown"], row)
                 break
@@ -228,19 +242,36 @@ def attribute(runs: list[dict], usage: list[dict], *, since: str | None = None,
     totals = _empty()
     for _, _, run in windows:
         for key, table in ((run["stage"], by_stage), (run["phase"], by_phase)):
-            bucket = table.setdefault(key, {**_empty(), "runs": 0})
+            bucket = table.setdefault(key, {**_empty(), "runs": 0,
+                                            "unmeasured_runs": 0})
+            bucket["runs"] += 1
+            if not run["measured"]:
+                bucket["unmeasured_runs"] += 1
+                continue
             for k, v in run["tokens"].items():
                 bucket[k] += v
-            bucket["runs"] += 1
-        for k, v in run["tokens"].items():
-            totals[k] += v
+        if run["measured"]:
+            for k, v in run["tokens"].items():
+                totals[k] += v
+        else:
+            run["tokens"] = None
+    # A stage or phase none of whose runs was measured has no numbers: not
+    # measured is not zero.
+    for table in (by_stage, by_phase):
+        for bucket in table.values():
+            bucket["measured"] = bucket["unmeasured_runs"] < bucket["runs"]
+            if not bucket["measured"]:
+                bucket.update({k: None for k in _empty()})
+    missed = sum(1 for _, _, run in windows if not run["measured"])
 
     return {"runs": [w[2] for w in windows], "by_stage": by_stage,
             "by_phase": by_phase, "totals": totals, "by_model": dict(by_model),
             "excluded": {"before_first_stage": before,
                          "after_last_stage": after,
-                         "excluded_windows": carved},
-            "exclude_windows": [list(w) for w in (exclude or [])]}
+                         "excluded_windows": carved,
+                         "during_unmeasured_runs": unmeasured},
+            "exclude_windows": [list(w) for w in (exclude or [])],
+            "unmeasured_runs": missed, "partial": bool(missed)}
 
 
 def _named(runs: list[dict], out_dir) -> list[dict]:
@@ -311,11 +342,27 @@ def build_token_report(out_dir, *, transcripts=None, projects_dir=None,
                               "(CLAUDE_CODE_SESSION_ID was unset), so there is "
                               "no transcript to read. Pass --transcript to "
                               "point at one."}
-        transcripts = [p for s in sessions for p in find_transcripts(s, projects)]
+        found = {s: find_transcripts(s, projects) for s in sessions}
+        transcripts = [p for s in sessions for p in found[s]]
         if not transcripts:
             return {"measured": False, "sessions": sessions,
                     "reason": f"no transcript found for session(s) "
                               f"{', '.join(sessions)} under {projects}"}
+        # Measured per run: only a run whose OWN session's transcript was
+        # read has numbers. The others are named, with the reason.
+        read = {s for s, paths in found.items() if paths}
+
+        def _mark(run: dict) -> dict:
+            sid = run.get("claude_session_id")
+            if sid in read:
+                return {**run, "measured": True}
+            return {**run, "measured": False, "unmeasured_reason": (
+                f"no transcript found for session {sid} under {projects}"
+                if sid else "ran outside a Claude Code session "
+                            "(CLAUDE_CODE_SESSION_ID was unset)")}
+
+        runs = [_mark(r) for r in runs]
+        in_flight = _mark(in_flight) if in_flight else in_flight
     usage = load_usage(transcripts)
     rep = attribute(_named(runs, out_dir), usage, since=since,
                     in_flight=in_flight, exclude=exclude)
@@ -336,10 +383,24 @@ def _row(name: str, b: dict, runs: bool = True) -> str:
     cells = [name]
     if runs:
         cells.append(str(b.get("runs", "")))
+    if b.get("measured") is False:
+        # No transcript was read for any of these runs: not zero.
+        return "| " + " | ".join(cells + ["not measured"] * 6) + " |"
+    if b.get("unmeasured_runs"):
+        cells[0] += f' *({b["unmeasured_runs"]} run(s) not measured)*'
     cells += [_n(b["input"]), _n(b["output"]), _n(b["cache_creation"]),
               _n(b["cache_read"]), f'**{_n(b["total"])}**',
               str(b["messages"])]
     return "| " + " | ".join(cells) + " |"
+
+
+def _partial_line(rep: dict) -> list[str]:
+    if not rep.get("partial"):
+        return []
+    return [f'**Partial: {rep["unmeasured_runs"]} stage run(s) not '
+            'measured** -- no transcript was read for their session, so '
+            'their tokens are unknown. They are marked "not measured" '
+            'below and left out of every total; they are not zero.', ""]
 
 
 _HEAD = ("| Input | Output | Cache write | Cache read | Total | Msgs |")
@@ -364,6 +425,7 @@ def render_tokens(rep: dict) -> str:
             "The engine makes no LLM call; these are the tokens the agent "
             "driving it spent. A stage is credited with everything spent "
             "after the previous stage ended, up to its own end.", ""]
+    out += _partial_line(rep)
     out += ["## By phase", "", "| Phase | Stage runs " + _HEAD,
             "|---|---:" + _RULE]
     out += [_row(p, rep["by_phase"][p]) for p in _phase_order(rep["by_phase"])]
@@ -381,9 +443,13 @@ def render_tokens(rep: dict) -> str:
             "|---:|---|---|---|---:|---:|---:|"]
     for i, r in enumerate(rep["runs"], 1):
         flight = " *(in flight)*" if r.get("in_flight") else ""
+        tokens = r.get("tokens")
+        cells = ((_n(tokens["total"]), str(tokens["messages"])) if tokens
+                 else (f'not measured ({r.get("unmeasured_reason") or "no transcript read"})',
+                       "not measured"))
         out.append(f'| {i} | `{r["stage"]}`{flight} | {r["started_at"]} | '
                    f'{r["ended_at"]} | {r.get("exit_code", "")} | '
-                   f'{_n(r["tokens"]["total"])} | {r["tokens"]["messages"]} |')
+                   f'{cells[0]} | {cells[1]} |')
     out.append("")
 
     if rep.get("by_model"):
@@ -404,7 +470,14 @@ def render_tokens(rep: dict) -> str:
             f'**{_n(ex.get("excluded_windows", _empty())["total"])}** tokens'
             + (" — " + ", ".join(f"{a} → {b}" for a, b in
                                  rep.get("exclude_windows") or [])
-               if rep.get("exclude_windows") else "") + ".", "",
+               if rep.get("exclude_windows") else "") + "."]
+    if rep.get("partial"):
+        during = ex.get("during_unmeasured_runs") or _empty()
+        out.append(f'- During the stage runs that were not measured: '
+                   f'**{_n(during["total"])}** tokens from the transcripts '
+                   f'that were read ({during["messages"]} call(s)) -- not '
+                   f'credited to a stage whose own session is unknown.')
+    out += ["",
             "Transcripts read: " + ", ".join(
                 f"`{pathlib.Path(p).name}`" for p in rep.get("transcripts") or []),
             ""]
@@ -418,6 +491,7 @@ def tokens_section(rep: dict | None) -> list[str]:
         reason = (rep or {}).get("reason", "no token report was built")
         return out + [f"Not measured: {reason}", ""]
     t = rep["totals"]
+    out += _partial_line(rep)
     out += ["| Phase | Stage runs " + _HEAD, "|---|---:" + _RULE]
     out += [_row(p, rep["by_phase"][p]) for p in _phase_order(rep["by_phase"])]
     out += [_row("**Total**", {**t, "runs": len(rep["runs"])}), "",
