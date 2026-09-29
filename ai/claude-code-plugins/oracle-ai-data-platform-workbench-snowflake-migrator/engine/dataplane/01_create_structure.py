@@ -922,23 +922,30 @@ def main(argv: list[str] | None = None) -> int:
 
     log(f"run: created or already there {created_total}, not in plan "
         f"{not_in_plan_total}, failed or drifted {failures}")
-    if failures:
-        return 1
-    if args.mode == "ddl-plan" and not args.dry_run and not created_total \
-            and not_in_plan_total:
+    error = None
+    if not failures and args.mode == "ddl-plan" and not args.dry_run \
+            and not created_total and not_in_plan_total:
         # Every per-table record above is right; the RUN still did nothing.
         # Exit 0 here gave three SUCCESS jobs (structure, copy, reconcile)
         # for a plan that never overlapped the requested schema.
-        return fail(f"error: created 0 table(s); {not_in_plan_total} were not "
-                    f"in the approved plan ({ddl_path}). The plan and the "
-                    f"requested schema(s) do not overlap -- is this the "
-                    f"ddl_plan.json for THIS estate and wave? Nothing was "
-                    f"created, so 02_copy_schema has nothing to copy.")
+        error = (f"error: created 0 table(s); {not_in_plan_total} were not "
+                 f"in the approved plan ({ddl_path}). The plan and the "
+                 f"requested schema(s) do not overlap -- is this the "
+                 f"ddl_plan.json for THIS estate and wave? Nothing was "
+                 f"created, so 02_copy_schema has nothing to copy.")
 
+    # Written by EVERY run that got this far, failed ones included: it used
+    # to be written only on success, so a failed re-run left the previous
+    # run's `failures: 0` in report/output beside this run's exit 1.
     write_step_output(args.output_dir, "S10_structure.json", {
         "step": "S10", "stage": "structure", "mode": args.mode,
         "target_catalog": args.target_catalog, "schemas": summary,
-        "views": len(view_facts), "failures": failures})
+        "views": len(view_facts), "failures": failures,
+        "outcome": ("failed" if failures else
+                    "created_nothing" if error else "ok"),
+        **({"error": error} if error else {})})
+    if error:
+        return fail(error)
     return 1 if failures else 0
 
 
