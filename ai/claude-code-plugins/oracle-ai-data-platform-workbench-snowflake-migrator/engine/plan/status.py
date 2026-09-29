@@ -196,6 +196,11 @@ def pipeline_status(board: dict) -> dict:
     for r in rows:
         if r["stage"] in done:
             continue
+        # A job still going is not something to start again, and a stage
+        # PENDING on its running twin must not be offered alongside it.
+        if r["status"] in ("RUNNING", "PENDING"):
+            blocked[r["stage"]] = [r.get("found") or r["status"]]
+            continue
         missing = [group for group in r.get("requires") or []
                    if not done & set(group)]
         if missing:

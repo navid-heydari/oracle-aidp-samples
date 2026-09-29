@@ -243,6 +243,37 @@ def _load(out_dir: pathlib.Path, name: str):
         return {"_unreadable": True}
 
 
+def _expected_jobs(out_dir: pathlib.Path, spec: dict) -> list[str] | None:
+    """The jobs a per-job stage must have run, from what provision REGISTERED.
+
+    For the copy stage that is `copy_jobs` in provision_result.json -- one job
+    per schema of the approved plan. Without it the run files that happen to
+    exist were the whole answer, so one schema's SUCCESS read as the copy
+    done while the others had never run. None when there is no such record.
+    """
+    if not spec.get("job_prefix"):
+        return None
+    record = _load(out_dir, "provision_result.json")
+    if not isinstance(record, dict) or record.get("_unreadable"):
+        return None
+    jobs = [str(j.get("job")) for j in record.get("copy_jobs") or []
+            if isinstance(j, dict) and j.get("job")]
+    return jobs or None
+
+
+def _load_stage(out_dir: pathlib.Path, spec: dict):
+    """A stage's artifact, with every registered job that has NOT run
+    listed as such -- so "some ran" can never read as "all ran"."""
+    data = _load(out_dir, spec["artifact"])
+    expected = _expected_jobs(out_dir, spec)
+    if not expected or not isinstance(data, dict) or "_many" not in data:
+        return data
+    seen = {r.get("job") for r in data["_many"] if isinstance(r, dict)}
+    missing = [{"job": job, "_not_run": True} for job in expected
+               if job not in seen]
+    return {"_many": data["_many"] + missing} if missing else data
+
+
 def run_verdict(run: dict) -> tuple[str, str]:
     """(verdict, kind) for one job-run record -- the ONE reading of a run,
     for every workflow row and the phase report alike.
@@ -255,9 +286,12 @@ def run_verdict(run: dict) -> tuple[str, str]:
     verdict), then the terminal status. Only a restart that actually
     resubmitted (`new_run` set) is counted as one.
 
-    kind is success, failed, running or unknown. A record written before
-    `terminal` existed is read as terminal.
+    kind is success, failed, running, unknown or pending (a registered job
+    with no run recorded). A record written before `terminal` existed is
+    read as terminal.
     """
+    if run.get("_not_run"):
+        return ("NOT RUN — registered, no run recorded", "pending")
     status = run.get("status") or _UNKNOWN
     terminal = run.get("terminal", True)
     resubmitted = sum(1 for r in run.get("restarts") or []
@@ -530,7 +564,7 @@ def build_stage_board(out_dir) -> dict:
     # its artifact says, not by the file being there.
     ran = {}
     for spec in STAGES:
-        data = _load(out_dir, spec["artifact"])
+        data = _load_stage(out_dir, spec)
         if data is not None:
             ran[spec["stage"]] = _done_row(spec, data)
     for spec in STAGES:
@@ -538,6 +572,17 @@ def build_stage_board(out_dir) -> dict:
             rows.append(ran[spec["stage"]])
             continue
         twin = ran.get(spec.get("alternative_to"))
+        if twin and twin["status"] == "RUNNING":
+            # The alternative is still going (or its state is unknown): it
+            # may be creating exactly what this stage would. Offering this
+            # one as next would be a second, concurrent write of the same
+            # objects -- live, S10's poll budget ran out while the job went
+            # on to SUCCESS. Wait for the twin, never run past it.
+            rows.append({**spec, "status": "PENDING",
+                         "found": f"pending on `{twin['stage']}`: "
+                                  f"{twin['found']}",
+                         "attention": True})
+            continue
         if _satisfies(twin):
             rows.append({**spec, "status": "SATISFIED",
                          "found": f"satisfied by `{twin['stage']}`",
@@ -556,9 +601,30 @@ def build_stage_board(out_dir) -> dict:
             "needs_attention": [r["stage"] for r in rows if r["attention"]]}
 
 
+def _run_kinds(spec: dict, data) -> list[str]:
+    """run_verdict's kind for every job-run record behind a workflow row."""
+    if not spec.get("job") or not isinstance(data, dict):
+        return []
+    return [run_verdict(r)[1] for r in _job_runs(data)
+            if not r.get("_unreadable")]
+
+
 def _done_row(spec: dict, data) -> dict:
     found, attention = _finding(spec["stage"], data)
-    return {**spec, "status": "DONE", "found": found,
+    kinds = _run_kinds(spec, data)
+    # A job run that is still going, or whose state is not established, did
+    # not finish: it is RUNNING, not DONE -- and not "failed" either, which
+    # is what `ok: false` on an unfinished run used to make it. A registered
+    # job with no run makes a per-job stage PARTIAL.
+    if "failed" in kinds:
+        status = "DONE"
+    elif "running" in kinds or "unknown" in kinds:
+        status = "RUNNING"
+    elif "pending" in kinds:
+        status = "PARTIAL"
+    else:
+        status = "DONE"
+    return {**spec, "status": status, "found": found,
            "attention": attention,
            # A caveat and a failure both raise `attention`, and
            # they are not the same for what comes next: `deps`
@@ -566,11 +632,10 @@ def _done_row(spec: dict, data) -> dict:
            # purpose and planning still proceeds, while a job run
            # that answered `ok: false` did not do its work. Only
            # the second one blocks.
-           "failed": bool(isinstance(data, dict)
-                          and (data.get("ok") is False
-                               or data.get("failed")
-                               or any(r.get("ok") is False
-                                      for r in _job_runs(data)))),
+           "failed": (("failed" in kinds) if kinds else
+                      bool(isinstance(data, dict)
+                           and (data.get("ok") is False
+                                or data.get("failed")))),
            # Present and unreadable: nothing it says can be relied
            # on, so it satisfies no twin.
            "unreadable": bool(isinstance(data, dict)
@@ -675,7 +740,7 @@ def _job_result(art) -> str | None:
                              if kind == "running"
                              else verdict.replace("**", "")), kind))
     for kind, head in (("failed", "FAIL"), ("unknown", "UNKNOWN"),
-                       ("running", "STILL RUNNING")):
+                       ("running", "STILL RUNNING"), ("pending", "PARTIAL")):
         hits = [(r, v) for r, v, k in graded if k == kind]
         if hits:
             # One job per schema: name the ones behind the verdict.
@@ -704,6 +769,8 @@ def _phase_summary(rows: list[dict]) -> list[dict]:
         failed = sum(1 for x in res if x.startswith(("FAIL", "HALT")))
         unknown = sum(1 for x in res if x.startswith("UNKNOWN"))
         running = sum(1 for x in res if x.startswith("STILL RUNNING"))
+        # Some of a per-job stage's registered jobs have not run.
+        partial = sum(1 for x in res if x.startswith("PARTIAL"))
         not_run = [r["stage"] for r in mine if r["result"] == "NOT_RUN"]
         skipped = sum(1 for x in res if x.startswith("SKIPPED"))
         if failed:
@@ -712,6 +779,8 @@ def _phase_summary(rows: list[dict]) -> list[dict]:
             verdict = "UNKNOWN"
         elif running:
             verdict = "STILL RUNNING"
+        elif partial:
+            verdict = "PARTIAL"
         elif not_run:
             verdict = "NOT_RUN" if not passed else "PARTIAL"
         elif not passed and skipped == len(mine):
@@ -775,7 +844,7 @@ def phase_report(out_dir) -> dict:
                "started_at": None, "ended_at": None,
                "duration_seconds": None, "retries": 0}
         # A workflow can exit 0 locally with a job that did not succeed.
-        art = _load(out_dir, spec["artifact"]) if spec.get("job") else None
+        art = _load_stage(out_dir, spec) if spec.get("job") else None
         job_result = _job_result(art)
         if mine:
             last = mine[-1]
