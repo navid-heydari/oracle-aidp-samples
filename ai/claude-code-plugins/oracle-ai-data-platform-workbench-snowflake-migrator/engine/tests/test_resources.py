@@ -55,8 +55,13 @@ def test_everything_provision_created_is_listed_with_its_phase(tmp_path):
 
 
 def test_both_catalogs_are_listed_with_their_types(tmp_path):
+    # provision only NAMES them in the job parameters; the catalog stage
+    # creates them (test_resources_catalogs.py), so without its evidence
+    # they are listed apart, not billed as allocated.
     res = build_resources(_out(tmp_path))
-    cats = {c["name"]: c for c in _by(res, "catalog")}
+    assert _by(res, "catalog") == []
+    cats = {c["name"]: c for c in res["not_allocated"]
+            if c["kind"] == "catalog"}
     assert cats["src_ext"]["type"] == "EXTERNAL"
     assert cats["tgt_int"]["type"] == "INTERNAL"
 
@@ -68,11 +73,16 @@ def test_the_catalog_ledger_adds_what_the_overwritten_result_lost(tmp_path):
          "name": "extra_cat", "type": "INTERNAL", "key": "extra_cat",
          "action": "created"}) + "\n")
     names = {c["name"] for c in _by(build_resources(out), "catalog")}
-    assert names == {"src_ext", "tgt_int", "extra_cat"}
+    assert names == {"extra_cat"}
 
 
 def test_billing_is_classified_never_priced(tmp_path):
-    res = build_resources(_out(tmp_path))
+    out = _out(tmp_path)
+    (out / "resources.jsonl").write_text(json.dumps(
+        {"at": "2026-09-24T19:30:00Z", "stage": "catalog", "kind": "catalog",
+         "name": "tgt_int", "type": "INTERNAL", "key": "tgt_int",
+         "action": "created"}) + "\n")
+    res = build_resources(out)
     by = {r["kind"]: r for r in res["resources"]}
     assert by["cluster"]["billing"] == "compute while ACTIVE"
     assert by["job"]["billing"] == "via cluster compute"
