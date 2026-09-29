@@ -29,6 +29,50 @@ first release.
 - A quoted in-migration reference (`"COMMERCE"."Orders"`) is rewritten, and an unquoted `COMMERCE.orders` no longer resolves to it.
 - The unresolved-reference rule is now `R45_VIEW_REFS_UNRESOLVED`. It used to share `R44` with `R44_VIEW_COLUMN_LIST`.
 
+### Fixed — token-summary tests skip cleanly where symlinks are not permitted
+- Two tests in `tests/test_phases.py` point a fake `~/.claude/projects` at their transcripts with a symlink. On Windows without Developer Mode or admin rights, creating the symlink raises WinError 1314, so the tests failed because of the machine, not the code.
+- They now skip and give the reason, so the full suite can be green on such a machine.
+
+### Fixed — per-schema copy runs appear on the stage board and in the phase report
+- Once a plan is pushed, provision creates one `snowmig_02_copy_<schema>` job per schema. The board read only `run_snowmig_02_copy_schema.json`, so a copy that moved rows, or failed, showed as NOT_RUN or "SKIPPED (optional)" and was not attributed to any stage.
+- `copy-workflow` now reads every `run_snowmig_02_copy_*.json` and reports each job. A failed job sets attention and blocks reconcile.
+- `stage_for` maps per-schema job names to `copy-workflow`, so the run log and token roll-up credit those runs correctly.
+- SUMMARY.md, PLANNED_OBJECTS.md and DATA_MOVEMENT_OPTIONS.md name `snowmig_02_copy_<schema>`.
+
+### Fixed — a crashed or interrupted stage no longer makes its phase PASS
+- A stage that raised an uncaught exception, or was stopped with Ctrl-C, is logged with no exit code. The phase report counted neither a pass nor a failure and then rounded the phase up to PASS, so PHASES.md could show "planning — PASS" when plan and ddl had both crashed.
+- Such a run is now UNKNOWN, and so is its phase. It is counted in a new `unknown_runs` column.
+- A workflow artifact that answered `ok: false` with no logged run is now FAIL instead of "DONE (not logged)".
+
+### Fixed — the stage board and phase report read workflow runs the same way RUN.md does
+- A run whose poll budget ran out is STILL RUNNING. Before, PHASES.md showed "FAIL (job RUNNING)" and the target phase failed.
+- An unrecognised or unreadable state is UNKNOWN. An unconfirmed cancel says nothing was resubmitted. Exhausted cold-start attempts say nothing ran.
+- Only cold-start restarts that actually resubmitted a run are counted. The board no longer claims "5 cold-start restart(s)" when RUN.md says nothing ran.
+
+### Fixed — a job still going is RUNNING, its alternative waits, and a partial copy is PARTIAL
+- A structure run whose poll budget ran out read DONE and `failed`, and the board offered `deploy` — the other way to create the same objects — as the next step, a second write while the job may still be creating them. The run is now RUNNING (not failed); its alternative is PENDING on it and is neither next nor unblocked.
+- One schema's copy SUCCESS read as the copy done. `copy-workflow` now checks against the jobs provision registered (`copy_jobs`): a registered job with no run makes it PARTIAL, names the job, and keeps reconcile blocked. The phase report agrees.
+
+### Fixed — a dry-run, failed or unreadable stage no longer satisfies its alternative
+- structure-workflow and deploy (and assess and ingest) are alternatives: doing either satisfies both. The board satisfied one as soon as the other's artifact existed, so dry runs and failed jobs counted phases as complete and unblocked copy and teardown.
+- A stage is now satisfied only when its alternative really ran, did not fail, was not a dry run and its artifact could be read. Otherwise the board says "not satisfied" and why.
+- The phase diagram no longer shows dry runs as done. The phase report marks satisfied stages the same way the board does.
+
+### Fixed — token report says 'not measured' for stages whose transcript was not read
+- Once any one transcript was found, every other stage run showed **0** tokens: runs under another session (for example resumed the next day, or with pruned transcripts) and runs made by hand. The grand total silently left them out.
+- Each run is now measured only when its own session's transcript was read. The others show as "not measured" with the reason, and are never shown as zero.
+- TOKENS.md, tokens.json, the SUMMARY section, the `tokens` command and the per-stage snapshot flag the report as **partial** with a count of unmeasured runs.
+
+### Fixed — the stage-board skill and ARCHITECTURE.md list every stage that writes to AIDP
+- They said "Four stages write ... everything else is read-only", while the board lists seven writers. So the sentence the agent gives a nervous user called `publish`, and the cluster-stopping `teardown`, read-only.
+- Both documents, and the stage module docstring, now name all seven writers, including the per-schema copy jobs. `teardown` is called destructive.
+- A test keeps the writer count in step with the board.
+
+### Fixed — translation map no longer counts views the plan refused by kind
+- The map ran the dialect translator over secure and materialized views that the plan refuses and ddl never emits. So it reported them as "dialect-translated" or "carried verbatim", with rules such as T01_IFF applied to them. The built-in demo showed this.
+- These views are now counted as "refused by kind" and appear in no dialect rule.
+- A view whose SQL was captured but cannot be parsed now counts as "unparseable", not "no SQL captured".
+
 ### Fixed — findings of the 2026-09-29 end-to-end run on a fresh workspace
 
 - **Cold start: one retry was not enough.** The first run was cancelled at

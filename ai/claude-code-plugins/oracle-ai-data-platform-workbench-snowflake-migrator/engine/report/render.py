@@ -851,7 +851,9 @@ def render_translation_map(tmap: dict) -> str:
            f'distinct Snowflake types. Views: **{t.get("views_translated", 0)}** '
            f'dialect-translated · **{t.get("views_verbatim", 0)}** carried '
            f'verbatim · **{t.get("views_refused", 0)}** refused · '
-           f'**{t.get("views_without_sql", 0)}** with no SQL captured.', "",
+           f'**{t.get("views_blocked_by_kind", 0)}** refused by kind · '
+           f'**{t.get("views_without_sql", 0)}** with no SQL captured · '
+           f'**{t.get("views_unparseable", 0)}** unparseable.', "",
            "Every rule is either an exact rewrite or a refusal: nothing here "
            "is approximated. A refused view is left untouched and listed in "
            "`cannot_migrate` rather than translated into SQL that mostly "
@@ -859,6 +861,12 @@ def render_translation_map(tmap: dict) -> str:
     if t.get("unmapped_columns"):
         out += [f'> ⚠️ **{t["unmapped_columns"]} column(s) have no target '
                 f'type** and block their object. See the unmapped rows.', ""]
+    kinds = tmap.get("views_blocked_by_kind") or []
+    if kinds:
+        out += ["Refused by kind, as the plan refuses them -- no dialect rule "
+                "was run over these: " + ", ".join(
+                    f'`{v["source_identifier"]}` ({v["kind"]})'
+                    for v in kinds) + ".", ""]
 
     out += ["## Types", "", "| Snowflake type | → | Spark type | Status | "
             "Columns | Objects |", "|---|---|---|---|---:|---:|"]
@@ -933,7 +941,8 @@ def translation_map_section(tmap: dict | None) -> list[str]:
            f'{t.get("distinct_source_types", 0)} Snowflake type(s); views '
            f'{t.get("views_translated", 0)} translated · '
            f'{t.get("views_verbatim", 0)} verbatim · '
-           f'{t.get("views_refused", 0)} refused.', "",
+           f'{t.get("views_refused", 0)} refused · '
+           f'{t.get("views_blocked_by_kind", 0)} refused by kind.', "",
            f"- Dialect rules applied: {_tick(applied)}",
            f"- Dialect rules that refused a view: {_tick(refused)}",
            "- Type mappings: " + (", ".join(
@@ -1041,8 +1050,10 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
             "`DATA_CLONE` → `DONE`, or `BLOCKED`.", "",
             "**`DATA_CLONE` and `DONE` are not reported by this summary.** It "
             "reads only the control-plane deploy result -- structure, not rows; "
-            "whether rows were copied by the in-AIDP job "
-            "`snowmig_02_copy_schema` is reported by `snowmig_03_reconcile` in "
+            "whether rows were copied by the in-AIDP copy jobs "
+            "(`snowmig_02_copy_<schema>`, one per schema of the pushed plan; "
+            "`snowmig_02_copy_schema` before a plan is pushed) is reported by "
+            "`snowmig_03_reconcile` in "
             "`MIGRATION_REPORT.md` / `reconciliation.json`. `SHALLOW_CLONE` "
             "means the object exists in AIDP with its columns; it says nothing "
             "about rows.", ""]
@@ -1116,7 +1127,9 @@ def render_smoke(result: dict) -> str:
 DATA_OPTIONS_NOTE = (
     "Proposal only. The control-plane CLI moves no bytes. One path is "
     "implemented by the data plane: in-AIDP INSERT-SELECT from the EXTERNAL "
-    "catalog, run schema by schema by the `snowmig_02_copy_schema` job. The "
+    "catalog, run schema by schema by the copy jobs "
+    "`snowmig_02_copy_<schema>` (one per schema of the pushed plan; "
+    "`snowmig_02_copy_schema` before a plan is pushed). The "
     "other options are not implemented.")
 
 
@@ -1167,8 +1180,10 @@ def architecture_section(plan: dict) -> list[str]:
     decision = architecture_decision(plan.get("architecture_choice"))
     out = ["## Data-movement architecture", "",
            "**The control-plane CLI moves no bytes.** Rows move only through "
-           "the in-AIDP job `snowmig_02_copy_schema`, when the operator runs "
-           "it; none of the other paths below is implemented.", "",
+           "the in-AIDP copy jobs, `snowmig_02_copy_<schema>` (one per schema "
+           "of the pushed plan; `snowmig_02_copy_schema` before a plan is "
+           "pushed), when the operator runs them; none of the other paths "
+           "below is implemented.", "",
            decision["statement"], ""]
 
     if decision["decided"]:
@@ -1833,7 +1848,7 @@ def render_stages(board: dict) -> str:
            "**and `copy-workflow`** (S11, copies rows — registered, never run "
            "by the migrator). **A workflow has no dry run**: `run` takes no "
            "`--execute`, so invoking it IS the write. **`publish`** copies the finished report into "
-           "the workspace and **`teardown`** stops (or deletes) the clusters "
+           "the workspace and **`teardown`**, destructive, stops (or deletes) the clusters "
            "this migration allocated, both dry runs unless `--execute`. "
            "Every other stage is read-only. The one further write is "
            "`smoke --write-probe --execute`, which creates one probe schema "
@@ -1900,7 +1915,11 @@ def render_phase_report(rep: dict) -> str:
            "do one part of the migration; a phase fails if any stage in it "
            "failed. A stage that did not run is listed, never omitted, and the "
            "last run of a stage decides its verdict (earlier failures are "
-           "counted).", "",
+           "counted). A run logged with no exit code crashed or was "
+           "interrupted: it is UNKNOWN, and so is its phase -- never PASS. A "
+           "workflow is read from its job record, as RUN.md reads it: a job "
+           "still going is STILL RUNNING, one in a state this plugin does "
+           "not classify is UNKNOWN, neither is a FAIL or a PASS.", "",
            "## Phases at a glance", "",
            "| Phase | Verdict | Stages | Passed | Failed | Not run | Duration "
            "| Retries | Resources | Runbook steps |",
@@ -1923,8 +1942,10 @@ def render_phase_report(rep: dict) -> str:
                 f'| `{p["stage"]}` | {p["runbook"]} | '
                 f'{p.get("runs_on", "—")} | {p["started_at"] or "—"} | '
                 f'{p["ended_at"] or "—"} | {_dur(p["duration_seconds"])} | '
-                f'{p["result"]} | {p["runs"]} | {p["failed_runs"]} | '
-                f'{p.get("retries", 0)} |')
+                f'{p["result"]} | {p["runs"]} | {p["failed_runs"]}'
+                + (f' (+{p["unknown_runs"]} unknown)'
+                   if p.get("unknown_runs") else "")
+                + f' | {p.get("retries", 0)} |')
         out.append("")
         allocated = ph.get("resources") or []
         out.append("Resources allocated in this phase: " + (

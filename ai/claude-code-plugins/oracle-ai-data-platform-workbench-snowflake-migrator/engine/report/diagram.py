@@ -87,8 +87,10 @@ def phase_diagram(board: dict | None = None) -> str:
             out.append(f'  class {",".join(nodes)} {kind}')
 
     if board:
+        # A dry run wrote its artifact and created nothing: not green.
         done = [_node(r["stage"]) for r in board.get("stages") or []
-                if r["status"] in ("DONE", "SATISFIED") and not r.get("attention")]
+                if r["status"] in ("DONE", "SATISFIED")
+                and not r.get("attention") and not r.get("dry_run")]
         flagged = [_node(r["stage"]) for r in board.get("stages") or []
                    if r.get("attention")]
         if done:
