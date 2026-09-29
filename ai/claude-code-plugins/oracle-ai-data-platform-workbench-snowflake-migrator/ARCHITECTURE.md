@@ -67,7 +67,9 @@ change the destination.
 | — | `stages` | offline | everything present | `STAGES.md` | no |
 | — | `demo` | offline | — | every artifact above, emulated, + `DEMO.md` | no |
 
-Past `provision`, the work moves INSIDE AIDP: four jobs run the scripts in
+Past `provision`, the work moves INSIDE AIDP: 3 + N jobs (one copy job per
+schema of the approved plan, each passing `schema` as a task parameter) run
+the scripts in
 `data-migration-scripts/` — self-contained `.ipynb`, generated from
 `engine/dataplane/` (discover → structure → copy, schema by schema →
 reconcile), and their reports land in the workspace, not in `--out-dir`.

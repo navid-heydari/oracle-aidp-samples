@@ -291,7 +291,8 @@ def declared_stage_params() -> dict[str, list[str]]:
     return names
 
 
-def check_stage_params(params: dict[str, object]) -> None:
+def check_stage_params(params: dict[str, object],
+                       copy_schemas=()) -> None:
     """Refuse a --stage-param no stage can take, before anything is called.
 
     A name no stage declared used to be dropped per stage without a word,
@@ -305,8 +306,16 @@ def check_stage_params(params: dict[str, object]) -> None:
     and fail argparse when its job ran. `schema=A,B` does not either: two
     schemas to 01, the literal `A,B` to 02. Such a value is refused with
     the `<stage>.<name>` form that sends it to the one stage meant.
+
+    With per-schema copy jobs (`copy_schemas`, from the approved plan) the
+    ONE 02_copy_schema notebook backs every copy job, and each job passes
+    its `schema` as a task parameter, which wins over the PARAMS literal.
+    So a baked copy `schema` changes nothing the copy does -- it would only
+    narrow 01 and be recorded as written -- and a baked `tables` narrows
+    EVERY schema's copy job at once. Both are refused.
     """
     by_key = {s.key: s for s in STAGES}
+    _check_against_copy_jobs(params, list(copy_schemas or ()))
     declared = declared_stage_params()
     unknown = sorted(k for k in params
                      if _split_name(k)[0] is None and k not in declared)
@@ -371,6 +380,37 @@ def check_stage_params(params: dict[str, object]) -> None:
     for stage in STAGES:
         for key, value in _for_stage(stage, params).items():
             _coerce(stage, key, value)
+
+
+def _check_against_copy_jobs(params: dict[str, object],
+                             copy_schemas: list[str]) -> None:
+    if not copy_schemas:
+        return
+    jobs = ", ".join(copy_schemas)
+    for name in ("schema", "copy_schema.schema"):
+        if name in params:
+            raise ValueError(
+                f"--stage-param {name}={params[name]!r}: every per-schema "
+                f"copy job ({jobs}) passes its own `schema` as a task "
+                f"parameter, and a task parameter wins over the PARAMS "
+                f"literal, so a baked copy `schema` would change nothing "
+                f"the copy does"
+                + (" -- and, unqualified, it would still narrow "
+                   "01_create_structure" if name == "schema" else "")
+                + ". To narrow the structure stage write "
+                f"structure.schema=<value>; to copy fewer schemas, narrow "
+                f"the approved plan and re-push.")
+    if len(copy_schemas) < 2:
+        return
+    for name in ("tables", "copy_schema.tables"):
+        if name in params:
+            raise ValueError(
+                f"--stage-param {name}={params[name]!r}: the one "
+                f"02_copy_schema notebook backs every per-schema copy job "
+                f"({jobs}), so a baked `tables` would narrow every "
+                f"per-schema copy job to those names and leave the rest of "
+                f"each schema uncopied. Narrow the approved plan instead, "
+                f"or set `tables` on the one job's task in the console.")
 
 
 def dataplane_dir() -> pathlib.Path:

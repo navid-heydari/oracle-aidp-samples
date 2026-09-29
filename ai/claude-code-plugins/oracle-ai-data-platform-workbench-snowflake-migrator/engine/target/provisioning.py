@@ -551,7 +551,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               if copy_schemas else set())
     stage_params = dict(stage_params or {})
     if stage_params:
-        check_stage_params(stage_params)
+        check_stage_params(stage_params, copy_schemas=copy_schemas)
         if reuse_existing and not refresh_notebooks:
             raise ValueError(
                 "--stage-param " + ", ".join(sorted(stage_params))

@@ -261,14 +261,19 @@ bin/snowmig provision ... --execute
 Creates the workspace (name translated to a charset the API cannot reject),
 the `migration_assets` cluster, **one cluster per Snowflake warehouse with the
 same name** on the AIDP default config, the workspace folder
-`backup-snowflake-migration/` holding the scripts and the plan, and four
-**unscheduled** jobs. `--external-catalog` and `--target-catalog` are names
+`backup-snowflake-migration/` holding the scripts and the plan, and 3 + N
+**unscheduled** jobs: discover, structure and reconcile, plus one copy job
+per schema of the approved plan. `--external-catalog` and `--target-catalog` are names
 being pre-declared for the job parameters, not catalogs that must already
 exist. Read `PROVISION.md`: pending is pending, never rounded up.
 
-Stage parameters (the schema a copy covers, `tables`, `mode`, `dry-run`,
-reconcile's `counts`) live in each stage notebook's own PARAMS cell, because
-job parameters never reach a notebook. `--stage-param NAME=VALUE`
+Stage parameters (`tables`, `mode`, `dry-run`, reconcile's `counts`, ...)
+have their defaults in each stage notebook's own PARAMS cell. A job task's
+`parameters` win over those defaults by the same name (read with
+`oidlUtils.parameters.getParameter`, live-verified), and that is how each
+per-schema copy job passes the schema it covers; a run-level `run --param`
+is refused, because that run parameters reach a task is not verified.
+`--stage-param NAME=VALUE`
 (repeatable; NAME is the stage flag without `--`) writes one there: a name
 no stage declares is refused, a switch takes `true`/`false`, a list flag
 takes `A,B`. An unqualified NAME reaches every stage that declares it, so
@@ -277,7 +282,11 @@ its value must suit them all -- `mode` is `ddl-plan`/`ctas`/`manifest` in
 is refused; `copy_schema.mode=overwrite` (stages: `discover`, `structure`,
 `copy_schema`, `reconcile`) writes that stage only. With `--reuse-existing` add `--refresh-notebooks`, or the
 notebooks already on the workspace are kept and the value is refused rather
-than dropped.
+than dropped. Next to per-schema copy jobs, `schema` and
+`copy_schema.schema` are refused (the job's task parameter wins, so the
+value would change nothing the copy does; `structure.schema=` narrows 01
+only), and so is `tables` with two or more copy schemas: the one shared
+`02_copy_schema` notebook would narrow every per-schema copy job.
 
 **Hand-off.** After `--execute`, `provision_result.json` records the
 **workspace key** under `workspace.key` and the **cluster key** under

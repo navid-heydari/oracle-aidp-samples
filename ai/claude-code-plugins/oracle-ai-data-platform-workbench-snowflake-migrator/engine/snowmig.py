@@ -1141,49 +1141,85 @@ def cmd_run(args) -> int:
         parameters[name] = value
 
     if parameters:
-        # REFUSE, rather than accept-and-discard. Job `parameters` are taken
-        # by the run API and reach the notebook neither as argv nor as
-        # environment (probed live) -- so a `--param schema=SALES` used to
-        # start a run that quietly ignored it, and the stage ran at whatever
-        # its PARAMS cell already said. A scope flag that silently does
-        # nothing is worse than one that is missing: it reads as applied.
+        # REFUSE, rather than accept-and-discard. A RUN-level `parameters`
+        # is taken by the run API and was probed live to reach the notebook
+        # neither as argv nor as environment; the route a stage notebook
+        # does read -- oidlUtils.parameters.getParameter -- is live-verified
+        # for a job TASK's parameters only, not a run's. So a `--param
+        # schema=SALES` would start a run that quietly ignored it. A scope
+        # flag that silently does nothing is worse than one that is missing:
+        # it reads as applied.
         # Only a name some stage declares is offered as a --stage-param:
         # provision refuses any other, so suggesting it would send the
-        # operator to a second refusal. For a job that is one of the stages
-        # the name is qualified with that stage: an unqualified name goes to
-        # every stage declaring it, and `mode` means different things to 01
-        # and 02, so an unqualified `mode` 01 cannot take is refused in turn.
+        # operator to a second refusal. The name is qualified with the job's
+        # stage -- a per-schema copy job (snowmig_02_copy_<schema>) is the
+        # copy_schema stage -- because an unqualified name goes to every
+        # stage declaring it, and `mode` means different things to 01 and
+        # 02. A job that is no stage gets `<stage>.<name>` for a name more
+        # than one stage declares.
+        from target.provisioning import COPY_JOB_PREFIX
         from target.stage_notebooks import STAGES, declared_stage_params
         head = (
-            "--param does not reach a notebook stage: AIDP job parameters "
-            "arrive as neither argv nor environment, so this run would "
-            "ignore " + ", ".join(sorted(parameters)) + " and execute "
-            "whatever the notebook's PARAMS cell already holds.\n")
+            "--param is refused: a run-level job parameter is not known to "
+            "reach a notebook stage (probed live: neither argv nor "
+            "environment; oidlUtils.parameters.getParameter is "
+            "live-verified for a job TASK's parameters only). This run "
+            "would ignore " + ", ".join(sorted(parameters)) + " and execute "
+            "what the job already carries: its task parameters, which win "
+            "over the notebook's PARAMS cell, then the PARAMS literals.\n")
         stage = next((s for s in STAGES if s.job == args.job), None)
-        declared = (list(stage.params) if stage
-                    else sorted(declared_stage_params()))
-        prefix = f"{stage.key}." if stage else ""
-        known = sorted(n for n in parameters if n in declared)
+        per_schema = bool(stage is None and args.job
+                          and args.job.startswith(COPY_JOB_PREFIX))
+        if per_schema:
+            stage = next(s for s in STAGES if s.key == "copy_schema")
+        by_name = declared_stage_params()
+        declared = list(stage.params) if stage else sorted(by_name)
+
+        def _qualified(name: str) -> str:
+            if stage:
+                return f"{stage.key}.{name}"
+            return (f"<stage>.{name}" if len(by_name.get(name, ())) > 1
+                    else name)
+
+        task_scoped = ("schema" in parameters) and per_schema
+        known = sorted(n for n in parameters if n in declared
+                       and not (task_scoped and n == "schema"))
         unknown = sorted(n for n in parameters if n not in declared)
+        scoped = (
+            f"`schema` is the task parameter of {args.job}: the job is "
+            f"already scoped to its schema, and that task parameter wins "
+            f"over any PARAMS literal, so no --stage-param changes it. To "
+            f"copy another schema run that schema's own job "
+            f"(snowmig_02_copy_<schema>); a schema with no job is added by "
+            f"re-planning and re-pushing.\n" if task_scoped else "")
         route = (
             "  * re-run `provision --execute --reuse-existing "
             "--refresh-notebooks "
-            + " ".join(f"--stage-param {prefix}{name}=<value>"
+            + " ".join(f"--stage-param {_qualified(name)}=<value>"
                        for name in known)
             + "` -- it rewrites each stage notebook's PARAMS cell and "
-            "uploads it (console edits to that cell are lost), or\n"
-            if known else "")
+            "uploads it (console edits to that cell are lost)"
+            + ("; <stage> is one of " + ", ".join(s.key for s in STAGES)
+               if not stage and any("<stage>" in _qualified(n)
+                                    for n in known) else "")
+            + (". The one 02_copy_schema notebook backs every per-schema "
+               "copy job, so a value baked there applies to all of them"
+               if stage and stage.key == "copy_schema" else "")
+            + ", or\n" if known else "")
         undeclared = (
             (f"{stage.notebook_name} does not declare " if stage
              else "No stage notebook declares ")
             + ", ".join(unknown) + ", so no route sets it. Declared names: "
             + ", ".join(declared) + ".\n" if unknown else "")
+        if not (known or unknown):
+            raise MissingTarget(head + scoped.rstrip("\n"))
         raise MissingTarget(
-            head + undeclared
+            head + scoped + undeclared
             + "Set stage parameters where they are actually read:\n"
             + route
-            + "  * edit the PARAMS cell of "
-            "backup-snowflake-migration/scripts/<stage>.ipynb in the "
+            + "  * set a task parameter of that name on the job's task, or "
+            "edit the PARAMS cell of "
+            "backup-snowflake-migration/scripts/<stage>.ipynb, in the "
             "console.\n"
             "Scope is an INPUT either way -- never edit the stage logic to "
             "make it cover less.")
@@ -2601,7 +2637,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="provision the AIDP migration environment: workspace, "
              "migration-assets cluster, cluster libraries, the "
              "backup-snowflake-migration/ folder with the data-migration "
-             "scripts and plan artifacts, and four parametrised jobs. "
+             "scripts and plan artifacts, and the migration jobs: discover, "
+             "structure and reconcile, plus one copy job per schema of the "
+             "approved plan (each passing `schema` as a task parameter, "
+             "read in the notebook with oidlUtils.parameters.getParameter). "
              "Dry-run without --execute")
     pv.add_argument("--config", "--connection-config", dest="config",
                     help="the migration config; its `decisions:` and "
@@ -2665,11 +2704,14 @@ def build_parser() -> argparse.ArgumentParser:
     pv.add_argument("--stage-param", action="append", default=[],
                     metavar="NAME=VALUE",
                     help="a value to write into every stage notebook's "
-                         "PARAMS cell that declares it, repeatable. This is "
-                         "how `schema` reaches 02_copy_schema: job "
-                         "parameters do not reach a notebook, so a stage "
-                         "parameter has to be IN the notebook, and this "
-                         "writes it there. NAME is the stage flag without "
+                         "PARAMS cell that declares it, repeatable. PARAMS "
+                         "holds the DEFAULTS: a job task's parameters, read "
+                         "with oidlUtils.parameters.getParameter, win over "
+                         "them by the same name -- which is how each "
+                         "per-schema copy job passes its `schema`, so "
+                         "`schema` or copy_schema.schema is refused next to "
+                         "those jobs, and so is a `tables` that would narrow "
+                         "all of them. NAME is the stage flag without "
                          "`--` (schema, tables, mode, dry-run, counts, ...); "
                          "a name no stage declares is refused. Prefix NAME "
                          "with a stage (discover, structure, copy_schema, "
@@ -2713,8 +2755,13 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--job", help="job display name, e.g. snowmig_00_discover")
     rn.add_argument("--job-key", help="job key; use when the name is ambiguous")
     rn.add_argument("--param", action="append", metavar="NAME=VALUE",
-                    help="a job parameter, repeatable. Scope and mode are "
-                         "INPUTS -- never edit a script to change them")
+                    help="refused, with the route that does set the value: "
+                         "a run-level parameter is not known to reach a "
+                         "notebook (only a job TASK's parameters are "
+                         "live-verified to), so it would be ignored. Set "
+                         "stage values with `provision --stage-param` or on "
+                         "the job's task. Scope and mode are INPUTS -- "
+                         "never edit a script to change them")
     rn.add_argument("--poll-seconds", type=float, default=30.0,
                     help="seconds between polls (default: 30)")
     rn.add_argument("--max-polls", type=int, default=40,
