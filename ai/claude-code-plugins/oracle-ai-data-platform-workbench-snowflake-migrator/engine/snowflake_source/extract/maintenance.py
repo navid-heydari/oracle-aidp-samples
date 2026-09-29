@@ -181,7 +181,10 @@ def _signals(rec: dict) -> list[dict]:
             "aidp_equivalent": "liquid clustering (CLUSTER BY) or ZORDER",
             "aidp_requires": "a scheduled job -- on AIDP, clustering runs as "
                              "a scheduled OPTIMIZE, where Snowflake "
-                             "reclusters in the background"})
+                             "reclusters in the background. A plain-column "
+                             "key is carried into the CREATE TABLE by `ddl` "
+                             "as a liquid clustering key (not by `snowmig "
+                             "deploy --execute`)"})
     if rec["search_optimization"]:
         out.append({
             "signal": "Search Optimization Service enabled",
@@ -196,7 +199,11 @@ def _signals(rec: dict) -> list[dict]:
             "detail": "streams or CDC consumers may depend on this",
             "aidp_equivalent": "Delta Change Data Feed "
                                "(delta.enableChangeDataFeed)",
-            "aidp_requires": "enabling it explicitly on the target table"})
+            "aidp_requires": "nothing more on the structure-notebook path: "
+                             "`ddl` carries it into the CREATE TABLE as "
+                             "delta.enableChangeDataFeed = true (not "
+                             "`snowmig deploy --execute`); stream offsets "
+                             "do not transfer"})
     if rec["retention_set_at"] == "table":
         out.append({
             "signal": "table-level Time Travel override",
@@ -204,10 +211,12 @@ def _signals(rec: dict) -> list[dict]:
                       f'schema default',
             "aidp_equivalent": "delta.deletedFileRetentionDuration + "
                                "delta.logRetentionDuration",
-            "aidp_requires": "a deliberate retention, because on Delta the "
-                             "reclamation setting is ALSO the time-travel "
+            "aidp_requires": "a deliberate VACUUM cadence, because on Delta "
+                             "the reclamation setting is ALSO the time-travel "
                              "bound -- reclaiming aggressively deletes the "
-                             "recovery window"})
+                             "recovery window. `ddl` carries a retention "
+                             "above Delta's 7 / 30 day defaults into the "
+                             "CREATE TABLE properties"})
     churn = rec["dml_churn"]
     if churn["measured"] and (churn["rows_rewritten"] or 0) >= CHURN_ROWS_SIGNAL:
         out.append({

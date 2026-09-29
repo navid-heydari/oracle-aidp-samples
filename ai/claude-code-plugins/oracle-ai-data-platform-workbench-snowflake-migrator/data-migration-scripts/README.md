@@ -58,9 +58,14 @@ read-only grant is a second guarantee.
 - **A per-table failure is recorded and the run continues**; the report, not
   the exit code alone, is the deliverable.
 - **Verification is explicit.** Row counts by default; `counts+sums` adds an
-  exact `SUM` over every decimal column **of the source** (cast to
-  `DECIMAL(38,s)` with the source's scale on both sides). Floats are never
-  summed for equality, because float tolerance is wrong for money. A target
+  exact `SUM` over every decimal column **of the source**, at the source's
+  scale on both sides. In connector mode the source total is computed in
+  Snowflake (`sum("C")::VARCHAR`, one qualified pushdown per table) and the
+  target's by Spark over the Delta column, and the two are compared as exact
+  decimals. Floats are never summed for equality, because float tolerance is
+  wrong for money. A total past 38 digits cannot be held by either engine's
+  SUM: that column is listed under `sums_not_comparable`, the other decimal
+  columns are still compared, and the table is `sum_not_comparable`. A target
   column that cannot hold a source decimal without loss stops the copy as
   `type_drift` before any row moves, in both verify modes.
 
@@ -93,6 +98,39 @@ resolves them. The copy refuses to run when the structure report on disk
 targets a different schema, rather than widening its scope to the whole
 manifest.
 
+## How the copy reads a table (connector mode)
+
+`02_copy_schema` reads each table with **one qualified pushdown**, never the
+connector's table read, which costs minutes a table and is lossy: it drops
+`NUMBER` digits, `TIME` / `TIMESTAMP` fractions and the `TIMESTAMP_TZ`
+offset, and cannot open a table holding a `VECTOR`, `MAP` or structured
+`OBJECT`.
+
+- The approved `ddl_plan.json` carries a per-column read spec on every
+  TABLE statement (`columns`: `name`, `target_type`, `read_expr`,
+  `convert_expr`). The copy sends
+  `SELECT <read_expr> AS "<name>", ... FROM "DB"."SCHEMA"."TABLE"` as one
+  pushdown (e.g. `"N"::VARCHAR`, `TO_VARCHAR("T", 'HH24:MI:SS.FF9')`,
+  `"V"::ARRAY::VARCHAR`), then inserts
+  `SELECT <convert_expr> AS <target column>, ...` in the target's column
+  order (e.g. `CAST(N AS DECIMAL(38,37))`, `from_json(V, 'array<float>')`).
+- Every table a pushdown names is fully qualified, with the database taken
+  from the source config: the pushdown session has no current schema.
+- **A plan without `columns`**, written by an older `ddl`, is still copied:
+  every column is read bare (`"NAME"`), with the connector's own typing and
+  its losses. Each table's record says so under `read.bare`. Re-run `ddl`
+  for the exact reads.
+- Before any row is read, the live source's columns come from
+  `INFORMATION_SCHEMA.COLUMNS` (one query per chunk of tables) and are
+  compared with the target's by name, and each source `NUMBER(p,s)` with the
+  target's DECIMAL: a renamed, dropped or added column, or a narrower target
+  DECIMAL, is `type_drift` and nothing is read or written. A table
+  `INFORMATION_SCHEMA` does not list, or a chunk whose query fails, is
+  `failed`, NOT copied.
+- `external-catalog` mode reads the three-part name; the plan's read
+  expressions are Snowflake SQL and are not applied there (the run log says
+  so).
+
 ## Structure modes
 
 `01_create_structure` `--mode`:
@@ -109,9 +147,12 @@ nothing on a table that is already there, so without the read-back a stale
 layout could be certified as created from the plan — and the copy fills the
 target's columns in the target's order.
 
-`--parallel` (default 4) sets how many tables are created at a time within a
-schema, each still read back on its own; `ctas` and dry runs create one at a
-time, and `parallel=1` creates them one by one.
+`--parallel` (default 8) sets how many tables are created at a time within a
+schema, in every mode, each still read back on its own; dry runs create one
+at a time, and `parallel=1` creates them one by one. The report lists every
+table in the manifest's order, whatever the setting. Views are not parallel:
+they are created after **every** table exists, one at a time, in the plan's
+dependency order.
 
 ## Statuses and verdicts
 
@@ -149,16 +190,17 @@ manifest lists as tables.
 | `skipped_nonempty` | `skip-existing` found rows already there, **equal** to the source count; not re-verified | no |
 | `count_mismatch` | counts differ — after a copy, or on a `skip-existing` target that already held a different number of rows (nothing copied) | **yes** |
 | `sum_mismatch` | counts equal, a decimal column does not sum equal | **yes** |
+| `sum_not_comparable` | counts equal (and every other decimal column sums equal), but a decimal column's total is past 38 digits, which neither engine's SUM can hold; `sums_not_comparable` names each such column and why. Re-copying does not change it: re-copy with `--mode overwrite --verify counts` to accept the count check for that table | **yes** |
 | `type_drift` | the live source's column names are not the target's (renamed, dropped or added since the plan; `layout_drift` lists them), or a source DECIMAL column is not DECIMAL, or narrower, on the target; NOT copied — the rows would land in the wrong columns, or be rounded or truncated, with the count intact. A source whose columns are only **reordered** is copied: every column is selected by name, in the target's order | **yes** |
-| `failed` | the copy raised — including a `DESCRIBE` of the target that failed for any reason but not-found (a metastore timeout, a permission denied: "could not look" is never recorded as absent); `insert_completed: true` means the rows landed before verification failed, so re-copy with `--mode overwrite`, never `append` | **yes** |
+| `failed` | the copy raised — including a `DESCRIBE` of the target that failed for any reason but not-found (a metastore timeout, a permission denied: "could not look" is never recorded as absent); `insert_completed: true` means the rows landed before verification failed (or, with `awaiting_source_recount: true`, before the run that wrote them stopped), so re-copy with `--mode overwrite`; an `append` run refuses such a table and records why | **yes** |
 | `target_missing` | Spark says there is no table to copy into (usually `not_in_plan` upstream); the table is skipped and the run continues | no — **yes** when the structure report records the table `created` or `already_existed`, or the approved plan places the table at this target (also with `--tables`, or before `01_create_structure` has run) |
 
 The copy's default scope is **what the structure step created for this
 target**, not the whole manifest. A re-run never softens a recorded failure:
-`count_mismatch`, `sum_mismatch`, `type_drift` and `failed` stand until a real
-re-copy verifies the table. `--force` re-copies verified tables and needs
-`--mode overwrite` or `append` — `skip-existing` cannot re-copy a table that
-holds rows.
+`count_mismatch`, `sum_mismatch`, `sum_not_comparable`, `type_drift` and
+`failed` stand until a real re-copy verifies the table. `--force` re-copies
+verified tables and needs `--mode overwrite` or `append` — `skip-existing`
+cannot re-copy a table that holds rows.
 
 **`MIGRATION_REPORT.md` verdicts** (per table, from the two reports plus the
 live catalog)
@@ -179,8 +221,8 @@ live catalog)
 | `MISSING_DESPITE_REPORT` | a report says created or verified; the catalog lacks it | **yes** |
 | `STRUCTURE_FAILED` | the CREATE raised | **yes** |
 | `STRUCTURE_TYPE_DRIFT` | the table's layout is not the plan's — outranks a verified copy, since counts match when rows land in the wrong columns | **yes** |
-| `STRUCTURE_ONLY_COPY_FAILED` | the copy ended in a mismatch, drift or failure, or recorded `target_missing` for a table the catalog lists | **yes** |
-| `COUNT_DRIFT` | `--counts` only: verified at N rows, the target now holds a different number — changed since the copy, not by it | **yes** |
+| `STRUCTURE_ONLY_COPY_FAILED` | the copy ended in a mismatch, drift or failure (`sum_not_comparable` included), or recorded `target_missing` for a table the catalog lists | **yes** |
+| `COUNT_DRIFT` | `--counts` only (the live counts are read in one batched query per 50 tables; a chunk with an unreadable table is re-counted one by one, and that table keeps its own `count_error`): verified at N rows, the target now holds a different number — changed since the copy, not by it | **yes** |
 | `TARGET_UNREADABLE` | `SHOW TABLES` failed; not the same as empty | **yes** |
 
 A report written for a **different target** — another catalog, or another
@@ -231,6 +273,16 @@ job's task parameter — never edit the stage logic to make it cover less.
   copy batches a schema's source counts into **one** round trip per 50 tables
   instead of two per table. `--verify counts+sums` still costs a read per
   table for the sums, which is why it is opt-in.
+
+Within a schema, the copy runs `--parallel` tables at once (default 8; `1`
+copies them one after another), in chunks of 50: one batched source count
+before the chunk, one `INFORMATION_SCHEMA` read, the copies, then one batched
+count after it, so a source that grew while a table was copied is still
+`count_mismatch`, with the source named as the side that moved. Each table's
+record is written as soon as its copy finishes — provisionally `failed` with
+`insert_completed: true` and `awaiting_source_recount: true` until the
+chunk's recount replaces it with the verdict — so a job that stops mid-chunk
+leaves no table holding rows without a record.
 
 Every notebook is **resumable**: re-running skips work its report already
 records as done (`--force` overrides; for the copy it needs `--mode overwrite`

@@ -19,8 +19,11 @@ runs one of the in-AIDP copy jobs: `snowmig_02_copy_<schema>`, one per schema
 of the approved plan, each running the `02_copy_schema` notebook (before a
 plan is pushed, the single `snowmig_02_copy_schema` job). The jobs carry **no
 schedule**, and row data flows from Snowflake to your AIDP cluster and catalog
-storage without passing through your machine. Stored procedures, tasks,
-streams and pipes are inventoried with effort bands, not translated.
+storage without passing through your machine. Stored procedures, streams and
+pipes are inventoried with effort bands, not translated. Tasks, dynamic tables
+and materialized views get generated MANUAL jobs (`snowmig jobs`, see
+[Generated jobs](#generated-jobs)): SQL translated where the translation is
+exact, a stub that fails when run where it is not.
 
 Two modes: **dev** (`bin/snowmig demo --out-dir ./snowmig_demo` — the whole
 pipeline against a built-in emulation, no credentials, every artifact
@@ -404,7 +407,7 @@ environment, as `provision_result.json` records it.
 `snowmig_01_structure` works schema by schema: it creates the schemas, then
 the empty Delta tables, then the approved plan's views, and reads each table
 back (`DESCRIBE`) to compare it with the plan, column by column. Tables are
-created `parallel` at a time within a schema (default 4); set the job's task
+created `parallel` at a time within a schema (default 8); set the job's task
 parameter `parallel=1` to create them one at a time. Each schema's outcome
 is in `structure_report_<schema>.json`.
 
@@ -568,7 +571,7 @@ the per-object roll-up, `SUMMARY.md`.
 |---|---|---|
 | `--row-counts metadata\|exact\|none` | `metadata` | free, and exact for a settled table. `exact` runs `COUNT(*)` per object and **executes every view** |
 | `--semi-structured string\|block` | `string` | `block` refuses a table with `VARIANT`/`OBJECT`/`ARRAY` until a typed design exists |
-| `--geospatial block\|string` | `block` | `string` carries `GEOGRAPHY`/`GEOMETRY` as text |
+| `--geospatial block\|string\|wkt` | `block` (or the config's `mapping.geospatial`) | `string` carries `GEOGRAPHY`/`GEOMETRY` as GeoJSON text, `wkt` as WKT text |
 | `--timestamp-ntz timestamp\|preserve` | `timestamp` | `preserve` keeps `TIMESTAMP_NTZ`, and `ddl` then halts on it |
 | `--mapping-defaults on\|off` | the config's `mapping.enabled` (`true`) | `off` restores the strict modes for one run |
 
@@ -619,8 +622,11 @@ Dialect is the other half. The translator carries 21 rules
   `$$…$$`, … — **block** the view with the construct named, rather than being
   rewritten on a guess.
 
-A mixed view is blocked, never partially translated. Secure and materialized
-views are blocked outright. The authoritative rule table is
+A mixed view is blocked, never partially translated. Secure views are
+blocked unless you opt in with `--secure-views as-view` (see
+[Security posture](#security-posture)); a materialized view migrates as a
+table snapshot (see [What is not a table or a view](#what-is-not-a-table-or-a-view)).
+The authoritative rule table is
 [references/dialect-translation.md](references/dialect-translation.md);
 [references/type-mapping.md](references/type-mapping.md) summarises it.
 
@@ -643,8 +649,17 @@ Rows are verified by the copy job, after the copy.
 | Snowflake | Default | Alternative |
 |---|---|---|
 | `VARIANT`, `OBJECT`, `ARRAY` | carried as JSON text (`STRING`), with a warning on every affected column (`mapping.semi_structured: string`) | `--semi-structured block`: the table is blocked until a typed struct/map/array design exists |
-| `GEOGRAPHY`, `GEOMETRY` | the table is blocked | `--geospatial string`: carried as text, with no spatial type, index or predicate support |
+| `GEOGRAPHY`, `GEOMETRY` | the table is blocked | `--geospatial string` (GeoJSON) or `--geospatial wkt` (WKT, which does not carry a `GEOMETRY`'s SRID): carried as text, with no spatial type, index or predicate support |
 | `TIMESTAMP_NTZ` | carried as `TIMESTAMP`, with the timezone caveat recorded on every affected column (`mapping.timestamp_ntz: timestamp`); values are read through the session timezone, so keep sessions on UTC | `--timestamp-ntz preserve`: kept as `TIMESTAMP_NTZ`, which the target refuses at CREATE TABLE, so `ddl` halts (exit 3) |
+
+**Structured** types are typed, so neither switch applies to them:
+`VECTOR(FLOAT, n)` becomes `ARRAY<FLOAT>`, `MAP(K, V)` `MAP<STRING, v>`, a
+structured `OBJECT(f T, ...)` a `STRUCT` and `ARRAY(T)` a typed `ARRAY`, each
+with a warning for what the typed column does not carry (a VECTOR's dimension,
+a numeric MAP key's type). Their full type is read with `DESCRIBE TABLE` (or
+`GET_DDL` in the in-AIDP discovery), only for the tables that hold one; where
+that read fails, a VECTOR or MAP is blocked with the reason. See
+[references/type-mapping.md](references/type-mapping.md).
 
 Carrying JSON as text defers the design rather than completing it: nothing is
 lost, but nothing on the target can address a field inside the value until a
@@ -661,17 +676,49 @@ streams, alerts, materialized and dynamic tables, stages (internal and
 external, told apart), pipes, sequences, file formats, secrets, network
 rules, Streamlit apps, notebooks and container services per database, and
 the account's shares, roles, network policies, applications and compute
-pools once per run → `CENSUS.md`. **None of them migrate**, and no
-equivalent is generated: rebuilding them on AIDP is outside this plugin's
-scope, and each is listed with an effort band so the work can be planned.
-The scope statement travels into `PLANNED_OBJECTS.md` and `SUMMARY.md`, so
-the migratable count is never mistaken for the size of the estate.
+pools once per run → `CENSUS.md`. **None of them migrate as objects**, and
+no procedure or UDF equivalent is generated: rebuilding them on AIDP is
+outside this plugin's scope, and each is listed with an effort band so the
+work can be planned. Tasks, dynamic tables and materialized views are the
+exception, where a translation can be exact: see
+[Generated jobs](#generated-jobs). The scope statement travels into
+`PLANNED_OBJECTS.md` and `SUMMARY.md`, so the migratable count is never
+mistaken for the size of the estate.
 
-A table that `SHOW TABLES` flags as dynamic, external, Iceberg, event or
-hybrid is not a plain table either: `plan` blocks it with the reason named
-(`unsupported_object`), under "Object kinds with no AIDP equivalent" in
-`PLANNED_OBJECTS.md`. A view whose base table or view is blocked or excluded
-is blocked too (`dependency_not_migrated`), naming what it depends on.
+For tasks, dynamic tables, materialized views and streams, the census also
+records what a generated job needs (`source_facts` in `inventory.json`): a
+task's schedule, predecessors, condition and body; a dynamic table's target
+lag and defining query; a materialized view's query; a stream's base table.
+They come from the `SHOW` rows already read, whether or not
+`--capture-definitions` is given.
+
+A table that `SHOW TABLES` flags as event or hybrid is not a plain table
+either: `plan` blocks it with the reason named (`unsupported_object`), under
+"Object kinds with no AIDP equivalent" in `PLANNED_OBJECTS.md`.
+
+An **external or Iceberg** table is registered in place (`register_in_place`):
+its files already sit in object storage, so nothing is copied.
+`bin/snowmig external-registration` (read-only against Snowflake) writes
+`EXTERNAL_REGISTRATION.md`: per table, the S3/Azure/GCS path its files come
+from and the statement to run on AIDP **once the files are in OCI Object
+Storage** — `CREATE TABLE ... USING <format> LOCATION 'oci://...'` for an
+external table; for an Iceberg table, `CALL
+<iceberg_catalog>.system.register_table(...)` over its root metadata file
+after the absolute paths in it are rewritten, so it is not counted as
+registered. The plugin does not move the files or rewrite the metadata, and
+executes nothing; the report lists what to check on AIDP.
+
+A **dynamic table** or **materialized view** migrates as a **table
+snapshot**: planned as a `TABLE` (`snapshot_of` names what it was), created
+with `CREATE TABLE` and copied like any other table. Snowflake's refresh does
+not travel: `plan` translates the defining query with the view translator and
+marks each snapshot `refresh generated` or `refresh NOT generated: <why>`.
+`INVENTORY.md` shows `table snapshot (<kind>)`, and `PLANNED_OBJECTS.md` lists
+each under "Planned as table snapshots". A secure materialized view is
+refused, as secure; a dynamic Iceberg table is registered in place.
+
+A view whose base table or view is blocked or excluded is blocked too
+(`dependency_not_migrated`), naming what it depends on.
 
 Procedures and UDFs are read from `INFORMATION_SCHEMA`, which lists the
 account's own routines (`SHOW PROCEDURES` also lists system built-ins) and
@@ -682,6 +729,54 @@ Pay particular attention to **tasks**: a task that populates a table you are
 migrating does not move with it, so after cutover that table is no longer
 refreshed until an equivalent AIDP job exists.
 
+An **outbound share** is a live contract with a consumer account.
+`bin/snowmig share-plan` (read-only; run it after `security`, without which
+every shared table is held) writes `SHARE_PLAN.md`: each share mapped to an
+AIDP Delta Sharing share, one recipient per consumer account, and the
+`aidp delta-share` steps to run, none of them executed. A shared table
+carrying a masking or row-access policy is held, because Delta Sharing
+publishes the table as stored.
+
+## Generated jobs
+
+```bash
+bin/snowmig jobs              # offline: generated_jobs.json, GENERATED_JOBS.md, generated_jobs/*.ipynb
+bin/snowmig jobs --register   # also create the jobs in AIDP, unscheduled
+```
+
+`jobs` reads `plan.json` and `inventory.json` and writes a notebook and a job
+spec per object. Every job is **MANUAL**: the cadence Snowflake used is
+recorded as the intended one and, where it maps exactly onto a Quartz cron,
+written down as a paused proposal that is never sent.
+
+- **Refresh jobs**, one per table snapshot marked `refresh generated`: an
+  `INSERT OVERWRITE TABLE <target> <defining query>`, the query translated and
+  its references rewritten to the migrated tables. It is a full refresh, not
+  Snowflake's incremental one. A snapshot marked `refresh NOT generated` gets
+  no notebook.
+- **Task-graph jobs**, one per task graph (a root task and everything after
+  it), its tasks in dependency order. A single `INSERT`, `DELETE` or
+  `TRUNCATE` over migrated tables is translated. Any other body — `CALL`,
+  Snowflake Scripting, `EXECUTE IMMEDIATE`, `MERGE`, `UPDATE`, a read of a
+  stage, a table function or a session variable, anything that touches an
+  object not migrating — is a **stub notebook that raises when run**, with the
+  reason. A body over a stream names its nearest equivalent (the Delta change
+  data feed of the migrated base table), which is not generated. A `WHEN`
+  condition, overlapping execution and a finalizer task are recorded and not
+  carried.
+- `GENERATED_JOBS.md` maps each load that stops at cutover to the job that
+  would take it over, and says which of those are stubs.
+
+`--register` uploads the notebooks to
+`backup-snowflake-migration/generated_jobs/`, reads them back, creates the
+jobs and confirms them with a job listing. A job is never pointed at a
+notebook that is not visible, and a job name that already exists is not
+adopted or overwritten (exit 1). It needs the DataLake OCID, the workspace key
+and the cluster key — from flags or the config's `aidp:` block, otherwise the
+keys `provision_result.json` records — and is held to
+`decisions.allow_new_objects` like any `--execute`. A multi-task job has not
+yet been verified live.
+
 ## Security posture
 
 `snowmig security` reports masking, row-access, aggregation and projection
@@ -689,10 +784,13 @@ policy *attachments*, secure views, and who holds grants today →
 `SECURITY.md`.
 
 A masked column arrives **unmasked**. A row filter is absent. A secure view
-loses `SECURE`. The copy **succeeds without the protection**. Recreating it on
-AIDP — for example, a restricted view plus ontology sensitivity granted per
-role — is a design decision rather than a translation, so this plugin
-reports and changes nothing.
+is refused by `plan` unless you pass `--secure-views as-view`, which plans it
+as a plain view without `SECURE` and says so in a SECURITY WARNING section of
+`PLANNED_OBJECTS.md`, on its DDL statement (`R60_SECURE_VIEW_AS_PLAIN`) and at
+HIGH in `SUMMARY.md`. The copy **succeeds without the protection**.
+Recreating it on AIDP — for example, a restricted view plus ontology
+sensitivity granted per role — is a design decision rather than a
+translation, so this plugin reports and changes nothing.
 
 If `ACCOUNT_USAGE` cannot be read, the exposure count is `null` and the report
 says the question is **unanswered** — never "none found".
@@ -714,12 +812,27 @@ opposite decisions. The retention *level* is inferred from effective values
 rather than probed per table, so the stage costs a handful of queries;
 `--probe-table-parameters` opts into the exact path.
 
-This plugin reports the gap per object and applies nothing — no maintenance
-DDL is generated. Source settings with an AIDP equivalent (`cluster_by`,
-`retention_time`, `change_tracking`) appear in the DDL plan under
-*"Maintenance and layout — decisions, NOT applied"*, with the equivalent
-named, and raise the object's risk to MEDIUM. Every data-movement option also
-states who takes on `OPTIMIZE`/`VACUUM`.
+This plugin schedules no maintenance — no `OPTIMIZE` or `VACUUM` job is
+generated. Source settings with a Delta equivalent are **carried into the
+CREATE TABLE** by `ddl` and listed per object under *"Carried into the CREATE
+TABLE"*:
+
+- a plain-column clustering key as liquid `CLUSTER BY` (at most four keys,
+  each on a column Delta keeps statistics for);
+- `retention_time` as `delta.deletedFileRetentionDuration` /
+  `delta.logRetentionDuration`, only where it is above Delta's 7 / 30 day
+  defaults (nothing is lowered);
+- `change_tracking`, or a stream on the table, as
+  `delta.enableChangeDataFeed = true`.
+
+The structure job applies them and reads the properties back. `snowmig deploy
+--execute` cannot carry them (the catalog API's table body has no field for
+them); the plan says so per table (`R13`) and the deploy result lists each
+clause under `properties_not_applied`. What cannot be carried — an expression
+key, a key on a type Delta cannot cluster on — stays in the DDL plan under
+*"Maintenance and layout — decisions, NOT applied"* with the reason, and
+raises the object's risk to MEDIUM. Every data-movement option also states
+who takes on `OPTIMIZE`/`VACUUM`.
 
 Two points to know up front: on Delta, **`VACUUM` is what bounds time
 travel** (on Snowflake the two are independent and automatic), and

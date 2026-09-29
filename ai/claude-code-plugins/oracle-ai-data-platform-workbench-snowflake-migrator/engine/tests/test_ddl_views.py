@@ -124,10 +124,13 @@ def test_a_view_mixing_translatable_and_structural_sql_is_still_blocked():
 def test_portable_view_generates_create_view():
     res = build_create_view(view_record(), "TEST_DB.PUBLIC.ACME_ORDER_360_VW")
     assert res.blocked is False
-    # REAL's header column list is carried (see test_view_column_list.py).
+    # REAL's header column list is carried by aliasing the body, never as a
+    # view column list, which AIDP cannot read back (see
+    # test_view_column_list_live.py).
     assert res.sql.startswith(
         "CREATE VIEW IF NOT EXISTS `TEST_DB`.`PUBLIC`.`ACME_ORDER_360_VW` "
-        "(`ORDER_ID`, `ITEM_COUNT`) AS")
+        "AS SELECT * FROM (")
+    assert res.sql.endswith(") AS named_columns(`ORDER_ID`, `ITEM_COUNT`)")
     assert "SELECT" in res.sql
     assert "OR REPLACE" not in res.sql
 

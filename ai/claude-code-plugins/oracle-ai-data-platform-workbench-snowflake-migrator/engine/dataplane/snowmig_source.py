@@ -32,11 +32,14 @@ snowmig-config.example.yaml (JSON, on the workspace mount).
 """
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import pathlib
+import re
 
 __all__ = ["SOURCE_MODES", "SourceConfigError", "SnowflakeSource",
-           "write_step_output",
+           "write_step_output", "read_plan_json",
            "load_source_config"]
 
 SOURCE_MODES = ("connector", "external-catalog")
@@ -173,6 +176,24 @@ def q(identifier: str) -> str:
 def _sql_ident(identifier: str) -> str:
     """Double-quote one SNOWFLAKE identifier (the pushdown runs there)."""
     return '"' + str(identifier).replace('"', '""') + '"'
+
+
+# An identifier Snowflake reads WITHOUT quotes, and so resolves upper-cased.
+_UNQUOTED_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def _sql_database(name: str) -> str:
+    """The config's database, quoted as the name Snowflake resolves it to.
+
+    `database: snowmig_db` in the config is an unquoted identifier to the
+    connector, so it names SNOWMIG_DB; quoting it verbatim would name a
+    different (lower-case) database. A name that is not a plain identifier
+    can only have been meant verbatim.
+    """
+    text = str(name).strip()
+    if _UNQUOTED_IDENT.match(text):
+        text = text.upper()
+    return _sql_ident(text)
 
 
 def _sql_literal(value: str) -> str:
@@ -316,6 +337,24 @@ class SnowflakeSource:
     def database(self) -> str | None:
         return self._options.get("database.name")
 
+    def qualified(self, schema: str, table: str) -> str:
+        """`"DB"."SCHEMA"."TABLE"` for a pushdown, the database from the config.
+
+        LIVE 2026-09-29: the pushdown session has NO current schema, whatever
+        the connector's `schema` option says, so an unqualified `"T"` fails
+        with "Object does not exist" -- the root cause of the batched count's
+        CONNECTOR_0099. Every table a pushdown names goes through here.
+        Schema and table keep their exact case: they come from
+        INFORMATION_SCHEMA, where the case is the name.
+        """
+        database = self.database()
+        if not database:
+            raise SourceConfigError(
+                "a qualified pushdown needs the source database; add "
+                "`database:` to the source config")
+        return (f"{_sql_database(database)}.{_sql_ident(schema)}."
+                f"{_sql_ident(table)}")
+
     def pushdown(self, sql: str, *, schema: str | None = None):
         """Run `sql` IN SNOWFLAKE and return a DataFrame.
 
@@ -357,6 +396,11 @@ class SnowflakeSource:
         UNION ALL answers a whole schema instead; it is chunked because a
         statement with thousands of branches is its own problem.
 
+        Every branch names its table "DB"."SCHEMA"."TABLE" (see `qualified`):
+        unqualified, the live pushdown session refused every chunk with
+        CONNECTOR_0099 and the copy fell back to a count per table.
+        Qualified, 50 tables answered in one query in 25 s (2026-09-29).
+
         External-catalog mode has no session to amortise, so it falls back to
         a count per table -- correct either way, and the caller does not care.
         """
@@ -373,12 +417,104 @@ class SnowflakeSource:
                 # and the identifier are escaped: one apostrophe in a table
                 # name would otherwise break the whole chunk.
                 f"select '{_sql_literal(t)}' as SNOWMIG_TABLE, "
-                f"count(*) as SNOWMIG_N from {_sql_ident(t)}"
+                f"count(*) as SNOWMIG_N from {self.qualified(schema, t)}"
                 for t in batch)
             for row in self.pushdown(sql, schema=schema).collect():
                 data = row.asDict()
                 out[str(data["SNOWMIG_TABLE"])] = int(data["SNOWMIG_N"])
         return out
+
+    def live_columns(self, schema: str, tables: list[str], *,
+                     chunk: int = 200) -> dict[str, dict[str, str]]:
+        """`{table: {column: type}}` for many tables, from INFORMATION_SCHEMA.
+
+        The copy compares the LIVE source's columns with the target's before
+        it moves a row. The connector's table read answered that from its
+        own metadata lookup, at 126-241 s per table (2026-09-29); one
+        INFORMATION_SCHEMA.COLUMNS query answers a chunk of tables instead.
+        Types are what the copy's pre-flight compares: NUMBER(p,s) becomes
+        `decimal(p,s)` (the DECIMAL check), everything else is Snowflake's
+        own type name lower-cased. A table the query does not list is ABSENT
+        from the result, never an empty list -- the caller says so.
+        Connector mode only.
+        """
+        out: dict[str, dict[str, str]] = {}
+        database = self.database()
+        if not database:
+            raise SourceConfigError(
+                "reading INFORMATION_SCHEMA needs the source database; add "
+                "`database:` to the source config")
+        for start in range(0, len(tables), chunk):
+            batch = tables[start:start + chunk]
+            names = ", ".join(f"'{_sql_literal(t)}'" for t in batch)
+            sql = ("select TABLE_NAME, COLUMN_NAME, DATA_TYPE, "
+                   "NUMERIC_PRECISION, NUMERIC_SCALE, ORDINAL_POSITION "
+                   f"from {_sql_database(database)}.INFORMATION_SCHEMA.COLUMNS "
+                   f"where TABLE_SCHEMA = '{_sql_literal(schema)}' "
+                   f"and TABLE_NAME in ({names}) "
+                   "order by TABLE_NAME, ORDINAL_POSITION")
+            rows = sorted((r.asDict() for r in
+                           self.pushdown(sql, schema=schema).collect()),
+                          key=lambda d: (str(d["TABLE_NAME"]),
+                                         int(d["ORDINAL_POSITION"] or 0)))
+            for data in rows:
+                kind = str(data.get("DATA_TYPE") or "").strip()
+                if kind.upper() in ("NUMBER", "DECIMAL", "NUMERIC") and \
+                        data.get("NUMERIC_PRECISION") is not None:
+                    kind = (f"decimal({int(data['NUMERIC_PRECISION'])},"
+                            f"{int(data.get('NUMERIC_SCALE') or 0)})")
+                out.setdefault(str(data["TABLE_NAME"]), {})[
+                    str(data["COLUMN_NAME"])] = kind.lower()
+        return out
+
+    def read_columns(self, schema: str, table: str,
+                     select: list[tuple[str, str]]):
+        """ONE qualified pushdown: `SELECT <expr> AS "<name>", ... FROM
+        "DB"."SCHEMA"."TABLE"`.
+
+        `select` is `[(name, read_expr)]`: a Snowflake expression over the
+        quoted source column, unaliased. Each is aliased to the column's
+        exact name, so the Spark side sees the source's names. Live
+        2026-09-29 this cost ~8.5 s a table where the connector's table read
+        cost 126-241 s, and the exact reads it carries (`::VARCHAR`,
+        `TO_VARCHAR(.., FF9)`, `::ARRAY::VARCHAR`) are what keep NUMBER,
+        TIME/TIMESTAMP fractions and VECTOR/MAP/OBJECT columns intact.
+        The whole statement goes through the read-only guard, as every
+        pushdown does.
+        """
+        if not select:
+            raise SourceConfigError(f"no columns to read from {schema}.{table}")
+        items = ", ".join(f"{expr} as {_sql_ident(name)}"
+                          for name, expr in select)
+        return self.pushdown(
+            f"select {items} from {self.qualified(schema, table)}",
+            schema=schema)
+
+    def source_sums(self, schema: str, table: str,
+                    columns: list[str]) -> dict[str, str | None]:
+        """`{column: exact total as text}` summed IN SNOWFLAKE, one pushdown.
+
+        `select sum("C")::VARCHAR as "C", ... from "DB"."SCHEMA"."TABLE"`:
+        Snowflake adds its own NUMBERs exactly, and `::VARCHAR` carries the
+        total past the connector's typing, which cut NUMBER to ten
+        significant digits live (2026-09-29). None is SQL NULL -- no rows,
+        or only NULLs.
+        """
+        if not columns:
+            return {}
+        items = ", ".join(f"sum({_sql_ident(c)})::VARCHAR as {_sql_ident(c)}"
+                          for c in columns)
+        row = self.pushdown(
+            f"select {items} from {self.qualified(schema, table)}",
+            schema=schema).collect()[0].asDict()
+        return {c: (None if row.get(c) is None else str(row[c]))
+                for c in columns}
+
+    def register_columns_view(self, schema: str, table: str, view: str,
+                              select: list[tuple[str, str]]) -> str:
+        """`read_columns` registered as a session temp view; its name."""
+        self.read_columns(schema, table, select).createOrReplaceTempView(view)
+        return q(view)
 
     def read_table(self, schema: str, table: str):
         """A DataFrame over one source table."""
@@ -422,6 +558,50 @@ class SnowflakeSource:
                        role=self._options.get("role"),
                        auth=self._options.get("authentication.method"))
         return out
+
+
+# What `provision` puts under a plan file's plain name when the file itself
+# was too large to upload and went up gzipped beside it (see
+# target/provisioning.py COMPRESS_OVER_BYTES).
+PLAN_POINTER_KEY = "snowmig_compressed_to"
+
+
+def read_plan_json(path) -> dict:
+    """A plan file `provision` pushed: plain JSON, or a pointer to its gzip
+    copy in the same folder, which is read and checked against the digest.
+
+    Raises ValueError naming the file when what is there is not a plan.
+    Live 2026-09-29, a failed overwrite upload left ddl_plan.json EMPTY on
+    the workspace, and the stage died on a bare JSONDecodeError at char 0.
+    """
+    path = pathlib.Path(path)
+    raw = path.read_bytes()
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
+        raise ValueError(
+            f"{path} is not valid JSON ({len(raw):,} bytes: {exc}). A failed "
+            f"upload leaves the file empty or partial; re-run `provision "
+            f"--execute` and check that its upload of this file succeeded"
+        ) from None
+    if not (isinstance(doc, dict) and doc.get(PLAN_POINTER_KEY)):
+        return doc
+    name = str(doc[PLAN_POINTER_KEY])
+    if pathlib.PurePosixPath(name).name != name or "\\" in name:
+        raise ValueError(f"{path}: the pointer names {name!r}, which is not "
+                         f"a file beside it")
+    target = path.with_name(name)
+    try:
+        data = gzip.decompress(target.read_bytes())
+    except (OSError, EOFError) as exc:
+        raise ValueError(f"{target} (the plan {path.name} points at) could "
+                         f"not be read: {exc}; re-run `provision --execute`"
+                         ) from None
+    if doc.get("sha256") and hashlib.sha256(data).hexdigest() != doc["sha256"]:
+        raise ValueError(f"{target} does not match the digest its pointer "
+                         f"{path.name} records: the two were not pushed "
+                         f"together; re-run `provision --execute`")
+    return json.loads(data.decode("utf-8"))
 
 
 def write_step_output(output_dir: str | None, name: str,

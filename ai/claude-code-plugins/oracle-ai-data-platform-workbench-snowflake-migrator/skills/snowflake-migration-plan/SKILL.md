@@ -47,10 +47,77 @@ Categories:
 | `restriction` | The user's own restriction excluded it. Name which one |
 | `unmapped_type` | A column type has no Delta equivalent, e.g. `VARIANT`, `GEOGRAPHY` |
 | `snowflake_only_sql` | A view uses a construct the translator recognises but has no exact rewrite for — `QUALIFY`, `LATERAL FLATTEN`, `DATEDIFF`/`TIMESTAMPDIFF`, `TIMESTAMPADD`/`TIMEADD`, `$$…$$`, `DECODE`, `NVL2`, a `::` cast over an expression or to `VARIANT` or `TIME`, a `DATEADD` whose amount is an expression or whose unit is quoted or a nested call. The reason names the construct and why. `IFF`, `x::TYPE` on a bare column or literal, `LISTAGG(x, sep)`, `DATEADD(unit, n, col)` and `"quoted identifiers"` are translated, not blocked. Full rule table: [references/dialect-translation.md](../../references/dialect-translation.md) |
-| `unsupported_object` | Secure view, materialized view; dynamic, external, Iceberg, event or hybrid table (`SHOW TABLES` flags) — see also `CENSUS.md` |
+| `unsupported_object` | Secure view (unless `plan --secure-views as-view`, below; a secure materialized view too); event or hybrid table (`SHOW TABLES` flags; decided by its kind before its column types) — see also `CENSUS.md`. A plain dynamic table or materialized view is **not** here: it is planned as a table snapshot, listed under "Planned as table snapshots" with `refresh generated` or `refresh NOT generated: <why>` |
+| `register_in_place` | External or Iceberg table (a dynamic Iceberg table too): its files already sit in object storage, so they are **not copied**. Once the files are moved to OCI Object Storage they are registered as an AIDP table there — `snowmig external-registration` writes the statements (below). Never pointed at the S3/Azure/GCS source |
 | `dependency_not_migrated` | Depends on an object that is not migrating (a blocked or excluded base table or view, or an object outside the assessed scope, e.g. another database); the reason names it |
 | `no_definition` / `unparseable_sql` | The view SQL could not be read or parsed |
 | `columns_unread` | The schema's `INFORMATION_SCHEMA.COLUMNS` read failed (the reason quotes the error, e.g. a timeout), so no column was assessed. Not a privilege verdict and not an empty table: fix the read and re-run `assess` |
+
+## Secure views — refused unless the operator opts in, loudly
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig plan --secure-views as-view [--bronze-catalog-prefix ...]
+```
+
+Default `refuse`: a SECURE view is `unsupported_object`. `as-view` plans it as
+a **plain** view — only on the operator's explicit request, never as your
+suggestion without saying what it costs: the definition becomes visible, the
+secure-view optimizer barrier is gone, and any row filter keyed to Snowflake
+roles (`CURRENT_ROLE()`, `IS_ROLE_IN_SESSION()` — named in the warning when
+the body calls them) does not filter the same rows on AIDP.
+`PLANNED_OBJECTS.md` opens with a **SECURITY WARNING** section, the DDL
+statement carries `R60_SECURE_VIEW_AS_PLAIN` and the warning, and
+`SUMMARY.md` scores the view HIGH. The translator still applies (Snowflake-only
+SQL stays refused), and a secure *materialized* view stays refused. Common
+reason to ask for it: the view is secure only because a Snowflake share
+required it.
+
+## External and Iceberg tables — register in place, after the files move
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig external-registration
+```
+
+Reads Snowflake read-only (`SHOW EXTERNAL TABLES` / `SHOW ICEBERG TABLES` per
+database, `DESCRIBE EXTERNAL VOLUME` / `CATALOG INTEGRATION`,
+`SYSTEM$GET_ICEBERG_TABLE_INFORMATION`) and writes `EXTERNAL_REGISTRATION.md`:
+per table, where the files come FROM (the S3/Azure/GCS path), where they are
+registered AT (`oci://<bucket>@<namespace>/<source key prefix>`), and, for an
+external table, one `CREATE TABLE IF NOT EXISTS … USING PARQUET|CSV|… LOCATION
+'oci://…'` with placeholders. An Iceberg table gets a `CALL
+<iceberg_catalog>.system.register_table(table => …, metadata_file => '…/metadata/<rewritten root metadata file>')`
+instead, listed as **not registrable as generated** until the rewrite. Say
+four things out loud:
+
+- **The move is a prerequisite, not a step this plugin performs.** It moves no
+  bytes and executes none of the statements; until the files are in the OCI
+  bucket each statement registers a table over nothing.
+- **Iceberg metadata holds absolute paths**, so a byte-copy is not yet a
+  readable table: the paths are rewritten (or the table re-written) first.
+- **Never `CREATE TABLE … USING ICEBERG LOCATION`** over the moved directory:
+  it does not adopt the existing metadata -- it makes a new, empty table (or a
+  path catalog rejects it) that reads 0 rows. `register_table` adopts it. An
+  Iceberg table catalogued in Glue (or another external catalog) forks when a
+  copy is registered on AIDP.
+- **None of it is live-verified on AIDP** — the report's last section lists
+  the checks.
+
+## Outbound shares — a Delta Sharing plan, never executed
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig share-plan      # after `security`, so exposures are known
+```
+
+For each OUTBOUND share (`SHOW SHARES`, `DESCRIBE SHARE`, read-only) it
+writes `SHARE_PLAN.md`: the AIDP share, one Delta Sharing recipient per
+consumer account, each shared object with its AIDP target and status, and the
+`aidp delta-share` steps (create → manage-data-asset → create-recipient →
+manage-access). Carry to the user: a recipient is **not a Snowflake account**
+(consumers switch to a Delta Sharing client); a shared table with a masking or
+row-access policy is **HELD**, because Delta Sharing ships raw values; only
+`list` / `list-recipients` are live-verified, so the bodies come from `--help`;
+nothing is run by `snowmig`, and every step publishes data outside the
+tenancy.
 
 ## Restrictions — ask for them, do not invent them
 
@@ -165,12 +232,21 @@ Automatic Clustering and reclaims storage in the background, un-asked. AIDP has
 them**. So a customer who asks for "the same maintenance on AIDP" is not asking
 for a missing feature — they are inheriting a responsibility.
 
-If the DDL plan has a *"Maintenance and layout — decisions, NOT applied"*
-section, read it out. Say three things:
+If the DDL plan has a *"Carried into the CREATE TABLE"* section, say that
+those source settings (a plain clustering key, retention, change tracking or a
+stream) are emitted in the CREATE TABLE and applied by the structure notebook
+-- and NOT by `snowmig deploy --execute`, which has no field for them (R13).
+After such a deploy, its summary lists each dropped clause per table under
+*"Properties this transport cannot carry"*; read those out, they are not
+applied even though the table verified.
 
-1. **Every listed setting has an AIDP equivalent, and none of them was
-   applied.** A clustering key that does not arrive is a performance regression
-   on the largest tables in the estate, and it is silent.
+If it has a *"Maintenance and layout — decisions, NOT applied"* section, read
+it out. Say three things:
+
+1. **Every listed setting has an AIDP equivalent this table could not take as
+   it stands**, and each row says why (an expression key, a key Delta cannot
+   cluster on). A clustering key that does not arrive is a performance
+   regression on the largest tables in the estate, and it is silent.
 2. **On Delta, `VACUUM` is what bounds time travel.** On Snowflake, retention
    and storage reclamation are independent and automatic. A customer used to
    reclaiming storage freely will delete their own recovery window. Snowflake's

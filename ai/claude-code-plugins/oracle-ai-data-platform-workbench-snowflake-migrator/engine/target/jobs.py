@@ -189,6 +189,39 @@ def fetch_task_output(call: Callable[..., dict], *, workspace: str,
     return extract_notebook_text(payload)
 
 
+# The job runner's own call to the cluster failing, not the notebook: live
+# 2026-09-29 a 76-minute copy ended FAILED on "TransientServiceError ...
+# 'target_service': 'dataflowdp', 'status': 503 ... get_command_status".
+_PLATFORM_TRANSIENT = re.compile(
+    r"TransientServiceError|'status':\s*50[234]\b|ServiceUnavailable")
+ERROR_TRACE_CHARS = 2000
+
+
+def task_error_trace(call: Callable[..., dict], *, workspace: str,
+                     run_key: str) -> str | None:
+    """The first task run's `state.errorTrace`, or None.
+
+    Only a task run read by key carries it: the job run's envelope says
+    "Exception during execution of notebook" whatever happened, and the
+    list items omit it. Never raises -- the verdict stands without it.
+    """
+    try:
+        items = call("list_task_runs", workspace=workspace,
+                     run_key=run_key).get("items") or []
+        for item in items:
+            key = str(item.get("key") or item.get("taskRunKey") or "")
+            if not key:
+                continue
+            task = call("get_task_run", workspace=workspace, task_run_key=key)
+            trace = ((task.get("state") or {}).get("errorTrace")
+                     or task.get("errorTrace"))
+            if trace:
+                return str(trace)[:ERROR_TRACE_CHARS]
+    except Exception:
+        return None
+    return None
+
+
 def extract_notebook_text(payload: dict) -> str:
     """Every cell output of an executed notebook, concatenated.
 
@@ -407,8 +440,16 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
         output = fetch_task_output(call, workspace=workspace, run_key=run_key)
     except Exception as exc:  # the verdict still stands without the log
         output = f"(output unavailable: {str(exc)[:200]})"
+    # Why a run that ended badly ended: the fetched output is only the head
+    # of a long notebook's log (~10,800 characters live), so the failure is
+    # not in it.
+    error_trace = (task_error_trace(call, workspace=workspace, run_key=run_key)
+                   if terminal and status not in SUCCESS_STATES else None)
     return {"run_key": run_key, "status": status, "message": message,
-            "output": output, "terminal": terminal, "restarts": restarts,
+            "output": output, "error_trace": error_trace,
+            "platform_transient": bool(
+                error_trace and _PLATFORM_TRANSIENT.search(error_trace)),
+            "terminal": terminal, "restarts": restarts,
             "polls": attempt,
             "unrecognised": ((not terminal) and status not in ACTIVE_STATES
                              and status != UNREADABLE),

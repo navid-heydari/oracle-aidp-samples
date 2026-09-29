@@ -11,9 +11,13 @@ this module emits disabled job stubs for them rather than inventing
 transformation logic nobody specified.
 
 SHOW TABLES lists dynamic, external, Iceberg, event and hybrid tables next to
-standard ones, and the extractor keeps the is_* flags. None of those is a table
-this plugin can copy: each lands in `cannot_migrate` with a reason specific to
-its kind, so the plan agrees with CENSUS.md instead of contradicting it.
+standard ones, and the extractor keeps the is_* flags. External, Iceberg,
+event and hybrid tables are not tables this plugin can copy: each lands in
+`cannot_migrate` with a reason specific to its kind, so the plan agrees with
+CENSUS.md instead of contradicting it. A dynamic table and a materialized
+view are different: their current contents are readable, so they migrate as
+a TABLE SNAPSHOT, and each says whether its refresh can be generated
+(`snapshot_kind`, `_snapshot_refreshes`, target/generated_jobs.py).
 TRANSIENT and TEMPORARY tables do migrate, as permanent Delta tables, and the
 plan carries a warning per object saying so, which PLANNED_OBJECTS.md lists and
 SUMMARY.md scores MEDIUM.
@@ -36,8 +40,11 @@ from snowflake_source.dialect.views import (
 )
 from target.ddl import (
     DEFERRED_EQUIVALENT_PROPERTIES, SCRUBBED_PROPERTIES,
+    classify_table_properties,
     uncarried_column_facts,
 )
+from target.generated_jobs import (SNAPSHOT_KINDS, refresh_query,
+                                   snapshot_definition)
 
 from .medallion import (TARGET_KEY_MAX, TARGET_NAME_RULE_TEXT, bronze_target,
                         detect_target_collisions, layer_jobs,
@@ -45,7 +52,8 @@ from .medallion import (TARGET_KEY_MAX, TARGET_NAME_RULE_TEXT, bronze_target,
 from .restrictions import apply_restrictions, restriction_matches
 from .waves import compute_waves
 
-__all__ = ["build_plan", "TargetCollision", "object_kind_block"]
+__all__ = ["build_plan", "TargetCollision", "object_kind_block",
+           "kind_before_types", "SECURE_VIEW_MODES", "snapshot_kind"]
 
 # Values that mean "this property is not set"; the same list ddl.py skips.
 _UNSET = (None, "", "false", "FALSE", "N", "OFF", "null", "NULL")
@@ -60,17 +68,11 @@ def _maintenance_facts(rec: dict) -> tuple[list[dict], list[str]]:
     LOW with "no properties dropped". The tables are ddl.py's own, so the
     two reports name the same settings.
     """
-    deferred: list[dict] = []
-    omitted: list[str] = []
-    for prop, value in (rec.get("source_metadata") or {}).items():
-        if value in _UNSET:
-            continue
-        if prop in DEFERRED_EQUIVALENT_PROPERTIES:
-            deferred.append({"property": prop, "value": value,
-                             "aidp_equivalent": DEFERRED_EQUIVALENT_PROPERTIES[prop]})
-        elif prop in SCRUBBED_PROPERTIES:
-            omitted.append(f"{prop}={value}")
-    return deferred, omitted
+    # ddl's own classifier: a setting ddl CARRIES into the CREATE TABLE
+    # (a plain clustering key, retention, change tracking) is not a
+    # deferred decision, and scoring it as one would contradict DDL_PLAN.md.
+    settings = classify_table_properties(rec)
+    return settings["deferred"], settings["omitted"]
 
 
 class TargetCollision(RuntimeError):
@@ -100,11 +102,11 @@ def _is_set(value) -> bool:
 # object). First match wins; a table carrying several flags is still one
 # refusal. The label is what INVENTORY.md prints in its Compatibility column,
 # so the inventory and the plan read one table and cannot disagree.
+#
+# `is_dynamic` is LAST on purpose: a dynamic table migrates as a snapshot
+# (snapshot_kind), but a dynamic ICEBERG table is refused as Iceberg, and it
+# is the first match that decides.
 _TABLE_KIND_BLOCKS = (
-    ("is_dynamic", "dynamic table",
-     "Snowflake dynamic table: refreshed by Snowflake from its "
-     "defining query; the census lists them; no equivalent is "
-     "generated -- a copy would be a snapshot that never refreshes"),
     ("is_external", "external table",
      "Snowflake external table: its data lives in the stage's "
      "object storage, not in Snowflake; point AIDP at that "
@@ -119,6 +121,10 @@ _TABLE_KIND_BLOCKS = (
     ("is_hybrid", "hybrid table",
      "Snowflake hybrid (Unistore) table: row-store OLTP "
      "semantics do not carry to Delta"),
+    ("is_dynamic", "dynamic table",
+     "Snowflake dynamic table: refreshed by Snowflake from its "
+     "defining query; it migrates as a table snapshot, and its refresh "
+     "is a generated job where the query translates"),
 )
 
 # The same for views, from SHOW VIEWS.
@@ -127,8 +133,8 @@ _VIEW_KIND_BLOCKS = (
      "Snowflake secure view: its definition and row-visibility rules have "
      "no Delta equivalent"),
     ("is_materialized", "materialized view",
-     "Snowflake materialized view: no AIDP equivalent; rebuild as a table "
-     "plus a refresh job"),
+     "Snowflake materialized view: no AIDP equivalent; it migrates as a "
+     "table snapshot plus a generated refresh job"),
 )
 
 
@@ -147,6 +153,164 @@ def object_kind_block(rec: dict) -> tuple[str, str] | None:
             return label, reason
     return None
 
+# Table kinds whose verdict is the KIND, whatever the column types say, so
+# they are decided before the type check. Under the strict mapping an event
+# table's OBJECT columns and an external table's VALUE VARIANT filed both as
+# `unmapped_type`, sending the operator to fix a type; `--semi-structured
+# string` then "fixed" it and the real refusal appeared one run later. (The
+# dynamic-table flag keeps its original place: K4, the JOBS lane, owns it.)
+_KIND_BEFORE_TYPES = ("is_external", "is_iceberg", "is_event", "is_hybrid")
+
+
+# The two kinds whose files already sit in object storage: not copied, but
+# registered in place over OCI Object Storage once the files are moved there
+# (target/external_registration.py writes the statements). K4: SIM lane.
+_REGISTER_IN_PLACE = (
+    ("is_external", "external table",
+     "Snowflake external table: its rows are files in the stage's object "
+     "storage, not in Snowflake, so nothing is copied. It can be registered "
+     "in place on AIDP as a table over OCI Object Storage once the files are "
+     "moved there from the source bucket -- the S3/Azure/GCS location itself "
+     "is never used -- see EXTERNAL_REGISTRATION.md (`snowmig "
+     "external-registration`)"),
+    ("is_iceberg", "Iceberg table",
+     "Snowflake Iceberg table: already open-format files in object storage, "
+     "so it is not copied into Delta. It can be registered in place on AIDP "
+     "as an Iceberg table over OCI Object Storage once its files are moved "
+     "there and its metadata's absolute paths rewritten -- see "
+     "EXTERNAL_REGISTRATION.md (`snowmig external-registration`)"),
+)
+
+
+def kind_before_types(rec: dict) -> tuple[str, str, str] | None:
+    """(category, label, reason) when a table's kind decides its verdict
+    before its column types are looked at; None otherwise.
+
+    Read by the planner and by render_inventory's Compatibility cell, so
+    INVENTORY.md and PLANNED_OBJECTS.md name the same reason.
+    """
+    if rec.get("object_type") == "VIEW":
+        return None
+    meta = rec.get("source_metadata") or {}
+    for flag, label, reason in _REGISTER_IN_PLACE:
+        if _is_set(meta.get(flag)):
+            return "register_in_place", label, reason
+    for flag, label, reason in _TABLE_KIND_BLOCKS:
+        if flag in _KIND_BEFORE_TYPES and _is_set(meta.get(flag)):
+            return "unsupported_object", label, reason
+    return None
+
+def snapshot_kind(rec: dict) -> str | None:
+    """`dynamic table` / `materialized view` when the object migrates as a
+    TABLE SNAPSHOT of its current contents, else None.
+
+    The kind still has no plain-Delta equivalent (object_kind_block says
+    so, and TRANSLATION_MAP.md counts it); the snapshot is what the plan
+    does about it. A secure materialized view or a dynamic Iceberg table is
+    decided by that other flag first, and stays refused.
+    """
+    block = object_kind_block(rec)
+    return block[0] if block and block[0] in SNAPSHOT_KINDS else None
+
+
+def _snapshot_warning(label: str) -> str:
+    return (f"Snowflake {label}: migrates as a table snapshot of its "
+            f"contents at copy time. Snowflake refreshed it; on AIDP it "
+            f"changes only when its generated refresh job runs, and that job "
+            f"is created MANUAL -- not scheduled -- so until someone runs or "
+            f"schedules it, the table is as of the copy")
+
+
+def _snapshot_definition(rec: dict, facts: dict) -> str | None:
+    """The statement that defines a snapshot's refresh, or None -- read
+    where the generator reads it, so the two cannot look in different
+    places."""
+    return snapshot_definition(rec, facts)
+
+
+def _snapshot_cadence(label: str, facts: dict, captured: bool
+                      ) -> tuple[dict | None, str]:
+    """(intended cadence, the sentence that explains it). Recorded, never
+    applied: the generated job is MANUAL."""
+    if label == "materialized view":
+        return None, ("no cadence: Snowflake maintained it on every change "
+                      "to its base table, so there is no interval to carry. "
+                      "Choose one; the generated job is MANUAL")
+    lag = facts.get("target_lag")
+    if not lag:
+        return None, ("no cadence recorded: "
+                      + ("SHOW DYNAMIC TABLES carried no target_lag for it"
+                         if captured else
+                         "SHOW DYNAMIC TABLES was not read for it (no "
+                         "census, or the role could not see it)"))
+    if str(lag).strip().upper() == "DOWNSTREAM":
+        return ({"source": "TARGET_LAG", "value": str(lag)},
+                "TARGET_LAG DOWNSTREAM: Snowflake refreshed it only when a "
+                "dynamic table reading it needed to, so it has no cadence of "
+                "its own; run it before whatever reads it")
+    return ({"source": "TARGET_LAG", "value": str(lag)},
+            f"TARGET_LAG {lag}: Snowflake kept it within {lag} of its "
+            f"sources. Recorded as the intended cadence; the generated job "
+            f"is MANUAL and nothing schedules it")
+
+
+_NOT_CAPTURED = "the defining query was not captured"
+
+
+def _snapshot_refreshes(can: list[dict], by_id: dict[str, dict],
+                        census: dict | None, targets: dict[str, str]
+                        ) -> None:
+    """Decide, per planned snapshot, whether its refresh can be generated.
+
+    Run after the cascade, so `name_map` is exactly the objects that
+    migrate: a query over anything else has no table on the target to read
+    and gets `refresh NOT generated`, naming it. The same translation
+    `snowmig jobs` runs (target/generated_jobs.refresh_query), so the plan
+    cannot promise a notebook the generator will not write.
+    """
+    facts_by_id = {o.get("source_identifier"): o.get("source_facts") or {}
+                   for o in (census or {}).get("objects") or []
+                   if o.get("kind") in SNAPSHOT_KINDS.values()}
+    name_map = {c["source_identifier"]: targets[c["source_identifier"]]
+                for c in can}
+    by_target = {t.lower(): s for s, t in name_map.items()}
+    snapshots = {c["source_identifier"] for c in can if c.get("snapshot_of")}
+    for c in can:
+        label = c.get("snapshot_of")
+        if not label:
+            continue
+        ident = c["source_identifier"]
+        rec = by_id[ident]
+        captured = ident in facts_by_id
+        facts = facts_by_id.get(ident, {})
+        db, schema, _ = _name_parts(rec)
+        result = refresh_query(
+            _snapshot_definition(rec, facts), source_identifier=ident,
+            source_database=db, source_schema=schema, target_fqn=c["target"],
+            name_map=name_map)
+        reason = result["reason"]
+        if reason == _NOT_CAPTURED and label == "dynamic table":
+            reason += (": a dynamic table's query is only on SHOW DYNAMIC "
+                       "TABLES, which the census reads -- re-run `assess` "
+                       "without --no-census, with a role that can see it")
+        cadence, note = _snapshot_cadence(label, facts, captured)
+        reads_snapshots = sorted(
+            by_target[t.lower()] for t in result["reads"]
+            if by_target.get(t.lower()) in snapshots
+            and by_target[t.lower()] != ident)
+        c["refresh"] = {
+            "generated": result["generated"],
+            "verdict": ("refresh generated" if result["generated"]
+                        else f"refresh NOT generated: {reason}"),
+            "cadence": cadence,
+            "cadence_note": note,
+            "refresh_mode": facts.get("refresh_mode"),
+            "reads": result["reads"],
+            # Other snapshots it reads: their refresh runs first.
+            "reads_snapshots": reads_snapshots,
+        }
+
+
 # SHOW TABLES `kind` values that migrate, as permanent tables, with a warning.
 _TABLE_KIND_WARNINGS = {
     "TRANSIENT": "TRANSIENT table in Snowflake (no Fail-safe, short Time "
@@ -161,7 +325,7 @@ _TABLE_KIND_WARNINGS = {
 def _table_verdict(rec: dict) -> tuple[bool, str, str]:
     """(can_migrate, category, reason) for one table, from its SHOW flags."""
     block = object_kind_block(rec)
-    if block:
+    if block and not snapshot_kind(rec):
         return False, "unsupported_object", block[1]
     return True, "", ""
 
@@ -176,6 +340,10 @@ def _table_kind_warning(rec: dict) -> dict | None:
 
 def _view_verdict(rec: dict) -> tuple[bool, str, str]:
     """(can_migrate, category, reason) for one view."""
+    if snapshot_kind(rec):
+        # Created as a table and copied; its SQL is the refresh's business
+        # (_snapshot_refreshes), not a CREATE VIEW's.
+        return True, "", ""
     block = object_kind_block(rec)
     if block:
         return False, "unsupported_object", block[1]
@@ -192,6 +360,64 @@ def _view_verdict(rec: dict) -> tuple[bool, str, str]:
         return False, "snowflake_only_sql", "uses " + "; ".join(
             f'{u["construct"]} ({u["reason"]})' for u in unsupported)
     return True, "", ""
+
+
+# `plan --secure-views`. `refuse` (default) keeps the unsupported_object
+# verdict; `as-view` plans a secure view as a PLAIN view -- K4, SIM lane --
+# with a warning every report carries. Never a default: it removes a
+# security boundary.
+SECURE_VIEW_MODES = ("refuse", "as-view")
+
+_SECURE_AS_VIEW_WARNING = (
+    "SECURITY WARNING: Snowflake SECURE view planned as a PLAIN view "
+    "(`plan --secure-views as-view`). On AIDP its definition is visible to "
+    "anyone who can describe it, the optimizer is free to push predicates "
+    "through it (the secure-view barrier against inferring filtered rows is "
+    "gone), and any row-visibility logic in its body evaluates against AIDP "
+    "identities, not Snowflake roles. Restrict who can read it before "
+    "anyone is granted it")
+
+# Session functions whose value is a Snowflake identity: in a secure view's
+# body they ARE the row filter, and they mean nothing on AIDP.
+_ROLE_FUNCTIONS = ("CURRENT_ROLE", "IS_ROLE_IN_SESSION", "CURRENT_USER",
+                   "CURRENT_ACCOUNT", "INVOKER_ROLE", "INVOKER_SHARE",
+                   "CURRENT_SECONDARY_ROLES", "IS_DATABASE_ROLE_IN_SESSION")
+
+
+def _secure_as_view_verdict(rec: dict, mode: str
+                            ) -> tuple[bool, str, str, str | None] | None:
+    """(can, category, reason, warning) for a secure view under `as-view`,
+    or None when the normal view verdict applies.
+
+    Only the SECURE flag is set aside: the view is judged by the same
+    translator as any other, and a secure MATERIALIZED view stays refused
+    as the materialized view it is.
+    """
+    meta = rec.get("source_metadata") or {}
+    if (mode != "as-view" or rec.get("object_type") != "VIEW"
+            or not _is_set(meta.get("is_secure"))):
+        return None
+    if _is_set(meta.get("is_materialized")):
+        # Refused as what it is: the opt-in drops SECURE, and a plain view
+        # is not a materialized view either.
+        reason = next(r for f, _, r in _VIEW_KIND_BLOCKS
+                      if f == "is_materialized")
+        return (False, "unsupported_object",
+                reason + " (--secure-views as-view drops SECURE only; it "
+                         "does not make a materialized view)", None)
+    plain = {**rec, "source_metadata": {**meta, "is_secure": "false"}}
+    ok, category, reason = _view_verdict(plain)
+    if not ok:
+        return ok, category, reason, None
+    body = str(rec.get("view_ddl_get_ddl") or rec.get("view_text_show") or "")
+    code = body.upper().replace(" (", "(")
+    used = [f for f in _ROLE_FUNCTIONS if f"{f}(" in code]
+    warning = _SECURE_AS_VIEW_WARNING
+    if used:
+        warning += (". Its body calls " + ", ".join(f"{f}()" for f in used)
+                    + ": that IS a row filter keyed to Snowflake identities, "
+                      "and it will not filter the same rows on AIDP")
+    return True, "", "", warning + "."
 
 
 def _cascade_dependency_exclusions(can: list[dict], cannot: list[dict],
@@ -331,7 +557,11 @@ def build_plan(inventory: dict, dependencies: dict, *,
                restrictions: dict | None = None,
                bronze_catalog_prefix: str | None = None,
                bronze_schema_style: str = "db_schema",
-               architecture_choice: dict | None = None) -> dict:
+               architecture_choice: dict | None = None,
+               secure_views: str = "refuse") -> dict:
+    if secure_views not in SECURE_VIEW_MODES:
+        raise ValueError(f"unknown secure_views mode {secure_views!r}; "
+                         f"expected one of {list(SECURE_VIEW_MODES)}")
     records = inventory.get("inventory", [])
 
     kept, restricted = apply_restrictions(records, restrictions)
@@ -419,6 +649,13 @@ def build_plan(inventory: dict, dependencies: dict, *,
                       f'it.')})
             continue
 
+        early = kind_before_types(rec)
+        if early:
+            cannot.append({
+                "source_identifier": ident, "object_type": rec.get("object_type"),
+                "category": early[0], "reason": early[2]})
+            continue
+
         if rec.get("compatibility_status") == "blocked":
             cannot.append({
                 "source_identifier": ident, "object_type": rec.get("object_type"),
@@ -443,38 +680,51 @@ def build_plan(inventory: dict, dependencies: dict, *,
                            "Re-run `assess` once that read succeeds.")})
             continue
 
-        verdict = _view_verdict if rec.get("object_type") == "VIEW" else _table_verdict
-        ok, category, reason = verdict(rec)
+        as_view = _secure_as_view_verdict(rec, secure_views)
+        if as_view is not None:
+            ok, category, reason, secure_warning = as_view
+        else:
+            verdict = _view_verdict if rec.get("object_type") == "VIEW" else _table_verdict
+            (ok, category, reason), secure_warning = verdict(rec), None
         if not ok:
             cannot.append({
                 "source_identifier": ident, "object_type": rec.get("object_type"),
                 "category": category, "reason": reason})
             continue
         warning = _table_kind_warning(rec)
+        if secure_warning:
+            warning = {"source_identifier": ident, "kind": "SECURE VIEW",
+                       "warning": secure_warning}
         if warning:
             kind_warnings.append(warning)
+        # A dynamic table or materialized view is created as a TABLE: every
+        # table fact below applies to it, whatever SHOW listed it under.
+        snapshot = snapshot_kind(rec)
+        planned_type = "TABLE" if snapshot else rec.get("object_type")
 
         # ddl reports maintenance settings for tables only (build_create_view
         # reads is_secure/is_materialized alone); the plan mirrors that split
         # so SUMMARY.md and DDL_PLAN.md name the same settings.
-        deferred, omitted = (([], []) if rec.get("object_type") == "VIEW"
+        deferred, omitted = (([], []) if planned_type == "VIEW"
                              else _maintenance_facts(rec))
         # A column DEFAULT or an IDENTITY that does not travel changes what
         # an INSERT DOES after cutover -- NULL, or a failure, where Snowflake
         # supplied a value -- so it goes in `warnings`, which assess_risk
         # counts and PLANNED_OBJECTS.md prints. The sentences come from
         # target.ddl so this and DDL_PLAN.md cannot say different things.
-        column_facts = ([] if rec.get("object_type") == "VIEW"
+        column_facts = ([] if planned_type == "VIEW"
                         else uncarried_column_facts(rec))
         # Constraints are kept OUT of `warnings` on purpose: PK/UNIQUE/FK are
         # unenforced metadata on BOTH sides, so nothing behaves differently
         # after cutover, and raising every table with a primary key to MEDIUM
         # would drown the settings that do change behaviour. They are carried
         # as a fact per object instead, and named in DDL_PLAN.md (R20).
-        constraints = ([] if rec.get("object_type") == "VIEW"
+        constraints = ([] if planned_type == "VIEW"
                        else list(rec.get("constraints") or []))
         can.append({"source_identifier": ident,
-                    "object_type": rec.get("object_type"),
+                    "object_type": planned_type,
+                    **({"source_object_type": rec.get("object_type"),
+                        "snapshot_of": snapshot} if snapshot else {}),
                     "target": targets[ident],
                     "rows": rec.get("row_count_exact"),
                     "columns": len(rec.get("columns") or []),
@@ -488,13 +738,23 @@ def build_plan(inventory: dict, dependencies: dict, *,
                     # Kept apart from the column warnings: assess_risk counts
                     # those, but a TRANSIENT/TEMPORARY table planned as a
                     # permanent one is a sentence about the object itself.
-                    "kind_warning": warning["warning"] if warning else None,
+                    "kind_warning": (warning["warning"] if warning
+                                     else _snapshot_warning(snapshot)
+                                     if snapshot else None),
                     "deferred_properties": deferred,
                     "omitted_properties": omitted})
 
+    # A snapshot is read from the dynamic table or materialized view itself,
+    # so what IT reads is not needed for it to exist on the target -- only
+    # for its refresh, which _snapshot_refreshes decides. Its own edges are
+    # left out of the cascade (and kept for the waves below).
+    snapshot_ids = {c["source_identifier"] for c in can if c.get("snapshot_of")}
     can, cannot = _cascade_dependency_exclusions(
-        can, cannot, dependencies.get("edges", []),
+        can, cannot, [e for e in dependencies.get("edges", [])
+                      if e["from"] not in snapshot_ids],
         {r["source_identifier"] for r in records})
+    _snapshot_refreshes(can, {r["source_identifier"]: r for r in records},
+                        inventory.get("census"), targets)
 
     # A pipe or task the census read as writing a table that migrates. The
     # census TASK verdict says such a table stops being populated at cutover;
@@ -556,10 +816,26 @@ def build_plan(inventory: dict, dependencies: dict, *,
             (w for w in kind_warnings
              if w["source_identifier"] in {c["source_identifier"] for c in can}),
             key=lambda w: w["source_identifier"]),
+        # Dynamic tables and materialized views planned as table snapshots,
+        # each with its refresh verdict. The same facts sit on the entry.
+        "table_snapshots": [
+            {"source_identifier": c["source_identifier"],
+             "snapshot_of": c["snapshot_of"], "target": c["target"],
+             **c["refresh"]}
+            for c in sorted(can, key=lambda c: c["source_identifier"])
+            if c.get("snapshot_of")],
         # Migrating tables loaded by a pipe or task that does not migrate.
         "loads_that_stop": sorted(
             loads_that_stop,
             key=lambda x: (x["table"], x["kind"], x["source_identifier"])),
+        # `plan --secure-views`: the mode, and every secure view planned as
+        # a plain view under it. ddl reads the list; PLANNED_OBJECTS.md and
+        # SUMMARY.md carry the warning.
+        "secure_views_mode": secure_views,
+        "secure_views_as_views": sorted(
+            w["source_identifier"] for w in kind_warnings
+            if w["kind"] == "SECURE VIEW"
+            and w["source_identifier"] in {c["source_identifier"] for c in can}),
         "restrictions_applied": restrictions or {},
         # What each list entry matched in this inventory. A zero is a typo
         # until shown otherwise, and the report says so.

@@ -67,7 +67,10 @@ TWO BEHAVIOURS LEARNED FROM A LIVE RUN, both of which broke the first attempt:
     no nullability key, so a plan that declares a column NOT NULL is applied
     with less than it says. Nothing is invented: the gap is recorded per
     object in `properties_not_applied`, and DDL_PLAN.md names it per object
-    too (rule R21). Column and table COMMENTs DO travel -- `fieldDescription`
+    too (rule R21). Nor can it carry the Delta clauses `ddl` puts in the
+    reviewed CREATE TABLE (`delta_features`: liquid CLUSTER BY, the change
+    data feed, retention TBLPROPERTIES); each is named per object in the
+    same report (rule R13 in the plan). Column and table COMMENTs DO travel -- `fieldDescription`
     and `description` -- and are compared on the read-back, so a comment the
     target quietly dropped is reported rather than assumed applied.
 
@@ -88,6 +91,7 @@ from .runner import is_active, is_conflict
 from .catalog_api import (
     PROPERTIES_THIS_BODY_CANNOT_CARRY, build_schema_body, build_table_body,
     build_view_body)
+from .ddl import render_cluster_by, render_tblproperties
 
 __all__ = ["deploy_catalog", "RefusedToExecute"]
 
@@ -109,6 +113,37 @@ def _resolve_catalog_type(call, catalog: str) -> str | None:
         if name == catalog.strip().lower():
             return str(item.get("catalogType") or "").upper() or "UNKNOWN"
     return None
+
+
+def _delta_feature_gaps(stmt: dict) -> list[dict]:
+    """One `properties_not_applied` entry per Delta feature of a planned
+    TABLE that this transport drops: the liquid `CLUSTER BY` keys, and each
+    TBLPROPERTIES key (change data feed, retention) with its value.
+
+    `delta_features` is what `ddl` carried into the reviewed CREATE TABLE.
+    The catalog API body has no field for either, so every one of them is
+    absent from the table this path creates. The clause is quoted in the
+    same form as the reviewed DDL, so the reason can be pasted as the fix.
+    """
+    features = stmt.get("delta_features") or {}
+    base = {"source_identifier": stmt.get("source_identifier"),
+            "target_fqn": stmt["target_fqn"]}
+    gaps = []
+    keys = [str(k) for k in (features.get("cluster_by") or [])]
+    if keys:
+        gaps.append({**base, "property": "CLUSTER BY", "columns": keys,
+                     "reason": (f"the reviewed CREATE TABLE has "
+                                f"{render_cluster_by(features)}; "
+                                + PROPERTIES_THIS_BODY_CANNOT_CARRY[
+                                    "cluster_by"])})
+    for key, value in (features.get("tblproperties") or {}).items():
+        clause = render_tblproperties({"tblproperties": {key: value}})
+        gaps.append({**base, "property": f"TBLPROPERTIES {key}",
+                     "columns": [], "value": str(value),
+                     "reason": (f"the reviewed CREATE TABLE has {clause}; "
+                                + PROPERTIES_THIS_BODY_CANNOT_CARRY[
+                                    "tblproperties"])})
+    return gaps
 
 
 def _split(fqn: str) -> tuple[str, str, str]:
@@ -398,7 +433,8 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         # silently behind in someone's catalog.
         "diagnosis_probes": [],
         "unverified_structure_targets": [], "unverified_structure": [],
-        # Planned properties this TRANSPORT cannot express (NOT NULL). The
+        # Planned properties this TRANSPORT cannot express (NOT NULL, and
+        # each Delta CLUSTER BY / TBLPROPERTIES in `delta_features`). The
         # object is still created and still verified for structure -- but a
         # plan that said NOT NULL and a table that is nullable is exactly the
         # reviewed-versus-applied gap, so it is named per object here as well
@@ -602,6 +638,15 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 "reason": (f'{", ".join(not_null)} are NOT NULL in the '
                            f"reviewed plan and are created NULLABLE here: "
                            + PROPERTIES_THIS_BODY_CANNOT_CARRY["not_null"])})
+        # The same gap for the Delta clauses the reviewed CREATE TABLE
+        # carries (clustering, change data feed, retention). DDL_PLAN.md
+        # says it before the deploy (R13); this says it in the deploy's own
+        # result, which is otherwise "verified" and nothing more.
+        feature_gaps = _delta_feature_gaps(stmt) if not is_view else []
+        if feature_gaps:
+            if ident not in out["properties_not_applied_targets"]:
+                out["properties_not_applied_targets"].append(ident)
+            out["properties_not_applied"] += feature_gaps
 
         # Schema creation is async, so a 409 here means "not settled yet".
         accepted = False

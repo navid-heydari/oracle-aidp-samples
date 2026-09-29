@@ -62,12 +62,18 @@ def test_a_kind_the_planner_refuses_is_not_shown_as_supported(kind, flag, label)
 
 @pytest.mark.parametrize("kind,flag,label", KIND_FLAGS)
 def test_the_inventory_and_the_plan_say_the_same_thing(kind, flag, label):
-    """The property that broke: one inventory, two reports, two answers."""
+    """The property that broke: one inventory, two reports, two answers.
+
+    A dynamic table and a materialized view now migrate as a table
+    snapshot, and the inventory says `table snapshot (...)`; an external or
+    Iceberg table is refused as `register in place (...)`, not `blocked`. So
+    refused must be exactly "neither supported nor a snapshot"."""
     rec = _rec("X", kind=kind, **{flag: "true"})
     plan = build_plan(_inv(rec), {"edges": []})
     refused = {c["source_identifier"] for c in plan["cannot_migrate"]}
-    shown_blocked = _cell(render_inventory(_inv(rec)), "D.S.X") != "supported"
-    assert ("D.S.X" in refused) == shown_blocked
+    cell = _cell(render_inventory(_inv(rec)), "D.S.X")
+    copied = cell == "supported" or cell.startswith("table snapshot")
+    assert ("D.S.X" in refused) == (not copied), cell
 
 
 def test_a_plain_table_is_still_supported():
@@ -107,7 +113,7 @@ def test_no_explanation_when_nothing_is_kind_blocked():
 def test_the_label_is_the_planners_own():
     """One table of kinds, read by both reports. A second copy in the
     renderer is the drift this test exists to stop."""
-    label, reason = object_kind_block(_rec("X", is_dynamic="Y"))
-    assert label == "dynamic table"
-    plan = build_plan(_inv(_rec("X", is_dynamic="Y")), {"edges": []})
+    label, reason = object_kind_block(_rec("X", is_hybrid="Y"))
+    assert label == "hybrid table"
+    plan = build_plan(_inv(_rec("X", is_hybrid="Y")), {"edges": []})
     assert plan["cannot_migrate"][0]["reason"] == reason

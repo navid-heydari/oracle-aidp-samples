@@ -21,7 +21,8 @@ Two source choices worth keeping:
     per-database view and SHOW accepts `IN DATABASE`, so the whole census costs
     about ten queries per database rather than ten per schema.
   * Except for the handful of things that are not in a database at all. Shares,
-    roles, network policies, applications and compute pools belong to the
+    roles, network policies, applications, compute pools and replication
+    and failover groups belong to the
     ACCOUNT, so a `"scope": "account"` entry is read ONCE per run no matter how
     many databases are in scope. Reading them per database would issue the same
     statement N times and count every row N times.
@@ -46,7 +47,7 @@ from ..dialect import lexer
 from .catalog import SHOW_PAGE_SIZE, show_paged
 
 __all__ = ["KINDS", "LANGUAGE_VERDICTS", "VISIBILITY_GRANTS", "build_census",
-           "secondary_roles_active"]
+           "name_at", "secondary_roles_active"]
 
 # What a COMPLETE census needs the role to hold, per Snowflake's documentation
 # of each source. Listed in CENSUS.md's header. Documentation, not a probe:
@@ -79,6 +80,9 @@ VISIBILITY_GRANTS: tuple[tuple[str, str], ...] = (
                                           "ATTACH POLICY privilege"),
     ("applications (account-scoped)", "USAGE on each installed application (or "
                                       "OWNERSHIP)"),
+    ("replication and failover groups (account-scoped)",
+     "OWNERSHIP, MONITOR or REPLICATE on each group; one SHOW REPLICATION "
+     "GROUPS lists both kinds"),
     ("all of the above at once", "an owner or governance role that holds a "
                                  "privilege on every object -- or cross-check "
                                  "the counts against SNOWFLAKE.ACCOUNT_USAGE, "
@@ -202,6 +206,16 @@ _SHARE_INBOUND_REASON = (
     "anything downstream of it is planned.")
 
 
+def _refine_stream(row: dict) -> dict | None:
+    """The table a stream reads, from SHOW STREAMS' `table_name` (live
+    shape: `SNOWMIG_COVERAGE.CORE.ORDERS`). `ddl` turns on the Delta change
+    data feed for that table; a stream on a view reads no table here."""
+    table = row.get("table_name")
+    if not table or str(row.get("source_type") or "Table").lower() != "table":
+        return None
+    return {"on_table": str(table)}
+
+
 def _refine_share(row: dict) -> dict | None:
     """An inbound share and an outbound one break in opposite directions."""
     direction = str(row.get("kind") or "").strip().upper()
@@ -216,6 +230,33 @@ def _refine_share(row: dict) -> dict | None:
         detail += f" on {database}"
     if direction == "INBOUND":
         return {"reason": _SHARE_INBOUND_REASON, "detail": detail}
+    return {"detail": detail}
+
+
+_FAILOVER_GROUP_REASON = (
+    "a failover group is the account's disaster-recovery contract: the "
+    "objects it lists can be promoted in the secondary account if this one "
+    "fails. It does not follow the migration, so from cutover the migrated "
+    "data has no failover at all until an OCI-side recovery design exists -- "
+    "and a failover exercised after cutover promotes a Snowflake copy that "
+    "stopped changing the day the target took over.")
+
+
+def _refine_group(row: dict) -> dict | None:
+    """SHOW REPLICATION GROUPS lists replication AND failover groups, told
+    apart by `type`. One read, so a failover group is counted once; reading
+    SHOW FAILOVER GROUPS as well would count it twice."""
+    kind = str(row.get("type") or "").strip().upper()
+    if not kind:
+        return None
+    detail = f"type={kind}"
+    for field in ("object_types", "allowed_accounts", "replication_schedule"):
+        value = str(row.get(field) or "").strip()
+        if value:
+            detail += f" {field}={value.replace(' ', '')}"
+    if kind == "FAILOVER":
+        return {"kind": "FAILOVER_GROUP", "reason": _FAILOVER_GROUP_REASON,
+                "detail": detail}
     return {"detail": detail}
 
 
@@ -299,7 +340,69 @@ def written_tables(body: str, db: str, schema: str) -> list[str]:
     return found
 
 
+def name_at(body: str, pos: int) -> tuple[list[str], int] | None:
+    """The one- to three-part object name that starts after whitespace at
+    `pos` in `body`, as (parts, end) -- quoted parts keep their case, bare
+    ones fold -- or None when no name stands there. The reading
+    `written_tables` applies to a write target."""
+    target = _TARGET.match(body, pos)
+    if not target:
+        return None
+    return [_part(p) for p in _PART.findall(target.group(1))], target.end()
+
+
+def _task_name(text: str, db: str, schema: str) -> str:
+    """A predecessor as SHOW TASKS spells it -> DB.SCHEMA.TASK.
+
+    Each part may be double-quoted (case kept) or bare (folded). A bare or
+    two-part name resolves in the task's OWN database and schema, the rule
+    `written_tables` follows for a body.
+    """
+    parts = [_part(p) for p in _PART.findall(str(text))]
+    if not parts or len(parts) > 3:
+        raise ValueError(f"not a task name: {text!r}")
+    return ".".join([db, schema][:3 - len(parts)] + parts)
+
+
+def _predecessors(value, db: str, schema: str) -> list[str]:
+    """SHOW TASKS `predecessors`: a JSON array of names, held in a STRING
+    (live 2026-09-29: "[]" on a root task). Raises when it is not one --
+    the caller keeps the raw text rather than reading it as "no parents"."""
+    items = value if isinstance(value, list) else json.loads(str(value))
+    if not isinstance(items, list):
+        raise ValueError(f"predecessors is not a JSON array: {value!r}")
+    return [_task_name(i, db, schema) for i in items]
+
+
+def _source_facts(spec: dict, row: dict, db: str | None, schema: str,
+                  identifier: str, notes: list[str]) -> dict | None:
+    """What a generated job needs, copied from the row the census already
+    read -- no statement is added for it. Only fields the row CARRIES are
+    kept: an absent column stays absent rather than reading as "none"."""
+    keep = spec.get("facts")
+    if not keep:
+        return None
+    facts = {f: _iso(row[f]) for f in keep if f in row}
+    if "predecessors" in facts and db is not None:
+        raw = facts.pop("predecessors")
+        if raw in (None, ""):
+            facts["predecessors"] = []
+        else:
+            try:
+                facts["predecessors"] = _predecessors(raw, db, str(schema))
+            except (ValueError, TypeError) as exc:
+                # Not "no parents": a child read as a root would be
+                # generated as a job with its own schedule.
+                facts["predecessors_unread"] = raw
+                notes.append(f"{spec['kind']} {identifier}: predecessors "
+                             f"not readable ({str(exc)[:160]}), so its place "
+                             f"in the task graph is unknown")
+    return facts
+
+
 # Each kind: where to read it, how to name it, and why it cannot migrate here.
+# `facts` names the SHOW columns a generated AIDP job needs (see
+# target/generated_jobs.py); they are kept on the entry as `source_facts`.
 KINDS: tuple[dict, ...] = (
     {"kind": "PROCEDURE", "source": "information_schema",
      "relation": "procedures", "name_col": "PROCEDURE_NAME",
@@ -347,6 +450,9 @@ KINDS: tuple[dict, ...] = (
                "architecture decision (see the data-movement options)."},
     {"kind": "TASK", "source": "show", "relation": "tasks",
      "writes_col": "definition",
+     "facts": ("schedule", "predecessors", "condition", "warehouse", "state",
+               "definition", "allow_overlapping_execution",
+               "task_relations"),
      "reason": "a task is a scheduler. AIDP Jobs are the equivalent, but the "
                "schedule, dependencies and body all have to be re-expressed. "
                "**A task that populates a migrated table means that table "
@@ -388,17 +494,28 @@ KINDS: tuple[dict, ...] = (
                "cutover; rehosting the image is an OCI decision (Container "
                "Instances or OKE) outside this plugin."},
     {"kind": "STREAM", "source": "show", "relation": "streams",
+     "refine": _refine_stream,
+     "facts": ("table_name", "mode", "source_type", "type", "stale"),
      "reason": "a stream is CDC state. Delta Change Data Feed is the nearest "
                "equivalent, but stream offsets do not transfer, so consumers "
                "restart from a new baseline."},
     {"kind": "MATERIALIZED_VIEW", "source": "show", "relation": "materialized views",
+     "facts": ("text", "invalid", "invalid_reason"),
      "reason": "Snowflake maintains materialized views automatically. AIDP has "
-               "no equivalent: it becomes a table plus a scheduled refresh "
-               "job, which the customer then owns."},
+               "no equivalent. Its current contents migrate as a table "
+               "snapshot (PLANNED_OBJECTS.md); what does not migrate is the "
+               "maintenance -- the refresh is a generated job, created "
+               "unscheduled, where its query translates, and the customer "
+               "then owns it."},
     {"kind": "DYNAMIC_TABLE", "source": "show", "relation": "dynamic tables",
+     "facts": ("target_lag", "refresh_mode", "text", "warehouse",
+               "scheduling_state"),
      "reason": "a dynamic table is a declarative pipeline with a target "
-               "lag. AIDP has no equivalent object; it becomes a scheduled "
-               "job whose cadence must be chosen deliberately."},
+               "lag. AIDP has no equivalent object. Its current contents "
+               "migrate as a table snapshot (PLANNED_OBJECTS.md); what does "
+               "not migrate is the pipeline -- the refresh is a generated "
+               "job, created unscheduled, whose cadence must be chosen "
+               "deliberately (the target lag is recorded, not applied)."},
 
     # Account-scoped. Read once per run, not once per database: these objects
     # do not live in a database, and asking per database would count each of
@@ -434,6 +551,17 @@ KINDS: tuple[dict, ...] = (
                "translate and nothing to copy: whatever the app was doing has "
                "to be sourced again on AIDP or done without, and that is a "
                "procurement question, not a migration step."},
+    {"kind": "REPLICATION_GROUP", "source": "show",
+     "relation": "replication groups", "scope": "account",
+     "sub_kinds": ("FAILOVER_GROUP",), "refine": _refine_group,
+     "reason": "a replication group copies databases -- and sometimes roles, "
+               "warehouses and integrations -- to another Snowflake account "
+               "on a schedule. Nothing replicates the AIDP target: after "
+               "cutover the secondary account holds a copy of a source that "
+               "has stopped changing, and whatever reads that secondary is "
+               "reading a frozen estate. The target's own replication "
+               "(OCI Object Storage replication, a second region) is a "
+               "separate decision this plugin does not make."},
     {"kind": "COMPUTE_POOL", "source": "show", "relation": "compute pools",
      "scope": "account",
      "reason": "a compute pool is the node pool the container services above "
@@ -800,6 +928,14 @@ def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
             entry["detail"] = (f'{entry["detail"]} '
                                f'writes={",".join(writes)}').strip()
 
+    # A task's schedule, graph and body; a dynamic table's lag and query; a
+    # materialized view's query; a stream's base table. Kept whether or not
+    # --capture-definitions was given: a job cannot be generated from a body
+    # nobody kept, and a view's text is always captured for the same reason.
+    facts = _source_facts(spec, row, db, str(schema), identifier, notes)
+    if facts is not None:
+        entry["source_facts"] = facts
+
     if include_definitions:
         for key in ("PROCEDURE_DEFINITION", "FUNCTION_DEFINITION", "text",
                     "definition", "DEFINITION"):
@@ -824,7 +960,8 @@ def _scope_statement(total: int, by_kind, kinds: dict,
                 f"dynamic tables, stages, pipes, sequences, file formats, "
                 f"alerts, secrets, network rules, Streamlit apps, notebooks "
                 f"or services -- and no share, role, network policy, "
-                f"application or compute pool in the account -- "
+                f"application, compute pool, replication or failover group "
+                f"in the account -- "
                 f"were visible to {who}.** SHOW and INFORMATION_SCHEMA return "
                 f"only the objects the role holds a privilege on, so this zero "
                 f"means *none visible*, not *none exist*, and it is a lower "

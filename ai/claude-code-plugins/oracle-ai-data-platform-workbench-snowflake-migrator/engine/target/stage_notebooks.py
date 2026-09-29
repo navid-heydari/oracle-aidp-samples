@@ -157,7 +157,9 @@ STAGES: tuple[StageSpec, ...] = (
             "move.** Every table arrives empty.\n\n"
             "Runs on AIDP compute, where each table is read back after its "
             "CREATE and, in the default `ddl-plan` mode, compared with the "
-            "approved plan column by column."),
+            "approved plan column by column. `parallel` tables "
+            "are created at once (default 8); views follow every "
+            "table, one at a time, in the plan's order."),
         # `mode` is `ddl-plan`, matching the stage's own argparse default and
         # runbook S10 ("reading the approved plan"). It used to ship
         # `manifest`, which CANNOT work alongside the `connector` source-mode
@@ -186,7 +188,9 @@ STAGES: tuple[StageSpec, ...] = (
             "already sitting here.\n\n"
             "One notebook per SCHEMA, never per table: each job run has its "
             "own startup time, so one run per schema pays it once for every "
-            "table in that schema."),
+            "table in that schema. Within the schema, `parallel` "
+            "tables are copied at once (default 8; 1 = one after "
+            "another)."),
         params={"source-mode": "connector", "source-config": None,
                 "source-catalog": None, "target-catalog": None,
                 "schema": None, "target-schema": None, "ddl-plan": None,
@@ -194,7 +198,7 @@ STAGES: tuple[StageSpec, ...] = (
                 "mode": "skip-existing", "verify": "counts",
                 "reports-dir": None, "output-dir": None, "dry-run": False,
                 "retries": None, "retry-base-delay": None,
-                "retry-multiplier": None, "force": False},
+                "retry-multiplier": None, "parallel": None, "force": False},
         required=("target-catalog", "schema"),
         lists=("tables",),
         choices={"source-mode": _SOURCE_MODES,
@@ -219,6 +223,24 @@ _TRUE = ("true", "yes", "on", "1")
 _FALSE = ("false", "no", "off", "0", "")
 
 
+# A drive-letter path. A stage notebook runs on the AIDP cluster (Linux), so
+# no such path is ever right there -- and it is exactly what Git Bash makes
+# of `/Workspace/...` (MSYS path conversion: live 2026-09-29, reports-dir
+# became `C:/Program Files/Git/Workspace/...`, discovery wrote its manifest
+# to that local path on the cluster, and the next stage could not find it).
+_WINDOWS_PATH = re.compile(r"^\s*[A-Za-z]:[\\/]")
+
+
+def _refuse_windows_path(key: str, value: object) -> None:
+    if isinstance(value, str) and _WINDOWS_PATH.match(value):
+        raise ValueError(
+            f"--stage-param {key}={value!r}: a Windows path cannot be right "
+            f"for a stage that runs on the AIDP cluster. If you typed a "
+            f"/Workspace/... path in Git Bash, Git Bash rewrote it (MSYS path "
+            f"conversion): re-run with MSYS_NO_PATHCONV=1 set, or write the "
+            f"value as //Workspace/...")
+
+
 def _coerce(stage: StageSpec, key: str, value: object) -> object:
     """A --stage-param value, as text, into the literal PARAMS holds.
 
@@ -230,6 +252,7 @@ def _coerce(stage: StageSpec, key: str, value: object) -> object:
     """
     if value is None or isinstance(value, bool):
         return value
+    _refuse_windows_path(key, value)
     if isinstance(stage.params.get(key), bool):
         text = str(value).strip().lower()
         if text in _TRUE:
@@ -330,6 +353,8 @@ def check_stage_params(params: dict[str, object],
     EVERY schema's copy job at once. Both are refused.
     """
     by_key = {s.key: s for s in STAGES}
+    for name, value in params.items():
+        _refuse_windows_path(name, value)
     _check_against_copy_jobs(params, list(copy_schemas or ()))
     declared = declared_stage_params()
     unknown = sorted(k for k in params

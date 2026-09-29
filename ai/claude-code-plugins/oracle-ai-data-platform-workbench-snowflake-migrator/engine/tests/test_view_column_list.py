@@ -17,10 +17,12 @@ deploy reported the mismatch only after creating the view, and CREATE ... IF
 NOT EXISTS never corrects it. Views whose list repeats the body's own names
 lost nothing, which is why the live estate never showed it.
 
-The list is now carried: CREATE VIEW <fqn> (c1, c2) AS <body> in the SQL,
-and, because the catalog API takes the SELECT alone, its viewText is
-`SELECT * FROM (<body>) AS named_columns(c1, c2)`. A list that cannot be
-read blocks the view rather than being guessed at.
+The list is now carried, and a list that cannot be read blocks the view
+rather than being guessed at. It first went into the SQL as a view column
+list, CREATE VIEW <fqn> (c1, c2) AS <body>; live on AIDP such a view is
+created and then cannot be read (test_view_column_list_live.py), so the SQL
+now names them the way the catalog API's viewText always did:
+`CREATE VIEW <fqn> AS SELECT * FROM (<body>) AS named_columns(c1, c2)`.
 """
 import pytest
 
@@ -77,9 +79,12 @@ def test_an_unreadable_list_blocks_the_view_in_plan_and_ddl():
 def test_the_create_view_names_the_columns():
     res = build_create_view(_view(RENAMING), "lake.db_s.v_cust_totals")
     assert res.blocked is False, res.blocked_reason
+    # Aliased in the body, not a view column list (unreadable on AIDP).
     assert res.sql.startswith(
         "CREATE VIEW IF NOT EXISTS `lake`.`db_s`.`v_cust_totals` "
-        "(`CUSTOMER`, `TOTAL`) AS\n"), res.sql
+        "AS SELECT * FROM (\n"), res.sql
+    assert res.sql.endswith(
+        ") AS named_columns(`CUSTOMER`, `TOTAL`)"), res.sql
 
 
 def test_sql_and_view_text_both_expose_the_header_names():
@@ -88,7 +93,7 @@ def test_sql_and_view_text_both_expose_the_header_names():
             "waves": [["DB.S.V_CUST_TOTALS"]],
             "clone_targets": ["DB.S.V_CUST_TOTALS"]}
     (stmt,) = build_ddl_payload(inv, plan)["statements"]
-    assert "(`CUSTOMER`, `TOTAL`)" in stmt["sql"]
+    assert "named_columns(`CUSTOMER`, `TOTAL`)" in stmt["sql"]
     assert stmt["view_text"] == (
         "SELECT * FROM (\nselect CUST_ID, SUM(AMT) from DB.S.ORDERS "
         "group by 1\n) AS named_columns(`CUSTOMER`, `TOTAL`)"), stmt["view_text"]
@@ -97,9 +102,24 @@ def test_sql_and_view_text_both_expose_the_header_names():
 
 
 def test_generated_view_sql_with_a_list_still_yields_its_body():
+    """The generated SQL carries no header list any more; its body is the
+    aliased query, which still starts from the source body."""
     res = build_create_view(_view(RENAMING), "lake.db_s.v_cust_totals")
-    assert extract_view_body(res.sql).startswith("select CUST_ID")
-    assert extract_view_columns(res.sql) == ["CUSTOMER", "TOTAL"]
+    assert extract_view_body(res.sql).startswith(
+        "SELECT * FROM (\nselect CUST_ID")
+    assert extract_view_columns(res.sql) == []
+
+
+def test_an_older_plan_with_a_header_list_still_yields_named_view_text():
+    """A ddl_plan.json written before the change still carries the header
+    list; its catalog viewText is the same aliased query."""
+    from target.ddl import _view_text
+    old = ("CREATE VIEW IF NOT EXISTS `lake`.`db_s`.`v_cust_totals` "
+           "(`CUSTOMER`, `TOTAL`) AS\nselect CUST_ID, SUM(AMT) from "
+           "DB.S.ORDERS group by 1")
+    assert _view_text(old) == (
+        "SELECT * FROM (\nselect CUST_ID, SUM(AMT) from DB.S.ORDERS "
+        "group by 1\n) AS named_columns(`CUSTOMER`, `TOTAL`)")
 
 
 def test_the_emitted_sql_and_view_text_parse_as_spark():

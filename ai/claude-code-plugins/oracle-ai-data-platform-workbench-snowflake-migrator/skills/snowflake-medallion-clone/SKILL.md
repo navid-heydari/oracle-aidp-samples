@@ -87,6 +87,11 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig ddl
 Show `DDL_PLAN.md`: the SQL, the rule behind each transformation, dropped
 properties, and everything blocked. Statements come out in wave order, so a view
 always follows the tables it reads. Nothing has touched AIDP.
+`R04_EXACT_READ` lists the columns the copy reads as text and converts on AIDP
+(NUMBER, FLOAT, TIME, timestamps, structured and geospatial types): the
+connector's own read loses digits, fractions or offsets on those, or cannot open
+the table at all. Each table statement in `ddl_plan.json` carries that per-column
+spec as `columns`.
 
 **Exit code 3 is a halt, not a failure:** a column uses a type the target
 refuses at CREATE TABLE, usually `TIMESTAMP_NTZ` on a default-assessed estate.

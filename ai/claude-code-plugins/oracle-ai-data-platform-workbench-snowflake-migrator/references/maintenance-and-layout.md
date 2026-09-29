@@ -89,7 +89,7 @@ Delta Spark settings that keep this historical prefix.
 
 ## What this plugin does
 
-**Measures the source, reports the gap, applies nothing.** `snowmig
+**Measures the source and reports the gap.** `snowmig
 maintenance` writes `maintenance.json` + `MAINTENANCE.md`: clustering keys,
 `automatic_clustering`, Search Optimization, `change_tracking`, the retention
 cascade with per-table effective values, and reclustering credits plus DML
@@ -98,13 +98,30 @@ the grant is absent.
 
 Each data-movement option also declares who takes on the maintenance work and
 which of the four points above apply to it, so the choice is made with that
-cost visible. Source settings with an AIDP equivalent — `cluster_by`,
-`retention_time`, `data_retention_time_in_days`, `change_tracking` — are
-listed per object in the DDL plan under *"Maintenance and layout — decisions,
-NOT applied"*, with the equivalent named, and they raise the object's risk to
-MEDIUM.
+cost visible.
 
-**No maintenance DDL is generated or executed** — no `OPTIMIZE`, no `VACUUM`,
-no `CLUSTER BY`, no `TBLPROPERTIES`. Choosing a cadence and a retention needs
-the customer's recovery requirements and query patterns, so it stays with the
-team that owns the target tables and is outside this plugin's scope.
+Source settings with a Delta equivalent are **carried into the CREATE TABLE**
+by `ddl` and listed per object in the DDL plan under *"Carried into the CREATE
+TABLE"*:
+
+- a plain-column clustering key as liquid `CLUSTER BY` (at most four keys,
+  each on a column Delta keeps statistics for);
+- `retention_time` (`DATA_RETENTION_TIME_IN_DAYS`) as
+  `delta.deletedFileRetentionDuration` / `delta.logRetentionDuration`, only
+  where it is above Delta's 7 / 30 day defaults (nothing is lowered);
+- `change_tracking`, or a stream on the table, as
+  `delta.enableChangeDataFeed = true`.
+
+The structure job applies them and reads the properties back. `snowmig deploy
+--execute` cannot carry them (the catalog API's table body has no field for
+them); the plan says so per table (`R13`) and the deploy result lists each
+clause under `properties_not_applied`. What cannot be carried — an expression
+key, a key on a type Delta cannot cluster on — stays under *"Maintenance and
+layout — decisions, NOT applied"* with the reason, and raises the object's
+risk to MEDIUM.
+
+**No maintenance job is generated or executed** — no `OPTIMIZE`, no `VACUUM`,
+no `ZORDER BY`. The settings above are carried because they are the source's
+own values; choosing a cadence needs the customer's recovery requirements and
+query patterns, so it stays with the team that owns the target tables and is
+outside this plugin's scope.

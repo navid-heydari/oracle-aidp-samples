@@ -272,7 +272,10 @@ def test_maintenance_report_lists_tables_with_signals():
 def test_maintenance_report_states_nothing_was_applied():
     md = render_maintenance(_maint(tables=[_mt()])).lower()
     assert "applies nothing" in md, "the report must say it changed nothing"
-    assert "none applied" in md
+    # It used to say "none applied"; ddl now carries the table settings, and
+    # the report says which path does and which does not.
+    assert "carried into the create table by `ddl`" in md
+    assert "applied by nobody" in md
     assert "proposes no cadence" in md
 
 
@@ -405,7 +408,8 @@ def test_planned_objects_with_an_empty_census_carries_the_visibility_caveat():
              "show network rules": [], "show streamlits": [],
              "show notebooks": [], "show services": [], "show shares": [],
              "show roles": [], "show network policies": [],
-             "show applications": [], "show compute pools": []}
+             "show applications": [], "show compute pools": [],
+             "show replication groups": []}
     plan = dict(PLAN)
     plan["census"] = build_census(FakeSql(empty), ["DB"], role="R")
     md = render_planned_objects(plan)

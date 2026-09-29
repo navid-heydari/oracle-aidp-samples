@@ -154,6 +154,13 @@ mapping:
   #   preserve            -- keep TIMESTAMP_NTZ; `ddl` halts on every table
   #                          that has one until the metastore accepts it.
   timestamp_ntz: timestamp
+  #
+  # geospatial: GEOGRAPHY / GEOMETRY
+  #   block (default) -- the table is refused until a spatial design exists.
+  #   string          -- carried as GeoJSON text, with a warning.
+  #   wkt             -- carried as WKT text (ST_ASWKT), with a warning; a
+  #                      GEOMETRY's SRID is not in WKT.
+  geospatial: block
 
 compute:
   # Warehouse-equivalent compute (runbook S12; always proposed, created only

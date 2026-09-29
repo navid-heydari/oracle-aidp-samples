@@ -412,10 +412,12 @@ stage logic to make it cover less.
 **Creation speed.** A table create is a few metastore round trips. The
 structure job lists each schema once (`SHOW TABLES`), so a table known to be
 absent skips the `DESCRIBE` before its create; it creates `parallel` tables at
-a time within a schema (default 4; each still read back on its own; CTAS and
-dry runs one at a time), and writes its report every few seconds rather than
-after every table. If the metastore objects to concurrent creates, set the
-job's task parameter `parallel=1` — no notebook edit, no re-provision.
+a time within a schema (default 8; each still read back on its own; dry runs
+one at a time), and writes its report every few seconds rather than after
+every table. AIDP's CREATE TABLE sets the pace: on a cluster with a 2-OCPU
+driver, about 2 s a table at the default, so roughly a day per 50,000 tables
+per cluster of that size. If the metastore objects to concurrent creates, set
+the job's task parameter `parallel=1` — no notebook edit, no re-provision.
 
 Monitor the runs and report progress. Report `verified`, never `executed` — a
 batch can report success while statements inside it failed.
@@ -451,6 +453,24 @@ parameters and refuses a name that matches no spelling of a stage parameter
 (`dryRn=true` would leave `dry-run` False: a real write) or a value the stage
 refuses (`mode=apend`) — before any job start-up is spent. A job definition
 that cannot be read is reported and does not block.
+
+**What Snowflake refreshed or scheduled** gets generated jobs, never
+scheduled ones:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig jobs              # offline: GENERATED_JOBS.md + notebooks
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig jobs --register   # create them in AIDP, UNSCHEDULED
+```
+
+A dynamic table or materialized view the plan migrated as a table snapshot
+with `refresh generated` gets an `INSERT OVERWRITE` refresh notebook; each
+task graph gets one job with its tasks in dependency order, SQL DML bodies
+over migrated tables translated, everything else (CALL, Scripting, MERGE,
+UPDATE, streams, anything not migrating) a stub that FAILS when run. Every
+job is MANUAL: the source cadence (TARGET_LAG, SCHEDULE) is recorded and,
+where exact, shown as a PAUSED Quartz proposal — never applied. Present
+GENERATED_JOBS.md, stubs and "not carried" list first, and register only on
+explicit confirmation; say that the schedule is recorded, not applied.
 
 ### S12 — Propose the warehouse-equivalent clusters
 

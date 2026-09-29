@@ -16,15 +16,18 @@ Pure function over artifacts, zero I/O. Views are re-run through the same
 `translate_view_body` the DDL stage calls, so the map cannot disagree with
 what was emitted -- and a view the planner refused still shows WHICH rule
 refused it, which the DDL payload records only as prose. A view refused for
-its KIND (secure, materialized: plan.build.object_kind_block, checked first
-as plan and ddl check it) is never translated; it is counted as refused by
-kind.
+its KIND (secure: plan.build.object_kind_block, checked first as plan and
+ddl check it) is never translated; it is counted as refused by kind. A plain
+materialized view or a dynamic table is NOT refused: the plan migrates it as
+a table snapshot (plan.build.snapshot_kind), so it has its own bucket, with
+the refresh verdict the plan recorded, and no dialect rule is counted for it
+here -- its query is translated only for the generated refresh.
 """
 from __future__ import annotations
 
 import collections
 
-from plan.build import object_kind_block
+from plan.build import object_kind_block, snapshot_kind
 from snowflake_source.dialect.translate import RULES
 from snowflake_source.dialect.views import extract_view_body, translate_view_body
 
@@ -64,6 +67,17 @@ def _types(records: list[dict]) -> list[dict]:
                                       -r["columns"], r["source_type"]))
 
 
+def _snapshots(records: list[dict], plan: dict) -> list[dict]:
+    """Objects the plan migrates as a TABLE SNAPSHOT, with the refresh
+    verdict it recorded (None when the plan has no entry for it)."""
+    refresh = {c["source_identifier"]: (c.get("refresh") or {}).get("verdict")
+               for c in plan.get("can_migrate") or []}
+    return [{"source_identifier": rec["source_identifier"], "kind": kind,
+             "refresh": refresh.get(rec["source_identifier"])}
+            for rec in records
+            if (kind := snapshot_kind(rec))]
+
+
 def _dialect(records: list[dict]) -> tuple[list[dict], dict]:
     applied: dict[str, set] = collections.defaultdict(set)
     refused: dict[str, set] = collections.defaultdict(set)
@@ -74,9 +88,14 @@ def _dialect(records: list[dict]) -> tuple[list[dict], dict]:
         if rec.get("object_type") != "VIEW":
             continue
         ident = rec["source_identifier"]
-        # The check plan and ddl apply first: a secure or materialized view
-        # is refused for what it IS, so no dialect rule ever touches it.
-        # Translating it here reported rules applied to SQL never emitted.
+        # A table snapshot (a plain materialized view) is not refused: it is
+        # counted in _snapshots, and its query is translated only for the
+        # generated refresh, which plan.json records.
+        if snapshot_kind(rec):
+            continue
+        # The check plan and ddl apply first: a secure view is refused for
+        # what it IS, so no dialect rule ever touches it. Translating it
+        # here reported rules applied to SQL never emitted.
         block = object_kind_block(rec)
         if block:
             views["blocked_by_kind"].append(
@@ -181,6 +200,7 @@ def build_translation_map(inventory: dict, plan: dict,
         for r in s.get("rules_applied") or [])
     catalogs, schemas = _containers(records, plan or {})
     names = _names(records, plan or {})
+    snapshots = _snapshots(records, plan or {})
     return {
         "catalogs": catalogs,
         "schemas": schemas,
@@ -189,6 +209,7 @@ def build_translation_map(inventory: dict, plan: dict,
         "names": names,
         "ddl_rules": dict(sorted(ddl_rules.items())),
         "views_blocked_by_kind": views["blocked_by_kind"],
+        "table_snapshots": snapshots,
         "ddl_ran": ddl_payload is not None,
         "totals": {
             "objects": len(records),
@@ -202,6 +223,7 @@ def build_translation_map(inventory: dict, plan: dict,
             "views_without_sql": views["no_sql"],
             "views_unparseable": views["unparseable"],
             "views_blocked_by_kind": len(views["blocked_by_kind"]),
+            "table_snapshots": len(snapshots),
             "rules_applied": sum(1 for r in rules if r["outcome"] == "applied"),
             "rules_refused": sum(1 for r in rules if r["outcome"] == "refused"),
             "renamed_objects": sum(1 for n in names if n["renamed"]),

@@ -445,11 +445,36 @@ not pass.
 - **Write to Snowflake.** The source is read-only, enforced at the transport.
 - **Span databases.** One Snowflake database is one migration and becomes one
   AIDP catalog; another database is another migration.
-- **Translate code or policies.** Stored procedures, UDFs, tasks, streams,
-  pipes and dynamic tables are inventoried with effort bands and a language
-  verdict; masking and row-access policies are reported per exposure. Their
+- **Translate code or policies.** Stored procedures, UDFs, streams and pipes
+  are inventoried with effort bands and a language verdict (tasks and
+  dynamic tables get generated jobs, below); masking and row-access policies are reported per exposure. Their
   AIDP equivalents are designed by people, with those reports as the
   worklist.
+- **Translate every generated job body.** `snowmig jobs` translates only a
+  single `INSERT`, `DELETE` or `TRUNCATE` over migrated tables, and a table
+  snapshot's refresh query as a full `INSERT OVERWRITE`. `CALL`, Snowflake
+  Scripting, `EXECUTE IMMEDIATE`, `MERGE`, `UPDATE`, stage loads, table
+  functions, session variables and stream consumers become stub notebooks
+  that fail when run; a `WHEN` condition, a finalizer task and an incremental
+  refresh are not carried, and no generated job is scheduled.
+- **Move external or Iceberg table files.** `snowmig external-registration`
+  writes each table's AIDP registration, to run once its files are in OCI
+  Object Storage. The plugin does not move the files, rewrite Iceberg
+  metadata paths, or execute the statements.
+- **Execute the Delta Sharing plan.** `snowmig share-plan` maps outbound
+  shares to AIDP Delta Sharing steps and runs none of them.
+- **Compare decimal totals past 38 digits.** Under `--verify counts+sums`, a
+  column whose total exceeds what a `DECIMAL(38)` SUM holds at its scale is
+  listed under `sums_not_comparable`, and the table is `sum_not_comparable`,
+  not verified; `--verify counts` accepts the count check for it.
+- **Carry typed complex columns or Delta table features through `deploy`.**
+  `snowmig deploy --execute` refuses a table with a typed `ARRAY`, `MAP` or
+  `STRUCT` column and cannot set `CLUSTER BY` or table properties, because
+  the catalog API has no field for them; the structure job carries both.
+- **Create structure faster than the metastore.** Table creation runs at
+  about 2 s a table at the default `--parallel 8` on a cluster with a 2-OCPU
+  driver, so roughly a day per 50,000 tables per cluster of that size; plan
+  the S10 window for the estate's size.
 - **Plan views from the in-AIDP manifest.** The discovery manifest carries a
   view's columns, not its SQL, so `ingest` marks such a view untranslatable.
   An estate whose views must migrate is planned from a live `assess` (and
@@ -481,8 +506,6 @@ Planned capabilities:
   families, each with a count, and decided once per family.
 - Estate statistics at S11: largest, smallest and average table, and totals
   per schema.
-- A faster bulk copy, with several tables copied in parallel within a
-  schema's job.
 - A per-table maintenance proposal — `OPTIMIZE` cadence from measured churn,
   `ZORDER`/`CLUSTER BY` keys seeded from the source clustering key, a
   `VACUUM` retention never shorter than the source's — emitted as a disabled

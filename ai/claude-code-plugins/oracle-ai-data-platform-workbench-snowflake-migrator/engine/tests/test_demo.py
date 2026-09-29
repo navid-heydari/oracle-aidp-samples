@@ -156,7 +156,12 @@ def test_the_demo_summary_rates_the_clustered_table_medium(demo):
     md = (out / "SUMMARY.md").read_text(encoding="utf-8")
     orders = next(l for l in md.splitlines() if "`SNOWDEMO.SALES.ORDERS`" in l)
     assert "| MEDIUM |" in orders, orders
-    assert "cluster_by=LINEAR(ORDER_DATE)" in orders
+    # The clustering key, change tracking and retention are now CARRIED into
+    # the CREATE TABLE, so SUMMARY.md no longer lists them as not applied --
+    # and DDL_PLAN.md shows where they went.
+    assert "not applied" not in orders, orders
+    ddl_md = (out / "DDL_PLAN.md").read_text(encoding="utf-8")
+    assert "CLUSTER BY (ORDER_DATE)" in ddl_md
     view = next(l for l in md.splitlines()
                 if "`SNOWDEMO.ANALYTICS.ORDER_SUMMARY_VW`" in l)
     assert "| HIGH |" in view, "a view's column warnings must not pull it down"
