@@ -300,4 +300,3 @@ def test_a_view_on_a_view_is_created_after_the_view_it_reads(
     views = _report(reports, "structure_report_sales.json")["views"]
     assert {v: r["status"] for v, r in views.items()} == {
         "B_DETAIL": "created", "A_SUMMARY": "created"}
-
