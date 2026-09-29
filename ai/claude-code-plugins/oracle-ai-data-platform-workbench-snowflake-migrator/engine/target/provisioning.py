@@ -145,20 +145,43 @@ def copy_job_specs(schemas) -> list[dict]:
     name. Two schemas that translate to the same name (`A-B` and `A_B`)
     would share a job and a notebook, so that is refused rather than
     resolved by guessing which one wins.
+
+    A name equal to a stage job's -- a schema named SCHEMA would get
+    `snowmig_02_copy_schema`, the generic parameterless copy job -- is
+    disambiguated to `snowmig_02_copy_schema_<slug>`, so the plan's job is
+    never skipped as "the generic one" nor adopted from it.
     """
+    stage_jobs = {spec["name"] for spec in JOB_SPECS}
     specs, seen = [], {}
     for schema in schemas:
         slug = translate_name(schema, kind="schema").name
-        if slug in seen:
+        name = f"{COPY_JOB_PREFIX}{slug}"
+        if name in stage_jobs:
+            name = f"{COPY_JOB_PREFIX}schema_{slug}"
+        if name in seen:
             raise ValueError(
-                f"schemas {seen[slug]!r} and {schema!r} both translate to "
-                f"{slug!r}, so their copy jobs would collide. Scope one of "
-                f"them out with --restrictions and run it as its own wave.")
-        seen[slug] = schema
-        specs.append({"name": f"{COPY_JOB_PREFIX}{slug}",
+                f"schemas {seen[name]!r} and {schema!r} both give the copy "
+                f"job name {name!r}, so their copy jobs would collide. Scope "
+                f"one of them out with --restrictions and run it as its own "
+                f"wave.")
+        seen[name] = schema
+        specs.append({"name": name,
                       "notebook": COPY_STAGE_NOTEBOOK,
                       "task_parameters": {"schema": schema}})
     return specs
+
+
+def _listed_task_parameters(job: dict) -> dict | None:
+    """The task parameters a job listing carries, when it carries them
+    (None when it does not: the listing may be a summary)."""
+    tasks = job.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return None
+    params = (tasks[0] or {}).get("parameters")
+    if not isinstance(params, list):
+        return None
+    return {str(p.get("name")): str(p.get("value")) for p in params
+            if isinstance(p, dict)}
 
 
 def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
@@ -1233,10 +1256,23 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
 
     def _create_job(spec: dict, *, kept: bool = False) -> None:
         notebook_path = f'{SCRIPTS_FOLDER}/{spec["notebook"]}'
-        if _match(existing, spec["name"]) is not None:
+        found_job = _match(existing, spec["name"])
+        if found_job is not None:
             overwritten = (
                 "OVERWRITTEN from this run's flags; console edits to its "
                 "PARAMS cell are gone")
+            wanted = spec.get("task_parameters")
+            listed = _listed_task_parameters(found_job) if wanted else None
+            if wanted and listed is not None and any(
+                    listed.get(k) != str(v) for k, v in wanted.items()):
+                # A job of this name that runs something else is not this
+                # plan's workflow, whatever its name says.
+                step("job", "name_taken", False,
+                     f'{spec["name"]} already exists with task parameters '
+                     f'{listed}, not {wanted}; it was NOT adopted. Delete or '
+                     f'rename it in the console, then re-push.')
+                _outcome(spec, "name taken, not registered")
+                return
             if reuse_existing:
                 step("job", "reused", True,
                      f'{spec["name"]} (stage notebook '

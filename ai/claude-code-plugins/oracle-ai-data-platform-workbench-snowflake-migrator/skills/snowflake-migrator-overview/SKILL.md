@@ -446,6 +446,10 @@ stage notebook reads workflow parameters over its PARAMS literals at run
 time — `oidlUtils.parameters.getParameter(name)`, resolved by the AIDP
 runtime and never imported, then the environment a task parameter is
 exported to. One script; each schema its own job, run history and evidence.
+A schema whose job name would be a stage job's (a schema named `SCHEMA`
+would get the generic `snowmig_02_copy_schema`) gets
+`snowmig_02_copy_schema_<schema>` instead, and a job of the right name whose
+listed task parameters name another schema is refused, not adopted.
 `PROVISION.md` lists them (schema → job → this push's outcome for it). A
 schema reduced out of the plan gets no new job; a copy job an earlier push
 registered for it is still on the workspace and runnable, so the push
