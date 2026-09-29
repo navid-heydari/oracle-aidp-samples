@@ -55,7 +55,9 @@ BILLING = {
                   "copied"),
 }
 
-_STOPPED = {"STOPPED", "INACTIVE", "TERMINATED"}
+# The same stopped set teardown uses, DELETED included: a cluster teardown
+# verified gone is not billing.
+from target.teardown import RELEASED_ACTIONS, STOPPED_STATES as _STOPPED
 
 
 def _phase(stage: str) -> str:
@@ -140,13 +142,19 @@ def build_resources(out_dir) -> dict:
     teardown = _load(out, "teardown_result.json") or {}
     released = {}
     if teardown and not teardown.get("dry_run"):
-        ends = [r["ended_at"] for r in runs
-                if r["stage"] == "teardown" and r.get("exit_code") == 0]
+        # The run that wrote teardown_result.json, WHATEVER its exit code:
+        # teardown exits 1 when any one target is unverified, and the ones
+        # it did verify are released all the same.
+        ends = [r["ended_at"] for r in runs if r["stage"] == "teardown"]
         for step in teardown.get("steps") or []:
-            if step.get("verified") and step.get("cluster"):
+            action = step.get("action")
+            if (step.get("verified") and step.get("cluster")
+                    and action in RELEASED_ACTIONS):
                 released[step["cluster"]] = {
-                    "state": step.get("state") or step.get("action"),
-                    "at": ends[-1] if ends else None,
+                    "state": (RELEASED_ACTIONS[action]
+                              or str(step.get("state") or "STOPPED")),
+                    "at": (step.get("at") or teardown.get("at")
+                           or (ends[-1] if ends else None)),
                     "action": teardown.get("action")}
 
     shape = _cluster_shape()
@@ -181,8 +189,10 @@ def build_resources(out_dir) -> dict:
             start = created_at
             source = "approximate (end of first provision run)"
         hours = None
-        if start:
-            end = _ts(rel["at"]) if rel and rel.get("at") else \
+        if start and not (rel and not rel.get("at")):
+            # Released at an unrecorded time: the window is unknown, and
+            # "until now" would bill a stopped cluster for nothing.
+            end = _ts(rel["at"]) if rel else \
                 datetime.datetime.now(datetime.timezone.utc)
             hours = round((end - _ts(start)).total_seconds() / 3600, 2)
         resources.append(_res(
@@ -296,6 +306,13 @@ def render_resources_section(res: dict) -> list[str]:
                        f'{r["billing_driver"]} |')
         out.append("")
         for r in (x for x in res["resources"] if x["kind"] == "cluster"):
+            if (r.get("running_hours") is None and r["state"] in _STOPPED
+                    and r.get("created_at")):
+                out.append(
+                    f'- **Compute exposure — `{r["name"]}`**: ran from '
+                    f'{r["created_at"]} (source: {r.get("created_at_source")}) '
+                    f'until teardown left it {r["state"]}, at a time the '
+                    f'record does not carry; running hours unknown.')
             if r.get("running_hours") is not None:
                 lo, hi = r["ocpu_hours"]
                 end = r.get("released_at") or "now (still running)"

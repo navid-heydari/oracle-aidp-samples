@@ -21,14 +21,26 @@ not the claim.
 """
 from __future__ import annotations
 
+import datetime
 import time
 
 from .provenance import CREATED, NOT_CREATED, cluster_records
 
-__all__ = ["ACTIONS", "teardown", "render_teardown"]
+__all__ = ["ACTIONS", "RELEASED_ACTIONS", "STOPPED_STATES", "teardown",
+           "render_teardown"]
 
 ACTIONS = ("stop", "delete")
-_STOPPED = {"STOPPED", "INACTIVE", "TERMINATED", "DELETED"}
+# One stopped set, shared with the billing report (report/resources.py).
+STOPPED_STATES = frozenset({"STOPPED", "INACTIVE", "TERMINATED", "DELETED"})
+_STOPPED = STOPPED_STATES
+# A VERIFIED step with one of these actions released its cluster: the
+# state it was left in, None meaning "the state the step read back".
+RELEASED_ACTIONS = {"stopped": None, "already_stopped": None,
+                    "deleted": "DELETED", "already_gone": "DELETED"}
+
+
+def _now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 KEPT = ["the workspace (scripts, plans, report/output — the run's record)",
         "the catalogs (the migration's output)",
         "the jobs (the registered S11 copy scripts)"]
@@ -122,11 +134,12 @@ def teardown(call, prov: dict, *, action: str, execute: bool,
             before = _state(call, where, t["cluster"])
             if action == "stop" and before in _STOPPED:
                 step.update(action="already_stopped", verified=True,
-                            state=before)
+                            state=before, at=_now())
                 base["steps"].append(step)
                 continue
             if before is None:
-                step.update(action="already_gone", verified=True, state=None)
+                step.update(action="already_gone", verified=True, state=None,
+                            at=_now())
                 base["steps"].append(step)
                 continue
             call(f"{action}_cluster", workspace=where, cluster=t["cluster"])
@@ -140,13 +153,15 @@ def teardown(call, prov: dict, *, action: str, execute: bool,
                 if done:
                     break
             verb = {"stop": "stopped", "delete": "deleted"}[action]
+            # Stamped when it was read back: the billing report's release
+            # time, whatever the exit code of the run as a whole.
             step.update(action=verb if done else f"{action}_requested",
-                        verified=done, state=state)
+                        verified=done, state=state, at=_now())
         except Exception as exc:
             step.update(action="failed", verified=False,
                         detail=str(exc)[:200])
         base["steps"].append(step)
-    return {**base, "note": "",
+    return {**base, "note": "", "at": _now(),
             "verified": sum(1 for s in base["steps"] if s["verified"])}
 
 
