@@ -1332,8 +1332,8 @@ def test_the_refusal_names_the_flag_that_actually_works():
     the value they asked for."""
     import snowmig
     src = pathlib.Path(snowmig.__file__).read_text(encoding="utf-8")
-    i = src.index("--param does not reach a notebook stage")
-    block = src[i:i + 1200]
+    i = src.index("--param is refused: a run-level job parameter")
+    block = src[i:i + 3000]
     assert "--stage-param" in block, block[:500]
 
 

@@ -152,12 +152,14 @@ def make_run_sql(target, *, backend: str,
                 raise BackendError(
                     f"{backend} exited {result.returncode}: "
                     f"{(result.stderr or '')[:_MAX_STDERR]}")
-            return result
+            # Inside the attempt: `oci raw-request` exits 0 and puts an HTTP
+            # error in the body, so a throttled statement is only visible
+            # here, where the retry rule can still see it.
+            return parse_cli_json(getattr(result, "stdout", ""))
         # A statement may be DDL: repeated only on a refusal that proves it
         # did not run (429), never on a 5xx that may have applied it.
-        result = retry_call(attempt, label="sql",
-                            retryable=is_retryable(read=False))
-        return parse_cli_json(getattr(result, "stdout", ""))
+        return retry_call(attempt, label="sql",
+                          retryable=is_retryable(read=False))
 
     return (run_sql, planned) if dry_run else run_sql
 
@@ -235,13 +237,15 @@ def make_call(target, *, backend: str, run_process=None):
                     raise CatalogTransportError(
                         f"{operation} failed (exit {proc.returncode}): "
                         f"{(proc.stderr or proc.stdout or '')[:300]}")
-                return proc
+                # Inside the attempt, so an HTTP error `oci raw-request`
+                # carried in a 0-exit body meets the retry rule too.
+                return parse_cli_envelope(proc.stdout)
             # A read is retried on any transient failure; a write only on a
             # response that proves it was not applied (see retry.py). A
             # timed-out write is NOT retried: _NOT_APPLIED does not match it.
-            proc = retry_call(attempt, label=operation,
-                              retryable=is_retryable(read=_is_read(operation)))
-            rows, headers = parse_cli_envelope(proc.stdout)
+            rows, headers = retry_call(
+                attempt, label=operation,
+                retryable=is_retryable(read=_is_read(operation)))
         finally:
             if spooled:
                 try:

@@ -34,8 +34,11 @@ def _demo_md(out):
 
 
 def test_the_upload_count_is_the_provision_reports(demo):
+    # The generated notebooks only: the demo now pushes the plan too, as
+    # provision does, and a plan file is not a notebook.
     uploads = [l for l in (demo / "PROVISION.md").read_text(
-        encoding="utf-8").splitlines() if "| would upload |" in l]
+        encoding="utf-8").splitlines()
+        if "| would upload |" in l and "(generated" in l]
     line = next(l for l in _demo_md(demo).splitlines() if "provision (dry run)" in l)
     m = re.search(r"folder with (\d+) ", line)
     assert m, line
