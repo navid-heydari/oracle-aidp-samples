@@ -2651,12 +2651,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "Snowflake connector fallback")
     pv.add_argument("--source-mode", choices=["connector",
                                               "external-catalog"],
-                    default="connector",
+                    default=None,
                     help="how the in-AIDP scripts READ Snowflake. connector "
                          "(default) reads it directly from the cluster and "
                          "needs no catalog crawl — the path proven live; "
                          "external-catalog uses three-part names and needs a "
-                         "successful crawl")
+                         "successful crawl. A --reuse-existing re-push keeps "
+                         "the mode the earlier push recorded")
     pv.add_argument("--source-config",
                     help="the Snowflake connection config to place on the "
                          "workspace mount for connector mode. It carries the "

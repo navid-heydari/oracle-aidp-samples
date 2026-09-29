@@ -223,6 +223,11 @@ bin/snowmig provision --execute --reuse-existing --workspace-name <the S1 name> 
   --plan-label FULL        # REDUCED after an S9 scope reduction
 ```
 
+Where no flag gives them, the push keeps the catalogs, the `--source-mode`
+and the credential path the step-6 push recorded (same aiDataPlatform and
+workspace key only), so a `--refresh-notebooks` re-push does not flip an
+external-catalog migration to connector mode.
+
 A push never drops what an earlier push allocated: the clusters step 6
 created stay in `provision_result.json` (under `earlier_allocations` when
 this push does not record them itself, as the plan push does not), so

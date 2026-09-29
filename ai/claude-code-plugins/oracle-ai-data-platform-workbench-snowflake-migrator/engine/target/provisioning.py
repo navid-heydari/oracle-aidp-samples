@@ -502,11 +502,14 @@ def _current_credential(prior: dict) -> str | None:
 
 
 def _inherited(prior: dict, *, external_catalog, target_catalog,
-               credential_given: bool):
-    """(external_catalog, target_catalog, credential path) after inheriting
-    from `prior` wherever no argument gave a value."""
+               source_mode, credential_given: bool):
+    """(external_catalog, target_catalog, source_mode, credential path)
+    after inheriting from `prior` wherever no argument gave a value. The
+    source mode travels with the catalogs: external-catalog notebooks
+    regenerated as connector, with no source-config, fail every stage."""
     return (external_catalog or prior.get("external_catalog"),
             target_catalog or prior.get("target_catalog"),
+            source_mode or prior.get("source_mode"),
             None if credential_given else _current_credential(prior))
 
 
@@ -519,7 +522,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               maven: list[str] = (),
               external_catalog: str | None = None,
               target_catalog: str | None = None,
-              source_mode: str = "connector",
+              source_mode: str | None = "connector",
               source_config: pathlib.Path | None = None,
               warehouse_clusters: list[dict] = (),
               execute: bool = False,
@@ -561,8 +564,8 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
 
     `prior` is the earlier EXECUTED record of this out dir. A
     `reuse_existing` re-push into the workspace it records inherits the
-    catalogs and the credential path it baked in, where no argument gives
-    them -- only when it names the same aiDataPlatform (`datalake_ocid`)
+    catalogs, the source mode (`source_mode=None`) and the credential path
+    it baked in, where no argument gives them -- only when it names the same aiDataPlatform (`datalake_ocid`)
     and, once listed, the same workspace KEY; a name alone is not the same
     workspace. An inherited credential path is listed on the workspace
     before it is baked into a notebook or announced. A credential object is
@@ -618,10 +621,13 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         inherit_from = prior
     inherited_credential = None
     if inherit_from is not None and not execute:
-        external_catalog, target_catalog, inherited_credential = _inherited(
+        (external_catalog, target_catalog, source_mode,
+         inherited_credential) = _inherited(
             inherit_from, external_catalog=external_catalog,
-            target_catalog=target_catalog,
+            target_catalog=target_catalog, source_mode=source_mode,
             credential_given=credential_object is not None)
+    # `connector` only when nothing -- flag or inheritance -- gave a mode.
+    requested_mode, source_mode = source_mode, source_mode or "connector"
     # One cluster per Snowflake warehouse, named after it. Sizing is NOT
     # carried over: the user asked for same-name clusters on the AIDP default
     # config, and the `compute` stage's proposal stays a proposal until
@@ -822,12 +828,15 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     if inherit_from is not None and found is not None:
         was = (inherit_from.get("workspace") or {}).get("key")
         if was == ws_key:
-            external_catalog, target_catalog, inherited_credential = (
-                _inherited(inherit_from, external_catalog=external_catalog,
-                           target_catalog=target_catalog,
-                           credential_given=credential_object is not None))
+            (external_catalog, target_catalog, source_mode,
+             inherited_credential) = _inherited(
+                inherit_from, external_catalog=external_catalog,
+                target_catalog=target_catalog, source_mode=requested_mode,
+                credential_given=credential_object is not None)
+            source_mode = source_mode or "connector"
             out.update(external_catalog=external_catalog,
                        target_catalog=target_catalog,
+                       source_mode=source_mode,
                        inherited_from={"run": inherit_from.get("run"),
                                        "workspace": ws_key})
         else:
