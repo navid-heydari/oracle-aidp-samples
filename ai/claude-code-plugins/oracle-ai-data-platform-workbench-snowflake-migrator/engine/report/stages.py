@@ -571,18 +571,39 @@ def _job_runs(art) -> list[dict]:
     return [r for r in runs if isinstance(r, dict)]
 
 
+# A run logged with no exit code raised out of main() or was interrupted
+# (Ctrl-C): it neither passed nor failed, and it is never rounded to either.
+UNKNOWN_RESULT = "UNKNOWN (no exit code: crashed or interrupted)"
+
+
 def _verdict(code) -> str:
     if code is None:
-        return "UNKNOWN"
+        return UNKNOWN_RESULT
     return {0: "PASS", 3: "HALT"}.get(int(code), "FAIL")
+
+
+def _job_failure(art) -> str | None:
+    """FAIL (...) when a workflow artifact's job answered ok: false, else
+    None. Applies whether or not the run was logged: a job that did not do
+    its work is a failure either way."""
+    bad = [r for r in _job_runs(art) if r.get("ok") is False]
+    if not bad:
+        return None
+    if "_many" in art:
+        # One job per schema: name the ones that did not succeed.
+        return "FAIL (" + ", ".join(
+            f'job {r.get("job")} {r.get("status", "?")}' for r in bad) + ")"
+    return f'FAIL (job {bad[0].get("status", "?")})'
 
 
 def _phase_summary(rows: list[dict]) -> list[dict]:
     """Stage rows rolled up into their phases, in pipeline order.
 
     A phase FAILS if any of its stages' last run failed or halted; it is
-    NOT_RUN while any required stage in it has not run; SKIPPED when every
-    stage in it is optional and none ran; otherwise it PASSES."""
+    UNKNOWN if any stage's outcome was not established (a crash or an
+    interrupt logs no exit code) -- never PASS; it is NOT_RUN while any
+    required stage in it has not run; SKIPPED when every stage in it is
+    optional and none ran; otherwise it PASSES."""
     out = []
     for phase in dict.fromkeys(r["phase"] for r in rows):
         mine = [r for r in rows if r["phase"] == phase]
@@ -590,10 +611,13 @@ def _phase_summary(rows: list[dict]) -> list[dict]:
         res = [r["result"] for r in mine]
         passed = sum(1 for x in res if x == "PASS" or x.startswith("DONE"))
         failed = sum(1 for x in res if x.startswith(("FAIL", "HALT")))
+        unknown = sum(1 for x in res if x.startswith("UNKNOWN"))
         not_run = [r["stage"] for r in mine if r["result"] == "NOT_RUN"]
         skipped = sum(1 for x in res if x.startswith("SKIPPED"))
         if failed:
             verdict = "FAIL"
+        elif unknown:
+            verdict = "UNKNOWN"
         elif not_run:
             verdict = "NOT_RUN" if not passed else "PARTIAL"
         elif not passed and skipped == len(mine):
@@ -602,7 +626,8 @@ def _phase_summary(rows: list[dict]) -> list[dict]:
             verdict = "PASS"
         out.append({
             "phase": phase, "stages": len(mine), "passed": passed,
-            "failed": failed, "not_run": len(not_run), "skipped": skipped,
+            "failed": failed, "unknown": unknown, "not_run": len(not_run),
+            "skipped": skipped,
             "duration_seconds": round(sum(r["duration_seconds"] or 0
                                           for r in mine), 1),
             "retries": sum(r.get("retries", 0) for r in mine),
@@ -618,8 +643,9 @@ def phase_report(out_dir) -> dict:
 
     Read from run_log.jsonl. A phase that never ran is listed as NOT_RUN (or
     SKIPPED for an optional one) rather than left out; an artifact with no
-    logged run is DONE (not logged), never given a time it was not measured
-    at. The LAST run of a phase decides its verdict, and earlier failures
+    logged run is DONE (not logged) -- or FAIL when its job answered ok:
+    false -- never given a time it was not measured at. A run logged with
+    no exit code is UNKNOWN. The LAST run of a phase decides its verdict, and earlier failures
     are counted, not forgotten.
     """
     out_dir = pathlib.Path(out_dir)
@@ -646,8 +672,15 @@ def phase_report(out_dir) -> dict:
                "runs": len(mine),
                "failed_runs": sum(1 for r in mine
                                   if r.get("exit_code") not in (0, None)),
+               # Logged with no exit code: crashed or interrupted. Counted
+               # apart -- not a failure the stage reported, not a pass.
+               "unknown_runs": sum(1 for r in mine
+                                   if r.get("exit_code") is None),
                "started_at": None, "ended_at": None,
                "duration_seconds": None, "retries": 0}
+        # A workflow can exit 0 locally with a job that did not succeed.
+        art = _load(out_dir, spec["artifact"]) if spec.get("job") else None
+        job_failure = _job_failure(art)
         if mine:
             last = mine[-1]
             lo, hi = _ts(last.get("started_at")), _ts(last.get("ended_at"))
@@ -658,25 +691,16 @@ def phase_report(out_dir) -> dict:
                                      if lo and hi else None),
                 "result": _verdict(last.get("exit_code")),
                 "retries": sum(int(r.get("retries") or 0) for r in mine)})
-            # A workflow can exit 0 locally with a job that did not succeed.
-            art = _load(out_dir, spec["artifact"])
-            jobs = _job_runs(art) if spec.get("job") else []
             # Retries inside an AIDP job are in its own output, one RETRY
             # line each (the copy notebook writes them).
-            for run in jobs:
+            for run in _job_runs(art):
                 row["retries"] += sum(
                     1 for line in str(run.get("output") or "").splitlines()
                     if _RETRY_LINE.search(line))
-            bad = [r for r in jobs if r.get("ok") is False]
-            if bad and "_many" in art:
-                # One job per schema: name the ones that did not succeed.
-                row["result"] = "FAIL (" + ", ".join(
-                    f'job {r.get("job")} {r.get("status", "?")}'
-                    for r in bad) + ")"
-            elif bad:
-                row["result"] = f'FAIL (job {bad[0].get("status", "?")})'
+            if job_failure:
+                row["result"] = job_failure
         elif _artifact_paths(out_dir, spec["artifact"]):
-            row["result"] = "DONE (not logged)"
+            row["result"] = job_failure or "DONE (not logged)"
         else:
             row["result"] = ("SKIPPED (optional)" if spec.get("optional")
                              else "NOT_RUN")

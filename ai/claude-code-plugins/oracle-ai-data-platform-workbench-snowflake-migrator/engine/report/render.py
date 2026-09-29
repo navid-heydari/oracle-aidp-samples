@@ -1906,7 +1906,8 @@ def render_phase_report(rep: dict) -> str:
            "do one part of the migration; a phase fails if any stage in it "
            "failed. A stage that did not run is listed, never omitted, and the "
            "last run of a stage decides its verdict (earlier failures are "
-           "counted).", "",
+           "counted). A run logged with no exit code crashed or was "
+           "interrupted: it is UNKNOWN, and so is its phase -- never PASS.", "",
            "## Phases at a glance", "",
            "| Phase | Verdict | Stages | Passed | Failed | Not run | Duration "
            "| Retries | Resources | Runbook steps |",
@@ -1929,8 +1930,10 @@ def render_phase_report(rep: dict) -> str:
                 f'| `{p["stage"]}` | {p["runbook"]} | '
                 f'{p.get("runs_on", "—")} | {p["started_at"] or "—"} | '
                 f'{p["ended_at"] or "—"} | {_dur(p["duration_seconds"])} | '
-                f'{p["result"]} | {p["runs"]} | {p["failed_runs"]} | '
-                f'{p.get("retries", 0)} |')
+                f'{p["result"]} | {p["runs"]} | {p["failed_runs"]}'
+                + (f' (+{p["unknown_runs"]} unknown)'
+                   if p.get("unknown_runs") else "")
+                + f' | {p.get("retries", 0)} |')
         out.append("")
         allocated = ph.get("resources") or []
         out.append("Resources allocated in this phase: " + (
