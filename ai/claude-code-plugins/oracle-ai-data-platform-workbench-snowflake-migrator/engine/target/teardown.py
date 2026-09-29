@@ -160,23 +160,38 @@ def teardown(call, prov: dict, *, action: str, execute: bool,
                 base["steps"].append(step)
                 continue
             call(f"{action}_cluster", workspace=where, cluster=t["cluster"])
-            state = before
-            done = False
+        except Exception as exc:
+            # Refused, or never sent: nothing changed as far as we know.
+            step.update(action="failed", verified=False,
+                        detail=str(exc)[:200])
+            base["steps"].append(step)
+            continue
+        # From here the action WAS accepted. A read-back that errors is
+        # "requested, outcome unknown", never "failed": the record must not
+        # lose that the delete (or stop) was sent.
+        state = before
+        done = False
+        try:
             for wait in (0.0, *delays):
                 time.sleep(wait)
                 state = _state(call, where, t["cluster"])
-                done = (state is None) if action == "delete" \
-                    else (state in _STOPPED)
+                done = ((state is None) if action == "delete"
+                        else (state in _STOPPED))
                 if done:
                     break
-            verb = {"stop": "stopped", "delete": "deleted"}[action]
-            # Stamped when it was read back: the billing report's release
-            # time, whatever the exit code of the run as a whole.
-            step.update(action=verb if done else f"{action}_requested",
-                        verified=done, state=state, at=_now())
         except Exception as exc:
-            step.update(action="failed", verified=False,
-                        detail=str(exc)[:200])
+            step.update(action=f"{action}_requested", verified=False,
+                        state=None, at=_now(),
+                        detail=f"{action} sent and accepted; the read-back "
+                               f"failed ({str(exc)[:160]}), so its outcome "
+                               f"is unknown -- check the console")
+            base["steps"].append(step)
+            continue
+        verb = {"stop": "stopped", "delete": "deleted"}[action]
+        # Stamped when it was read back: the billing report's release
+        # time, whatever the exit code of the run as a whole.
+        step.update(action=verb if done else f"{action}_requested",
+                    verified=done, state=state, at=_now())
         base["steps"].append(step)
     # Counted, so the run cannot report full success over them.
     base["steps"] += unkeyed
@@ -209,7 +224,16 @@ def render_teardown(res: dict) -> str:
                 for s in res["left_alone"]]
     out += ["", "Kept:", ""] + [f"- {k}" for k in res.get("kept") or []]
     if res.get("action") == "delete":
-        out += ["", "⚠️ `delete` is final: the registered copy jobs now point "
-                "at a cluster that no longer exists and must be re-bound "
-                "before a data move."]
+        gone = [s for s in res.get("steps") or [] if s.get("verified")
+                and s.get("action") in ("deleted", "already_gone")]
+        if res.get("dry_run"):
+            out += ["", "⚠️ `delete` is final: once run with `--execute`, "
+                    "the registered copy jobs will point at a cluster that is "
+                    "gone and must be re-bound before a data move. `stop` is "
+                    "the reversible choice."]
+        elif gone:
+            out += ["", "⚠️ `delete` is final: the registered copy jobs bound "
+                    "to " + ", ".join(f'`{s.get("name")}`' for s in gone)
+                    + " now point at a cluster that no longer exists and "
+                    "must be re-bound before a data move."]
     return "\n".join(out) + "\n"
