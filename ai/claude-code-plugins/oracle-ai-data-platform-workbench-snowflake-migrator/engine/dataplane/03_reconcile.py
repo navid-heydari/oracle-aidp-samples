@@ -337,8 +337,9 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                 v_exists, v_verdict = None, "TARGET_UNREADABLE"
             else:
                 v_exists = True if name.lower() in live else None
-                v_verdict = (_VIEW_VERDICTS.get(s_view)
-                             if s_rec or s_view != "not_attempted" else None)                     or "VIEW_NOT_CREATED_BY_THIS_PATH"
+                v_verdict = ((_VIEW_VERDICTS.get(s_view)
+                              if s_rec or s_view != "not_attempted" else None)
+                             or "VIEW_NOT_CREATED_BY_THIS_PATH")
             view_rows.append({"view": name, "structure": s_view,
                               "exists_in_target": v_exists,
                               "verdict": v_verdict,
