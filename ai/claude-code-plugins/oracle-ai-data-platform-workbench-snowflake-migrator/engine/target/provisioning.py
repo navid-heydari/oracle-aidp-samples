@@ -51,7 +51,7 @@ from .provision_api import (
 __all__ = ["JOB_SPECS", "SCRIPTS_FOLDER", "PLAN_FOLDER", "REPORTS_FOLDER",
            "BACKUP_FOLDER", "PLAN_BACKUP_FILES", "plan_backup_names",
            "COPY_JOB_PREFIX", "plan_copy_schemas", "copy_job_specs",
-           "download_ws_file", "carry_forward",
+           "DOWNLOAD_TIMEOUT", "download_ws_file", "carry_forward",
            "ProvisionTransportError",
            "make_provision_call", "provision", "render_provision",
            "source_config_payload",
@@ -1573,14 +1573,24 @@ def _carry_credentials(res: dict, prior: dict, same_ws: bool) -> None:
         res["earlier_credential_objects"] = earlier
 
 
+# Seconds one GET of a pre-authenticated download URL may take. The process
+# default socket timeout is None, so without it a stalled object-storage GET
+# held `fetch` -- and `run` after a successful discovery -- open for ever.
+DOWNLOAD_TIMEOUT = 120
+
+
 def download_ws_file(call: Callable[..., dict], *, workspace: str,
                      path: str, dest: pathlib.Path,
-                     opener: Callable | None = None) -> dict:
+                     opener: Callable | None = None,
+                     timeout: float = DOWNLOAD_TIMEOUT,
+                     sleep: Callable[[float], None] | None = None) -> dict:
     """Bring one workspace file down to `dest`; returns {path, dest, size}.
 
     Two steps, the console's own: ask for a pre-authenticated URL, then GET
     it. The URL grants read access to the object for as long as it lives,
-    so it is never printed, logged or returned. The byte count is checked
+    so it is never printed, logged or returned -- nor carried by an error or
+    a retry line. The GET is bounded by `timeout` and retried by the read
+    rule (a transient error or a timeout). The byte count is checked
     against the size the server reported: a short read is an error, not a
     smaller file.
     """
@@ -1592,8 +1602,20 @@ def download_ws_file(call: Callable[..., dict], *, workspace: str,
         raise ProvisionTransportError(
             f"download {path}: the server returned no download URL "
             f"(fields: {sorted(k for k in meta if not k.startswith('_'))})")
-    with (opener or urllib.request.urlopen)(url) as resp:
-        data = resp.read()
+
+    def get() -> bytes:
+        try:
+            with (opener or urllib.request.urlopen)(url,
+                                                     timeout=timeout) as resp:
+                return resp.read()
+        except Exception as exc:
+            text = str(exc).replace(url, "<pre-authenticated URL>")
+            # `from None`: the original exception may carry the URL.
+            raise ProvisionTransportError(
+                f"download {path}: GET failed: {text[:200]}") from None
+
+    data = retry_call(get, label=f"download {path}",
+                      retryable=is_retryable(read=True), sleep=sleep)
     expected = meta.get("size")
     if expected is not None and int(expected) != len(data):
         raise ProvisionTransportError(
