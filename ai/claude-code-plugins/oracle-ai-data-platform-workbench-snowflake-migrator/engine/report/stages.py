@@ -500,47 +500,85 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
     return ("written", False)
 
 
+def _satisfies(row: dict | None) -> bool:
+    """Whether a stage's row did the work its twin would have done: it ran,
+    for real, did not fail, and its artifact could be read. Existence alone
+    is not enough -- a dry run, a failed or unrecognised job run and an
+    unreadable artifact all exist and created nothing that can be relied
+    on."""
+    return bool(row and row["status"] == "DONE" and not row.get("dry_run")
+                and not row.get("failed") and not row.get("unreadable"))
+
+
+def _unsatisfied(twin: dict) -> str:
+    if twin.get("dry_run"):
+        return f"not satisfied: `{twin['stage']}` was a dry run"
+    if twin.get("unreadable"):
+        return f"not satisfied: `{twin['stage']}` artifact unreadable"
+    return f"not satisfied: `{twin['stage']}` {twin['found']}"
+
+
 def build_stage_board(out_dir) -> dict:
     out_dir = pathlib.Path(out_dir)
     rows: list[dict] = []
     next_stage = None
-    present = {spec["stage"] for spec in STAGES
-               if _artifact_paths(out_dir, spec["artifact"])}
+    # First every stage that wrote an artifact, so a twin is judged by what
+    # its artifact says, not by the file being there.
+    ran = {}
     for spec in STAGES:
         data = _load(out_dir, spec["artifact"])
-        twin = spec.get("alternative_to")
-        if data is None and twin in present:
+        if data is not None:
+            ran[spec["stage"]] = _done_row(spec, data)
+    for spec in STAGES:
+        if spec["stage"] in ran:
+            rows.append(ran[spec["stage"]])
+            continue
+        twin = ran.get(spec.get("alternative_to"))
+        if _satisfies(twin):
             rows.append({**spec, "status": "SATISFIED",
-                         "found": f"satisfied by `{twin}`", "attention": False})
-            continue
-        if data is None:
-            rows.append({**spec, "status": "NOT_RUN", "found": "—",
+                         "found": f"satisfied by `{twin['stage']}`",
                          "attention": False})
-            # An optional stage that has not run is not "next": the pipeline
-            # proceeds without it.
-            if next_stage is None and not spec.get("optional"):
-                next_stage = spec["stage"]
             continue
-        found, attention = _finding(spec["stage"], data)
-        rows.append({**spec, "status": "DONE", "found": found,
-                     "attention": attention,
-                     # A caveat and a failure both raise `attention`, and
-                     # they are not the same for what comes next: `deps`
-                     # over a manifest is flagged `not_extracted` on
-                     # purpose and planning still proceeds, while a job run
-                     # that answered `ok: false` did not do its work. Only
-                     # the second one blocks.
-                     "failed": bool(isinstance(data, dict)
-                                    and (data.get("ok") is False
-                                         or data.get("failed")
-                                         or any(r.get("ok") is False
-                                                for r in _job_runs(data)))),
-                     # A dry run wrote its artifact and created nothing, so
-                     # it satisfies no prerequisite.
-                     "dry_run": bool(isinstance(data, dict)
-                                     and data.get("dry_run"))})
+        rows.append({**spec, "status": "NOT_RUN",
+                     "found": _unsatisfied(twin) if twin else "—",
+                     # A twin that failed or could not be read is a finding;
+                     # a dry run is only a note.
+                     "attention": bool(twin and not twin.get("dry_run"))})
+        # An optional stage that has not run is not "next": the pipeline
+        # proceeds without it.
+        if next_stage is None and not spec.get("optional"):
+            next_stage = spec["stage"]
     return {"out_dir": str(out_dir), "stages": rows, "next_stage": next_stage,
             "needs_attention": [r["stage"] for r in rows if r["attention"]]}
+
+
+def _done_row(spec: dict, data) -> dict:
+    found, attention = _finding(spec["stage"], data)
+    return {**spec, "status": "DONE", "found": found,
+           "attention": attention,
+           # A caveat and a failure both raise `attention`, and
+           # they are not the same for what comes next: `deps`
+           # over a manifest is flagged `not_extracted` on
+           # purpose and planning still proceeds, while a job run
+           # that answered `ok: false` did not do its work. Only
+           # the second one blocks.
+           "failed": bool(isinstance(data, dict)
+                          and (data.get("ok") is False
+                               or data.get("failed")
+                               or any(r.get("ok") is False
+                                      for r in _job_runs(data)))),
+           # Present and unreadable: nothing it says can be relied
+           # on, so it satisfies no twin.
+           "unreadable": bool(isinstance(data, dict)
+                              and (data.get("_unreadable")
+                                   or any(isinstance(r, dict)
+                                          and r.get("_unreadable")
+                                          for r in data.get("_many")
+                                          or []))),
+           # A dry run wrote its artifact and created nothing, so
+           # it satisfies no prerequisite.
+           "dry_run": bool(isinstance(data, dict)
+                           and data.get("dry_run"))}
 
 
 def stage_for(command: str, job: str | None = None) -> str:
@@ -657,7 +695,8 @@ def _phase_summary(rows: list[dict]) -> list[dict]:
         mine = [r for r in rows if r["phase"] == phase]
         optional = {s["stage"] for s in STAGES if s.get("optional")}
         res = [r["result"] for r in mine]
-        passed = sum(1 for x in res if x == "PASS" or x.startswith("DONE"))
+        passed = sum(1 for x in res if x == "PASS"
+                     or x.startswith(("DONE", "SATISFIED")))
         failed = sum(1 for x in res if x.startswith(("FAIL", "HALT")))
         unknown = sum(1 for x in res if x.startswith("UNKNOWN"))
         running = sum(1 for x in res if x.startswith("STILL RUNNING"))
@@ -715,6 +754,7 @@ def phase_report(out_dir) -> dict:
                          else _legacy_run_stage(rec, out_dir))
             runs.setdefault(stage, []).append(rec)
 
+    board = {r["stage"]: r for r in build_stage_board(out_dir)["stages"]}
     phases = []
     for spec in STAGES:
         mine = sorted(runs.get(spec["stage"], []),
@@ -753,6 +793,10 @@ def phase_report(out_dir) -> dict:
                 row["result"] = job_result
         elif _artifact_paths(out_dir, spec["artifact"]):
             row["result"] = job_result or "DONE (not logged)"
+        elif board[spec["stage"]]["status"] == "SATISFIED":
+            # The board's reading, so the two reports agree: the twin ran
+            # for real and did the work this stage would have done.
+            row["result"] = (f'SATISFIED (by `{spec["alternative_to"]}`)')
         else:
             row["result"] = ("SKIPPED (optional)" if spec.get("optional")
                              else "NOT_RUN")
