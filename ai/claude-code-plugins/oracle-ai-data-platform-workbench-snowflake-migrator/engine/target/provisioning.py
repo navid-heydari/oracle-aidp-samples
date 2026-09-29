@@ -224,18 +224,21 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
                     raise ProvisionTransportError(
                         f"{operation} failed (exit {proc.returncode}): "
                         f"{(proc.stderr or proc.stdout or '')[:300]}")
-                return proc
+                # Parsed INSIDE the attempt: `oci raw-request` exits 0 on an
+                # HTTP error and carries it in the body, so a 429/503 is only
+                # an exception once the envelope is read -- parsed after
+                # retry_call it was never retried. The aidp CLI's literal
+                # "Response:" prefix is stripped by the parser; the headers
+                # come back with the rows because a list endpoint names its
+                # next page in one of them.
+                return parse_cli_envelope(proc.stdout or "")
             # Includes the workspace->cluster race: a create answered 409
             # "not in an active state" was not applied, so it is repeated
             # with backoff instead of leaving the run partial.
-            proc = retry_call(
+            rows, headers = retry_call(
                 attempt, label=operation,
                 retryable=is_retryable(
                     read=operation.startswith(("get_", "list_"))))
-            # The aidp CLI's literal "Response:" prefix is stripped by the
-            # parser; the headers come back with the rows because a list
-            # endpoint names its next page in one of them.
-            rows, headers = parse_cli_envelope(proc.stdout or "")
         finally:
             if spooled:
                 try:
