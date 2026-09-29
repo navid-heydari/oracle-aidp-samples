@@ -54,6 +54,11 @@ DEFAULT_REPORTS_DIR = "/Workspace/backup-snowflake-migration/reports"
 # the CLI publishes after every stage. `--output-dir ''` switches it off.
 DEFAULT_OUTPUT_DIR = "/Workspace/report/output"
 MANIFEST_NAME = "discovery_manifest.json"
+# Runbook S6: the manifest is backed up, dated, BEFORE any later stage reads
+# it. The reports/ copy is the working one and a re-run merges into it; the
+# dated copy is what a later reader can trust was the input. It goes to the
+# `backup/` folder beside `reports/` unless --backup-dir says otherwise.
+BACKUP_FOLDER_NAME = "backup"
 
 # Snowflake's own system schema: never a migration target.
 _SYSTEM_SCHEMAS = {"information_schema"}
@@ -382,6 +387,25 @@ def render_summary(manifest: dict) -> str:
     return "\n".join(lines)
 
 
+def backup_manifest(manifest: dict, backup_dir: str,
+                    now: datetime.datetime | None = None) -> pathlib.Path | None:
+    """Write the dated copy of the manifest into `backup_dir`; '' skips.
+
+    Named by the UTC time of the run, never overwritten: every discovery
+    leaves its own copy, so the input to a plan can be found again after a
+    later re-run has merged new schemas into reports/.
+    """
+    if not backup_dir:
+        return None
+    stamp = (now or datetime.datetime.now(datetime.timezone.utc)
+             ).strftime("%Y%m%dT%H%M%SZ")
+    folder = pathlib.Path(backup_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{pathlib.Path(MANIFEST_NAME).stem}_{stamp}.json"
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return path
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--source-mode", choices=list(SOURCE_MODES),
@@ -411,6 +435,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="where this step saves its values (report/output in "
                          "the workspace); '' to skip")
     ap.add_argument("--reports-dir", default=DEFAULT_REPORTS_DIR)
+    ap.add_argument("--backup-dir", default=None,
+                    help="where the dated copy of the manifest is written "
+                         "(runbook S6). Default: the backup/ folder beside "
+                         "--reports-dir; '' to skip")
     ap.add_argument("--force", action="store_true",
                     help="rediscover the named --schemas even if the manifest "
                          "already carries them (the others are kept), and "
@@ -517,11 +545,17 @@ def main(argv: list[str] | None = None) -> int:
     log(f"{len(manifest['schemas'])} schema(s), {total} table(s) "
         f"-> {manifest_path}")
     log(f"summary -> {reports / 'DISCOVERY.md'}")
+    backup_dir = (str(reports.parent / BACKUP_FOLDER_NAME)
+                  if args.backup_dir is None else args.backup_dir)
+    backup_path = backup_manifest(manifest, backup_dir)
+    if backup_path:
+        log(f"backup -> {backup_path}")
     write_step_output(args.output_dir, "S06_discover.json", {
         "step": "S06", "stage": "discover",
         "schemas": len(manifest["schemas"]), "tables": total,
         "views": sum(len(s["views"]) for s in manifest["schemas"]),
-        "failures": failures, "manifest": str(manifest_path)})
+        "failures": failures, "manifest": str(manifest_path),
+        "backup": str(backup_path) if backup_path else None})
 
     if not manifest["schemas"]:
         log("ZERO schemas discovered. In external-catalog mode that usually "

@@ -306,7 +306,32 @@ def test_the_watchdog_gives_up_rather_than_restarting_forever():
                     cold_start_seconds=60, cold_start_restarts=2,
                     max_polls=20, sleep=lambda s: None)
     assert len(fake.submitted) == 3   # the original plus two restarts
-    assert res["terminal"] is False   # STILL RUNNING, never a verdict
+    assert res["terminal"] is False   # never a verdict
+    # ...and it STOPS on the last unstarted run instead of polling it for
+    # the rest of the budget, cancelling it so it does not hold the slot.
+    assert res["cold_start_exhausted"]["run"] == "run-3"
+    assert res["cold_start_exhausted"]["cancel_state"] == "CANCELED"
+    assert fake.cancelled == ["run-1", "run-2", "run-3"]
+    assert res["polls"] < 20
+
+
+def test_the_defaults_survive_a_cluster_that_ignores_two_runs():
+    """Live 2026-09-29: a fresh cluster ignored the first run AND its one
+    resubmission; the old default (one restart) then watched the second
+    wedged run for 16 minutes. The third submission ran in 90 seconds."""
+    fake = ColdStart(ignore_runs=2)
+    res = watch_job(fake, workspace="ws", job_key="j", poll_seconds=30,
+                    max_polls=40, sleep=lambda s: None)
+    assert res["ok"] is True
+    assert res["run_key"] == "run-3"
+    assert res["cold_start_exhausted"] is None
+
+
+def test_the_default_pick_up_budget_is_two_minutes():
+    fake = ColdStart(ignore_runs=1)
+    res = watch_job(fake, workspace="ws", job_key="j", poll_seconds=30,
+                    max_polls=40, sleep=lambda s: None)
+    assert res["restarts"][0]["after_seconds"] == 120
 
 
 def test_the_watchdog_can_be_switched_off():
@@ -507,7 +532,8 @@ class CancelNeverLands(ColdStart):
 def test_a_cancel_that_raises_is_recorded_and_nothing_is_resubmitted():
     fake = CancelNeverLands("missing_cli")
     res = watch_job(fake, workspace="ws", job_key="j", poll_seconds=30,
-                    cold_start_seconds=60, max_polls=10, sleep=lambda s: None)
+                    cold_start_seconds=60, cold_start_restarts=1,
+                    max_polls=10, sleep=lambda s: None)
     assert fake.submitted == ["run-1"], "the slot was never freed"
     assert res["run_key"] == "run-1"
     assert res["terminal"] is False and res["ok"] is False

@@ -10,6 +10,41 @@ first release.
 
 ## [Unreleased]
 
+### Fixed — findings of the 2026-09-29 end-to-end run on a fresh workspace
+
+- **Cold start: one retry was not enough.** The first run was cancelled at
+  60 s as designed, the resubmitted run wedged too (16 min, task `PENDING`,
+  `startTime: null`), and the watch kept polling it. `run` now waits 120 s
+  for pick-up and retries up to 5 times; when every attempt is spent it
+  cancels the last run (so it does not hold the job's slot) and exits 1 as
+  **COLD START — attempts exhausted** instead of reporting STILL RUNNING.
+- **Workflow parameters reach the notebooks.** The earlier probe looked only
+  in argv and the environment. A NOTEBOOK_TASK's `parameters` are read with
+  `oidlUtils.parameters.getParameter` (live-verified), and every generated
+  stage notebook now applies them over its `PARAMS` literals.
+- **One copy workflow per schema (runbook S11).** `provision` reads the
+  approved `ddl_plan.json` and creates `snowmig_02_copy_<schema>` jobs, each a
+  task running the SAME `02_copy_schema` notebook with `schema` as a task
+  parameter. The generic `snowmig_02_copy_schema` job, which has no schema,
+  is not created alongside them.
+- **Backups are written by the stages.** The discovery notebook writes a
+  dated copy of the manifest into `backup/`; every plan push through
+  `provision` writes dated copies of `plan.json` and `ddl_plan.json` there
+  (`--plan-label FULL|REDUCED`). The folder existed and nothing wrote to it,
+  so backups were made by hand.
+- **The manifest comes down by itself.** `run` downloads it after a
+  discovery that SUCCEEDED, and `snowmig fetch` downloads any workspace file,
+  through the console's own route (`actions/downloadFileMeta`, a
+  pre-authenticated URL, size-checked). `workspace-object get` answers 404
+  for the same file.
+- **A re-push inherits its own coordinates.** `provision --reuse-existing`
+  into this migration's workspace takes the catalogs and the credential path
+  from `provision_result.json` when no flag gives them, so notebooks it adds
+  are configured like the ones already there.
+- The EXTERNAL catalog is registered even when its connection test answers
+  `FAILED` with an empty reason (a known platform issue); the migration reads
+  through the connector and does not depend on it.
+
 ### Fixed — reconcile failed every schema-by-schema run until the last schema
 
 - Live 2026-09-25, on AIDP: schema R3 was discovered, structured, copied and

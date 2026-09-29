@@ -75,7 +75,9 @@ first.
    AIDP first, and nothing writes the reduced plan as a distinct, named
    artifact. The runbook requires both.
 
-6. **S11 creates one copy job, not one per schema.** `provision` wires four
+6. **FIXED 2026-09-29 — S11 creates one copy job per schema**, each a task
+   running the same `02_copy_schema` notebook with `schema` as a task
+   parameter. Previously: **S11 creates one copy job, not one per schema.** `provision` wires four
    jobs, one of which is `snowmig_02_copy_schema` taking `--schema` as a
    parameter. The runbook asks for **one script and one workflow per schema**
    so each has its own run history and evidence. Parameterising one job is
@@ -150,7 +152,7 @@ authors**.
 | Smoke test, destination half | **Live-verified** — read + write probe with cleanup, catalog-type aware |
 | **EXTERNAL catalog registration** | **Executed and created.** The API itself enumerated the real contract (`connectionDetails.connectionProperties`, `SNOWFLAKE_*` keys, auth enum `Basic\|KeyPair`) — see B2a. The connection **values** remain unproven: the crawler/testConnection fail with "Login has timed out", and every pre-existing external catalog in that DataLake is Oracle-network ATP/ADW, so crawler egress to the public internet is the suspect, not the body |
 | Provisioning (workspace/cluster reuse, folder tree, uploads, jobs) | **Live-verified end to end, exit 0** — via the `workspace-object` surface; the Jupyter contents API on that build 200s on PUT and then 404/500s on read-back, and cannot create directories |
-| Jobs | **Live-verified**: creation, run and output fetch for NOTEBOOK_TASK (driver notebooks). PYTHON_TASK is accepted at creation and fails every run resolving the file; job `parameters` reach the notebook neither as argv nor env — hence the generated drivers with inline args. `/Workspace` mount on cluster FS probed and confirmed |
+| Jobs | **Live-verified**: creation, run and output fetch for NOTEBOOK_TASK (driver notebooks). PYTHON_TASK is accepted at creation and fails every run resolving the file; job `parameters` reach the notebook neither as argv nor env — but that probe never tried the platform route: a NOTEBOOK_TASK's `parameters` ARE read in the notebook with `oidlUtils.parameters.getParameter` (live-verified 2026-09-29), which every stage notebook now does over its PARAMS literals. `/Workspace` mount on cluster FS probed and confirmed |
 | Data plane: `00_discover` | **Live-verified** — ran to SUCCESS as a job on a migration cluster: 11 schemas / 1065 relations / 9935 columns in two `INFORMATION_SCHEMA` queries |
 | Data plane: `01_create_structure` | **Live-verified** in `ddl-plan` mode from the approved plan (2026-09-19, a healthy 23-minute run); `ctas` mode is not scale-tested (14a) |
 | Data plane: `02_copy_schema` | **Not yet confirmed by the authors.** The data-plane README described a five-table copy verified by counts and decimal sums (2026-09-16); the 0.25.0 changelog (2026-09-19) says the copy had not executed. Until the person who ran the cluster jobs states which is right, treat the copy as unproven and canary one small schema first |

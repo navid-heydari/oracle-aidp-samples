@@ -192,7 +192,7 @@ STAGES: tuple[dict, ...] = (
 # CLI commands that are tools, not steps of a migration. Every other command
 # must be a phase above -- a test holds that.
 UTILITY_COMMANDS = ("stages", "demo", "databases", "catalogs", "clean",
-                    "build-notebooks", "init-config")
+                    "build-notebooks", "init-config", "fetch")
 
 _UNKNOWN = "could not be determined"
 

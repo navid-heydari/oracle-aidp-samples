@@ -43,8 +43,8 @@ STAGE_LOG = "run_log.jsonl"
 # stage is still counted before anyone remembers to classify it.
 PHASES: dict[str, tuple[str, ...]] = {
     "setup": ("init-config", "preflight", "demo", "build-notebooks", "clean"),
-    "discovery": ("assess", "ingest", "deps", "maintenance", "security",
-                  "compute", "databases", "catalogs"),
+    "discovery": ("assess", "fetch", "ingest", "deps", "maintenance",
+                  "security", "compute", "databases", "catalogs"),
     "planning": ("data-options", "plan", "ddl"),
     "target": ("smoke", "provision", "catalog", "deploy", "run", "notebook"),
     "reporting": ("summary", "stages", "tokens"),

@@ -29,6 +29,7 @@ import datetime
 import json
 import os
 import pathlib
+import re
 import tempfile
 import time
 from typing import Callable
@@ -48,7 +49,10 @@ from .provision_api import (
 )
 
 __all__ = ["JOB_SPECS", "SCRIPTS_FOLDER", "PLAN_FOLDER", "REPORTS_FOLDER",
-           "BACKUP_FOLDER", "ProvisionTransportError",
+           "BACKUP_FOLDER", "PLAN_BACKUP_FILES", "plan_backup_names",
+           "COPY_JOB_PREFIX", "plan_copy_schemas", "copy_job_specs",
+           "download_ws_file",
+           "ProvisionTransportError",
            "make_provision_call", "provision", "render_provision",
            "source_config_payload",
            "async_operation_key", "connection_test_outcome"]
@@ -89,7 +93,7 @@ BACKUP_FOLDER = f"{_ROOT}/backup"
 JOB_SPECS: tuple[dict, ...] = (
     {"name": "snowmig_00_discover", "notebook": "00_discover_snowflake.ipynb",
      "parameters": ("source-mode", "source-config", "source-catalog",
-                    "reports-dir")},
+                    "reports-dir", "backup-dir")},
     {"name": "snowmig_01_structure", "notebook": "01_create_structure.ipynb",
      "parameters": ("source-mode", "source-config", "source-catalog",
                     "target-catalog", "reports-dir")},
@@ -103,6 +107,58 @@ JOB_SPECS: tuple[dict, ...] = (
 # The shared helpers are INLINED into each generated notebook (see
 # target/stage_notebooks.py), so nothing is uploaded beside them and no
 # notebook depends on a module sitting on the /Workspace mount.
+
+
+# The per-schema copy workflows (runbook S11): ONE job per source schema,
+# each with ONE task running THE SAME 02_copy_schema notebook and passing
+# its schema as a task parameter. The notebook reads it at run time with
+# oidlUtils.parameters.getParameter (see the PARAMS cell the notebooks are
+# generated with), so there is one script, and each schema still gets its
+# own job, run history and evidence in the console.
+COPY_STAGE_NOTEBOOK = "02_copy_schema.ipynb"
+COPY_JOB_PREFIX = "snowmig_02_copy_"
+
+
+def plan_copy_schemas(ddl_plan: dict) -> list[str]:
+    """The source schemas an approved ddl_plan moves tables for, sorted.
+
+    The same reading 01_create_structure and 02_copy_schema apply: a TABLE
+    statement with a three-part `source_identifier`; its middle part is the
+    value `--schema` takes. Views are not copied, so they add no job.
+    """
+    out = set()
+    for stmt in ddl_plan.get("statements") or []:
+        source = str(stmt.get("source_identifier") or "").split(".")
+        if len(source) != 3:
+            continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue
+        out.add(source[1])
+    return sorted(out)
+
+
+def copy_job_specs(schemas) -> list[dict]:
+    """One job spec per schema: its job name, the shared notebook, and the
+    task parameter that scopes it to the schema.
+
+    Names go through the same safe-charset translation as every other AIDP
+    name. Two schemas that translate to the same name (`A-B` and `A_B`)
+    would share a job and a notebook, so that is refused rather than
+    resolved by guessing which one wins.
+    """
+    specs, seen = [], {}
+    for schema in schemas:
+        slug = translate_name(schema, kind="schema").name
+        if slug in seen:
+            raise ValueError(
+                f"schemas {seen[slug]!r} and {schema!r} both translate to "
+                f"{slug!r}, so their copy jobs would collide. Scope one of "
+                f"them out with --restrictions and run it as its own wave.")
+        seen[slug] = schema
+        specs.append({"name": f"{COPY_JOB_PREFIX}{slug}",
+                      "notebook": COPY_STAGE_NOTEBOOK,
+                      "task_parameters": {"schema": schema}})
+    return specs
 
 
 def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
@@ -398,6 +454,29 @@ def _credential_line(source_name: str, remote: str) -> str:
             f"/Workspace; remove it when the migration is done")
 
 
+# The plan artifacts that are backed up, dated, on every push: the plan
+# itself and the DDL plan S10 executes. The rest of plan/ is derived from
+# these and is not worth a copy per push.
+PLAN_BACKUP_FILES = ("plan.json", "ddl_plan.json")
+
+
+def plan_backup_names(plan_files, *, stamp: str,
+                      label: str | None = None) -> list[tuple]:
+    """(local path, backup name) for each plan artifact that is backed up.
+
+    `ddl_plan.json` pushed at 2026-09-29T03:10:00Z with label FULL becomes
+    `ddl_plan_20260929T031000Z_FULL.json`. The label is the operator's word
+    for which plan this is (FULL before a scope reduction, REDUCED after);
+    it is folded to the safe charset, never trusted as a path.
+    """
+    suffix = ""
+    if label:
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", label).strip("_")
+        suffix = f"_{safe}" if safe else ""
+    return [(p, f"{pathlib.Path(p).stem}_{stamp}{suffix}.json")
+            for p in plan_files if pathlib.Path(p).name in PLAN_BACKUP_FILES]
+
+
 def _pypi_from_requirements(path: pathlib.Path | None) -> list[str]:
     if path is None or not path.is_file():
         return []
@@ -428,7 +507,11 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               warehouse_cluster_mode: str = "new",
               existing_cluster_id: str | None = None,
               output_dir: str = "report/output",
-              refresh_notebooks: bool = False) -> dict:
+              refresh_notebooks: bool = False,
+              plan_label: str | None = None,
+              copy_schemas=(),
+              inherited_credential: str | None = None,
+              now: datetime.datetime | None = None) -> dict:
     """Provision this migration's own environment inside AIDP.
 
     `reuse_existing=False` is the default and the rule: a migration creates
@@ -453,6 +536,16 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     keeps are refused with a ValueError, never dropped -- a scope flag that
     silently does nothing reads as applied.
     """
+    stamp = (now or datetime.datetime.now(datetime.timezone.utc)
+             ).strftime("%Y%m%dT%H%M%SZ")
+    # The four stage jobs, then one copy job per schema of the approved plan.
+    # With per-schema jobs the generic copy JOB is not created: it has no
+    # schema anywhere (the notebook requires one), so running it could only
+    # fail. Its NOTEBOOK is still uploaded -- every per-schema job runs it.
+    job_specs = list(JOB_SPECS) + copy_job_specs(copy_schemas)
+    no_job = ({spec["name"] for spec in JOB_SPECS
+               if spec["notebook"] == COPY_STAGE_NOTEBOOK}
+              if copy_schemas else set())
     stage_params = dict(stage_params or {})
     if stage_params:
         check_stage_params(stage_params)
@@ -513,13 +606,23 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         "source_mode": source_mode,
         # Workspace objects that hold a credential, so the report can say so
         # in one place and the operator knows what to remove afterwards.
-        "credential_objects": [credential_object] if credential_object else [],
+        # A re-push that inherited the path records it too: the object is
+        # still on the workspace, and the next push inherits from here.
+        "credential_objects": ([credential_object] if credential_object
+                               else [inherited_credential]
+                               if inherited_credential else []),
         # Stage notebooks left as found on the workspace (reuse_existing
         # without refresh_notebooks), so PROVISION.md can list them.
         "notebooks_kept": [],
         # The explicit --stage-param values, as given, so the record says
         # what this run wrote into PARAMS beyond the derived coordinates.
         "stage_params": dict(stage_params),
+        # One copy job per schema of the approved plan (runbook S11), as
+        # {schema, job, notebook}; registered here, never run by provision.
+        "copy_jobs": [{"schema": sp["task_parameters"]["schema"],
+                       "job": sp["name"],
+                       "notebook": f'{SCRIPTS_FOLDER}/{sp["notebook"]}'}
+                      for sp in job_specs if sp.get("task_parameters")],
         "steps": [],
     }
 
@@ -556,10 +659,16 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         for path in plan_files:
             step("upload", "would upload", None,
                  f"{path.name} -> {PLAN_FOLDER}/{path.name}")
+        for path, name in plan_backup_names(plan_files, stamp=stamp,
+                                            label=plan_label):
+            step("backup", "would upload", None,
+                 f"{path.name} -> {BACKUP_FOLDER}/{name}")
         if credential_object:
             step("upload", "would upload", None,
                  _credential_line(source_config.name, credential_object))
-        for spec in JOB_SPECS:
+        for spec in job_specs:
+            if spec["name"] in no_job:
+                continue
             step("job", "would create", None, spec["name"])
         return out
 
@@ -800,18 +909,26 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
             step("folder", "create_failed_or_exists", None,
                  f"{folder}: {str(exc)[:120]}")
 
-    for folder, files in ((PLAN_FOLDER, plan_files),):
+    # The plan goes to plan/ (what S10 reads) AND, dated, to backup/ (runbook
+    # S9: the full plan is backed up before scope is reduced, and every plan
+    # that drives a run stays recoverable). The dated names never collide,
+    # so a reduced plan pushed later cannot overwrite the full one's copy.
+    backups = [(path, name) for path, name in
+               plan_backup_names(plan_files, stamp=stamp, label=plan_label)]
+    for folder, files in ((PLAN_FOLDER, [(p, p.name) for p in plan_files]),
+                          (BACKUP_FOLDER, backups)):
         # Upload the folder's files, THEN read the folder back once. The
         # read-back is the claim and is unchanged -- a 2xx never was one --
         # but it is the same evidence gathered once instead of per file.
         # Each listing is its own CLI process; the live run spent seven.
+        kind = "backup" if folder == BACKUP_FOLDER else "upload"
         upload_errors: dict[str, str] = {}
-        for path in files:
+        for path, name in files:
             try:
                 call("upload_ws_file", workspace=ws_key,
-                     path=f"{folder}/{path.name}", local_path=str(path))
+                     path=f"{folder}/{name}", local_path=str(path))
             except Exception as exc:
-                upload_errors[path.name] = str(exc)[:200]
+                upload_errors[name] = str(exc)[:200]
         if not files:
             continue
         try:
@@ -820,23 +937,23 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
             listing_failure = None
         except Exception as exc:
             items, listing_failure = [], str(exc)[:200]
-        for path in files:
-            remote = f"{folder}/{path.name}"
-            if path.name in upload_errors:
+        for path, name in files:
+            remote = f"{folder}/{name}"
+            if name in upload_errors:
                 # The upload itself raised: that is what to report, not the
                 # absence it necessarily causes in the listing.
-                step("upload", "failed", False,
-                     f"{remote}: {upload_errors[path.name]}")
+                step(kind, "failed", False,
+                     f"{remote}: {upload_errors[name]}")
                 continue
             if listing_failure is not None:
-                step("upload", "upload_requested", None,
+                step(kind, "upload_requested", None,
                      f"{remote}: uploaded, but the folder could not be "
                      f"listed to confirm it ({listing_failure})")
                 continue
             found = any(
-                str(i.get("path") or "").endswith("/" + path.name)
-                or i.get("displayName") == path.name for i in items)
-            step("upload", "uploaded" if found else "upload_requested",
+                str(i.get("path") or "").endswith("/" + name)
+                or i.get("displayName") == name for i in items)
+            step(kind, "uploaded" if found else "upload_requested",
                  found,
                  remote if found else f"{remote}: not visible in listing")
 
@@ -877,6 +994,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     # notebook's own PARAMS cell -- visible and editable in the console,
     # regenerated here when the defaults change.
     defaults = {"reports-dir": REPORTS_FOLDER, "source-mode": source_mode,
+                "backup-dir": f"/Workspace/{BACKUP_FOLDER}",
                 "output-dir": f"/Workspace/{output_dir}" if output_dir else ""}
     # Written last so an explicit --stage-param wins over a derived
     # coordinate: the operator naming a value outranks this function
@@ -892,6 +1010,10 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         # The scripts read the credential from the derived copy ON THE MOUNT,
         # so the path they receive is the /Workspace one, not the local one.
         defaults["source-config"] = f"/Workspace/{credential_object}"
+    elif inherited_credential:
+        # A re-push that did not re-upload it: the copy an earlier push of
+        # this same migration placed is still there, and still the path.
+        defaults["source-config"] = f"/Workspace/{inherited_credential}"
     defaults.update(explicit)
     try:
         existing = call("list_jobs", workspace=ws_key).get("items") or []
@@ -920,7 +1042,51 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         except Exception as exc:
             listing_error = exc
 
-    for spec in JOB_SPECS:
+    def _create_job(spec: dict, *, kept: bool = False) -> None:
+        notebook_path = f'{SCRIPTS_FOLDER}/{spec["notebook"]}'
+        if _match(existing, spec["name"]) is not None:
+            overwritten = (
+                "OVERWRITTEN from this run's flags; console edits to its "
+                "PARAMS cell are gone")
+            if reuse_existing:
+                step("job", "reused", True,
+                     f'{spec["name"]} (stage notebook '
+                     f'{"kept" if kept else overwritten})')
+            else:
+                step("job", "name_taken", False,
+                     f'{spec["name"]} already exists and was NOT adopted; '
+                     f'its stage notebook was {overwritten}, but the job '
+                     f'itself is not this migration\'s. Rename or '
+                     f'--reuse-existing.')
+            return
+        body = build_job_body(spec["name"], notebook_path=notebook_path,
+                              cluster_key=cluster_key,
+                              task_parameters=spec.get("task_parameters"))
+        try:
+            call("create_job", workspace=ws_key, body=body)
+            found, job_list_error = _poll(
+                lambda: call("list_jobs", workspace=ws_key), spec["name"],
+                delays)
+            step("job", "created" if found else "create_requested",
+                 found is not None,
+                 f'{spec["name"]}: read_back_failed: {job_list_error}'
+                 if job_list_error is not None else spec["name"])
+        except Exception as exc:
+            step("job", "failed", False, f'{spec["name"]}: {str(exc)[:200]}')
+
+    # Notebooks uploaded (or kept) and read back by this run. A per-schema
+    # copy job shares the 02 notebook, so it only needs that one to be here.
+    notebooks_ready: set[str] = set()
+    for spec in job_specs:
+        if spec.get("task_parameters"):
+            if spec["notebook"] not in notebooks_ready:
+                step("job", "failed", False,
+                     f'{spec["name"]}: its notebook {spec["notebook"]} is not '
+                     f'on the workspace (see its step above), so the job was '
+                     f'NOT created rather than pointed at nothing')
+                continue
+            _create_job(spec)
+            continue
         stage = stages_by_notebook.get(spec["notebook"])
         if stage is None:
             step("notebook", "failed", False,
@@ -979,34 +1145,13 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                      f"{notebook_path}: {str(exc)[:200]}")
                 continue
 
-        if _match(existing, spec["name"]) is not None:
-            overwritten = (
-                "OVERWRITTEN from this run's flags; console edits to its "
-                "PARAMS cell are gone")
-            if reuse_existing:
-                step("job", "reused", True,
-                     f'{spec["name"]} (stage notebook '
-                     f'{"kept" if kept else overwritten})')
-            else:
-                step("job", "name_taken", False,
-                     f'{spec["name"]} already exists and was NOT adopted; '
-                     f'its stage notebook was {overwritten}, but the job '
-                     f'itself is not this migration\'s. Rename or '
-                     f'--reuse-existing.')
+        notebooks_ready.add(spec["notebook"])
+        if spec["name"] in no_job:
+            step("job", "not_created", None,
+                 f'{spec["name"]}: superseded by the per-schema copy jobs '
+                 f'below, which run this same notebook with a schema')
             continue
-        body = build_job_body(spec["name"], notebook_path=notebook_path,
-                              cluster_key=cluster_key)
-        try:
-            call("create_job", workspace=ws_key, body=body)
-            found, job_list_error = _poll(
-                lambda: call("list_jobs", workspace=ws_key), spec["name"],
-                delays)
-            step("job", "created" if found else "create_requested",
-                 found is not None,
-                 f'{spec["name"]}: read_back_failed: {job_list_error}'
-                 if job_list_error is not None else spec["name"])
-        except Exception as exc:
-            step("job", "failed", False, f'{spec["name"]}: {str(exc)[:200]}')
+        _create_job(spec, kept=kept)
 
     # 6 · the environment diagnosis, beside the stages, with NO job --------
     # README step 8 has the operator open it from scripts/ before the jobs;
@@ -1053,6 +1198,37 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
              f"{diagnose_path}: {str(exc)[:200]}")
 
     return out
+
+
+def download_ws_file(call: Callable[..., dict], *, workspace: str,
+                     path: str, dest: pathlib.Path,
+                     opener: Callable | None = None) -> dict:
+    """Bring one workspace file down to `dest`; returns {path, dest, size}.
+
+    Two steps, the console's own: ask for a pre-authenticated URL, then GET
+    it. The URL grants read access to the object for as long as it lives,
+    so it is never printed, logged or returned. The byte count is checked
+    against the size the server reported: a short read is an error, not a
+    smaller file.
+    """
+    import urllib.request
+
+    meta = call("download_ws_file", workspace=workspace, path=path)
+    url = meta.get("parUrl")
+    if not url:
+        raise ProvisionTransportError(
+            f"download {path}: the server returned no download URL "
+            f"(fields: {sorted(k for k in meta if not k.startswith('_'))})")
+    with (opener or urllib.request.urlopen)(url) as resp:
+        data = resp.read()
+    expected = meta.get("size")
+    if expected is not None and int(expected) != len(data):
+        raise ProvisionTransportError(
+            f"download {path}: read {len(data)} byte(s), the server reported "
+            f"{expected}; nothing was written")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    return {"path": path, "dest": str(dest), "size": len(data)}
 
 
 def render_provision(res: dict) -> str:
@@ -1107,6 +1283,20 @@ def render_provision(res: dict) -> str:
                   "Remove it from the workspace once the migration is done, "
                   "and rotate the Snowflake credential if anyone who must "
                   "not hold it can read this workspace.", ""]
+
+    if res.get("copy_jobs"):
+        lines += [
+            "## Per-schema copy workflows (runbook S11)", "",
+            f'{len(res["copy_jobs"])} job(s), one per schema of the approved '
+            "`ddl_plan.json`, each with ONE task running the SAME "
+            "`02_copy_schema` notebook and passing `schema` as a task "
+            "parameter, which the notebook reads at run time "
+            "(`oidlUtils.parameters.getParameter`). **Registered, never "
+            "run**: moving rows is the customer's decision.", "",
+            "| Schema (task parameter) | Job | Notebook |", "|---|---|---|"]
+        lines += [f'| `{j["schema"]}` | `{j["job"]}` | `{j["notebook"]}` |'
+                  for j in res["copy_jobs"]]
+        lines.append("")
 
     if res.get("notebooks_kept"):
         lines += [

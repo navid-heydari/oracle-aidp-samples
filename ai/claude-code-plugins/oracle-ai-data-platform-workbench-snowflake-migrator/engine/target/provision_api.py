@@ -150,7 +150,8 @@ def build_library_items(*, pypi: list[str] = (),
 
 
 def build_job_body(name: str, *, notebook_path: str, cluster_key: str,
-                   max_concurrent_runs: int = 1) -> dict:
+                   max_concurrent_runs: int = 1,
+                   task_parameters: dict[str, str] | None = None) -> dict:
     """One job, one NOTEBOOK task, MANUAL (no schedule): migrations are
     driven runs, not crons.
 
@@ -164,12 +165,25 @@ def build_job_body(name: str, *, notebook_path: str, cluster_key: str,
     Top-level job `parameters` were probed on a live run and reach the
     notebook neither as argv nor as environment, so the driver notebook
     carries its arguments INLINE, regenerated when they change -- auditable
-    in the console, editable by hand."""
+    in the console, editable by hand.
+
+    That probe looked in argv and the environment only. The platform's own
+    route is `oidlUtils.parameters.getParameter(name, default)` inside the
+    notebook (the getting-started samples use it), and a NOTEBOOK_TASK
+    takes `parameters: [{name, value}]` (the aidp CLI's create-job schema).
+    `task_parameters` are sent that way, and every generated stage notebook
+    reads them over its PARAMS literals -- which is what lets ONE notebook
+    back one workflow per schema. LIVE-VERIFIED 2026-09-29: a task passing
+    `schema=PROBE_OK` was read back by getParameter in the notebook within
+    20 s; the same names were NOT present in the environment."""
     task: dict = {"type": "NOTEBOOK_TASK", "taskKey": name,
                   "notebookPath": notebook_path,
                   "source": "WORKSPACE",
                   "runIf": "ALL_SUCCESS",
                   "cluster": {"clusterKey": cluster_key}}
+    if task_parameters:
+        task["parameters"] = [{"name": k, "value": str(v)}
+                              for k, v in task_parameters.items()]
     return {"name": name,
             "maxConcurrentRuns": max_concurrent_runs,
             "tasks": [task]}
@@ -319,6 +333,15 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
     if operation == "list_ws_objects":
         return aidp_cli("workspace-object", "list", ws,
                         "--path", kwargs["path"])
+    if operation == "download_ws_file":
+        # What the console itself does (HAR, 2026-09-29): POST
+        # .../workspaces/{ws}/actions/downloadFileMeta with the path in a
+        # header, answered with a short-lived pre-authenticated `parUrl`
+        # that a plain GET then reads. `workspace-object get` answers 404
+        # NotAuthorizedOrNotFound for the same file, so it is not the route.
+        return aidp_cli("workspace-object", "download-with-par", ws,
+                        "--path", kwargs["path"], "--type", "FILE",
+                        "--should-generate-new-par")
 
     if operation == "list_jobs":
         return raw("GET", f"{base}/workspaces/{ws}/jobs", page=page)

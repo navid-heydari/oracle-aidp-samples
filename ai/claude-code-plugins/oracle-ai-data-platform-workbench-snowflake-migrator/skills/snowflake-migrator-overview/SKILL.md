@@ -123,6 +123,13 @@ returns nothing. **`PENDING` is reported as pending, never as a pass** — and a
 catalog showing zero schemas against a source that has many is the visible
 shape of that failure, not a quiet success.
 
+**Register it even when the test fails.** On the validated DataLake the test
+currently answers `FAILED` with an empty reason for a catalog whose
+credentials the connector proves at S6 — a known platform issue with a ticket
+open. The migration does not depend on it (discovery and copy read through
+the connector), so keep the registration, report the test result as it is,
+and move on. Never delete and re-register to make the test pass.
+
 ### S4 — Create the INTERNAL target catalog
 
 This is the catalog the migrated schemas and tables land in. It is a
@@ -242,11 +249,21 @@ Measured live on 2026-09-19: the first run on a new workspace sat **9+
 minutes** with its task unstarted; the identical job, cancelled and
 resubmitted, succeeded in **90 seconds**.
 
-`run` handles this itself. After `--cold-start-seconds` (default 60) with
-the task still unstarted, it cancels the run and resubmits, up to
-`--cold-start-restarts` times (default 1; `0` disables). The budget measures
-**pick-up, not work** -- a task that has started is never cancelled however
-long it then runs, because killing it would destroy real progress.
+Measured live again on 2026-09-29, and worse: on a fresh workspace the
+first run was cancelled at 65 s as designed, and **the resubmitted run
+wedged too** — 16 minutes at `RUNNING`, task `PENDING`, `startTime: null`.
+A third submission ran in 90 seconds. **One retry is not enough; expect to
+need several.**
+
+`run` handles this itself. After `--cold-start-seconds` (default **120** —
+the operators' rule: a first job not picked up in two minutes is wedged)
+with the task still unstarted, it cancels the run and resubmits, up to
+`--cold-start-restarts` times (default **5**; `0` disables). When every
+attempt is spent and the last run is still unstarted, it cancels that one
+too (so it does not hold the job's slot) and exits 1 with **COLD START —
+attempts exhausted**: nothing ran, check the cluster, re-run. The budget
+measures **pick-up, not work** -- a task that has started is never cancelled
+however long it then runs, because killing it would destroy real progress.
 
 Two things to carry into the conversation when it fires:
 
@@ -258,9 +275,11 @@ Two things to carry into the conversation when it fires:
   cancel is polled to a terminal state before the new run is submitted.
   Never fire a cancel and immediately resubmit by hand.
 
-The manifest is written to `reports/` and **backed up into `backup/`**, dated,
-as the reference input every later script reads. Never re-derive what the
-manifest already holds.
+The discovery notebook writes the manifest to `reports/` and **backs it up
+itself into `backup/`** as `discovery_manifest_<UTC>.json` — every run
+leaves its own dated copy, the reference input every later stage reads.
+Never re-derive what the manifest already holds, and never upload a backup
+by hand: if one is missing, the stage has a bug.
 
 ### S7 — Generate the translation plan, by script
 
@@ -275,8 +294,18 @@ rather than guessing. That flag is the deliverable of this step.
 **You do not translate types by hand.** Your turn comes at S8, and only for
 what the script flagged.
 
-Download the manifest from `backup-snowflake-migration/reports/` and bridge
-it into the shape the planning stages read:
+`run` downloads the manifest by itself when the discovery ends in SUCCESS
+(to `migration-artifacts/discovery_manifest.json`). If that download failed,
+or you need another file from the workspace, `fetch` is the route — the
+console's own download action, read-only, bytes checked against the size the
+server reports:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig fetch        # default: reports/discovery_manifest.json
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig fetch --path backup-snowflake-migration/reports/DISCOVERY.md
+```
+
+Then bridge it into the shape the planning stages read:
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig ingest \
@@ -350,8 +379,25 @@ creates the schemas and then the empty Delta tables. Per-schema, because a job
 run costs five to six minutes of startup and per-table runs are the wrong
 shape.
 
-The plan it reads is `ddl_plan.json` **on the workspace**, so upload the
-approved one to `backup-snowflake-migration/plan/` before running. The stage
+The plan it reads is `ddl_plan.json` **on the workspace**. It gets there
+the same way everything else does — through `provision`, re-run against
+this migration's own workspace. That push uploads `plan.json`,
+`ddl_plan.json` and their reports to `plan/`, backs the two plans up
+**dated** into `backup/`, and registers the per-schema copy workflows (S11):
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig provision --execute --reuse-existing \
+  --workspace-name <the S1 name> --plan-label FULL      # before an S9 reduction
+# re-plan with --restrictions, then:
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig provision --execute --reuse-existing \
+  --workspace-name <the S1 name> --plan-label REDUCED
+```
+
+`--reuse-existing` here re-adopts **this migration's own** environment, the
+one `provision_result.json` records — not the reuse the CREATE rule
+forbids. Never upload a plan with a raw `aidp workspace-object create`: it
+skips the backup and the copy workflows, and leaves no record in
+`PROVISION.md`. The stage
 runs in `ddl-plan` mode: those types are engine-translated. `manifest` mode
 refuses a connector-built manifest before creating anything: it records
 SNOWFLAKE types, which Delta rejects or, like `FLOAT` (64-bit in Snowflake,
@@ -363,9 +409,12 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig run \
   --datalake-ocid <ocid> --workspace <ws> --job snowmig_01_structure
 ```
 
-**Stage parameters are NOT passed on this command line.** AIDP job parameters
-reach a notebook as neither argv nor environment, so `--param` is refused
-rather than accepted and dropped. Each stage notebook carries its own `PARAMS`
+**Stage parameters are NOT passed on this command line** (yet). A job
+TASK's `parameters` do reach the notebook — through
+`oidlUtils.parameters.getParameter`, which every stage notebook now reads —
+and that is how the per-schema copy workflows are scoped (S11). A run-level
+`--param` is still refused until it is verified live that run parameters
+reach a task the same way. Each stage notebook carries its own `PARAMS`
 cell; `provision --execute --reuse-existing --refresh-notebooks` rewrites it
 and re-uploads (without `--refresh-notebooks`, `--reuse-existing` keeps a
 notebook already on the workspace, because its PARAMS cell may have been
@@ -389,9 +438,16 @@ batch can report success while statements inside it failed.
 **One script per SCHEMA, never per table. One workflow per script.** Register
 them; **do not run them.**
 
-Then summarise the data that would move: average table size, the largest and
-the smallest, row and byte totals, and the count per schema. The engineer needs
-the shape of the job before they decide to run it.
+`provision` does this from the approved `ddl_plan.json`: for every source
+schema it moves tables for, one job `snowmig_02_copy_<schema>` with ONE task
+running **the same** `02_copy_schema.ipynb` and passing
+`parameters: [{"name": "schema", "value": "<SCHEMA>"}]`. Every generated
+stage notebook reads workflow parameters over its PARAMS literals at run
+time — `oidlUtils.parameters.getParameter(name)`, resolved by the AIDP
+runtime and never imported, then the environment a task parameter is
+exported to. One script; each schema its own job, run history and evidence.
+`PROVISION.md` lists them (schema → job). A schema reduced out of the plan
+gets no job; re-push after re-planning to add it.
 
 ### S12 — Propose the warehouse-equivalent clusters
 

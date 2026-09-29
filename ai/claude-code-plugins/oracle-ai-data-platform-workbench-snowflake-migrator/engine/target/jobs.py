@@ -30,7 +30,8 @@ __all__ = ["TERMINAL_STATES", "ACTIVE_STATES", "SUCCESS_STATES",
            "JobRunCollision",
            "in_flight_runs", "run_job", "job_run_status",
            "fetch_task_output", "extract_notebook_text", "watch_job",
-           "task_started", "cancel_run"]
+           "task_started", "cancel_run", "COLD_START_SECONDS",
+           "COLD_START_RESTARTS"]
 
 TERMINAL_STATES = ("SUCCESS", "FAILED", "CANCELED", "TIMED_OUT",
                    "UPSTREAM_FAILED", "UPSTREAM_CANCELED", "BLOCKED",
@@ -50,6 +51,11 @@ UNREADABLE = "UNREADABLE"
 _PERMANENT_STATUS_ERROR = re.compile(
     r"session profile has expired|\b401\b|\b403\b|NotAuthenticated",
     re.IGNORECASE)
+# The cold-start watchdog's defaults (see watch_job). Two minutes for the
+# cluster to PICK UP a task, and several attempts, because a fresh cluster
+# has been seen to ignore two runs in a row (live 2026-09-29).
+COLD_START_SECONDS = 120.0
+COLD_START_RESTARTS = 5
 
 
 class JobRunCollision(RuntimeError):
@@ -221,7 +227,8 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
               parameters: dict[str, str] | None = None,
               poll_seconds: float = 30.0, max_polls: int = 40,
               on_poll: Callable[[str, int], None] | None = None,
-              cold_start_seconds: float = 60.0, cold_start_restarts: int = 1,
+              cold_start_seconds: float = COLD_START_SECONDS,
+              cold_start_restarts: int = COLD_START_RESTARTS,
               on_restart: Callable[[str, str], None] | None = None,
               sleep: Callable[[float], None] = time.sleep,
               on_submit: Callable[[str], None] | None = None) -> dict:
@@ -256,6 +263,17 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
     is deliberately generous to measure only the pick-up, not the work: it
     checks whether the cluster TOOK the task, which is independent of how
     long the task then runs. Set `cold_start_restarts=0` to disable.
+
+    ONE RESTART IS NOT ENOUGH. Live 2026-09-29, on a fresh workspace: the
+    first run was cancelled at 65s as designed, and the resubmitted run
+    wedged too -- 16 minutes at RUNNING, task PENDING, `startTime: null` --
+    while the watch, its single restart spent, kept polling it as if it
+    were working. A manual cancel and a third submission then succeeded in
+    90 seconds. Hence the defaults: two minutes to pick up (the operators'
+    rule of thumb) and several attempts. And when the attempts are spent
+    and the task has STILL not started, the watch stops and says so
+    (`cold_start_exhausted: True`) instead of spending the poll budget on a
+    run the cluster is not going to take.
 
     The resubmit happens ONLY once the cancel is confirmed terminal. If the
     cancel raises or the run never leaves CANCELING within the cancel poll,
@@ -293,6 +311,7 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
     terminal = False
     restarts: list[dict] = []
     restarts_left = max(0, cold_start_restarts)
+    exhausted: dict | None = None
     waited = 0.0
     attempt = 0
     polls_left = max_polls
@@ -320,6 +339,29 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
         # The watchdog acts only on a run KNOWN to be going: a status it
         # cannot classify is not a cold start, and cancelling it would turn
         # an unknown into a discarded run.
+        # Not when the run in hand is one whose cancel already failed to
+        # confirm: that is the cancel-unconfirmed path, reported as such.
+        if (cold_start_restarts > 0 and not restarts_left
+                and not (restarts and restarts[-1].get("new_run") is None)
+                and status in ACTIVE_STATES
+                and waited >= cold_start_seconds
+                and not task_started(call, workspace=workspace,
+                                     run_key=run_key)):
+            # Every attempt is spent and this run has not been picked up
+            # either. Watching it further only burns the budget on a run the
+            # cluster is ignoring; stop and let the caller say so. It is
+            # cancelled first: left alone it holds the job's only slot, and
+            # the next `run` would be refused as a collision with a run that
+            # is doing nothing.
+            cancel_errors = []
+            exhausted = {"run": run_key, "after_seconds": waited,
+                         "cancel_state": cancel_run(
+                             call, workspace=workspace, run_key=run_key,
+                             sleep=sleep,
+                             on_cancel_error=cancel_errors.append),
+                         "cancel_error": (cancel_errors[0]
+                                          if cancel_errors else None)}
+            break
         if (restarts_left and status in ACTIVE_STATES
                 and waited >= cold_start_seconds
                 and not task_started(call, workspace=workspace,
@@ -372,6 +414,9 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
                              and status != UNREADABLE),
             "status_unreadable": status == UNREADABLE,
             "status_error": status_error,
+            # None, or {run, after_seconds, cancel_state, cancel_error}: the
+            # attempts ran out and this last run was never picked up either.
+            "cold_start_exhausted": exhausted,
             # The state of the run being WATCHED, not of every attempt
             # ever made. An earlier attempt that could not confirm its
             # cancel is history the caller can read in `restarts`; if a

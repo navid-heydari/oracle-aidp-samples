@@ -9,7 +9,9 @@ schema by schema**, via the parametrised PySpark **notebooks** in
 verify every copy (row counts, exact decimal sums).
 
 **The control plane copies no data itself.** Rows move only when the operator
-runs the in-AIDP job `snowmig_02_copy_schema`, one schema per run. The data
+runs one of the in-AIDP copy jobs: `snowmig_02_copy_<schema>`, one per schema
+of the approved plan, each running the `02_copy_schema` notebook (before a
+plan is pushed, the single `snowmig_02_copy_schema` job). The data
 plane is the scripts on AIDP compute, and the jobs that run them carry **no
 schedule** — running one is always the operator's call. Stored procedures,
 tasks, streams and pipes are inventoried with effort bands, never
@@ -211,6 +213,16 @@ name, which under this runbook is the EXTERNAL pointer, and S10 refuses it. Use
 `--restrictions` to scope a first wave (a canary of a few tables is a good
 first live write).
 
+Once the environment exists (step 6), push the approved plan to the workspace
+with `provision` itself, never by hand: it uploads `plan.json`,
+`ddl_plan.json` and their reports to `plan/`, backs the two plans up dated
+into `backup/`, and registers one copy workflow per schema of the plan.
+
+```bash
+bin/snowmig provision --execute --reuse-existing --workspace-name <the S1 name> \
+  --plan-label FULL        # REDUCED after an S9 scope reduction
+```
+
 ### 5. Prove both ends reach each other
 
 ```bash
@@ -342,11 +354,13 @@ decision the customer makes, with the scripts already sitting there:
 
 | Job | What it does | Report |
 |---|---|---|
-| `snowmig_02_copy_schema` | copies ONE schema and **verifies** it (row counts; `--verify counts+sums` adds exact decimal sums) | `copy_report_<schema>.json` |
+| `snowmig_02_copy_<schema>` (`snowmig_02_copy_schema` before a plan is pushed) | one job per schema of the approved plan, each a task running the same `02_copy_schema` notebook with `schema` as a task parameter; copies that schema and **verifies** it (row counts; `--verify counts+sums` adds exact decimal sums) | `copy_report_<schema>.json` |
 | `snowmig_03_reconcile` | plan versus what the catalog actually holds | **`MIGRATION_REPORT.md`** |
 
-Edit the `PARAMS` cell at the top of a job's notebook to change its
-arguments (`schema`, `mode`, `verify`); they are there to be edited. There is
+A job task's `parameters` override the notebook's `PARAMS` cell by the same
+names (`schema`, `mode`, `verify`, ...): every stage notebook reads them at
+run time with `oidlUtils.parameters.getParameter`. The `PARAMS` literals are
+the defaults, and can still be edited in the console. There is
 no driver wrapper — the job runs the stage notebook itself. Every stage is
 resumable: a re-run skips what its report already records as done.
 

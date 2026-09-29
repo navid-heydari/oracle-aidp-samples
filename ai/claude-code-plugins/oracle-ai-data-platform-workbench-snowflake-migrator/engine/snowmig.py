@@ -110,7 +110,8 @@ from migration_config import (
     write_template,
 )
 from target.deploy import RefusedToExecute, deploy
-from target.jobs import JobRunCollision
+from target.jobs import (COLD_START_RESTARTS, COLD_START_SECONDS,
+                         JobRunCollision)
 from target.provisioning import ProvisionTransportError
 from target.executor import (
     NoBackendAvailable, detect_backend,
@@ -1109,7 +1110,7 @@ def cmd_run(args) -> int:
     to success and never rounded to failure.
     """
     from target.provisioning import make_provision_call
-    from target.jobs import watch_job
+    from target.jobs import TERMINAL_STATES, watch_job
 
     out = pathlib.Path(args.out_dir)
     # Flags first, then the config's `aidp:` block, like every other AIDP
@@ -1282,6 +1283,23 @@ def cmd_run(args) -> int:
               f'start another run until it has ended.', file=sys.stderr)
         return 1
     if not result["terminal"]:
+        exhausted = result.get("cold_start_exhausted")
+        if exhausted:
+            # Not "still running": the cluster ignored every attempt. The
+            # last run was cancelled so it does not hold the job's slot.
+            cancelled = exhausted.get("cancel_state") in TERMINAL_STATES
+            print(f'  {slug}: COLD START — the cluster did not pick up any of '
+                  f'{len(result.get("restarts") or []) + 1} run(s), each '
+                  f'given {args.cold_start_seconds:.0f}s. The last, '
+                  f'{exhausted["run"]}, was '
+                  + ("cancelled." if cancelled else
+                     f'NOT confirmed cancelled ({exhausted.get("cancel_state")}'
+                     f'); cancel it by hand (`aidp workflow cancel-job-run '
+                     f'{args.workspace} {exhausted["run"]}`).')
+                  + " Check the cluster in the console (state, recent "
+                    "restarts), then re-run; raise --cold-start-restarts if "
+                    "it simply needs more attempts.", file=sys.stderr)
+            return 1
         if result.get("unrecognised"):
             # Neither a verdict nor "still going": a status this plugin does
             # not classify. Saying STILL RUNNING here would round it up.
@@ -1307,6 +1325,23 @@ def cmd_run(args) -> int:
         return 0
     verdict = "SUCCESS" if result["ok"] else result["status"]
     print(f"  {slug}: {verdict}")
+    if result["ok"] and args.job == "snowmig_00_discover":
+        # Runbook S7 starts from this manifest; bring it down now, through
+        # the console's own download route, rather than leave the operator
+        # to find a way. A failed download does not unmake the discovery:
+        # the manifest is safe on the workspace, and `fetch` retries it.
+        from target.provisioning import download_ws_file
+        try:
+            got = download_ws_file(call, workspace=args.workspace,
+                                   path=DISCOVERY_MANIFEST_REMOTE,
+                                   dest=out / "discovery_manifest.json")
+            print(f'  manifest fetched -> {got["dest"]} ({got["size"]} '
+                  f'bytes); next: `ingest --manifest {got["dest"]} '
+                  f'--database-name <SOURCE_DB>`')
+        except Exception as exc:
+            print(f"  manifest NOT fetched ({str(exc)[:200]}); it is on the "
+                  f"workspace at {DISCOVERY_MANIFEST_REMOTE}. Run `fetch` to "
+                  f"retry.", file=sys.stderr)
     return 0 if result["ok"] else 1
 
 
@@ -1322,6 +1357,17 @@ def _render_run(result: dict) -> str:
                    f"running. This is neither success nor failure: check it "
                    f"in the console, and do not start another run until it "
                    f"has ended.")
+    elif not result.get("terminal") and result.get("cold_start_exhausted"):
+        ex = result["cold_start_exhausted"]
+        verdict = (f"**COLD START — attempts exhausted.** The cluster did not "
+                   f"pick up any of {len(result.get('restarts') or []) + 1} "
+                   f"run(s); the last, `{ex.get('run')}`, sat "
+                   f"{ex.get('after_seconds'):.0f}s with its task unstarted "
+                   f"and was then cancelled (cancel state "
+                   f"`{ex.get('cancel_state')}`"
+                   + (f", error: {ex.get('cancel_error')}"
+                      if ex.get("cancel_error") else "")
+                   + "). Nothing ran. Check the cluster, then re-run.")
     elif not result.get("terminal") and result.get("unrecognised"):
         verdict = (f'**UNRECOGNISED STATE `{result.get("status")}`** — after '
                    f'{polls} poll(s) the run reports a status this plugin '
@@ -1851,6 +1897,42 @@ def cmd_teardown(args) -> int:
     return 0 if res["verified"] == len(targets) else 1
 
 
+# What `fetch` brings down when no --path is given, and what `run` fetches
+# by itself after a discovery that SUCCEEDED: the manifest runbook S7 reads.
+DISCOVERY_MANIFEST_REMOTE = ("backup-snowflake-migration/reports/"
+                             "discovery_manifest.json")
+
+
+def cmd_fetch(args) -> int:
+    """Download one file from the migration workspace into the out dir.
+
+    Runbook S7 starts from the manifest the discovery WORKFLOW wrote inside
+    AIDP. This is how it comes down: the console's own download route, the
+    bytes checked against the size the server reports. Read-only on AIDP.
+    """
+    from target.provisioning import download_ws_file, make_provision_call
+
+    out = pathlib.Path(args.out_dir)
+    coords = _target_coords(args)
+    if not coords["datalake_ocid"] or not coords["workspace"]:
+        raise MissingTarget(
+            "fetch needs the aiDataPlatform OCID and the workspace key: put "
+            "them under `aidp.datalake_ocid` and `aidp.workspace` in the "
+            "config, or pass --datalake-ocid and --workspace.")
+    remote = (args.path or DISCOVERY_MANIFEST_REMOTE).lstrip("/")
+    if remote.startswith("Workspace/"):
+        # The cluster sees the tree under /Workspace; the API wants it
+        # relative. Accept the path either way it is copied from a log.
+        remote = remote[len("Workspace/"):]
+    dest = out / (args.to or remote.rsplit("/", 1)[-1])
+    call = make_provision_call(coords["datalake_ocid"],
+                               run_process=_oci_runner(args))
+    res = download_ws_file(call, workspace=coords["workspace"], path=remote,
+                           dest=dest)
+    print(f'  fetched {res["path"]} -> {res["dest"]} ({res["size"]} bytes)')
+    return 0
+
+
 def cmd_publish(args) -> int:
     """Copy the finished report into the migration's workspace folder.
     Dry run unless --execute; every file is read back."""
@@ -2049,6 +2131,12 @@ def cmd_provision(args) -> int:
                   ("inventory.json", "plan.json", "ddl_plan.json",
                    "PLANNED_OBJECTS.md", "DDL_PLAN.md", "SUMMARY.md")
                   if (out / n).is_file()]
+    # Runbook S11: one copy workflow per schema of the APPROVED plan -- the
+    # ddl_plan.json this push places in plan/. No plan yet, no copy jobs:
+    # the schemas are read from the plan, never typed by hand.
+    from target.provisioning import plan_copy_schemas
+    copy_schemas = (plan_copy_schemas(_read(out, "ddl_plan.json"))
+                    if (out / "ddl_plan.json").is_file() else [])
 
     # In connector mode the in-AIDP scripts need the connection config on the
     # mount. It carries the credential, so it is uploaded ONLY when the user
@@ -2108,6 +2196,27 @@ def cmd_provision(args) -> int:
     external_catalog = args.external_catalog or aidp.get("external_catalog")
     target_catalog = args.target_catalog or aidp.get("target_catalog")
 
+    # A re-push into THIS migration's own workspace (the plan, after S7/S9)
+    # inherits the coordinates the first push baked in, so the notebooks it
+    # adds -- the per-schema copy workflows -- carry the same catalogs and
+    # the same credential path as the stages already there. Only from the
+    # record of the same workspace; a flag still wins.
+    inherited_credential = None
+    prior = (_read(out, "provision_result.json")
+             if args.reuse_existing
+             and (out / "provision_result.json").is_file() else None)
+    if prior and not prior.get("dry_run") and (
+            (prior.get("workspace") or {}).get("requested")
+            == args.workspace_name):
+        external_catalog = external_catalog or prior.get("external_catalog")
+        target_catalog = target_catalog or prior.get("target_catalog")
+        if not args.source_config and prior.get("credential_objects"):
+            inherited_credential = prior["credential_objects"][0]
+        print(f"  re-push into this migration's workspace "
+              f"{prior['workspace'].get('name')}: catalogs and credential "
+              f"path taken from provision_result.json where no flag gave "
+              f"them")
+
     call = None
     if args.execute:
         ocid = args.datalake_ocid or aidp.get("datalake_ocid")
@@ -2133,7 +2242,9 @@ def cmd_provision(args) -> int:
         warehouse_cluster_mode=_compute_mode(args)["warehouse_clusters"],
         existing_cluster_id=_compute_mode(args)["cluster_id"],
         output_dir=_reporting(args)["workspace_dir"],
-        refresh_notebooks=args.refresh_notebooks)
+        refresh_notebooks=args.refresh_notebooks,
+        plan_label=args.plan_label, copy_schemas=copy_schemas,
+        inherited_credential=inherited_credential)
     _write(out, "provision_result.json", res)
     _write(out, "PROVISION.md", render_provision(res))
 
@@ -2558,6 +2669,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "on the workspace is kept, because its PARAMS cell "
                          "(schema, mode, verify) is edited in the console and "
                          "an overwrite would discard that silently")
+    pv.add_argument("--plan-label", default=None,
+                    help="a word appended to the dated backup of plan.json "
+                         "and ddl_plan.json in backup-snowflake-migration/"
+                         "backup/, e.g. FULL before an S9 scope reduction "
+                         "and REDUCED after. Every push is backed up whether "
+                         "or not a label is given; the label only says which "
+                         "plan the copy is")
     pv.set_defaults(func=cmd_provision)
 
     rn = sub.add_parser("run", parents=[common],
@@ -2580,16 +2698,23 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--max-polls", type=int, default=40,
                     help="poll budget (default: 40). Running out is reported "
                          "as STILL RUNNING, never as a verdict")
-    rn.add_argument("--cold-start-seconds", type=float, default=60.0,
+    rn.add_argument("--cold-start-seconds", type=float,
+                    default=COLD_START_SECONDS,
                     help="how long to wait for the CLUSTER TO PICK UP the "
                          "task before giving up on the run and resubmitting "
-                         "(default: 60). A cluster sometimes never takes the "
-                         "first run on a new workspace: it sits at RUNNING "
-                         "with the task unstarted and never fails")
-    rn.add_argument("--cold-start-restarts", type=int, default=1,
+                         f"(default: {COLD_START_SECONDS:.0f}). A cluster "
+                         "sometimes never takes the first run on a new "
+                         "workspace: it sits at RUNNING with the task "
+                         "unstarted and never fails")
+    rn.add_argument("--cold-start-restarts", type=int,
+                    default=COLD_START_RESTARTS,
                     help="how many times a never-picked-up run may be "
-                         "cancelled and resubmitted (default: 1; 0 disables). "
-                         "Every restart is named in the run report")
+                         "cancelled and resubmitted (default: "
+                         f"{COLD_START_RESTARTS}; 0 disables). A fresh "
+                         "cluster has ignored two runs in a row, so one is "
+                         "not enough. Every restart is named in the run "
+                         "report; when all are spent the last run is "
+                         "cancelled and the stage exits 1 as COLD START")
     rn.set_defaults(func=cmd_run)
 
     cat = sub.add_parser("catalog", parents=[common],
@@ -2673,6 +2798,22 @@ def build_parser() -> argparse.ArgumentParser:
                     help="as for `tokens`: a window of other work in the same "
                          "session, left out of the summary's token totals")
     su.set_defaults(func=cmd_summary)
+
+    fe = sub.add_parser("fetch", parents=[common],
+                        help="download a file from the migration workspace "
+                             "into the out dir (default: the discovery "
+                             "manifest runbook S7 reads). Read-only")
+    _add_target_args(fe)
+    fe.add_argument("--config", "--connection-config", dest="config",
+                    help="the ONE migration config: its `aidp:` block "
+                         "supplies --datalake-ocid and --workspace")
+    fe.add_argument("--path", default=None,
+                    help="workspace-relative path of the file (default: "
+                         f"{DISCOVERY_MANIFEST_REMOTE})")
+    fe.add_argument("--to", default=None,
+                    help="local file name inside the out dir (default: the "
+                         "remote file's name)")
+    fe.set_defaults(func=cmd_fetch)
 
     pb = sub.add_parser("publish", parents=[common],
                         help="copy the finished report (inputs + outputs) "
