@@ -851,7 +851,9 @@ def render_translation_map(tmap: dict) -> str:
            f'distinct Snowflake types. Views: **{t.get("views_translated", 0)}** '
            f'dialect-translated · **{t.get("views_verbatim", 0)}** carried '
            f'verbatim · **{t.get("views_refused", 0)}** refused · '
-           f'**{t.get("views_without_sql", 0)}** with no SQL captured.', "",
+           f'**{t.get("views_blocked_by_kind", 0)}** refused by kind · '
+           f'**{t.get("views_without_sql", 0)}** with no SQL captured · '
+           f'**{t.get("views_unparseable", 0)}** unparseable.', "",
            "Every rule is either an exact rewrite or a refusal: nothing here "
            "is approximated. A refused view is left untouched and listed in "
            "`cannot_migrate` rather than translated into SQL that mostly "
@@ -859,6 +861,12 @@ def render_translation_map(tmap: dict) -> str:
     if t.get("unmapped_columns"):
         out += [f'> ⚠️ **{t["unmapped_columns"]} column(s) have no target '
                 f'type** and block their object. See the unmapped rows.', ""]
+    kinds = tmap.get("views_blocked_by_kind") or []
+    if kinds:
+        out += ["Refused by kind, as the plan refuses them -- no dialect rule "
+                "was run over these: " + ", ".join(
+                    f'`{v["source_identifier"]}` ({v["kind"]})'
+                    for v in kinds) + ".", ""]
 
     out += ["## Types", "", "| Snowflake type | → | Spark type | Status | "
             "Columns | Objects |", "|---|---|---|---|---:|---:|"]
@@ -933,7 +941,8 @@ def translation_map_section(tmap: dict | None) -> list[str]:
            f'{t.get("distinct_source_types", 0)} Snowflake type(s); views '
            f'{t.get("views_translated", 0)} translated · '
            f'{t.get("views_verbatim", 0)} verbatim · '
-           f'{t.get("views_refused", 0)} refused.', "",
+           f'{t.get("views_refused", 0)} refused · '
+           f'{t.get("views_blocked_by_kind", 0)} refused by kind.', "",
            f"- Dialect rules applied: {_tick(applied)}",
            f"- Dialect rules that refused a view: {_tick(refused)}",
            "- Type mappings: " + (", ".join(

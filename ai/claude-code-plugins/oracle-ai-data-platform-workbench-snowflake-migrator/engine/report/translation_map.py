@@ -15,12 +15,16 @@ session's artifacts into one map:
 Pure function over artifacts, zero I/O. Views are re-run through the same
 `translate_view_body` the DDL stage calls, so the map cannot disagree with
 what was emitted -- and a view the planner refused still shows WHICH rule
-refused it, which the DDL payload records only as prose.
+refused it, which the DDL payload records only as prose. A view refused for
+its KIND (secure, materialized: plan.build.object_kind_block, checked first
+as plan and ddl check it) is never translated; it is counted as refused by
+kind.
 """
 from __future__ import annotations
 
 import collections
 
+from plan.build import object_kind_block
 from snowflake_source.dialect.translate import RULES
 from snowflake_source.dialect.views import extract_view_body, translate_view_body
 
@@ -64,11 +68,20 @@ def _dialect(records: list[dict]) -> tuple[list[dict], dict]:
     applied: dict[str, set] = collections.defaultdict(set)
     refused: dict[str, set] = collections.defaultdict(set)
     details: dict[str, list[str]] = collections.defaultdict(list)
-    views = {"translated": 0, "verbatim": 0, "refused": 0, "no_sql": 0}
+    views = {"translated": 0, "verbatim": 0, "refused": 0, "no_sql": 0,
+             "unparseable": 0, "blocked_by_kind": []}
     for rec in records:
         if rec.get("object_type") != "VIEW":
             continue
         ident = rec["source_identifier"]
+        # The check plan and ddl apply first: a secure or materialized view
+        # is refused for what it IS, so no dialect rule ever touches it.
+        # Translating it here reported rules applied to SQL never emitted.
+        block = object_kind_block(rec)
+        if block:
+            views["blocked_by_kind"].append(
+                {"source_identifier": ident, "kind": block[0]})
+            continue
         ddl = rec.get("view_ddl_get_ddl") or rec.get("view_text_show")
         if not ddl:
             views["no_sql"] += 1
@@ -76,7 +89,8 @@ def _dialect(records: list[dict]) -> tuple[list[dict], dict]:
         try:
             result = translate_view_body(extract_view_body(ddl))
         except ValueError:
-            views["no_sql"] += 1
+            # Captured, and not readable as a view: not "no SQL captured".
+            views["unparseable"] += 1
             continue
         for a in result.applied:
             applied[a["rule_id"]].add(ident)
@@ -174,6 +188,7 @@ def build_translation_map(inventory: dict, plan: dict,
         "dialect_rules": rules,
         "names": names,
         "ddl_rules": dict(sorted(ddl_rules.items())),
+        "views_blocked_by_kind": views["blocked_by_kind"],
         "ddl_ran": ddl_payload is not None,
         "totals": {
             "objects": len(records),
@@ -185,6 +200,8 @@ def build_translation_map(inventory: dict, plan: dict,
             "views_verbatim": views["verbatim"],
             "views_refused": views["refused"],
             "views_without_sql": views["no_sql"],
+            "views_unparseable": views["unparseable"],
+            "views_blocked_by_kind": len(views["blocked_by_kind"]),
             "rules_applied": sum(1 for r in rules if r["outcome"] == "applied"),
             "rules_refused": sum(1 for r in rules if r["outcome"] == "refused"),
             "renamed_objects": sum(1 for n in names if n["renamed"]),
