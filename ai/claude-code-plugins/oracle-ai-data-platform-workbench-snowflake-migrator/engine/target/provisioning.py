@@ -51,7 +51,8 @@ from .provision_api import (
 __all__ = ["JOB_SPECS", "SCRIPTS_FOLDER", "PLAN_FOLDER", "REPORTS_FOLDER",
            "BACKUP_FOLDER", "PLAN_BACKUP_FILES", "plan_backup_names",
            "COPY_JOB_PREFIX", "plan_copy_schemas", "copy_job_specs",
-           "DOWNLOAD_TIMEOUT", "download_ws_file", "carry_forward",
+           "DOWNLOAD_TIMEOUT", "PLAN_PUSH_FILES", "plan_push_inputs",
+           "download_ws_file", "carry_forward",
            "ProvisionTransportError",
            "make_provision_call", "provision", "render_provision",
            "source_config_payload",
@@ -135,6 +136,35 @@ def plan_copy_schemas(ddl_plan: dict) -> list[str]:
             continue
         out.add(source[1])
     return sorted(out)
+
+
+# The plan artifacts a push carries into plan/, whichever of them exist.
+PLAN_PUSH_FILES = ("inventory.json", "plan.json", "ddl_plan.json",
+                   "PLANNED_OBJECTS.md", "DDL_PLAN.md", "SUMMARY.md")
+
+
+def plan_push_inputs(out_dir) -> tuple[list[pathlib.Path], list[str]]:
+    """(plan files, copy schemas) that a provision push of `out_dir` takes.
+
+    Whatever plan artifacts exist travel with the scripts, and the copy
+    schemas are read from the APPROVED ddl_plan.json among them -- no plan
+    yet, no copy jobs. One reading for `snowmig provision` and the demo, so
+    the demo cannot drift back to the pre-plan shape it once showed.
+    """
+    out = pathlib.Path(out_dir)
+    files = [out / n for n in PLAN_PUSH_FILES if (out / n).is_file()]
+    ddl = out / "ddl_plan.json"
+    if not ddl.is_file():
+        return files, []
+    try:
+        plan = json.loads(ddl.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        # Name the file and the remedy, as snowmig._read does: the decoder's
+        # own message says where in the text, not which artifact.
+        raise ValueError(
+            f"{ddl} is not valid JSON ({exc}); delete it and re-run the "
+            f"stage that produces it (`snowmig ddl`)") from exc
+    return files, plan_copy_schemas(plan)
 
 
 def copy_job_specs(schemas) -> list[dict]:
@@ -247,18 +277,21 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
                     raise ProvisionTransportError(
                         f"{operation} failed (exit {proc.returncode}): "
                         f"{(proc.stderr or proc.stdout or '')[:300]}")
-                return proc
+                # Parsed INSIDE the attempt: `oci raw-request` exits 0 on an
+                # HTTP error and carries it in the body, so a 429/503 is only
+                # an exception once the envelope is read -- parsed after
+                # retry_call it was never retried. The aidp CLI's literal
+                # "Response:" prefix is stripped by the parser; the headers
+                # come back with the rows because a list endpoint names its
+                # next page in one of them.
+                return parse_cli_envelope(proc.stdout or "")
             # Includes the workspace->cluster race: a create answered 409
             # "not in an active state" was not applied, so it is repeated
             # with backoff instead of leaving the run partial.
-            proc = retry_call(
+            rows, headers = retry_call(
                 attempt, label=operation,
                 retryable=is_retryable(
                     read=operation.startswith(("get_", "list_"))))
-            # The aidp CLI's literal "Response:" prefix is stripped by the
-            # parser; the headers come back with the rows because a list
-            # endpoint names its next page in one of them.
-            rows, headers = parse_cli_envelope(proc.stdout or "")
         finally:
             if spooled:
                 try:
@@ -607,7 +640,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               if copy_schemas else set())
     stage_params = dict(stage_params or {})
     if stage_params:
-        check_stage_params(stage_params)
+        check_stage_params(stage_params, copy_schemas=copy_schemas)
         if reuse_existing and not refresh_notebooks:
             raise ValueError(
                 "--stage-param " + ", ".join(sorted(stage_params))
