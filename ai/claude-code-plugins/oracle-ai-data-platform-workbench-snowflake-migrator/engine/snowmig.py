@@ -1888,12 +1888,15 @@ def cmd_teardown(args) -> int:
                    datalake_ocid=ocid)
     _write(out, "teardown_result.json", res)
     _write(out, "TEARDOWN.md", render_teardown(res))
-    targets = [s for s in res["steps"] if s.get("cluster")]
+    targets = [s for s in res["steps"]
+               if str(s.get("action")).startswith("would ")]
     for s in res["steps"]:
-        if not s.get("cluster"):
-            # A create this migration asked for whose key was never seen.
-            print(f'  teardown: {s.get("name")}: {s.get("detail")}',
-                  file=sys.stderr)
+        if s.get("action") in ("key_unknown", "provenance_unknown"):
+            # A create this migration asked for whose key was never seen, or
+            # a cluster a pre-provenance record cannot place: never touched.
+            print(f'  teardown: {s.get("name")} '
+                  f'({s.get("cluster") or "key never recorded"}): '
+                  f'{s.get("detail")}', file=sys.stderr)
     if res.get("unknown"):
         # Could not tell is not "nothing to do".
         print(f'  teardown: {res["note"]}', file=sys.stderr)

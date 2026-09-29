@@ -5,7 +5,9 @@ PROVES this migration created (`created: true`, see target/provenance.py):
 the migration cluster and any warehouse clusters provision made. A cluster
 the record names but did not create -- adopted with --reuse-existing, or
 the one `compute.warehouse_clusters: existing` points at -- is listed as
-"not this migration's, left alone" and never stopped or deleted. It never
+"not this migration's, left alone" and never stopped or deleted. One a record
+written before provenance cannot place (see target/provenance.py) is not
+touched either, and is a failed step asking for the console. It never
 lists the workspace and picks clusters by name, which is how a teardown
 takes somebody else's compute with it.
 
@@ -24,7 +26,8 @@ from __future__ import annotations
 import datetime
 import time
 
-from .provenance import CREATED, NOT_CREATED, REQUESTED, cluster_records
+from .provenance import (CREATED, NOT_CREATED, REQUESTED, UNKNOWN,
+                         cluster_records)
 
 __all__ = ["ACTIONS", "RELEASED_ACTIONS", "STOPPED_STATES", "teardown",
            "render_teardown"]
@@ -41,20 +44,23 @@ RELEASED_ACTIONS = {"stopped": None, "already_stopped": None,
 
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
 KEPT = ["the workspace (scripts, plans, report/output — the run's record)",
         "the catalogs (the migration's output)",
         "the jobs (the registered S11 copy scripts)"]
 
 
 def _targets(prov: dict) -> tuple[list[dict], list[dict], list[dict]]:
-    """(targets, left_alone, unkeyed). A target is a cluster the record
+    """(targets, left_alone, unresolved). A target is a cluster the record
     proves this migration created -- including those an earlier push
     created, each in its own workspace; everything else it names with a key
-    is left alone and said so, once per key. `unkeyed` are creates this
-    migration asked for and never saw listed: failed steps, never looked up
-    by name."""
+    is left alone and said so, once per key. `unresolved` are failed steps,
+    never acted on: creates this migration asked for and never saw listed
+    (never looked up by name), and keyed clusters whose provenance the
+    record cannot tell (it predates provenance)."""
     records = cluster_records(prov)
-    targets, left, seen = [], [], set()
+    targets, left, seen, unknown = [], [], set(), []
     for rec in records:
         at = (rec["workspace"], rec["cluster"])
         if rec["provenance"] == CREATED and at not in seen:
@@ -63,6 +69,17 @@ def _targets(prov: dict) -> tuple[list[dict], list[dict], list[dict]]:
                             "role": rec["role"],
                             "workspace": rec["workspace"],
                             "datalake_ocid": rec["datalake_ocid"]})
+    for rec in records:
+        # Could not tell is neither "ours" nor "somebody else's": not
+        # touched, and counted, so the run cannot report success over it.
+        at = (rec["workspace"], rec["cluster"])
+        if rec["provenance"] == UNKNOWN and at not in seen:
+            seen.add(at)
+            unknown.append({"cluster": rec["cluster"], "name": rec["name"],
+                            "role": rec["role"],
+                            "workspace": rec["workspace"],
+                            "action": "provenance_unknown", "verified": False,
+                            "detail": rec["why"]})
     for rec in records:
         at = (rec["workspace"], rec["cluster"])
         if rec["provenance"] == NOT_CREATED and at not in seen:
@@ -84,7 +101,7 @@ def _targets(prov: dict) -> tuple[list[dict], list[dict], list[dict]]:
                           f'{rec["workspace"]} in the console and confirm '
                           f'it is this migration\'s before terminating it; '
                           f'teardown never picks a cluster by name'})
-    return targets, left, unkeyed
+    return targets, left, unknown + unkeyed
 
 
 def _state(call, workspace: str, key: str):

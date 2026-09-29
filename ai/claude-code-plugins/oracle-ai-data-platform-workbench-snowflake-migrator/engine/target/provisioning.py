@@ -1471,7 +1471,9 @@ def carry_forward(res: dict, prior: dict | None) -> dict:
     earlier record is the proof they were created here, so its `created`
     flag (and when) is carried onto the same keys -- only from a record of
     the same workspace key; a record of another workspace proves nothing
-    about this one.
+    about this one. A cluster whose provenance the earlier record cannot
+    tell (it predates provenance) stays unknown here
+    (`provenance_unknown: true`): this push finding it proves no more.
 
     Allocations: every cluster the earlier record proves this migration
     created, and that this push does not record itself --
@@ -1481,7 +1483,7 @@ def carry_forward(res: dict, prior: dict | None) -> dict:
     _carry_credentials). A record of another aiDataPlatform is never "the
     same workspace", whatever its key. Returns `res`, updated in place.
     """
-    from .provenance import CREATED, REQUESTED, cluster_records
+    from .provenance import CREATED, REQUESTED, UNKNOWN, cluster_records
     if (not prior or prior.get("dry_run") is not False
             or res.get("dry_run") is not False):
         return res
@@ -1499,10 +1501,15 @@ def carry_forward(res: dict, prior: dict | None) -> dict:
     _carry_credentials(res, prior, same_ws)
     records = cluster_records(prior)
     owned = {r["cluster"]: r for r in records if r["provenance"] == CREATED}
+    unknown = {r["cluster"] for r in records if r["provenance"] == UNKNOWN}
     here = [res.get("cluster") or {}, *(res.get("warehouse_clusters") or [])]
     for rec in here:
         earlier = owned.get(rec.get("key")) if same_ws else None
-        if earlier is None or rec.get("created") or rec.get("uses_existing"):
+        if rec.get("created") or rec.get("uses_existing"):
+            continue
+        if earlier is None:
+            if same_ws and rec.get("key") in unknown:
+                rec["provenance_unknown"] = True
             continue
         was = earlier["record"]
         rec.update(created=True,
@@ -1511,15 +1518,16 @@ def carry_forward(res: dict, prior: dict | None) -> dict:
         if was.get("created_at") and not rec.get("created_at"):
             rec["created_at"] = was["created_at"]
     recorded = {(ws, rec.get("key")) for rec in here
-                if same_ws and rec.get("key") and rec.get("created")}
+                if same_ws and rec.get("key")
+                and (rec.get("created") or rec.get("provenance_unknown"))}
     kept, seen = [], set()
     for r in records:
         # A create that was accepted and never listed is carried too, by
         # name: teardown keeps saying it cannot identify it until someone
         # does, rather than a later push forgetting it was ever asked for.
         at = (r["workspace"], r["cluster"] or f'name:{r["name"]}')
-        if (r["provenance"] not in (CREATED, REQUESTED) or at in recorded
-                or at in seen):
+        if (r["provenance"] not in (CREATED, REQUESTED, UNKNOWN)
+                or at in recorded or at in seen):
             continue
         seen.add(at)
         was = r["record"]
@@ -1529,6 +1537,8 @@ def carry_forward(res: dict, prior: dict | None) -> dict:
                  "created_run": was.get("created_run") or prior.get("run")}
         if r["provenance"] == REQUESTED:
             entry["create_requested"] = True
+        if r["provenance"] == UNKNOWN:
+            entry["provenance_unknown"] = True
         if was.get("created_at"):
             entry["created_at"] = was["created_at"]
         if prior.get("datalake_ocid"):

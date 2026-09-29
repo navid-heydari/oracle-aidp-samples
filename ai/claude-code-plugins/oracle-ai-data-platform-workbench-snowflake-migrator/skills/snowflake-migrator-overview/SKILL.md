@@ -478,7 +478,12 @@ re-push into the same workspace) are touched, never one found by name. A
 cluster the record names but did not create -- adopted with
 `--reuse-existing`, or the one `compute.warehouse_clusters: existing` maps
 the warehouses to -- is listed in `TEARDOWN.md` as not this migration's and
-left alone. Clusters an earlier push created stay in the record
+left alone. A record written before provenance was recorded (no `created`
+field) proves it only by a `created` step; any other keyed cluster there --
+the documented re-push records the migration's own cluster as `reused` --
+is `provenance_unknown`: not touched, a failed step (exit 1) asking you to
+confirm in the console, and listed apart, unbilled, in the billing report.
+Clusters an earlier push created stay in the record
 (`earlier_allocations`) however later pushes are run, and an executed record
 that names no workspace makes teardown exit 1 ("cannot tell what was
 allocated"), never "nothing to terminate". A cluster whose create was

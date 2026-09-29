@@ -132,7 +132,7 @@ def build_resources(out_dir) -> dict:
     prov = _load(out, "provision_result.json") or {}
     if not prov or prov.get("dry_run"):
         return {"resources": [], "accruing_now": [], "compute": [],
-                "not_allocated": [],
+                "not_allocated": [], "provenance_unknown": [],
                 "snowflake_usage": _snowflake_usage(out),
                 "note": "provision never ran for real, so this migration "
                         "allocated nothing in AIDP"}
@@ -170,7 +170,8 @@ def build_resources(out_dir) -> dict:
     # Only what the record PROVES this migration created: a cluster it
     # adopted, or the existing one a warehouse maps to, is not its
     # allocation and not its bill (target/provenance.py).
-    from target.provenance import CREATED, NOT_CREATED, cluster_records
+    from target.provenance import (CREATED, NOT_CREATED, UNKNOWN,
+                                   cluster_records)
     clusters, seen = [], set()
     for rec in cluster_records(prov):
         if rec["provenance"] == CREATED and rec["cluster"] not in seen:
@@ -258,6 +259,14 @@ def build_resources(out_dir) -> dict:
     not_allocated = [{"kind": "catalog", "name": name, "type": c["type"],
                       "why": c["why"]}
                      for name, c in sorted(others.items()) if name not in cats]
+    # Neither billed nor "not allocated": a record written before
+    # provenance cannot tell (target/provenance.py).
+    unknown = []
+    for rec in cluster_records(prov):
+        if rec["provenance"] == UNKNOWN and rec["cluster"] not in seen:
+            seen.add(rec["cluster"])
+            unknown.append({"kind": "cluster", "name": rec["name"],
+                            "key": rec["cluster"], "why": rec["why"]})
     for rec in cluster_records(prov):
         if rec["provenance"] == NOT_CREATED and rec["cluster"] not in seen:
             seen.add(rec["cluster"])
@@ -280,7 +289,7 @@ def build_resources(out_dir) -> dict:
                 if (r["kind"] == "cluster" and r["state"] not in _STOPPED)
                 or r["billing"] == "storage for data held"]
     return {"resources": resources, "accruing_now": accruing,
-            "not_allocated": not_allocated,
+            "not_allocated": not_allocated, "provenance_unknown": unknown,
             "shape": shape, "snowflake_usage": _snowflake_usage(out),
             "note": ""}
 
@@ -356,6 +365,13 @@ def render_resources_section(res: dict) -> list[str]:
                     "migration** (not billed here): " + "; ".join(
                         f'`{r.get("name") or r.get("key")}` {r["kind"]} — '
                         f'{r["why"]}' for r in others)]
+        unknown = res.get("provenance_unknown") or []
+        if unknown:
+            out += ["", "**Provenance unknown** (named in a record written "
+                    "before provenance; not billed here, confirm in the "
+                    "console): " + "; ".join(
+                        f'`{r.get("name") or r.get("key")}` '
+                        f'(`{r.get("key")}`) {r["kind"]}' for r in unknown)]
         accruing = res.get("accruing_now") or []
         out += ["", "**Still accruing now:** " + (
             "; ".join(f'{_label(r)} — {r["billing"]}' for r in accruing)

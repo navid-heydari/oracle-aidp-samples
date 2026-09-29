@@ -231,7 +231,11 @@ external-catalog migration to connector mode.
 A push never drops what an earlier push allocated: the clusters step 6
 created stay in `provision_result.json` (under `earlier_allocations` when
 this push does not record them itself, as the plan push does not), so
-`teardown` still reaches them. A push that halts before recording a
+`teardown` still reaches them. A record written before provenance was
+recorded (no `created` field) proves a cluster only by its `created` step;
+any other keyed cluster in it is `provenance_unknown`, which teardown never
+touches and reports as a failed step (exit 1) to confirm in the console. A
+push that halts before recording a
 workspace -- a name collision without `--reuse-existing` -- is written to
 `provision_result.halted.json` / `PROVISION_HALTED.md`, and the earlier
 record is kept.

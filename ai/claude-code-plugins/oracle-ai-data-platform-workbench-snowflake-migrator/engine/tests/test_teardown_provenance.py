@@ -155,7 +155,10 @@ def test_a_record_from_another_workspace_proves_nothing_here():
 
 def test_a_record_written_before_provenance_uses_its_steps():
     """provision_result.json files already on disk carry no `created`
-    field; their steps are the evidence, read the same positive way."""
+    field; their steps are the evidence, read the same positive way. A
+    `reused` step is not proof of "somebody else's" (the documented re-push
+    reuses the migration's own cluster): it is unknown, never touched, and
+    a failed step (see test_teardown_legacy_provenance.py)."""
     legacy = {"dry_run": False, "workspace": {"key": "ws"},
               "cluster": {"name": "migration_assets", "key": "mc"},
               "warehouse_clusters": [
@@ -168,8 +171,11 @@ def test_a_record_written_before_provenance_uses_its_steps():
                         {"step": "warehouse-cluster", "action": "reused",
                          "verified": True, "detail": "B_WH -> b"}]}
     res = teardown(None, legacy, action="stop", execute=False)
-    assert {s["cluster"] for s in res["steps"]} == {"mc", "wa"}
-    assert {c["cluster"] for c in res["left_alone"]} == {"wb"}
+    assert {s["cluster"] for s in res["steps"]
+            if s["action"] == "would stop"} == {"mc", "wa"}
+    assert [(s["cluster"], s["verified"]) for s in res["steps"]
+            if s["action"] == "provenance_unknown"] == [("wb", False)]
+    assert res["left_alone"] == []
 
 
 def test_the_cli_re_push_carries_provenance_into_the_record(tmp_path,
