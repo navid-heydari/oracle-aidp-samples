@@ -49,6 +49,16 @@ The rewrite matches whole three-part names on code and identifier segments only
 a quoted part must match exactly, an unquoted one case-insensitively, and the
 plan lists only the references that were actually rewritten.
 
+One- and two-part names are qualified too, where Snowflake resolves them: a
+bare `NAME` against the view's own schema, `SCHEMA.NAME` against its own
+database. They are read only where a relation stands -- every item of a FROM
+list (`from ORDERS o, CUSTOMERS c` has two) and after JOIN -- never the
+column in `EXTRACT(YEAR FROM o.D)`, `TRIM(... FROM c.X)`, `SUBSTRING(s FROM
+n)` or `a IS DISTINCT FROM c.Y`. A quoted part keeps its case (`"Orders"` is
+not `ORDERS`). One that names nothing in the migration is left as written and
+reported (`R42_VIEW_REFS_UNRESOLVED` for a bare name,
+`R45_VIEW_REFS_UNRESOLVED` for every one- or two-part name).
+
 A view's header column list (`create view V(CUSTOMER, TOTAL) as select
 CUST_ID, SUM(AMT) ...`) renames the body's output columns, so it is carried
 (`R44_VIEW_COLUMN_LIST`): `CREATE VIEW <fqn> (CUSTOMER, TOTAL) AS ...` in the
