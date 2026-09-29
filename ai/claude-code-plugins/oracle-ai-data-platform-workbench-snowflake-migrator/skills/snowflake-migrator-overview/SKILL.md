@@ -446,8 +446,11 @@ stage notebook reads workflow parameters over its PARAMS literals at run
 time — `oidlUtils.parameters.getParameter(name)`, resolved by the AIDP
 runtime and never imported, then the environment a task parameter is
 exported to. One script; each schema its own job, run history and evidence.
-`PROVISION.md` lists them (schema → job). A schema reduced out of the plan
-gets no job; re-push after re-planning to add it.
+`PROVISION.md` lists them (schema → job → this push's outcome for it). A
+schema reduced out of the plan gets no new job; a copy job an earlier push
+registered for it is still on the workspace and runnable, so the push
+reports it as `stale` (and exits 1) until it is deleted in the console.
+Re-push after re-planning to add a schema.
 
 ### S12 — Propose the warehouse-equivalent clusters
 

@@ -699,11 +699,19 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         # what this run wrote into PARAMS beyond the derived coordinates.
         "stage_params": dict(stage_params),
         # One copy job per schema of the approved plan (runbook S11), as
-        # {schema, job, notebook}; registered here, never run by provision.
+        # {schema, job, notebook, status}; registered here, never run by
+        # provision. `status` is this run's OUTCOME for the job -- "would
+        # register" in a dry run, "not registered" until a create or reuse
+        # says otherwise -- so a halt is never reported as a registration.
         "copy_jobs": [{"schema": sp["task_parameters"]["schema"],
                        "job": sp["name"],
-                       "notebook": f'{SCRIPTS_FOLDER}/{sp["notebook"]}'}
+                       "notebook": f'{SCRIPTS_FOLDER}/{sp["notebook"]}',
+                       "status": ("not registered" if execute
+                                  else "would register")}
                       for sp in job_specs if sp.get("task_parameters")],
+        # Copy jobs on the workspace that the present plan does not name
+        # (a schema reduced out of it): still runnable, so reported.
+        "stale_copy_jobs": [],
         "steps": [],
     }
 
@@ -1196,6 +1204,12 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         except Exception as exc:
             listing_error = exc
 
+    copy_status = {j["job"]: j for j in out["copy_jobs"]}
+
+    def _outcome(spec: dict, status: str) -> None:
+        if spec["name"] in copy_status:
+            copy_status[spec["name"]]["status"] = status
+
     def _create_job(spec: dict, *, kept: bool = False) -> None:
         notebook_path = f'{SCRIPTS_FOLDER}/{spec["notebook"]}'
         if _match(existing, spec["name"]) is not None:
@@ -1206,12 +1220,14 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                 step("job", "reused", True,
                      f'{spec["name"]} (stage notebook '
                      f'{"kept" if kept else overwritten})')
+                _outcome(spec, "reused")
             else:
                 step("job", "name_taken", False,
                      f'{spec["name"]} already exists and was NOT adopted; '
                      f'its stage notebook was {overwritten}, but the job '
                      f'itself is not this migration\'s. Rename or '
                      f'--reuse-existing.')
+                _outcome(spec, "name taken, not registered")
             return
         body = build_job_body(spec["name"], notebook_path=notebook_path,
                               cluster_key=cluster_key,
@@ -1225,12 +1241,16 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                  found is not None,
                  f'{spec["name"]}: read_back_failed: {job_list_error}'
                  if job_list_error is not None else spec["name"])
+            _outcome(spec, "created" if found else
+                     "create requested, not confirmed")
         except Exception as exc:
             step("job", "failed", False, f'{spec["name"]}: {str(exc)[:200]}')
+            _outcome(spec, "failed, not registered")
 
     # Notebooks uploaded (or kept) and read back by this run. A per-schema
     # copy job shares the 02 notebook, so it only needs that one to be here.
     notebooks_ready: set[str] = set()
+    kept_by_notebook: dict[str, bool] = {}
     for spec in job_specs:
         if spec.get("task_parameters"):
             if spec["notebook"] not in notebooks_ready:
@@ -1239,7 +1259,8 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                      f'on the workspace (see its step above), so the job was '
                      f'NOT created rather than pointed at nothing')
                 continue
-            _create_job(spec)
+            _create_job(spec, kept=kept_by_notebook.get(spec["notebook"],
+                                                        False))
             continue
         stage = stages_by_notebook.get(spec["notebook"])
         if stage is None:
@@ -1300,12 +1321,41 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                 continue
 
         notebooks_ready.add(spec["notebook"])
+        kept_by_notebook[spec["notebook"]] = kept
         if spec["name"] in no_job:
-            step("job", "not_created", None,
-                 f'{spec["name"]}: superseded by the per-schema copy jobs '
-                 f'below, which run this same notebook with a schema')
+            if _match(existing, spec["name"]) is not None:
+                # There, from an earlier push without a plan: it has no
+                # schema, so running it can only fail. Said, not hidden.
+                step("job", "exists_superseded", None,
+                     f'{spec["name"]}: on the workspace from an earlier push, '
+                     f'superseded by the per-schema copy jobs below; it has '
+                     f'no schema, so running it can only fail -- delete it '
+                     f'in the console')
+            else:
+                step("job", "not_created", None,
+                     f'{spec["name"]}: superseded by the per-schema copy '
+                     f'jobs below, which run this same notebook with a '
+                     f'schema')
             continue
         _create_job(spec, kept=kept)
+
+    # A copy job an earlier plan registered, for a schema this plan no
+    # longer names, is still on the workspace and still runnable: it would
+    # copy data the approved plan excludes, or nothing at all. Nothing is
+    # deleted behind the operator's back; it is a failed step until it is
+    # removed in the console.
+    planned = {spec["name"] for spec in job_specs}
+    generic = {spec["name"] for spec in JOB_SPECS}
+    for job in existing:
+        name = str(job.get("displayName") or job.get("name") or "")
+        if (name.lower().startswith(COPY_JOB_PREFIX)
+                and name not in planned and name not in generic):
+            out["stale_copy_jobs"].append(name)
+            step("job", "stale", False,
+                 f"{name} is on the workspace but its schema is not in this "
+                 f"plan (reduced out, or renamed); it is still runnable. "
+                 f"Delete it in the console, or re-plan to include the "
+                 f"schema")
 
     # 6 · the environment diagnosis, beside the stages, with NO job --------
     # README step 8 has the operator open it from scripts/ before the jobs;
@@ -1582,17 +1632,37 @@ def render_provision(res: dict) -> str:
         lines.append("")
 
     if res.get("copy_jobs"):
+        statuses = {j.get("status") for j in res["copy_jobs"]}
+        if res["dry_run"]:
+            verdict = ("**Would be registered** by `--execute`, and never "
+                       "run by it")
+        elif statuses <= {"created", "reused"}:
+            verdict = "**Registered, never run**"
+        else:
+            verdict = ("**NOT all registered** -- see the Status column; "
+                       "none is ever run by provision")
         lines += [
             "## Per-schema copy workflows (runbook S11)", "",
             f'{len(res["copy_jobs"])} job(s), one per schema of the approved '
             "`ddl_plan.json`, each with ONE task running the SAME "
             "`02_copy_schema` notebook and passing `schema` as a task "
             "parameter, which the notebook reads at run time "
-            "(`oidlUtils.parameters.getParameter`). **Registered, never "
-            "run**: moving rows is the customer's decision.", "",
-            "| Schema (task parameter) | Job | Notebook |", "|---|---|---|"]
-        lines += [f'| `{j["schema"]}` | `{j["job"]}` | `{j["notebook"]}` |'
+            f"(`oidlUtils.parameters.getParameter`). {verdict}: moving rows "
+            "is the customer's decision.", "",
+            "| Schema (task parameter) | Job | Notebook | Status |",
+            "|---|---|---|---|"]
+        lines += [f'| `{j["schema"]}` | `{j["job"]}` | `{j["notebook"]}` | '
+                  f'{j.get("status") or "—"} |'
                   for j in res["copy_jobs"]]
+        lines.append("")
+
+    if res.get("stale_copy_jobs"):
+        lines += [
+            "## Copy jobs NOT in this plan (still on the workspace)", "",
+            "Registered by an earlier push for a schema the present plan "
+            "does not name. They are still runnable; delete them in the "
+            "console (or re-plan to include the schema):", ""]
+        lines += [f"- `{name}`" for name in res["stale_copy_jobs"]]
         lines.append("")
 
     if res.get("notebooks_kept"):
