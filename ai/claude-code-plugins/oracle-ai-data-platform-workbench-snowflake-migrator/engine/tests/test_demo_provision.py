@@ -62,3 +62,18 @@ def test_the_demo_line_counts_notebooks_as_notebooks(demo):
     assert f"{notebooks} notebook(s)" in line, line
     jobs = sum(1 for s in prov["steps"] if s["step"] == "job")
     assert f"{jobs} jobs" in line, line
+
+
+def test_a_corrupt_ddl_plan_is_named_with_a_remedy(tmp_path):
+    # cmd_provision used to read ddl_plan.json through snowmig._read, which
+    # names the file and says how to recover. Reading it through
+    # plan_push_inputs with a bare json.loads surfaced the decoder's own
+    # "Expecting property name ..." with no path, so the operator could not
+    # tell which artifact was broken.
+    (tmp_path / "ddl_plan.json").write_text("{bad", encoding="utf-8")
+    with pytest.raises(ValueError) as exc:
+        plan_push_inputs(tmp_path)
+    message = str(exc.value)
+    assert str(tmp_path / "ddl_plan.json") in message
+    assert "not valid JSON" in message
+    assert "re-run" in message

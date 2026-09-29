@@ -154,9 +154,17 @@ def plan_push_inputs(out_dir) -> tuple[list[pathlib.Path], list[str]]:
     out = pathlib.Path(out_dir)
     files = [out / n for n in PLAN_PUSH_FILES if (out / n).is_file()]
     ddl = out / "ddl_plan.json"
-    schemas = (plan_copy_schemas(json.loads(ddl.read_text(encoding="utf-8")))
-               if ddl.is_file() else [])
-    return files, schemas
+    if not ddl.is_file():
+        return files, []
+    try:
+        plan = json.loads(ddl.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        # Name the file and the remedy, as snowmig._read does: the decoder's
+        # own message says where in the text, not which artifact.
+        raise ValueError(
+            f"{ddl} is not valid JSON ({exc}); delete it and re-run the "
+            f"stage that produces it (`snowmig ddl`)") from exc
+    return files, plan_copy_schemas(plan)
 
 
 def copy_job_specs(schemas) -> list[dict]:
