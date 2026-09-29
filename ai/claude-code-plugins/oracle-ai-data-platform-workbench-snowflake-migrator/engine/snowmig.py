@@ -1884,7 +1884,8 @@ def cmd_teardown(args) -> int:
         raise MissingTarget("teardown --execute needs --datalake-ocid (or "
                             "aidp.datalake_ocid in the config)")
     call = make_provision_call(ocid) if args.execute else None
-    res = teardown(call, prov, action=action, execute=args.execute)
+    res = teardown(call, prov, action=action, execute=args.execute,
+                   datalake_ocid=ocid)
     _write(out, "teardown_result.json", res)
     _write(out, "TEARDOWN.md", render_teardown(res))
     targets = [s for s in res["steps"] if s.get("cluster")]
@@ -2203,27 +2204,17 @@ def cmd_provision(args) -> int:
     # A re-push into THIS migration's own workspace (the plan, after S7/S9)
     # inherits the coordinates the first push baked in, so the notebooks it
     # adds -- the per-schema copy workflows -- carry the same catalogs and
-    # the same credential path as the stages already there. Only from the
-    # record of the same workspace; a flag still wins.
-    inherited_credential = None
-    prior = (_read(out, "provision_result.json")
-             if args.reuse_existing
-             and (out / "provision_result.json").is_file() else None)
-    if prior and not prior.get("dry_run") and (
-            (prior.get("workspace") or {}).get("requested")
-            == args.workspace_name):
-        external_catalog = external_catalog or prior.get("external_catalog")
-        target_catalog = target_catalog or prior.get("target_catalog")
-        if not args.source_config and prior.get("credential_objects"):
-            inherited_credential = prior["credential_objects"][0]
-        print(f"  re-push into this migration's workspace "
-              f"{prior['workspace'].get('name')}: catalogs and credential "
-              f"path taken from provision_result.json where no flag gave "
-              f"them")
+    # the same credential path as the stages already there. provision()
+    # decides that from the earlier EXECUTED record: same aiDataPlatform,
+    # same workspace key (known only once it is listed), and the inherited
+    # credential looked for before it is used; a flag still wins.
+    earlier = (_read(out, "provision_result.json")
+               if _executed_record_exists(out, "provision_result.json")
+               else None)
+    ocid = args.datalake_ocid or aidp.get("datalake_ocid")
 
     call = None
     if args.execute:
-        ocid = args.datalake_ocid or aidp.get("datalake_ocid")
         if not ocid:
             raise MissingTarget(
                 "--execute needs the aiDataPlatform OCID: put it under "
@@ -2248,7 +2239,14 @@ def cmd_provision(args) -> int:
         output_dir=_reporting(args)["workspace_dir"],
         refresh_notebooks=args.refresh_notebooks,
         plan_label=args.plan_label, copy_schemas=copy_schemas,
-        inherited_credential=inherited_credential)
+        prior=earlier, datalake_ocid=ocid)
+    if res.get("inherited_from"):
+        print(f"  re-push into this migration's workspace "
+              f"{res['workspace'].get('name')}: catalogs and credential "
+              f"path taken from provision_result.json where no flag gave "
+              f"them" + (" (provisional: an executed run confirms the "
+                         "workspace key and looks for the credential first)"
+                         if res["inherited_from"].get("provisional") else ""))
     # No executed push drops what an earlier one allocated. A re-push finds
     # what the first push created and records it as reused; the earlier
     # executed record is the proof it was created here, and whatever this
@@ -2256,9 +2254,6 @@ def cmd_provision(args) -> int:
     # --warehouse-clusters) is kept as `earlier_allocations`, so teardown
     # still reaches it -- and still leaves alone what this migration never
     # created.
-    earlier = (_read(out, "provision_result.json")
-               if _executed_record_exists(out, "provision_result.json")
-               else None)
     if (not res["dry_run"] and not res["workspace"].get("key") and earlier
             and (earlier.get("workspace") or {}).get("key")):
         # Halted before any key was recorded (name_taken without
@@ -2280,13 +2275,19 @@ def cmd_provision(args) -> int:
 
     for obj in res.get("credential_objects") or []:
         # Said out loud, dry run or not: this is the one object this plugin
-        # places anywhere that holds a secret.
+        # places anywhere that holds a secret. Executed, the list holds only
+        # what was read back on the workspace.
         print(f"  CREDENTIAL ON THE WORKSPACE MOUNT: {obj} "
               f"{'would hold' if res['dry_run'] else 'holds'} the Snowflake "
               f"connection block, credential included -- readable by every "
               f"member of workspace {res['workspace']['name']} and every "
               f"cluster in it via /Workspace. Remove it when the migration "
               f"is done.", file=sys.stderr)
+    for obj in res.get("credential_unconfirmed") or []:
+        print(f"  CREDENTIAL MAY BE ON THE WORKSPACE MOUNT: {obj} -- its "
+              f"upload could not be read back. Check workspace "
+              f"{res['workspace']['name']} and remove it if it is there.",
+              file=sys.stderr)
 
     failed = [s for s in res["steps"] if s["verified"] is False]
     if res["dry_run"]:

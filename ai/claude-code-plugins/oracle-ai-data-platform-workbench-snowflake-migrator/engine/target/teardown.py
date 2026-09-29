@@ -47,7 +47,8 @@ def _targets(prov: dict) -> tuple[list[dict], list[dict]]:
             seen.add(at)
             targets.append({"cluster": rec["cluster"], "name": rec["name"],
                             "role": rec["role"],
-                            "workspace": rec["workspace"]})
+                            "workspace": rec["workspace"],
+                            "datalake_ocid": rec["datalake_ocid"]})
     for rec in records:
         at = (rec["workspace"], rec["cluster"])
         if rec["provenance"] == NOT_CREATED and at not in seen:
@@ -68,7 +69,15 @@ def _state(call, workspace: str, key: str):
 
 def teardown(call, prov: dict, *, action: str, execute: bool,
              delays: tuple[float, ...] = (10.0, 20.0, 30.0, 30.0, 60.0,
-                                          60.0)) -> dict:
+                                          60.0),
+             datalake_ocid: str | None = None) -> dict:
+    """Stop or delete what `prov` proves this migration created.
+
+    `datalake_ocid` is the aiDataPlatform this teardown's transport talks
+    to. A cluster recorded in ANOTHER one is not looked for here (its
+    workspace key means nothing on this platform, and "not listed" would
+    read as gone); it is a failed step naming the platform to re-run
+    against."""
     if action not in ACTIONS:
         raise ValueError(f"unknown teardown action {action!r}; expected one "
                          f"of {', '.join(ACTIONS)}")
@@ -100,6 +109,15 @@ def teardown(call, prov: dict, *, action: str, execute: bool,
     for t in targets:
         step = dict(t)
         where = t.get("workspace") or workspace
+        if (datalake_ocid and t.get("datalake_ocid")
+                and t["datalake_ocid"] != datalake_ocid):
+            step.update(action="not_reached", verified=False,
+                        detail=f'recorded in aiDataPlatform '
+                               f'{t["datalake_ocid"]}, not the one this '
+                               f'teardown targets; re-run teardown with '
+                               f'--datalake-ocid {t["datalake_ocid"]}')
+            base["steps"].append(step)
+            continue
         try:
             before = _state(call, where, t["cluster"])
             if action == "stop" and before in _STOPPED:

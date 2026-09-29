@@ -488,6 +488,28 @@ def _pypi_from_requirements(path: pathlib.Path | None) -> list[str]:
     return out
 
 
+def _current_credential(prior: dict) -> str | None:
+    """The credential path the earlier record's notebooks were pointed at:
+    its own request, else the newest object it tracks that no later
+    --source-config superseded. Still to be LOOKED FOR before use."""
+    superseded = set(prior.get("credential_superseded") or [])
+    for obj in (prior.get("credential_requested"),
+                *(prior.get("credential_objects") or []),
+                *(prior.get("credential_unconfirmed") or [])):
+        if obj and obj not in superseded:
+            return obj
+    return None
+
+
+def _inherited(prior: dict, *, external_catalog, target_catalog,
+               credential_given: bool):
+    """(external_catalog, target_catalog, credential path) after inheriting
+    from `prior` wherever no argument gave a value."""
+    return (external_catalog or prior.get("external_catalog"),
+            target_catalog or prior.get("target_catalog"),
+            None if credential_given else _current_credential(prior))
+
+
 def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               cluster_name: str = "migration-assets",
               scripts: list[pathlib.Path],
@@ -510,7 +532,8 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               refresh_notebooks: bool = False,
               plan_label: str | None = None,
               copy_schemas=(),
-              inherited_credential: str | None = None,
+              prior: dict | None = None,
+              datalake_ocid: str | None = None,
               now: datetime.datetime | None = None) -> dict:
     """Provision this migration's own environment inside AIDP.
 
@@ -535,6 +558,16 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     rejects it), or values that would land only on a notebook this run
     keeps are refused with a ValueError, never dropped -- a scope flag that
     silently does nothing reads as applied.
+
+    `prior` is the earlier EXECUTED record of this out dir. A
+    `reuse_existing` re-push into the workspace it records inherits the
+    catalogs and the credential path it baked in, where no argument gives
+    them -- only when it names the same aiDataPlatform (`datalake_ocid`)
+    and, once listed, the same workspace KEY; a name alone is not the same
+    workspace. An inherited credential path is listed on the workspace
+    before it is baked into a notebook or announced. A credential object is
+    recorded in `credential_objects` only once its upload is read back;
+    one that may or may not have landed is `credential_unconfirmed`.
     """
     stamp = (now or datetime.datetime.now(datetime.timezone.utc)
              ).strftime("%Y%m%dT%H%M%SZ")
@@ -573,6 +606,22 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         credential_object = f"{PLAN_FOLDER}/{source_config.stem}.json"
         plan_files = [p for p in plan_files
                       if pathlib.Path(p).resolve() != source_config.resolve()]
+    # What a re-push may inherit, and from which record. In a dry run the
+    # workspace key is unknown, so the preview inherits provisionally; an
+    # executed run confirms the key before using any of it.
+    inherit_from = None
+    if (reuse_existing and prior and prior.get("dry_run") is False
+            and (prior.get("workspace") or {}).get("requested")
+            == workspace_name
+            and not (datalake_ocid and prior.get("datalake_ocid")
+                     and prior["datalake_ocid"] != datalake_ocid)):
+        inherit_from = prior
+    inherited_credential = None
+    if inherit_from is not None and not execute:
+        external_catalog, target_catalog, inherited_credential = _inherited(
+            inherit_from, external_catalog=external_catalog,
+            target_catalog=target_catalog,
+            credential_given=credential_object is not None)
     # One cluster per Snowflake warehouse, named after it. Sizing is NOT
     # carried over: the user asked for same-name clusters on the AIDP default
     # config, and the `compute` stage's proposal stays a proposal until
@@ -633,9 +682,16 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         # in one place and the operator knows what to remove afterwards.
         # A re-push that inherited the path records it too: the object is
         # still on the workspace, and the next push inherits from here.
-        "credential_objects": ([credential_object] if credential_object
+        # In a dry run, what would hold it; executed, only what was read
+        # back on the workspace (an upload that raised or was not seen is
+        # `credential_unconfirmed`: it may have landed).
+        "credential_objects": ([] if execute else
+                               [credential_object] if credential_object
                                else [inherited_credential]
                                if inherited_credential else []),
+        "credential_requested": credential_object,
+        "credential_unconfirmed": [],
+        "datalake_ocid": datalake_ocid,
         # Stage notebooks left as found on the workspace (reuse_existing
         # without refresh_notebooks), so PROVISION.md can list them.
         "notebooks_kept": [],
@@ -650,6 +706,10 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                       for sp in job_specs if sp.get("task_parameters")],
         "steps": [],
     }
+
+    if inherit_from is not None and not execute:
+        out["inherited_from"] = {"run": inherit_from.get("run"),
+                                 "provisional": True}
 
     def step(name: str, action: str, verified: bool | None,
              detail: str = "") -> None:
@@ -704,6 +764,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
 
     if call is None:
         raise ValueError("execute=True requires a transport callable")
+    credential_ready = False
 
     # 1 · workspace: look, create if absent, poll until visible AND ACTIVE --
     found = _match(call("list_workspaces").get("items") or [], ws_name.name)
@@ -750,6 +811,23 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     out["workspace"]["key"] = ws_key
     if ws_created:
         out["workspace"].update(created=True, created_run=stamp)
+    if inherit_from is not None and found is not None:
+        was = (inherit_from.get("workspace") or {}).get("key")
+        if was == ws_key:
+            external_catalog, target_catalog, inherited_credential = (
+                _inherited(inherit_from, external_catalog=external_catalog,
+                           target_catalog=target_catalog,
+                           credential_given=credential_object is not None))
+            out.update(external_catalog=external_catalog,
+                       target_catalog=target_catalog,
+                       inherited_from={"run": inherit_from.get("run"),
+                                       "workspace": ws_key})
+        else:
+            step("inherit", "skipped", None,
+                 f"the earlier record names workspace key {was}, this "
+                 f"workspace is {ws_key}: a different workspace under the "
+                 f"same name, so no catalog or credential path was "
+                 f"inherited")
     if found is None:
         if ws_created and ws_list_error is not None:
             step("halt", "stopped", False,
@@ -1021,14 +1099,47 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                      _credential_line(source_config.name, credential_object)
                      + ("" if found else "; not visible in listing"))
             except Exception as exc:
+                found = False
                 step("upload", "failed", False,
                      f"{credential_object}: {str(exc)[:200]} (it carries "
                      f"the credential; check whether it landed)")
+            credential_ready = found
+            out["credential_objects" if found
+                else "credential_unconfirmed"].append(credential_object)
         finally:
             try:
                 os.unlink(local)
             except OSError:
                 pass
+    elif inherited_credential:
+        # Named by the earlier record is not "on the workspace": its upload
+        # may have failed, or the object been removed since. Looked for
+        # before it is baked into a notebook or announced as holding it.
+        name = inherited_credential.rsplit("/", 1)[-1]
+        try:
+            items = call("list_ws_objects", workspace=ws_key,
+                         path=PLAN_FOLDER).get("items") or []
+            present = any(str(i.get("path") or "").endswith("/" + name)
+                          or i.get("displayName") == name for i in items)
+            why = f"is not in the listing of {PLAN_FOLDER}"
+        except Exception as exc:
+            present = False
+            why = f"could not be looked for ({str(exc)[:160]})"
+        if present:
+            out["credential_objects"].append(inherited_credential)
+            step("credential", "inherited", True,
+                 f"{inherited_credential}: placed by an earlier push of this "
+                 f"migration and still on the workspace; not re-uploaded. It "
+                 f"CARRIES THE SNOWFLAKE CREDENTIAL; remove it when the "
+                 f"migration is done")
+        else:
+            out.setdefault("credential_missing", []).append(
+                inherited_credential)
+            step("credential", "missing", False,
+                 f"{inherited_credential}: named by the earlier record, but "
+                 f"it {why}, so no notebook was pointed at it. Re-run with "
+                 f"--source-config <the migration config> to place it")
+            inherited_credential = None
 
     # 5 · stage notebooks + jobs ---------------------------------------------
     # Job `parameters` reach the notebook neither as argv nor as environment
@@ -1048,9 +1159,10 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         defaults["source-catalog"] = external_catalog
     if target_catalog:
         defaults["target-catalog"] = target_catalog
-    if credential_object:
+    if credential_object and credential_ready:
         # The scripts read the credential from the derived copy ON THE MOUNT,
         # so the path they receive is the /Workspace one, not the local one.
+        # Only once it was read back there: a path to nothing is not baked.
         defaults["source-config"] = f"/Workspace/{credential_object}"
     elif inherited_credential:
         # A re-push that did not re-upload it: the copy an earlier push of
@@ -1258,7 +1370,9 @@ def carry_forward(res: dict, prior: dict | None) -> dict:
     created, and that this push does not record itself --
     the plan push carries no --warehouse-clusters, a push may go to
     another workspace -- is kept under `earlier_allocations`, each with its
-    own workspace key. Returns `res`, updated in place.
+    own workspace key. Credential objects are kept the same way (see
+    _carry_credentials). A record of another aiDataPlatform is never "the
+    same workspace", whatever its key. Returns `res`, updated in place.
     """
     from .provenance import CREATED, cluster_records
     if (not prior or prior.get("dry_run") is not False
@@ -1267,11 +1381,15 @@ def carry_forward(res: dict, prior: dict | None) -> dict:
     ws = (res.get("workspace") or {}).get("key")
     prior_ws = prior.get("workspace") or {}
     same_ws = bool(ws) and prior_ws.get("key") == ws
+    if (same_ws and res.get("datalake_ocid") and prior.get("datalake_ocid")
+            and res["datalake_ocid"] != prior["datalake_ocid"]):
+        same_ws = False          # a key is only unique within one platform
     if same_ws and prior_ws.get("created") and not res["workspace"].get(
             "created"):
         res["workspace"].update(
             created=True, created_run=prior_ws.get("created_run")
             or prior.get("run"), created_by_earlier_push=True)
+    _carry_credentials(res, prior, same_ws)
     records = cluster_records(prior)
     owned = {r["cluster"]: r for r in records if r["provenance"] == CREATED}
     here = [res.get("cluster") or {}, *(res.get("warehouse_clusters") or [])]
@@ -1286,7 +1404,7 @@ def carry_forward(res: dict, prior: dict | None) -> dict:
         if was.get("created_at") and not rec.get("created_at"):
             rec["created_at"] = was["created_at"]
     recorded = {(ws, rec.get("key")) for rec in here
-                if rec.get("key") and rec.get("created")}
+                if same_ws and rec.get("key") and rec.get("created")}
     kept, seen = [], set()
     for r in records:
         at = (r["workspace"], r["cluster"])
@@ -1300,10 +1418,46 @@ def carry_forward(res: dict, prior: dict | None) -> dict:
                  "created_run": was.get("created_run") or prior.get("run")}
         if was.get("created_at"):
             entry["created_at"] = was["created_at"]
+        if prior.get("datalake_ocid"):
+            entry["datalake_ocid"] = prior["datalake_ocid"]
         kept.append(entry)
     if kept:
         res["earlier_allocations"] = kept
     return res
+
+
+def _carry_credentials(res: dict, prior: dict, same_ws: bool) -> None:
+    """Every credential placement stays tracked. Objects the earlier record
+    tracked on the same workspace are kept in `credential_objects` (one
+    this push's --source-config replaces is flagged in
+    `credential_superseded`: it still holds the previous credential);
+    objects on another workspace go to `earlier_credential_objects`."""
+    missing = set(res.get("credential_missing") or [])
+    earlier = [dict(e) for e in prior.get("earlier_credential_objects") or []]
+    if not same_ws:
+        where = (prior.get("workspace") or {}).get("key")
+        for obj in [*(prior.get("credential_objects") or []),
+                    *(prior.get("credential_unconfirmed") or [])]:
+            earlier.append({"workspace": where, "path": obj})
+    else:
+        mine = res.setdefault("credential_objects", [])
+        unsure = res.setdefault("credential_unconfirmed", [])
+        superseded = [o for o in prior.get("credential_superseded") or []]
+        requested = res.get("credential_requested")
+        for obj in prior.get("credential_objects") or []:
+            if obj in mine or obj in missing or obj in unsure:
+                continue
+            mine.append(obj)
+            if requested and obj != requested and obj not in superseded:
+                superseded.append(obj)
+        for obj in prior.get("credential_unconfirmed") or []:
+            if obj not in mine and obj not in missing and obj not in unsure:
+                unsure.append(obj)
+        superseded = [o for o in superseded if o in mine or o in unsure]
+        if superseded:
+            res["credential_superseded"] = superseded
+    if earlier:
+        res["earlier_credential_objects"] = earlier
 
 
 def download_ws_file(call: Callable[..., dict], *, workspace: str,
@@ -1401,11 +1555,31 @@ def render_provision(res: dict) -> str:
             "is readable by **every member of this workspace and every "
             "cluster in it** via `/Workspace`, for as long as it stays "
             "there:", ""]
-        lines += [f"- `{obj}`" for obj in res["credential_objects"]]
+        superseded = set(res.get("credential_superseded") or [])
+        lines += [f"- `{obj}`" + (" -- superseded by this push's "
+                                  "`--source-config`; it still holds the "
+                                  "previous credential; remove it"
+                                  if obj in superseded else "")
+                  for obj in res["credential_objects"]]
         lines += ["",
                   "Remove it from the workspace once the migration is done, "
                   "and rotate the Snowflake credential if anyone who must "
                   "not hold it can read this workspace.", ""]
+    if res.get("credential_unconfirmed"):
+        lines += ["## Credential placement NOT confirmed", "",
+                  "An upload of the Snowflake credential was attempted and "
+                  "could not be read back. It may or may not be on the "
+                  "workspace; check, and remove it if it is:", ""]
+        lines += [f"- `{obj}`" for obj in res["credential_unconfirmed"]]
+        lines.append("")
+    if res.get("earlier_credential_objects"):
+        lines += ["## Credential placed by an earlier push on another "
+                  "workspace", "",
+                  "Still tracked here so it is not forgotten; remove it "
+                  "there once the migration is done:", ""]
+        lines += [f'- `{e.get("path")}` in workspace `{e.get("workspace")}`'
+                  for e in res["earlier_credential_objects"]]
+        lines.append("")
 
     if res.get("copy_jobs"):
         lines += [

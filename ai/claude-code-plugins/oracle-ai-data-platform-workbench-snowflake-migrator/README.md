@@ -303,7 +303,13 @@ can reach Snowflake themselves. **It carries the credential**, which is why
 it is uploaded only when you pass it explicitly; the `aidp:` block is not
 copied, and a config whose secret is a `*_path` is refused before anything
 is uploaded, because that path does not exist on the cluster. The copy is
-JSON, so the scripts need no PyYAML to read it.
+JSON, so the scripts need no PyYAML to read it. It is recorded as holding
+the credential only once it is read back on the workspace. A
+`--reuse-existing` re-push inherits its path only into the same
+aiDataPlatform and workspace key, and only after finding the object there;
+a re-push with a different `--source-config` keeps the old object on the
+record, flagged as still holding the previous credential, until you
+remove it.
 
 ### 7. Register the source as an EXTERNAL catalog, then create the INTERNAL target (S3, S4)
 

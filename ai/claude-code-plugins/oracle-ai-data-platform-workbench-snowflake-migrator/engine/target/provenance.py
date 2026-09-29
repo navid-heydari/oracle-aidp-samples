@@ -60,7 +60,8 @@ def _verdict(rec: dict, legacy) -> tuple[str, str]:
 
 def cluster_records(prov: dict) -> list[dict]:
     """Every cluster the record names, each with its provenance:
-    {cluster, name, role, workspace, provenance, why, record}.
+    {cluster, name, role, workspace, datalake_ocid, provenance, why,
+    record}.
 
     `cluster` is the key (None for a create that was accepted but never
     listed). `role` of an earlier push's allocation is the role it was
@@ -75,6 +76,8 @@ def cluster_records(prov: dict) -> list[dict]:
         out.append({"cluster": rec.get("key"), "name": rec.get("name"),
                     "role": role,
                     "workspace": rec.get("workspace") or workspace,
+                    "datalake_ocid": (rec.get("datalake_ocid")
+                                      or prov.get("datalake_ocid")),
                     "provenance": provenance, "why": why, "record": rec})
 
     cl = prov.get("cluster") or {}
