@@ -19,17 +19,47 @@ Runs on AIDP compute. Three structure sources, chosen with --mode:
   manifest            types come from discovery_manifest.json verbatim. Only
                       valid when the manifest carries SPARK types, i.e. it
                       was built in external-catalog mode (DESCRIBE); a
-                      connector-mode manifest carries SNOWFLAKE types and is
-                      refused here rather than mistranslated.
+                      connector-mode manifest carries SNOWFLAKE types and the
+                      whole run is refused before anything is created. Some
+                      of those types Delta accepts verbatim with another
+                      meaning -- FLOAT is 64-bit in Snowflake and 32-bit in
+                      Spark -- so no per-type check can tell them apart.
 
 Safety: CREATE TABLE IF NOT EXISTS everywhere; nothing is ever dropped or
 replaced here. The target catalog must be INTERNAL — this script REFUSES to
 address the source catalog as its target, and AIDP refuses DDL on external
 catalogs anyway (documented), so the failure would be loud, not silent.
 
-Writes `structure_report_<schema>.json` per schema: created / already-existed
-/ failed, each with a reason. Resumable: an object already recorded as created
-is skipped (--force re-issues the IF NOT EXISTS create, which is idempotent).
+The CREATE returning is not the claim: IF NOT EXISTS is a silent no-op on a
+table that is already there, so every table is DESCRIBEd afterwards and
+compared with the plan, column by column and in order.
+
+In --mode ddl-plan the plan's `NOT NULL`, column COMMENTs and table COMMENT
+are applied, not just its names and types: they are in the CREATE TABLE the
+reviewer approved, and this stage used to render `name type` and then compare
+against the same reduced shape, so a table that differed from the approved
+SQL still read back as matching. Nullability is read from the table's schema
+(DESCRIBE does not report it); when that read fails the table's record says
+the property is UNCHECKED rather than counting it as applied.
+
+Writes `structure_report_<schema>.json` per schema, one status per table:
+  created          it was not there before, and it reads back as planned
+  already_existed  it was there before, and it matches the plan (in
+                   --mode ctas there is no plan: the layout is NOT
+                   compared, and the record's reason says so)
+  type_drift       it was there with a layout the plan did not produce; it
+                   is left as found, listed with the differing columns, and
+                   counted as a problem (exit 1) -- the copy is a positional
+                   INSERT, so a mismatched layout would land rows in the
+                   wrong columns with matching counts
+  not_in_plan      the approved plan carries no columns for it; NOT created
+  failed           the CREATE raised; the error is the reason
+Resumable: `created` and `already_existed` are skipped on a re-run with the
+same --mode (--force re-checks them); one recorded under another --mode is
+re-checked, because that mode's layout is not this one's -- a table --mode
+manifest created is not thereby what the ddl plan approved. `type_drift`,
+`failed` and `not_in_plan` are looked at again every run, so fixing the
+table or the plan is enough.
 """
 from __future__ import annotations
 
@@ -87,48 +117,247 @@ def _load_report(path: pathlib.Path, schema: str, target: str) -> dict:
     """
     if not path.exists():
         return {"schema": schema, "objects": {}, "target": target}
-    prior = json.loads(path.read_text())
+    prior = json.loads(path.read_text(encoding="utf-8"))
     if prior.get("target") and prior["target"] != target:
         log(f"{schema}: the previous report targeted {prior['target']}, not "
             f"{target} — starting a fresh record for this target (the old "
             f"one is kept at {path.name}.{prior['target'].replace('.', '_')})")
         path.with_suffix(
             f".{prior['target'].replace('.', '_')}.json").write_text(
-                json.dumps(prior, indent=2))
+                json.dumps(prior, indent=2), encoding="utf-8")
         return {"schema": schema, "objects": {}, "target": target}
     return prior
 
 
+class TypeDrift(Exception):
+    """The table was already there with a layout the plan did not produce."""
+
+
+def _describe_columns(spark, fqn: str) -> list[tuple[str, str]] | None:
+    """(name, type) pairs from DESCRIBE, or None when the table is not there.
+
+    Columns end at the first blank or `#` row (Delta's metadata section).
+    """
+    try:
+        rows = spark.sql(f"DESCRIBE {fqn}").collect()
+    except Exception:
+        return None
+    out: list[tuple[str, str]] = []
+    for row in rows:
+        name = str(row["col_name"] or "").strip()
+        if not name or name.startswith("#"):
+            break
+        out.append((name, str(row["data_type"] or "")))
+    return out
+
+
+def _describe_comments(spark, fqn: str) -> dict[str, str] | None:
+    """{column: comment} from DESCRIBE's third column, upper-cased keys.
+
+    None when the read-back carries no comment column at all -- a comment
+    that was NOT LOOKED AT must not read as a comment that is missing.
+    DESCRIBE reports comments; it does NOT report nullability, which is why
+    that is read from the table's schema instead.
+    """
+    try:
+        rows = spark.sql(f"DESCRIBE {fqn}").collect()
+    except Exception:
+        return None
+    out: dict[str, str] = {}
+    carried = False
+    for row in rows:
+        name = str(row["col_name"] or "").strip()
+        if not name or name.startswith("#"):
+            break
+        try:
+            value = row["comment"]
+            carried = True
+        except Exception:
+            value = None
+        out[name.upper()] = str(value or "")
+    return out if carried else None
+
+
+def _nullability(spark, fqn: str) -> dict[str, bool] | None:
+    """{column: nullable} from the table's schema, or None when unreadable.
+
+    DESCRIBE has no nullability column, so the read-back for `NOT NULL` is
+    the StructType. None means NOT CHECKED -- reported as such rather than
+    passed off as a match, because "we did not look" and "it is right" are
+    the two answers this whole stage exists to keep apart.
+    """
+    try:
+        fields = spark.table(fqn).schema.fields
+        return {str(f.name).upper(): bool(f.nullable) for f in fields}
+    except Exception:
+        return None
+
+
+def _norm_type(value: str) -> str:
+    """Compare types ignoring case and internal spacing only."""
+    return "".join(str(value).split()).upper()
+
+
+def _compare_columns(expected: list[dict],
+                     actual: list[tuple[str, str]],
+                     nullable: dict[str, bool] | None = None,
+                     comments: dict[str, str] | None = None) -> str | None:
+    """None if the structures match, else a one-line description of the diff.
+
+    Same rule as the control-plane deploy: names and types, in order. A
+    same-count layout in another order is a diff -- the copy is a positional
+    INSERT, so that is the case that lands rows in the wrong columns with
+    matching counts.
+
+    `NOT NULL` and column COMMENTs are part of the approved DDL, so they are
+    compared too when the read-back supplies them: a table created with the
+    reviewed SQL and reported "verified" against a name-and-type-only
+    comparison is how the reviewed artifact and the applied one came apart in
+    the first place. `nullable=None` means the schema could not be read; the
+    caller says so rather than counting it as a match.
+    """
+    want = [(str(c.get("name", "")).upper(), _norm_type(c.get("type", "")))
+            for c in expected]
+    got = [(n.upper(), _norm_type(ty)) for n, ty in actual]
+    if want != got:
+        if len(want) != len(got):
+            return (f"column count differs: planned {len(want)}, found {len(got)} "
+                    f"(planned {[n for n, _ in want]}, found {[n for n, _ in got]})")
+        diffs = [f"position {i + 1}: planned {w[0]} {w[1]}, found {g[0]} {g[1]}"
+                 for i, (w, g) in enumerate(zip(want, got)) if w != g]
+        return "; ".join(diffs)
+
+    property_diffs: list[str] = []
+    for col in expected:
+        name = str(col.get("name", "")).upper()
+        if nullable is not None and col.get("nullable") is False \
+                and nullable.get(name, True):
+            property_diffs.append(
+                f"{name}: planned NOT NULL, found nullable")
+        if comments is not None:
+            planned = str(col.get("description") or "")
+            found = str(comments.get(name) or "")
+            if planned and planned != found:
+                property_diffs.append(
+                    f"{name}: planned comment {planned!r}, found {found!r}")
+    return "; ".join(property_diffs) or None
+
+
 def create_table_ctas(source: SnowflakeSource, schema: str, name: str,
-                      target_catalog: str, target_schema: str) -> None:
+                      target_catalog: str, target_schema: str) -> str:
     """Empty table whose columns Spark derives from the SOURCE read.
 
     The source is addressed through `SnowflakeSource`, so this works in
     connector mode (a temp view over the connector read) as well as against
-    an external catalog's three-part name.
+    an external catalog's three-part name. Returns `created`, or
+    `already_existed` when the table was there before this run -- CTAS has
+    no plan to compare that layout with, so it is reported, not checked.
     """
+    fqn = three(target_catalog, target_schema, name)
+    if _describe_columns(source.spark, fqn) is not None:
+        return "already_existed"
     view = f"snowmig_src_{schema}_{name}".lower()[:120]
     ref = source.register_temp_view(schema, name, view)
     try:
         source.spark.sql(
-            f"CREATE TABLE IF NOT EXISTS "
-            f"{three(target_catalog, target_schema, name)} "
+            f"CREATE TABLE IF NOT EXISTS {fqn} "
             f"USING DELTA AS SELECT * FROM {ref} WHERE 1=0")
     finally:
         source.drop_temp_view(view)
+    return "created"
+
+
+def lit(value: str) -> str:
+    """A single-quoted Spark string literal, escaped the way Spark expects.
+
+    Backslash, not doubling: Spark reads `'it\\'\\'s'` as two adjacent
+    literals and concatenates them, so a doubled quote silently eats the
+    apostrophe. Identical to `target.ddl.quote_spark_string`, which this
+    stage cannot import (it is uploaded as a single standalone file).
+    """
+    escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
+    return "'" + escaped + "'"
+
+
+def _column_sql(col: dict) -> str:
+    """One column of the CREATE TABLE, from one `expected_columns` entry.
+
+    The SAME rules as `target.ddl.render_column_sql`, which wrote the SQL the
+    operator approved in DDL_PLAN.md -- a parity test in the engine's suite
+    holds the two together. This stage used to render `name type` only, so
+    the `NOT NULL` and the COMMENT in the approved SQL were dropped here and
+    the comparison below then agreed with itself.
+    """
+    piece = f'{q(col["name"])} {col["type"]}'
+    if col.get("nullable") is False:
+        piece += " NOT NULL"
+    if col.get("description"):
+        piece += " COMMENT " + lit(col["description"])
+    return piece
 
 
 def create_table_from_columns(spark, columns: list[dict],
                               target_catalog: str, target_schema: str,
-                              name: str) -> None:
-    """CREATE TABLE from an explicit column list. Types are used verbatim."""
+                              name: str, description: str = "",
+                              notes: list | None = None) -> str:
+    """CREATE TABLE from an explicit column list, then READ IT BACK.
+
+    Types are used verbatim, and so are the plan's `nullable` and
+    `description` -- the properties the approved SQL shows. `CREATE TABLE IF
+    NOT EXISTS` is a silent no-op on a table that is already there, so the
+    CREATE returning is not the claim: the table is DESCRIBEd afterwards and
+    compared with the plan, nullability included.
+    Returns `created` (it was not there before and now matches),
+    `already_existed` (it was there and matches), or raises TypeDrift when
+    what is there differs from the plan -- the table is left as found.
+    `notes` collects what could NOT be checked, so an unverified property is
+    never reported as a verified one.
+    """
     if not columns:
         raise ValueError("no column list for this table; rediscover it or "
                          "use --mode ctas")
-    cols = ", ".join(f'{q(c["name"])} {c["type"]}' for c in columns)
-    spark.sql(
-        f"CREATE TABLE IF NOT EXISTS {three(target_catalog, target_schema, name)} "
-        f"({cols}) USING DELTA")
+    fqn = three(target_catalog, target_schema, name)
+    before = _describe_columns(spark, fqn)
+    if before is None:
+        cols = ", ".join(_column_sql(c) for c in columns)
+        spark.sql(f"CREATE TABLE IF NOT EXISTS {fqn} ({cols}) USING DELTA"
+                  + (f" COMMENT {lit(description)}" if description else ""))
+        after = _describe_columns(spark, fqn)
+        if after is None:
+            raise RuntimeError("CREATE TABLE returned but the table does not "
+                               "DESCRIBE afterwards; NOT created")
+    else:
+        after = before
+
+    # Both extra read-backs are skipped when the plan asks for nothing they
+    # would check: a table with no NOT NULL and no comments costs exactly
+    # what it cost before.
+    wants_not_null = any(c.get("nullable") is False for c in columns)
+    wants_comments = any(c.get("description") for c in columns)
+    nullable = _nullability(spark, fqn) if wants_not_null else None
+    comments = _describe_comments(spark, fqn) if wants_comments else None
+    # Not a match and not a failure: it was not looked at. Said out loud,
+    # because a property reported as applied when nobody checked is the
+    # defect this stage is guarding against.
+    if notes is not None:
+        if wants_not_null and nullable is None:
+            notes.append(
+                "NOT NULL was requested but could not be verified: the "
+                "table's schema could not be read back, so nullability is "
+                "UNCHECKED on this table")
+        if wants_comments and comments is None:
+            notes.append(
+                "column COMMENTs were requested but DESCRIBE carried no "
+                "comment column, so they are UNCHECKED on this table")
+    diff = _compare_columns(columns, after, nullable, comments)
+    if diff is None:
+        return "created" if before is None else "already_existed"
+    if before is None:
+        raise TypeDrift(f"created by this run, but it reads back differently "
+                        f"from the plan -- {diff}")
+    raise TypeDrift(f"already there with a layout the plan did not produce -- "
+                    f"{diff}. CREATE TABLE IF NOT EXISTS left it as found; "
+                    f"NOT created from the plan")
 
 
 # Types Snowflake reports but Spark/Delta does not accept verbatim. Their
@@ -145,6 +374,28 @@ def _looks_like_snowflake_types(columns: list[dict]) -> bool:
                for c in columns for t in _SNOWFLAKE_ONLY_TYPES)
 
 
+def _snowflake_typed_manifest(manifest: dict, schemas: list[str]) -> str | None:
+    """Why this manifest's types are SNOWFLAKE types, or None.
+
+    Decided for the manifest, not per table. The prefix list above only
+    catches types Delta rejects; FLOAT, DATE and BOOLEAN pass it, and FLOAT
+    is then created 32-bit where Snowflake's is a double: READINGS(READING
+    FLOAT) was recorded `created` and the copy narrowed every value to ~7
+    digits. Discovery records which mode wrote the manifest, and the
+    connector's raw `data_type` field is never written by DESCRIBE.
+    """
+    mode = (manifest.get("source") or {}).get("mode")
+    if mode and mode != "external-catalog":
+        return f"it was built in {mode} mode"
+    by_name = {s.get("name"): s for s in manifest.get("schemas") or []}
+    for schema in schemas:
+        for table in (by_name.get(schema) or {}).get("tables") or []:
+            if any("data_type" in c for c in table.get("columns") or []):
+                return (f"{schema}.{table['name']} carries the connector's "
+                        f"raw `data_type` field")
+    return None
+
+
 def columns_from_ddl_plan(ddl_plan: dict) -> dict[tuple[str, str], list[dict]]:
     """{(source_schema, table): [{name, type}]} from the engine's ddl_plan.
 
@@ -159,29 +410,99 @@ def columns_from_ddl_plan(ddl_plan: dict) -> dict[tuple[str, str], list[dict]]:
         parts = ident.split(".")
         if len(parts) != 3 or not stmt.get("expected_columns"):
             continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue                    # views are not created by this path
         out[(parts[1], parts[2])] = stmt["expected_columns"]
     return out
 
 
-def targets_from_ddl_plan(ddl_plan: dict) -> dict[tuple[str, str], dict]:
-    """{(source_schema, name): statement facts} -- the plan's NAMES as well as
-    its types. The target key is the plan's decision (a catalog prefix and a
-    schema style may have renamed every schema); taking names from the
-    manifest instead created objects the plan never approved (live,
-    2026-09-24: 475 tables under the source schema names)."""
+def targets_from_ddl_plan(ddl_plan: dict
+                          ) -> dict[tuple[str, str], tuple[str, str]]:
+    """{(source_schema, table): (target_schema, target_name)} from the plan.
+
+    The plan's `target_fqn` IS the approved name. Deriving it again from the
+    source schema silently discards `--bronze-catalog-prefix` and
+    `--bronze-schema-style`, and creates an object the reviewer never saw.
+
+    A statement without a three-part `target_fqn` contributes nothing: this
+    map is only ever used to place an object the plan actually named.
+    """
+    out: dict[tuple[str, str], tuple[str, str]] = {}
+    for stmt in ddl_plan.get("statements") or []:
+        source = str(stmt.get("source_identifier") or "").split(".")
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(source) != 3 or len(target) != 3:
+            continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue
+        out[(source[1], source[2])] = (target[1], target[2])
+    return out
+
+
+def catalogs_from_ddl_plan(ddl_plan: dict) -> set:
+    """Every catalog the plan targets. More than one, or one that is not
+    the catalog this run was given, is the operator's to see."""
+    out = set()
+    for stmt in ddl_plan.get("statements") or []:
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(target) == 3:
+            out.add(target[0])
+    return out
+
+
+def descriptions_from_ddl_plan(ddl_plan: dict) -> dict[tuple[str, str], str]:
+    """{(source_schema, table): table COMMENT} from the engine's ddl_plan.
+
+    The source table's COMMENT is in the approved CREATE TABLE, so it is
+    applied here too rather than being the one property the reviewer sees
+    and the target never gets.
+    """
+    out: dict[tuple[str, str], str] = {}
+    for stmt in ddl_plan.get("statements") or []:
+        parts = str(stmt.get("source_identifier") or "").split(".")
+        if len(parts) != 3 or not stmt.get("description"):
+            continue
+        if str(stmt.get("object_type") or "TABLE").upper() == "VIEW":
+            continue
+        out[(parts[1], parts[2])] = str(stmt["description"])
+    return out
+
+
+
+def planned_view_facts(ddl_plan: dict) -> dict[tuple[str, str], dict]:
+    """{(source_schema, view): plan facts} for every VIEW the plan carries.
+
+    `targets_from_ddl_plan` is tables only, because it places tables. A view
+    needs its own CREATE VIEW SQL and the target the plan approved, so it is
+    collected separately rather than by widening that map.
+    """
     out: dict[tuple[str, str], dict] = {}
     for stmt in ddl_plan.get("statements") or []:
         parts = str(stmt.get("source_identifier") or "").split(".")
         target = str(stmt.get("target_fqn") or "").split(".")
         if len(parts) != 3 or len(target) != 3:
             continue
+        if str(stmt.get("object_type") or "TABLE").upper() != "VIEW":
+            continue
         out[(parts[1], parts[2])] = {
-            "kind": str(stmt.get("object_type") or "TABLE").upper(),
             "catalog": target[0], "schema": target[1], "name": target[2],
-            "target_fqn": ".".join(target), "sql": stmt.get("sql"),
-            "columns": stmt.get("expected_columns")}
+            "target_fqn": ".".join(target), "sql": stmt.get("sql")}
     return out
 
+
+def planned_schema_targets(ddl_plan: dict) -> dict[str, set]:
+    """{source_schema: {target_schema}} over EVERY statement.
+
+    Tables and views both: a schema the plan carries only views for still
+    has to be created under the name the plan approved, not the source one.
+    """
+    out: dict[str, set] = {}
+    for stmt in ddl_plan.get("statements") or []:
+        parts = str(stmt.get("source_identifier") or "").split(".")
+        target = str(stmt.get("target_fqn") or "").split(".")
+        if len(parts) == 3 and len(target) == 3:
+            out.setdefault(parts[1], set()).add(target[1])
+    return out
 
 def create_planned_views(spark, planned: dict, schemas: list[str],
                          reports: pathlib.Path, target_catalog: str, *,
@@ -191,7 +512,7 @@ def create_planned_views(spark, planned: dict, schemas: list[str],
     sorts first and reads COMMERCE). Returns the failure count."""
     failures = 0
     for (schema, name), fact in sorted(planned.items()):
-        if fact["kind"] != "VIEW" or schema not in schemas:
+        if schema not in schemas:
             continue
         path = _report_path(reports, schema)
         target = f'{target_catalog}.{fact["schema"]}'
@@ -226,6 +547,26 @@ def create_planned_views(spark, planned: dict, schemas: list[str],
     return failures
 
 
+def views_from_ddl_plan(ddl_plan: dict) -> set[tuple[str, str]]:
+    """{(source_schema, view)} for every VIEW statement in the plan."""
+    out: set[tuple[str, str]] = set()
+    for stmt in ddl_plan.get("statements") or []:
+        parts = str(stmt.get("source_identifier") or "").split(".")
+        if len(parts) == 3 and str(stmt.get("object_type") or "").upper() == "VIEW":
+            out.add((parts[1], parts[2]))
+    return out
+
+
+# This stage creates TABLES. The plan's CREATE VIEW statements are qualified
+# with the plan-time target and their bodies would need re-qualifying for a
+# run-time --target-catalog, so views are the catalog path's job (`snowmig
+# deploy --execute`). They are still LISTED here, so a view the plan promised
+# can never be absent from every report with exit 0.
+VIEW_NOT_CREATED = ("views are not created by this stage (tables only); "
+                    "create them with `snowmig deploy --execute` and verify "
+                    "them against the source")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--source-mode", choices=list(SOURCE_MODES),
@@ -255,7 +596,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="print every statement; execute nothing")
     ap.add_argument("--force", action="store_true",
-                    help="re-issue creates the report already records")
+                    help="re-check tables the report already records as "
+                         "created or already_existed")
     args = ap.parse_args(argv)
 
     if args.source_catalog and \
@@ -267,15 +609,31 @@ def main(argv: list[str] | None = None) -> int:
         return fail("error: --target-schema needs exactly one --schema")
 
     reports = pathlib.Path(args.reports_dir)
-    manifest = json.loads((reports / MANIFEST_NAME).read_text())
+    manifest = json.loads((reports / MANIFEST_NAME).read_text(encoding="utf-8"))
     by_name = {s["name"]: s for s in manifest["schemas"]}
     schemas = args.schema or sorted(by_name)
+
+    if args.mode == "manifest":
+        why = _snowflake_typed_manifest(manifest, schemas)
+        if why:
+            return fail(
+                f"error: --mode manifest needs a manifest of SPARK types, and "
+                f"this one records SNOWFLAKE types ({why}; 00_discover's "
+                f"default connector mode writes them on purpose). Delta "
+                f"rejects some of them and accepts others with a different "
+                f"meaning -- FLOAT would be created 32-bit -- so nothing was "
+                f"created. Use --mode ddl-plan (engine-translated types) or "
+                f"--mode ctas.")
 
     from pyspark.sql import SparkSession
     spark = SparkSession.builder.getOrCreate()
 
     planned_columns: dict = {}
-    planned: dict = {}
+    planned_descriptions: dict = {}
+    view_facts: dict = {}
+    planned_schemas: dict = {}
+    planned_views: set | None = None
+    planned_targets: dict = {}
     if args.mode == "ddl-plan":
         ddl_path = (pathlib.Path(args.ddl_plan) if args.ddl_plan
                     else reports.parent / "plan" / "ddl_plan.json")
@@ -283,22 +641,33 @@ def main(argv: list[str] | None = None) -> int:
             return fail(f"--mode ddl-plan needs ddl_plan.json; {ddl_path} is "
                         f"not there. Run the migrator's `ddl` stage and let "
                         f"`provision` upload it, or pass --ddl-plan")
-        ddl_plan = json.loads(ddl_path.read_text())
+        ddl_plan = json.loads(ddl_path.read_text(encoding="utf-8"))
         planned_columns = columns_from_ddl_plan(ddl_plan)
-        planned = targets_from_ddl_plan(ddl_plan)
-        # The plan and the job must agree on the destination. A mismatch is a
-        # plan built for another catalog; creating it here would put
-        # approved objects somewhere nobody approved.
-        stray = sorted({f["catalog"] for f in planned.values()
-                        if f["catalog"].lower() != args.target_catalog.lower()})
+        planned_descriptions = descriptions_from_ddl_plan(ddl_plan)
+        planned_views = views_from_ddl_plan(ddl_plan)
+        planned_targets = targets_from_ddl_plan(ddl_plan)
+        view_facts = planned_view_facts(ddl_plan)
+        planned_schemas = planned_schema_targets(ddl_plan)
+        # A plan for another catalog is a different migration. Creating its
+        # tables here under this run's catalog would be the same silent
+        # substitution this map exists to stop.
+        plan_catalogs = catalogs_from_ddl_plan(ddl_plan)
+        stray = {c for c in plan_catalogs
+                 if c.lower() != str(args.target_catalog).lower()}
         if stray:
-            return fail(f"the approved plan targets catalog(s) "
-                        f"{', '.join(stray)}, not --target-catalog "
-                        f"{args.target_catalog}. Re-plan, or run against the "
-                        f"catalog the plan names; nothing was created.")
+            return fail(
+                f"error: the approved plan targets catalog(s) "
+                f"{', '.join(sorted(stray))}, and this run was given "
+                f"--target-catalog {args.target_catalog}. Creating the "
+                f"plan's tables somewhere it does not name would be exactly "
+                f"the substitution the plan exists to prevent. Re-run `plan "
+                f"--bronze-catalog-prefix {args.target_catalog}` and `ddl` "
+                f"so the plan names this catalog, or point this run at the "
+                f"one the plan names.")
         log(f"ddl plan: {len(planned_columns)} table(s) with engine-"
-            f"translated types, {sum(1 for f in planned.values() if f['kind'] == 'VIEW')} "
-            f"view(s), target names from the plan, from {ddl_path}")
+            f"translated types, from {ddl_path}"
+            + (f"; {len(planned_views)} view(s) it carries are NOT created "
+               f"by this stage" if planned_views else ""))
 
     source = None
     if args.mode == "ctas":
@@ -312,22 +681,51 @@ def main(argv: list[str] | None = None) -> int:
             return fail(f"error: {exc}")
 
     failures = 0
+    # Per-schema status counts, for the run's step output.
     summary: dict[str, dict] = {}
+    # Run-wide, not per schema: a canary plan scoped to one schema
+    # legitimately leaves every other schema all-`not_in_plan`.
+    created_total = 0
+    not_in_plan_total = 0
     for schema in schemas:
         record = by_name.get(schema)
         if record is None:
             return fail(f"error: schema {schema!r} is not in the manifest; run "
                   f"00_discover first")
-        target_schema = args.target_schema or schema
-        # In ddl-plan mode the plan names the target schema; every object of
-        # one source schema lands in the same one.
-        plan_schema = next((f["schema"] for (s_, _), f in planned.items()
-                            if s_ == schema), None)
-        if plan_schema and not args.target_schema:
-            target_schema = plan_schema
+        # The approved plan decides the target namespace. Only where the
+        # plan is silent (ctas/manifest mode, or a table it does not carry)
+        # does the source schema name stand in.
+        planned_for_schema = {
+            tgt_schema for (src_schema, _t), (tgt_schema, _n)
+            in planned_targets.items() if src_schema == schema}
+        # A schema the plan carries only VIEWS for still has an approved
+        # target name; without this it would be created as the source name.
+        planned_for_schema |= planned_schemas.get(schema, set())
+        if args.target_schema:
+            target_schema = args.target_schema
+            if planned_for_schema and target_schema not in planned_for_schema:
+                return fail(
+                    f"error: --target-schema {target_schema!r} contradicts "
+                    f"the approved plan, which puts {schema} in "
+                    f"{', '.join(sorted(planned_for_schema))}. The plan is "
+                    f"the reviewed artifact; change it, or drop the flag.")
+        elif len(planned_for_schema) == 1:
+            target_schema = next(iter(planned_for_schema))
+        elif len(planned_for_schema) > 1:
+            return fail(
+                f"error: the approved plan puts source schema {schema} in "
+                f"more than one target schema "
+                f"({', '.join(sorted(planned_for_schema))}); this stage "
+                f"creates one schema per run. Pass --target-schema to say "
+                f"which.")
+        else:
+            target_schema = schema
         path = _report_path(reports, schema)
         target = f"{args.target_catalog}.{target_schema}"
         report = _load_report(path, schema, target)
+        # Which mode wrote the statuses loaded above, for records that
+        # predate the per-object `mode`.
+        prior_mode = report.get("mode")
         report["target"] = target
         report["mode"] = args.mode
 
@@ -340,10 +738,22 @@ def main(argv: list[str] | None = None) -> int:
 
         for table in record["tables"]:
             name = table["name"]
+            notes: list[str] = []
             prior = report["objects"].get(name, {})
-            if prior.get("status") == "created" and not args.force:
-                log(f"skip {schema}.{name}: already created")
+            done = prior.get("status") in ("created", "already_existed")
+            # Every report this stage writes names its mode; one that does
+            # not was not written by it, and is taken as this run's.
+            recorded_by = prior.get("mode", prior_mode) or args.mode
+            if done and not args.force and recorded_by == args.mode:
+                log(f"skip {schema}.{name}: already {prior['status']}")
+                created_total += 1
                 continue
+            if done and not args.force:
+                # Another mode's `created` checked that mode's layout, not
+                # this one's: a FLOAT table --mode manifest made was skipped
+                # here as done, with the plan saying DOUBLE.
+                log(f"re-check {schema}.{name}: recorded {prior['status']} "
+                    f"by --mode {recorded_by}, not {args.mode}")
             try:
                 if args.dry_run:
                     log(f"DRY RUN: would create "
@@ -351,9 +761,9 @@ def main(argv: list[str] | None = None) -> int:
                         f"({args.mode})")
                     status = "dry_run"
                 elif args.mode == "ctas":
-                    create_table_ctas(source, schema, name,
-                                      args.target_catalog, target_schema)
-                    status = "created"
+                    status = create_table_ctas(source, schema, name,
+                                               args.target_catalog,
+                                               target_schema)
                 elif args.mode == "ddl-plan":
                     columns = planned_columns.get((schema, name))
                     if not columns:
@@ -363,15 +773,22 @@ def main(argv: list[str] | None = None) -> int:
                                       "columns for this table -- the engine "
                                       "either blocked it or it was outside "
                                       "the plan's scope. NOT created."}
-                        path.write_text(json.dumps(report, indent=2))
+                        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
                         log(f"{schema}.{name}: not in the approved plan")
+                        not_in_plan_total += 1
                         continue
-                    fact = planned.get((schema, name)) or {}
-                    create_table_from_columns(spark, columns,
-                                              args.target_catalog,
-                                              target_schema,
-                                              fact.get("name") or name)
-                    status = "created"
+                    # The plan names the target TABLE as well as the
+                    # schema: a source `ORDERS` planned as `orders` has to
+                    # land as `orders`, or the copy addresses a table that
+                    # is not there.
+                    tgt_name = (planned_targets.get((schema, name))
+                                or (target_schema, name))[1]
+                    status = create_table_from_columns(
+                        spark, columns, args.target_catalog, target_schema,
+                        tgt_name,
+                        description=planned_descriptions.get((schema, name),
+                                                             ""),
+                        notes=notes)
                 else:
                     columns = table.get("columns") or []
                     if _looks_like_snowflake_types(columns):
@@ -380,14 +797,41 @@ def main(argv: list[str] | None = None) -> int:
                             "built in connector mode), which Delta will not "
                             "accept verbatim. Use --mode ddl-plan (engine-"
                             "translated types) or --mode ctas.")
-                    create_table_from_columns(spark, columns,
-                                              args.target_catalog,
-                                              target_schema, name)
-                    status = "created"
-                fqn = (planned.get((schema, name)) or {}).get("target_fqn") \
-                    or f"{args.target_catalog}.{target_schema}.{name}"
-                report["objects"][name] = {"status": status, "target_fqn": fqn}
-                log(f"{schema}.{name} -> {fqn}: {status}")
+                    status = create_table_from_columns(
+                        spark, columns, args.target_catalog, target_schema,
+                        name, notes=notes)
+                tgt_name = (planned_targets.get((schema, name))
+                            or (target_schema, name))[1]
+                report["objects"][name] = {
+                    "status": status, "mode": args.mode,
+                    "target_fqn": f"{args.target_catalog}."
+                                  f"{target_schema}.{tgt_name}"}
+                if notes:
+                    # Properties that could NOT be read back. Recorded next
+                    # to the status so "created" never implies "and every
+                    # property was checked".
+                    report["objects"][name]["unverified_properties"] = notes
+                if args.mode == "ctas" and status == "already_existed":
+                    # CTAS has no plan to compare the layout with: the
+                    # table was there before this run and nobody has
+                    # checked it. Said here, so the copy scope and the
+                    # reconcile report carry it rather than a bare pass.
+                    report["objects"][name]["reason"] = (
+                        "there before this run; --mode ctas has no plan "
+                        "to compare its layout with, so the layout was "
+                        "NOT compared")
+                log(f"{schema}.{name}: {status}")
+                if status in ("created", "already_existed"):
+                    created_total += 1
+            except TypeDrift as exc:
+                # A problem state, not a failure of THIS run: the table is
+                # there, it is not what the plan says, and a positional copy
+                # into it would land rows in the wrong columns with matching
+                # counts. Re-checked on every run until it matches.
+                failures += 1
+                report["objects"][name] = {"status": "type_drift",
+                                           "reason": str(exc)[:400]}
+                log(f"{schema}.{name}: TYPE DRIFT — {str(exc)[:200]}")
             except Exception as exc:
                 failures += 1
                 report["objects"][name] = {"status": "failed",
@@ -395,7 +839,24 @@ def main(argv: list[str] | None = None) -> int:
                 log(f"{schema}.{name}: FAILED — {str(exc)[:200]}")
             report["updated_at"] = datetime.datetime.now(
                 datetime.timezone.utc).isoformat()
-            path.write_text(json.dumps(report, indent=2))
+            path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+        # Views: listed, never created here. Kept apart from `objects` so
+        # the table tally, the resume logic and the copy scope stay table-only.
+        views = [v["name"] for v in record.get("views") or []]
+        if views:
+            report["views"] = {}
+            for view in views:
+                entry = {"status": "not_created_by_this_path",
+                         "reason": VIEW_NOT_CREATED}
+                if planned_views is not None:
+                    entry["in_plan"] = (schema, view) in planned_views
+                report["views"][view] = entry
+            path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            log(f"{schema}: {len(views)} view(s) in the manifest are NOT "
+                f"created by this stage ({', '.join(views[:5])}"
+                f"{', ...' if len(views) > 5 else ''}); use `snowmig deploy "
+                f"--execute` for views")
 
         counts = {}
         for obj in report["objects"].values():
@@ -403,17 +864,30 @@ def main(argv: list[str] | None = None) -> int:
         log(f"{schema}: {counts} -> {path}")
         summary[schema] = counts
 
-    if args.mode == "ddl-plan":
-        failures += create_planned_views(spark, planned, schemas, reports,
-                                         args.target_catalog,
-                                         dry_run=args.dry_run,
-                                         force=args.force)
+    if args.mode == "ddl-plan" and view_facts:
+        failures += create_planned_views(
+            spark, view_facts, schemas, reports, args.target_catalog,
+            dry_run=args.dry_run, force=args.force)
+
+    log(f"run: created or already there {created_total}, not in plan "
+        f"{not_in_plan_total}, failed or drifted {failures}")
+    if failures:
+        return 1
+    if args.mode == "ddl-plan" and not args.dry_run and not created_total \
+            and not_in_plan_total:
+        # Every per-table record above is right; the RUN still did nothing.
+        # Exit 0 here gave three SUCCESS jobs (structure, copy, reconcile)
+        # for a plan that never overlapped the requested schema.
+        return fail(f"error: created 0 table(s); {not_in_plan_total} were not "
+                    f"in the approved plan ({ddl_path}). The plan and the "
+                    f"requested schema(s) do not overlap -- is this the "
+                    f"ddl_plan.json for THIS estate and wave? Nothing was "
+                    f"created, so 02_copy_schema has nothing to copy.")
 
     write_step_output(args.output_dir, "S10_structure.json", {
         "step": "S10", "stage": "structure", "mode": args.mode,
         "target_catalog": args.target_catalog, "schemas": summary,
-        "views": sum(1 for f in planned.values() if f["kind"] == "VIEW"),
-        "failures": failures})
+        "views": len(view_facts), "failures": failures})
     return 1 if failures else 0
 
 

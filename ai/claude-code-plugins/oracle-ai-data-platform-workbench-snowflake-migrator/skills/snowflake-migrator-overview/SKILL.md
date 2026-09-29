@@ -11,7 +11,8 @@ sequence. Steps are skipped only when the user explicitly says to skip one, and
 you say out loud which step you skipped and what that costs.
 
 Before S1, two things must exist: the one connection config (copied from
-`snowmig-config.example.yaml`, gitignored, `0600`) and the user's answer to
+`snowmig-config.example.yaml`; `0600` on POSIX; gitignored only inside the
+plugin folder, so the user adds it to their own repo's `.gitignore`) and the user's answer to
 *which database*. `README.md` -> "How to run a migration, from zero" carries
 the prerequisites and the flags; this file is the sequence and the rules.
 
@@ -51,6 +52,16 @@ user — a new name — not an invitation to adopt the existing object.
 At S12 the migration is **done**: the assets exist, the scripts exist, the
 plans and backups exist. **The data migration is not run.** Moving rows is a
 later decision the customer makes, with the scripts already sitting there.
+
+Budget the shake-out from what has actually run, not from what exists. The
+per-stage register is `GAPS.md` → "What is actually proven"; its sentence:
+**What has run live:** the discovery job (`snowmig_00_discover`) ran to
+SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in
+two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
+ran on a cluster from the approved plan, a healthy 23-minute run left alone
+by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
+and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
+authors**. Say so if the user asks whether the copy is proven.
 
 ---
 
@@ -207,7 +218,10 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig run \
 
 `run` starts the job, polls it to a terminal state, and writes `RUN_*.md` with
 the task output as evidence. A poll budget that runs out is reported as
-**STILL RUNNING** -- never rounded to success, never to failure.
+**STILL RUNNING** -- never rounded to success, never to failure. A status
+that could not be read (a 503, an expired session) is **STATUS COULD NOT BE
+READ**, exit 1, with the run key in `RUN_*.md`: the run was submitted and may
+still be going, so check it in the console before starting another.
 
 #### The first run on a new workspace often is never picked up
 
@@ -270,9 +284,16 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig ingest \
   [--semi-structured string] [--timestamp-ntz timestamp]
 
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig plan \
+  --bronze-catalog-prefix <the INTERNAL catalog created at S4> \
   [--restrictions <file>]
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig ddl
 ```
+
+The prefix is not optional here. S10 creates each approved target name as it
+stands and refuses a plan whose catalog is not its `--target-catalog`; without
+the prefix the plan's catalog is the source database name, which in this
+runbook is the EXTERNAL pointer registered at S3, and S10 refuses it with
+exit 1.
 
 `ingest` calls the **same type mapper** a live `assess` calls, so a column
 planned from the manifest reaches the same verdict as one planned from a live
@@ -332,8 +353,10 @@ shape.
 The plan it reads is `ddl_plan.json` **on the workspace**, so upload the
 approved one to `backup-snowflake-migration/plan/` before running. The stage
 runs in `ddl-plan` mode: those types are engine-translated. `manifest` mode
-cannot be used with a connector-built manifest, which records SNOWFLAKE types
-that Delta rejects verbatim.
+refuses a connector-built manifest before creating anything: it records
+SNOWFLAKE types, which Delta rejects or, like `FLOAT` (64-bit in Snowflake,
+32-bit in Spark), accepts with a different meaning. A table another mode
+recorded as created is re-checked by a `ddl-plan` run, not skipped.
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig run \
@@ -343,9 +366,20 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig run \
 **Stage parameters are NOT passed on this command line.** AIDP job parameters
 reach a notebook as neither argv nor environment, so `--param` is refused
 rather than accepted and dropped. Each stage notebook carries its own `PARAMS`
-cell; `provision --execute --reuse-existing` rewrites it and re-uploads. To
-narrow what S10 creates, narrow the **plan** it reads — that is the input —
-and never edit the stage logic to make it cover less.
+cell; `provision --execute --reuse-existing --refresh-notebooks` rewrites it
+and re-uploads (without `--refresh-notebooks`, `--reuse-existing` keeps a
+notebook already on the workspace, because its PARAMS cell may have been
+edited in the console). The values it writes are `--stage-param NAME=VALUE`,
+repeatable, where NAME is the stage flag without `--` (`schema`, `tables`,
+`mode`, `dry-run`, `counts`, …): a name no stage declares is refused, a
+switch takes `true`/`false`, a list flag takes a comma-separated value, an
+unqualified value some declaring stage would reject is refused (`mode` is
+`ddl-plan`/`ctas`/`manifest` in 01 but `skip-existing`/`append`/`overwrite`
+in 02; write `copy_schema.mode=overwrite` to reach 02 only), and
+`--stage-param` with `--reuse-existing` but without `--refresh-notebooks` is
+refused rather than dropped. To narrow what S10 creates, narrow the **plan** it
+reads — that is the input — and never edit the stage logic to make it cover
+less.
 
 Monitor the runs and report progress. Report `verified`, never `executed` — a
 batch can report success while statements inside it failed.
@@ -481,12 +515,17 @@ Use `--out-dir` only when the user wants artifacts kept somewhere they chose
 
 4. **Read-only against Snowflake — enforced, not promised.** The transport
    rejects any statement whose verb is not `SELECT`, `SHOW`, `DESCRIBE`,
-   `DESC`, `WITH` or `EXPLAIN`, before it reaches Snowflake.
+   `DESC`, `WITH` (only when what follows the CTE list is a `SELECT`) or
+   `EXPLAIN`, before it reaches Snowflake.
    **Nothing is ever written to or dropped from the source**, whatever the
    credential permits and whatever any prompt asks for.
 
-5. **Structure, not data.** S1–S12 create schemas and empty tables. No rows
-   move. Say so plainly whenever the user's language suggests they expect data.
+5. **Structure first; data only by an explicit job.** S1–S12 create schemas
+   and empty tables and move no rows. Rows are copied only when the operator
+   runs `snowmig_02_copy_schema`, one schema per run, after S12 and on their
+   own decision — never as part of the runbook and never on their behalf.
+   Say which of the two the user is asking for whenever their language
+   suggests they expect data.
 
 6. **Dry-run is the default; approval does not carry.** Nothing is created on
    AIDP without `--execute`, a resolved destination, and confirmation **in that
@@ -503,8 +542,14 @@ Use `--out-dir` only when the user wants artifacts kept somewhere they chose
    reported as flagged, with the reason, and resolved at S8 with the user. Do
    not substitute a "close enough" type silently.
 
-8. **A halt is a halt.** Exit code 3 means an identifier-case or target-name
-   collision. Show the collisions and stop; do not pick a winner.
+8. **A halt is a halt.** Exit code 3 means a condition to resolve with the
+   user, never an error to retry and never one to pick a winner on. From
+   `assess` or `plan` it is an identifier-case or target-name collision:
+   show the collisions and stop. From `ddl` it is a column type the target
+   refuses at CREATE TABLE -- on a default-assessed estate, `TIMESTAMP_NTZ`:
+   show the columns stderr and `DDL_PLAN.md` name, and put the remedy
+   (`ddl --timestamp-ntz timestamp`, offline, which changes timezone
+   semantics) to the user as a decision.
 
 9. **Never report success ahead of verification.** AIDP creates are
    asynchronous and settle late or fail silently. "Pending", "still settling"

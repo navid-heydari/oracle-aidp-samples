@@ -181,9 +181,37 @@ _POLICY_REFS = [
 
 _GRANTS = [
     {"NAME": "ORDERS", "TABLE_SCHEMA": "SALES", "DATABASE_NAME": "SNOWDEMO",
+     "GRANTED_ON": "TABLE",
      "PRIVILEGE": "SELECT", "GRANTEE_NAME": "ANALYST_ROLE", "GRANTS": 1},
     {"NAME": "CUSTOMERS", "TABLE_SCHEMA": "SALES", "DATABASE_NAME": "SNOWDEMO",
+     "GRANTED_ON": "TABLE",
      "PRIVILEGE": "SELECT", "GRANTEE_NAME": "ANALYST_ROLE", "GRANTS": 1},
+    # Grants the old three-class read never saw: on a schema, and on a
+    # warehouse (which has no database at all).
+    {"NAME": "SALES", "TABLE_SCHEMA": None, "DATABASE_NAME": "SNOWDEMO",
+     "GRANTED_ON": "SCHEMA",
+     "PRIVILEGE": "USAGE", "GRANTEE_NAME": "ANALYST_ROLE", "GRANTS": 1},
+    {"NAME": "ANALYTICS_WH", "TABLE_SCHEMA": None, "DATABASE_NAME": None,
+     "GRANTED_ON": "WAREHOUSE",
+     "PRIVILEGE": "USAGE", "GRANTEE_NAME": "ANALYST_ROLE", "GRANTS": 1},
+]
+
+# One tag attachment, so the demo's SECURITY.md teaches that a classification
+# does not travel: PII on the e-mail column of a migrated table.
+_TAG_REFS = [
+    {"TAG_DATABASE": "SNOWDEMO", "TAG_SCHEMA": "SALES", "TAG_NAME": "PII",
+     "TAG_VALUE": "EMAIL", "OBJECT_DATABASE": "SNOWDEMO",
+     "OBJECT_SCHEMA": "SALES", "OBJECT_NAME": "CUSTOMERS",
+     "COLUMN_NAME": "EMAIL", "DOMAIN": "COLUMN", "LEVEL": "COLUMN"},
+    # A TABLE-level tag comes back once per column of the table, which is one
+    # finding and not four -- the shape that fooled the first reading of a
+    # real estate.
+    *[{"TAG_DATABASE": "SNOWDEMO", "TAG_SCHEMA": "SALES",
+       "TAG_NAME": "SENSITIVITY", "TAG_VALUE": "RESTRICTED",
+       "OBJECT_DATABASE": "SNOWDEMO", "OBJECT_SCHEMA": "SALES",
+       "OBJECT_NAME": "CUSTOMERS", "COLUMN_NAME": col, "DOMAIN": "TABLE",
+       "LEVEL": "TABLE"}
+      for col in ("CUSTOMER_ID", "EMAIL", "SIGNUP_TS")],
 ]
 
 _CLUSTERING_HISTORY = [
@@ -222,6 +250,19 @@ _TAGS = [
     {"name": "PII", "database_name": "SNOWDEMO", "schema_name": "SALES",
      "kind": "TAG"},
 ]
+
+
+def _names_object(flat: str, row: dict, prefix: str = "") -> bool:
+    """Is this per-object statement asking about the object in `row`?
+
+    The statement carries the object as a quoted three-part literal, so the
+    name is matched inside it rather than anywhere in the SQL.
+    """
+    name = str(row.get(f"{prefix}ENTITY_NAME")
+               or row.get("OBJECT_NAME") or "")
+    schema = str(row.get(f"{prefix}SCHEMA_NAME")
+                 or row.get("OBJECT_SCHEMA") or "")
+    return f'"{schema}"."{name}"'.lower() in flat
 
 
 def _schema_in(flat: str) -> str:
@@ -277,6 +318,37 @@ def demo_run_sql(sql: str, params: dict | None = None) -> list[dict]:
     if ("show materialized views in database" in flat
             or "show dynamic tables in database" in flat):
         return []
+    # One alert, so CENSUS.md teaches the lesson it can now teach: an alert
+    # that watched a migrated table stops firing at cutover, unannounced.
+    if "show alerts in database" in flat:
+        return [{"name": "LOW_STOCK_ALERT", "database_name": DEMO_DB,
+                 "schema_name": "SALES", "state": "started",
+                 "condition": "select 1 from SNOWDEMO.SALES.ORDERS"}]
+    if ("show secrets in database" in flat
+            or "show network rules in database" in flat
+            or "show streamlits in database" in flat
+            or "show notebooks in database" in flat
+            or "show services in database" in flat):
+        return []
+    # Constraints: one primary key, so DDL_PLAN.md's R20 names a real one.
+    if "show primary keys in database" in flat:
+        return [{"database_name": DEMO_DB, "schema_name": "SALES",
+                 "table_name": "ORDERS", "column_name": "ORDER_ID",
+                 "key_sequence": 1, "constraint_name": "ORDERS_PK",
+                 "rely": "false"}]
+    if ("show unique keys in database" in flat
+            or "show imported keys in database" in flat):
+        return []
+    # Account-scoped reads, issued once per run. One outbound share: a live
+    # contract with a consumer account, which finds out at cutover.
+    if flat.startswith("show shares"):
+        return [{"name": "SNOWDEMO_SALES_SHARE", "kind": "OUTBOUND",
+                 "database_name": DEMO_DB, "to": "PARTNER_ACCOUNT",
+                 "owner": "ACCOUNTADMIN"}]
+    if (flat.startswith("show roles") or flat.startswith("show network policies")
+            or flat.startswith("show applications")
+            or flat.startswith("show compute pools")):
+        return []
 
     # --- lineage / compute / security / maintenance ------------------------
     if "object_dependencies" in flat:
@@ -290,8 +362,22 @@ def demo_run_sql(sql: str, params: dict | None = None) -> list[dict]:
                  "schema_name": "SALES", "kind": "MASKING_POLICY"}]
     if "show row access policies" in flat:
         return []
+    # Enumerated, and empty: the report may say so because it asked.
+    if "show aggregation policies" in flat or "show projection policies" in flat:
+        return []
     if "show tags" in flat:
         return [dict(r) for r in _TAGS]
+    # The per-object reads: <db>.INFORMATION_SCHEMA.POLICY_REFERENCES and
+    # TAG_REFERENCES_ALL_COLUMNS take one object and answer for that object
+    # only. They are what the security stage trusts, because unlike the
+    # ACCOUNT_USAGE views they carry no ~2 h lag.
+    if "tag_references_all_columns" in flat:
+        return [dict(r) for r in _TAG_REFS if _names_object(flat, r)]
+    if "information_schema.policy_references" in flat:
+        return [dict(r) for r in _POLICY_REFS
+                if _names_object(flat, r, prefix="REF_")]
+    if "tag_references" in flat:
+        return [dict(r) for r in _TAG_REFS]
     if "policy_references" in flat:
         return [dict(r) for r in _POLICY_REFS]
     if "grants_to_roles" in flat:

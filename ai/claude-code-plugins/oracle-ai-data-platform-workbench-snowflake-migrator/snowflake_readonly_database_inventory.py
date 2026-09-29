@@ -161,7 +161,7 @@ def main():
                 'View/object lineage was not collected: ' + str(error)
             )
 
-        arguments.output.write_text(json.dumps(manifest, indent=2, default=json_value) + '\n')
+        arguments.output.write_text(json.dumps(manifest, indent=2, default=json_value) + '\n', encoding="utf-8")
         print(f'Wrote {len(manifest["assets"])} assets to {arguments.output.resolve()}')
     finally:
         cursor.close()

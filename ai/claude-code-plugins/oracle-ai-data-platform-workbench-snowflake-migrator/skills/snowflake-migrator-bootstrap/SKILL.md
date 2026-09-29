@@ -7,38 +7,34 @@ description: First-run setup for the Snowflake to AIDP migrator. Finds or create
 
 Getting from "nothing set up" to "both ends verified". Four steps, in order.
 
-## 1. Dependencies — one command, not a procedure
+## 1. Dependencies — nothing to install, nothing left behind
 
-The plugin ships its own launcher. It creates the environment on first use
-and then gets out of the way:
+`bin/snowmig` needs no bootstrap step and creates nothing that persists. It
+runs `engine/snowmig.py` on the first interpreter on `PATH` that already
+imports `yaml` and `snowflake.connector` (`SNOWMIG_PYTHON` is tried first,
+then `python3`, `python3.13`, `python3.12`, `python3.11`, `python`). If none
+does, it builds a throwaway venv under `$TMPDIR` for that one invocation,
+prints `building a throwaway environment (removed on exit)` to stderr — a
+notice, not an error — and deletes the venv on exit, failure or interrupt.
+Nothing lands in your home or beside the plugin.
 
-```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig --bootstrap
-```
-
-After that, **every stage is run through the launcher** and there is no
-interpreter path to remember:
+**Every stage is run through the launcher**, so there is no interpreter path
+to remember:
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig preflight --test-source
 ```
 
-`bin/snowmig` bootstraps automatically on any stage, so `--bootstrap` is only
-needed to rebuild a broken environment. `--python` prints the interpreter it
-uses, for the cases that genuinely need one.
+To avoid paying the install on every run, put the dependencies
+(`snowflake-connector-python`, `cryptography`, `pyyaml`) into the interpreter
+you use, and the launcher picks it up:
 
-**The venv is deliberately NOT inside the plugin folder.** It lives under
-`${XDG_DATA_HOME:-~/.local/share}/snowmig/venv`, overridable with
-`SNOWMIG_VENV`. The installer copies the plugin directory on every version
-bump, so a venv living there would be duplicated per version, and a
-credential file beside it would be copied too.
+```bash
+python3 -m pip install -r ${CLAUDE_PLUGIN_ROOT}/engine/requirements.txt
+```
 
-A half-built venv from an interrupted install *looks* present, so the
-launcher decides by importing the dependencies rather than by the directory
-existing, and rebuilds when that import fails.
-
-**Do not hand-roll a venv and do not pass `--break-system-packages`.** If the
-launcher cannot find a Python 3.10+, it says so and stops — that is a machine
+**Do not hand-roll a venv and do not pass `--break-system-packages`.** If no
+Python 3.10+ is on `PATH`, the launcher says so and stops — that is a machine
 to fix, not a step to improvise around.
 
 ## 2. Find the plugin, and the config — do not assume either
@@ -67,7 +63,8 @@ If there is no config, create one where the user is working:
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig init-config
 ```
 
-That writes `./snowmig-config.yaml` from the template, mode `0600`, and refuses
+That writes `./snowmig-config.yaml` from the template, mode `0600` on POSIX
+(Windows has no mode bits), and refuses
 to overwrite an existing one (that file holds live credentials). An installed
 plugin's own directory may be read-only, which is exactly why the config
 belongs in the working directory.
@@ -81,10 +78,10 @@ one file to fill in, and the secret goes *in that file*, not into the chat:
 
 | What | Where | Note |
 |---|---|---|
-| Snowflake account/host, user, warehouse, database, role, schema | `snowmig-config.yaml`, under `snowflake:` | created from the template; gitignored, `0600` |
+| Snowflake account/host, user, warehouse, database, role, schema | `snowmig-config.yaml`, under `snowflake:` | created from the template; `0600` on POSIX; gitignored only inside the plugin folder — tell the user to add it to their own `.gitignore` when it lives elsewhere |
 | The Snowflake **password or private key** | the same file — `password:` or `private_key: |` inline | inline is the default; `*_path` variants exist but are not what you propose first |
 | Which AIDP resources to use (DataLake OCID, workspace, cluster, catalog) | the same file, under `aidp:` | any of them can also be passed as a flag, and a flag wins |
-| AIDP **authentication** | `~/.oci/config` (`oci setup config`) | **not configured in this plugin at all** — it drives the `oci`/`aidp` CLIs with the user's normal OCI setup |
+| AIDP **authentication** | `~/.oci/config` (`oci setup config`) | never a value in the config file. `oci raw-request` runs with that file's `DEFAULT` profile (or `OCI_CLI_PROFILE` from the shell; `aidp.oci_profile`, when set, is announced on stdout and passed as `--profile` to every `oci` call, winning over `OCI_CLI_PROFILE`; the `aidp` CLI gets no profile flag; for the `oci` calls a session-token profile also needs `OCI_CLI_AUTH=security_token`, which the plugin does not add); every `aidp` call gets `--auth api_key --region <from the OCID>` appended, because the `aidp` CLI defaults to a session token. If a call fails with an auth error, that profile's API key is what to check |
 
 Rules that come with an inline secret, and they are not optional:
 
@@ -96,7 +93,9 @@ Rules that come with an inline secret, and they are not optional:
   conversation.** They put it in the file, on their own machine. If one does end
   up in the chat or in a committed file, say so plainly and tell them to rotate
   it.
-- The file is gitignored. Keep it out of tickets and commits too — an inline
+- The file is gitignored only inside the plugin folder; in the user's working
+  directory nothing ignores it until they add it to that repo's `.gitignore`
+  — say so when you create it. Keep it out of tickets and commits too — an inline
   secret is a secret that leaks the moment the file travels.
 
 Key-pair setup, if the user wants one instead of a password:

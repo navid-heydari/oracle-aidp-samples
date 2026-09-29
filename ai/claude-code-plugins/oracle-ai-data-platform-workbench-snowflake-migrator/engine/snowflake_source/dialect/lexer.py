@@ -20,6 +20,14 @@ contents are never interpreted, matched against, or split on.
 Scope: this recognises literal boundaries, not grammar. It is not a parser and
 does not validate SQL. Block comments do not nest -- the first `*/` closes,
 which is what every engine we target does in practice.
+
+Line comments open with `--` or `//`. The second is Snowflake's own and was
+missed: in `// don't` the apostrophe opened a literal that never closed, so a
+task body with that comment aborted `assess`, and a view with QUALIFY between
+two such comments had the construct swallowed by a phantom string. Spark has
+no `//` comment and no `//` operator, so reading it as a comment is also
+right on the Spark SQL this plugin emits -- where the translator has already
+rewritten every one to `--` (T21_SLASH_COMMENT) so the target never sees it.
 """
 from __future__ import annotations
 
@@ -27,7 +35,8 @@ import re
 
 __all__ = ["UnterminatedLiteral", "SEGMENT_KINDS", "segments", "code_only",
            "strip_comments", "split_statements", "leading_verb", "quote_ident",
-           "qualify", "like_literal", "find_code", "sub_code"]
+           "qualify", "like_literal", "find_code", "sub_code",
+           "cte_body_verb", "cte_scopes"]
 
 SEGMENT_KINDS = ("code", "string", "ident", "comment")
 
@@ -50,7 +59,8 @@ def _closing_quote(sql: str, start: int, quote: str) -> int:
     """Index just past the closing `quote`, honouring doubling and backslash.
 
     Snowflake accepts both `''` and `\\'` inside a single-quoted literal, and
-    `""` inside a quoted identifier.
+    `""` inside a quoted identifier. Spark doubles a backtick inside a
+    backtick-quoted identifier the same way.
     """
     i = start + 1
     n = len(sql)
@@ -66,7 +76,7 @@ def _closing_quote(sql: str, start: int, quote: str) -> int:
             return i + 1
         i += 1
     raise UnterminatedLiteral(
-        f"unterminated {'identifier' if quote == chr(34) else 'string'} "
+        f"unterminated {'string' if quote == chr(39) else 'identifier'} "
         f"starting at offset {start}")
 
 
@@ -91,7 +101,7 @@ def segments(sql: str) -> list[tuple[str, str]]:
         ch = sql[i]
         two = sql[i:i + 2]
 
-        if two == "--":
+        if two in ("--", "//"):
             end = sql.find("\n", i)
             end = n if end == -1 else end
             flush()
@@ -120,6 +130,15 @@ def segments(sql: str) -> list[tuple[str, str]]:
             i = end
         elif ch == '"':
             end = _closing_quote(sql, i, '"')
+            flush()
+            out.append(("ident", sql[i:end]))
+            i = end
+        elif ch == "`":
+            # Spark's quoted identifier. Not Snowflake syntax, so on source SQL
+            # this changes nothing; on the Spark SQL this plugin EMITS -- which
+            # the DDL generator re-lexes to hand the catalog API a view body --
+            # a `"` inside a backticked name must not open a phantom identifier.
+            end = _closing_quote(sql, i, "`")
             flush()
             out.append(("ident", sql[i:end]))
             i = end
@@ -282,3 +301,182 @@ def sub_code(pattern: str, repl, sql: str, *, flags: int = re.IGNORECASE,
         out = out[:span[0]] + replacement + out[span[1]:]
         count += 1
     return out, count
+
+
+def cte_body_verb(statement: str) -> str | None:
+    """The keyword after a statement's CTE list, upper-cased, or None.
+
+    `leading_verb` reports WITH for `WITH x AS (...) SELECT ...` and for
+    `WITH x AS (...) INSERT ...` alike, and only the first is a read. This
+    walks the CTE list -- `WITH [RECURSIVE] name [(cols)] AS (body) [, ...]`
+    -- at paren depth 0 and returns the first keyword after it. Everything
+    inside a parenthesis, a literal, a quoted identifier or a comment is
+    skipped, so a write verb inside a CTE body or a string is never read as
+    the statement's verb.
+
+    None whenever the walk does not land on a bare keyword: the statement
+    does not start with WITH, the CTE list is not shaped as above, or the
+    body is itself parenthesised (`WITH x AS (...) (SELECT ...)`). None means
+    "could not identify", never "harmless" -- the caller refuses on it.
+    """
+    depth = 0
+    # with -> first_name -> as -> [cols -> as_only ->] body_open -> body
+    #   -> next -> either `,` -> name -> as ... or the keyword we return.
+    state = "with"
+    for kind, text in segments(statement):
+        if kind == "comment":
+            continue
+        if kind != "code":
+            if depth:
+                continue                        # inside a body or column list
+            if kind == "ident" and state in ("first_name", "name"):
+                state = "as"                    # a quoted CTE name
+                continue
+            return None                         # a literal where a keyword belongs
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch in " \t\r\n":
+                i += 1
+            elif ch == "(":
+                depth += 1
+                i += 1
+                if depth > 1:
+                    continue
+                if state == "as":
+                    state = "cols"
+                elif state == "body_open":
+                    state = "body"
+                else:
+                    return None                 # a parenthesised body, or a stray paren
+            elif ch == ")":
+                depth -= 1
+                i += 1
+                if depth > 0:
+                    continue
+                if depth < 0:
+                    return None
+                state = {"cols": "as_only", "body": "next"}.get(state)
+                if state is None:
+                    return None
+            elif depth:
+                i += 1                          # inside a paren: not ours to read
+            elif ch == "," and state == "next":
+                state = "name"
+                i += 1
+            else:
+                match = _WORD.match(text, i)
+                if match is None:
+                    return None
+                word = match.group(0).upper()
+                i = match.end()
+                if state == "with":
+                    if word != "WITH":
+                        return None
+                    state = "first_name"
+                elif state == "first_name":
+                    state = "name" if word == "RECURSIVE" else "as"
+                elif state == "name":
+                    state = "as"
+                elif state in ("as", "as_only"):
+                    if word != "AS":
+                        return None
+                    state = "body_open"
+                elif state == "next":
+                    return word
+                else:
+                    return None
+    return None
+
+
+def _tokens(sql: str) -> list[tuple[str, str, int, int]]:
+    """(kind, text, start, end) for each word, quoted identifier, paren and
+    comma in `sql`; kind is "word", "ident", "(", ")", "," or "other".
+    Comments are dropped; a literal is one "other" token."""
+    out: list[tuple[str, str, int, int]] = []
+    pos = 0
+    for kind, text in segments(sql):
+        if kind == "ident":
+            out.append(("ident", text, pos, pos + len(text)))
+        elif kind == "string":
+            out.append(("other", text, pos, pos + len(text)))
+        elif kind == "code":
+            for m in re.finditer(r"[A-Za-z_][A-Za-z_0-9$]*|[(),]|\S", text):
+                tok = m.group(0)
+                k = ("word" if _WORD.fullmatch(tok)
+                     else tok if tok in "()," else "other")
+                out.append((k, tok, pos + m.start(), pos + m.end()))
+        pos += len(text)
+    return out
+
+
+def _name_key(kind: str, text: str) -> str:
+    """How Snowflake compares a name: unquoted folds to upper case, quoted
+    (`"x"`, or Spark's backticks after translation) is exact."""
+    if kind == "ident":
+        quote = text[0]
+        return text[1:-1].replace(quote * 2, quote)
+    return text.upper()
+
+
+def cte_scopes(sql: str) -> list[tuple[str, int, int]]:
+    """(name, scope_start, scope_end) for every CTE `sql` declares.
+
+    A CTE name shadows a table of the same name, so a rewriter that
+    qualifies bare table names has to know where each CTE is visible: from
+    the end of its own body to the end of the enclosing parenthesis (or of
+    the statement). A non-recursive CTE's body does not see its own name --
+    `with ORDERS as (select * from ORDERS ...)` reads the table there -- and
+    a later CTE sees an earlier one. Under RECURSIVE the whole list is in
+    scope from the WITH on. `name` is compared as Snowflake does (see
+    _name_key). A WITH that is not followed by a well-formed CTE list
+    (`timestamp with time zone`) declares nothing.
+    """
+    toks = _tokens(sql)
+    match: dict[int, int] = {}          # open paren -> its closing paren
+    parent: list[int | None] = []       # innermost open paren around a token
+    stack: list[int] = []
+    for idx, tok in enumerate(toks):
+        if tok[0] == ")" and stack:
+            match[stack.pop()] = idx
+        parent.append(stack[-1] if stack else None)
+        if tok[0] == "(":
+            stack.append(idx)
+
+    def is_word(j: int, word: str | None = None) -> bool:
+        return (j < len(toks) and toks[j][0] == "word"
+                and (word is None or toks[j][1].upper() == word))
+
+    found: list[tuple[str, int, int]] = []
+    for i, tok in enumerate(toks):
+        if not is_word(i, "WITH"):
+            continue
+        p = parent[i]
+        end = toks[match[p]][2] if p is not None and p in match else len(sql)
+        j = i + 1
+        recursive = is_word(j, "RECURSIVE")
+        if recursive:
+            j += 1
+        declared: list[tuple[str, int, int]] = []
+        while j < len(toks) and toks[j][0] in ("word", "ident"):
+            key = _name_key(toks[j][0], toks[j][1])
+            j += 1
+            if j < len(toks) and toks[j][0] == "(":      # column list
+                if j not in match:
+                    break
+                j = match[j] + 1
+            if not is_word(j, "AS"):
+                break
+            j += 1
+            if j >= len(toks) or toks[j][0] != "(" or j not in match:
+                break
+            close = match[j]
+            start = tok[2] if recursive else toks[close][3]
+            declared.append((key, start, end))
+            j = close + 1
+            if j < len(toks) and toks[j][0] == ",":
+                j += 1
+                continue
+            break
+        found.extend(declared)
+    return found

@@ -7,51 +7,29 @@ here: both the planner (deciding what can migrate) and the DDL generator
 A Snowflake-only construct is DETECTED AND REPORTED, never rewritten on a
 guess. A view that ships with a subtly wrong translation is worse than one
 reported as needing manual work, because the wrong one returns numbers.
+
+Quoting is normalised on the way through (see translate.py): "quoted
+identifiers" become `backticked`, `''` inside a literal becomes `\\'`, and a
+$$...$$ string is refused. Spark reads "..." as a string literal and `''` as
+two adjacent literals, so a body carried verbatim returned wrong data.
 """
 from __future__ import annotations
 
 import re
 
 from . import lexer
-from .translate import translate_sql
+from .translate import RULES, translate_sql
 
 __all__ = ["UNSUPPORTED_CONSTRUCTS", "detect_unsupported_constructs",
-           "extract_view_body", "translate_view_body"]
+           "extract_view_body", "extract_view_columns", "translate_view_body"]
 
-# construct -> (regex, brief reason)
+# construct -> (regex, brief reason). Derived from the translator's declared
+# rules, so this table cannot disagree with what detection actually does. A
+# hand-maintained copy did: it listed DATEDIFF as blocking while no rule
+# detected it, and listed IFF as blocking long after IFF was translated.
 UNSUPPORTED_CONSTRUCTS: dict[str, tuple[str, str]] = {
-    "QUALIFY": (
-        r"\bQUALIFY\b",
-        "no Spark equivalent; must be rewritten as a subquery with WHERE on the "
-        "window result"),
-    "LATERAL FLATTEN": (
-        r"\bLATERAL\s+FLATTEN\b|\bFLATTEN\s*\(",
-        "semi-structured expansion; maps to explode / LATERAL VIEW but the "
-        "mapping depends on the VARIANT shape"),
-    "IFF": (r"\bIFF\s*\(", "Spark uses IF(); a rename is safe but is not applied "
-                              "automatically in MVP-1"),
-    "DECODE": (r"\bDECODE\s*\(", "must become a CASE expression"),
-    "NVL2": (r"\bNVL2\s*\(", "no Spark equivalent; must become CASE"),
-    ":: CAST SHORTHAND": (
-        r"::\s*[A-Za-z]", "Snowflake cast shorthand; Spark requires CAST(x AS t)"),
-    "LISTAGG": (r"\bLISTAGG\s*\(",
-                "no Spark equivalent; becomes collect_list + concat_ws"),
-    "GENERATOR": (r"\bGENERATOR\s*\(|\bSEQ[48]\s*\(",
-                  "row generation; Spark uses range()"),
-    "ARRAY_CONSTRUCT": (r"\bARRAY_CONSTRUCT\s*\(", "Spark uses array()"),
-    "OBJECT_CONSTRUCT": (r"\bOBJECT_CONSTRUCT\s*\(",
-                         "Spark uses named_struct() or map()"),
-    "SYSTEM$ FUNCTION": (r"\bSYSTEM\$", "Snowflake-internal function with no target"),
-    "TIME TRAVEL": (r"\bAT\s*\(\s*(?:TIMESTAMP|OFFSET|STATEMENT)\b|\bBEFORE\s*\(",
-                    "Snowflake Time Travel has no Delta equivalent in this form"),
-    "VARIANT PATH": (r"[A-Za-z_][A-Za-z0-9_]*\s*:\s*[A-Za-z_]",
-                     "Snowflake VARIANT path access; needs an explicit struct design"),
-    "DATEADD/DATEDIFF": (
-        r"\bDATE(?:ADD|DIFF)\s*\(",
-        "argument order and unit strings differ from Spark's date functions; a "
-        "signature mapping is required, not a rename"),
-    "PIVOT/UNPIVOT": (r"\b(?:UN)?PIVOT\s*\(", "Spark syntax differs materially"),
-}
+    r.construct: (r.detect, r.detail or r.description)
+    for r in RULES if r.status == "declared"}
 
 # The header is located by SCANNING, not by regex. Two failures drove that:
 #
@@ -68,12 +46,108 @@ _CREATE_VIEW_PREFIX = re.compile(
     r"(?:(?:secure|recursive|transient|volatile)\s+)*view\b")
 
 
+_IF_NOT_EXISTS = re.compile(r"(?is)\s*(?:if\s+not\s+exists\b)?")
+_BARE_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+
+
+def extract_view_columns(ddl: str) -> list[str]:
+    """The names in a CREATE VIEW's header column list, or [] if it has none.
+
+    GET_DDL writes `create or replace view V(\\n\\tCUSTOMER,\\n\\tTOTAL\\n) as
+    select CUST_ID, SUM(AMT) ...`, and the list RENAMES the body's output
+    columns. Dropping it created a view whose columns were CUST_ID and
+    SUM(AMT) while the plan and the catalog API's viewFields said CUSTOMER
+    and TOTAL. Each item's name is its first token; what follows it (a
+    COMMENT, a MASKING POLICY, a TAG) is not a name. Unquoted names fold to
+    upper case as Snowflake folds them; a quoted name is exact. A list whose
+    items cannot be read raises ValueError: a guessed name is a wrong one.
+    """
+    if not ddl:
+        return []
+    try:
+        parts = lexer.segments(ddl)
+    except lexer.UnterminatedLiteral as exc:
+        raise ValueError(f"could not scan the view DDL: {exc}") from exc
+    mask = lexer.code_only(ddl)
+    prefix = _CREATE_VIEW_PREFIX.match(mask)
+    if not prefix:
+        return []
+    # Quoted identifiers are blank in the mask; their spans come from the scan.
+    quoted: dict[int, int] = {}
+    pos = 0
+    for kind, text in parts:
+        if kind == "ident":
+            quoted[pos] = pos + len(text)
+        pos += len(text)
+
+    def name_end(i: int) -> int | None:
+        if i in quoted:
+            return quoted[i]
+        m = _BARE_PART.match(mask, i)
+        return m.end() if m else None
+
+    def skip_blank(k: int) -> int:
+        # Whitespace and comments are blank in the mask -- and so is a quoted
+        # identifier, which is where a name may start.
+        while k < len(mask) and mask[k].isspace() and k not in quoted:
+            k += 1
+        return k
+
+    i = skip_blank(_IF_NOT_EXISTS.match(mask, prefix.end()).end())
+    # The view name: one to three parts.
+    while True:
+        end = name_end(i)
+        if end is None:
+            return []
+        i = skip_blank(end)
+        if i < len(mask) and mask[i] == ".":
+            i = skip_blank(i + 1)
+            continue
+        break
+    if i >= len(mask) or mask[i] != "(":
+        return []
+
+    # Items at depth 1 of the list, split on its own commas.
+    depth, start, items = 0, i + 1, []
+    for j in range(i, len(mask)):
+        ch = mask[j]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                items.append((start, j))
+                break
+        elif ch == "," and depth == 1:
+            items.append((start, j))
+            start = j + 1
+    else:
+        raise ValueError("could not read the view's column list: it never closes")
+
+    names: list[str] = []
+    for a, b in items:
+        k = skip_blank(a)
+        end = name_end(k) if k < b else None
+        if end is None or end > b:
+            raise ValueError(
+                "could not read the view's column list: item "
+                f"{ddl[a:b].strip()!r} does not start with a column name")
+        token = ddl[k:end]
+        names.append(token[1:-1].replace(token[0] * 2, token[0])
+                     if token[0] in '"`' else token.upper())
+    return names
+
+
 def extract_view_body(ddl: str) -> str:
     """Return the SELECT body of a CREATE VIEW statement, without the trailing `;`.
 
     The body starts after the first `AS` keyword that is in code and at paren
     depth zero -- so an `AS` inside a literal, a comment, a quoted identifier
     or the optional column list is not mistaken for the end of the header.
+
+    The column list is not part of the body (extract_view_columns reads it),
+    but a list that cannot be read makes the view unreadable here too, so the
+    planner and the DDL generator refuse the same views.
     """
     if not ddl:
         raise ValueError("could not locate a view body: empty DDL")
@@ -86,6 +160,7 @@ def extract_view_body(ddl: str) -> str:
     if not prefix:
         raise ValueError(
             "could not locate a view body: the DDL does not begin with CREATE VIEW")
+    extract_view_columns(ddl)
 
     offset, depth = 0, 0
     for kind, text in parts:

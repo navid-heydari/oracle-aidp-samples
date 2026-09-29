@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import urllib.parse
 from typing import Callable
 
 from .coords import region_from_ocid
@@ -41,7 +42,8 @@ from .coords import region_from_ocid
 __all__ = ["BackendError", "NoBackendAvailable", "StatementTooLarge",
            "BACKENDS",
            "build_command", "detect_backend", "parse_cli_json",
-           "MAX_ARGV_STATEMENT"]
+           "parse_cli_envelope", "collect_pages", "paged_uri",
+           "MAX_ARGV_STATEMENT", "MAX_LIST_PAGES"]
 
 # SQL is passed as one argv element. A single argument is capped well below
 # ARG_MAX (128KB on Linux, 256KB on macOS), and exceeding it produces a bare
@@ -52,6 +54,12 @@ MAX_ARGV_STATEMENT = 100_000
 BACKENDS = ("aidp_cli", "oci_raw")
 
 _API_VERSION = "20240831"
+
+# A list endpoint answers one PAGE and names the next in the `opc-next-page`
+# response header, which the next GET sends back as `page=`. Following it
+# is what makes a listing the whole collection; the cap is there so a server
+# that keeps handing out tokens cannot hold a deploy forever.
+MAX_LIST_PAGES = 200
 
 
 class BackendError(RuntimeError):
@@ -96,6 +104,43 @@ def detect_backend(*, which: Callable[[str], str | None] = shutil.which) -> str:
 def _endpoint(target) -> str:
     region = region_from_ocid(target.datalake_ocid)
     return f"https://aidp.{region}.oci.oraclecloud.com/{_API_VERSION}"
+
+
+def paged_uri(uri: str, page: str | None) -> str:
+    """`uri` asking for `page`, the token a previous response named in its
+    `opc-next-page` header. Byte-identical to `uri` when there is none, so
+    a first request looks exactly as it did before pagination existed."""
+    if not page:
+        return uri
+    sep = "&" if "?" in uri else "?"
+    return f"{uri}{sep}page={urllib.parse.quote(str(page), safe='')}"
+
+
+def collect_pages(fetch: Callable[[str | None], tuple[list[dict], str | None]],
+                  operation: str, *,
+                  max_pages: int = MAX_LIST_PAGES) -> list[dict]:
+    """Every item of a paged listing. `fetch(page_token)` performs ONE request
+    (None for the first page) and returns (rows, next_token); the loop ends
+    when the server sends no token. A token seen twice, or more than
+    `max_pages` pages, raises rather than spinning: a listing that cannot
+    finish is an error, not a shorter list."""
+    items: list[dict] = []
+    token: str | None = None
+    seen: set[str] = set()
+    for _ in range(max_pages):
+        rows, nxt = fetch(token)
+        items.extend(rows)
+        if not nxt:
+            return items
+        if nxt in seen:
+            raise RuntimeError(
+                f"{operation}: the server returned page token {nxt!r} twice; "
+                f"pagination did not terminate, so the listing is unusable")
+        seen.add(nxt)
+        token = nxt
+    raise RuntimeError(
+        f"{operation}: more than {max_pages} pages; pagination did not "
+        f"terminate, so the listing is unusable")
 
 
 def build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
@@ -173,13 +218,19 @@ def _build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
                                 f"{target.datalake_ocid}/catalogs",
                 "--request-body", body]
 
+    # The aidp CLI branches below take no `page`: its paging flags are
+    # undocumented, and a guessed one is a usage error on every second page.
+    # The oci_raw branches send the token back as `page=`.
+    page = kwargs.get("page")
+
     if operation == "list_catalogs":
         if backend == "aidp_cli":
             return ["aidp", "catalog", "list",
                     "--instance-id", target.datalake_ocid]
         return ["oci", "raw-request", "--http-method", "GET",
-                "--target-uri", f"{_endpoint(target)}/dataLakes/"
-                                f"{target.datalake_ocid}/catalogs"]
+                "--target-uri", paged_uri(
+                    f"{_endpoint(target)}/dataLakes/"
+                    f"{target.datalake_ocid}/catalogs", page)]
 
     if operation == "delete_table":
         key = f'{kwargs["catalog"]}.{kwargs["schema"]}.{kwargs["table"]}'
@@ -189,6 +240,15 @@ def _build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
         return ["oci", "raw-request", "--http-method", "DELETE",
                 "--target-uri", f"{_endpoint(target)}/dataLakes/"
                                 f"{target.datalake_ocid}/tables/{key}"]
+
+    if operation == "delete_view":
+        key = f'{kwargs["catalog"]}.{kwargs["schema"]}.{kwargs["view"]}'
+        if backend == "aidp_cli":
+            return ["aidp", "schema", "delete-view", "--instance-id",
+                    target.datalake_ocid, "--key", key]
+        return ["oci", "raw-request", "--http-method", "DELETE",
+                "--target-uri", f"{_endpoint(target)}/dataLakes/"
+                                f"{target.datalake_ocid}/views/{key}"]
 
     if operation == "delete_schema":
         key = f'{kwargs["catalog"]}.{kwargs["schema"]}'
@@ -204,9 +264,10 @@ def _build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
             return ["aidp", "schema", "list", "--instance-id",
                     target.datalake_ocid, "--catalog-key", target.catalog]
         return ["oci", "raw-request", "--http-method", "GET",
-                "--target-uri", f"{_endpoint(target)}/dataLakes/"
-                                f"{target.datalake_ocid}/schemas"
-                                f"?catalogKey={target.catalog}"]
+                "--target-uri", paged_uri(
+                    f"{_endpoint(target)}/dataLakes/"
+                    f"{target.datalake_ocid}/schemas"
+                    f"?catalogKey={target.catalog}", page)]
 
     if operation in ("list_tables_in", "list_views_in"):
         relation = "tables" if operation == "list_tables_in" else "views"
@@ -221,10 +282,11 @@ def _build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
                     "--catalog-key", kwargs["catalog"],
                     "--schema-key", qualified]
         return ["oci", "raw-request", "--http-method", "GET",
-                "--target-uri", f"{_endpoint(target)}/dataLakes/"
-                                f"{target.datalake_ocid}/{relation}"
-                                f'?catalogKey={kwargs["catalog"]}'
-                                f"&schemaKey={qualified}"]
+                "--target-uri", paged_uri(
+                    f"{_endpoint(target)}/dataLakes/"
+                    f"{target.datalake_ocid}/{relation}"
+                    f'?catalogKey={kwargs["catalog"]}'
+                    f"&schemaKey={qualified}", page)]
 
     if operation in ("get_table", "get_view"):
         relation = "tables" if operation == "get_table" else "views"
@@ -252,9 +314,10 @@ def _build_command(backend: str, operation: str, target, **kwargs) -> list[str]:
         qualified = (schema if schema.startswith(f"{target.catalog}.")
                      else f"{target.catalog}.{schema}")
         return ["oci", "raw-request", "--http-method", "GET",
-                "--target-uri",
-                f"{_endpoint(target)}/dataLakes/{target.datalake_ocid}/tables"
-                f"?catalogKey={target.catalog}&schemaKey={qualified}"]
+                "--target-uri", paged_uri(
+                    f"{_endpoint(target)}/dataLakes/{target.datalake_ocid}"
+                    f"/tables?catalogKey={target.catalog}"
+                    f"&schemaKey={qualified}", page)]
 
     if operation == "upload_notebook":
         path, local = kwargs["workspace_path"], kwargs["local_path"]
@@ -309,13 +372,26 @@ def parse_cli_json(stdout: str) -> list[dict]:
     the exit code proves nothing and the old `return [payload]` turned that
     error object into one row of "results".
     """
+    return parse_cli_envelope(stdout)[0]
+
+
+def parse_cli_envelope(stdout: str) -> tuple[list[dict], dict[str, str]]:
+    """The rows AND the response headers of one CLI/REST envelope, header
+    names lower-cased; `{}` when the output carries none.
+
+    `oci raw-request` prints `{"data": ..., "headers": {...}, "status": ...}`
+    and a list endpoint names its next page in the `opc-next-page` header,
+    so the headers are part of the answer: dropping them read every listing
+    as its first page. Everything `parse_cli_json` says about non-JSON output
+    and errors in the body holds here too.
+    """
     text = (stdout or "").strip()
     # The aidp CLI prefixes its JSON with a literal `Response:` line. Without
     # this, every successful aidp call read as "backend output is not JSON".
     if text.startswith("Response:"):
         text = text[len("Response:"):].strip()
     if not text:
-        return []
+        return [], {}
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -323,13 +399,20 @@ def parse_cli_json(stdout: str) -> list[dict]:
             f"backend output is not JSON ({exc.msg}): {text[:300]}") from exc
 
     if isinstance(payload, list):
-        return payload
+        return payload, {}
     if not isinstance(payload, dict):
         raise RuntimeError(
             f"unexpected backend payload type: {type(payload).__name__}")
 
     _raise_if_error(payload)
 
+    raw_headers = payload.get("headers")
+    headers = ({str(k).lower(): v for k, v in raw_headers.items()}
+               if isinstance(raw_headers, dict) else {})
+    return _rows(payload), headers
+
+
+def _rows(payload: dict) -> list[dict]:
     data = payload.get("data")
     # Collections arrive as {"data": {"items": [...]}} -- unwrap, or three
     # schemas get reported as one.

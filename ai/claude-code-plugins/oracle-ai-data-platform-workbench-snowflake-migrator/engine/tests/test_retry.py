@@ -207,8 +207,10 @@ def test_a_retry_is_logged_as_a_retry_with_attempt_delay_and_error(capsys):
     retry_call(flaky, label="list_catalogs", retryable=is_retryable(read=True),
                policy=RetryPolicy(base_delay=1.5, max_attempts=3),
                sleep=lambda s: None)
-    err = capsys.readouterr().err
-    assert "RETRY list_catalogs: attempt 2/3 in 1.5s after: 503" in err
+    # stdout: a retry is progress, and stderr is reserved for the one-line
+    # `error:` a caller reads once the retries are exhausted.
+    out = capsys.readouterr().out
+    assert "RETRY list_catalogs: attempt 2/3 in 1.5s after: 503" in out
     ev = retry.drain_events()
     assert ev[0]["attempt"] == 2 and ev[0]["delay_seconds"] == 1.5
     assert "503" in ev[0]["error"]

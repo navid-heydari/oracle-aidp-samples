@@ -44,11 +44,22 @@ re-run with `--execute`.
    `scripts/`, and whatever plan artifacts exist in `--out-dir`
    (`plan.json`, `ddl_plan.json`, `SUMMARY.md`, …) into `plan/`, each upload
    read back before it is called done.
-5. **Four jobs** — `snowmig_00_discover` → `03_reconcile`. Each runs a
-   **generated driver notebook** that calls its script with the arguments
-   inline, because job parameters reach a notebook neither as argv nor as
+5. **Four jobs** — `snowmig_00_discover` → `03_reconcile`. Each runs one
+   **self-contained stage notebook** whose own `PARAMS` cell carries the
+   arguments, because job parameters reach a notebook neither as argv nor as
    environment (established live). No schedule: running one is always the
-   user's call, and the driver is editable in the console.
+   user's call, and the PARAMS cell is editable in the console.
+
+   `--stage-param NAME=VALUE` (repeatable) writes a value into the PARAMS
+   cell of every stage that declares NAME — the stage flag without `--`,
+   e.g. `schema=SALES`, `tables=ORDERS,LINES`, `dry-run=true`. Prefix it
+   with a stage (`discover`, `structure`, `copy_schema`, `reconcile`) to
+   write that stage only: `copy_schema.mode=overwrite`. An unqualified
+   value a declaring stage would reject is refused — `mode` means
+   different things to 01 and 02 — as is a name no stage declares; a
+   switch takes `true`/`false`, and with
+   `--reuse-existing` it needs `--refresh-notebooks`, because a notebook
+   already on the workspace is otherwise kept as it is.
 
    A job is a **workflow**: logged, re-runnable, and its task output is
    exportable as evidence. Run one with `snowmig.py run --job <name>`, never
@@ -63,8 +74,11 @@ live, it needs no extra cluster library, and it does not wait on the external
 catalog's crawler — which on at least one deployment fails
 (`CONNECTOR_0067, Login has timed out`) with credentials the connector
 accepts. It needs `--source-config` so the credential reaches the workspace
-mount; that file carries a secret, so it is uploaded only when passed
-explicitly.
+mount: its `snowflake:` block is uploaded as JSON to
+`plan/<config stem>.json` (the `aidp:` block is not copied), and because that
+block carries a secret it is uploaded only when passed explicitly. A `*_path`
+secret is refused before anything is uploaded — the path is not on the
+cluster.
 
 `--source-mode external-catalog` uses three-part names instead, and needs a
 catalog whose crawl has actually succeeded. Check that first — an empty
@@ -80,6 +94,12 @@ not the same as an empty database.
   API accepted and the object never became visible in the poll budget — say
   it is pending and point at the console. `name_taken` is neither: it means
   something of that name was already there and this run did **not** adopt it.
+- **Hand-off.** After `--execute`, read `workspace.key` and `cluster.key`
+  from `provision_result.json` and have the user put them under `aidp:` in
+  `snowmig-config.yaml` (`aidp.workspace`, `aidp.cluster_id`) before
+  `/snowflake-catalog`. `PROVISION.md` shows the display names, which are
+  not the keys; the catalog step needs the keys, and `provision` does not
+  write them back.
 - **Never reuse, never "ensure".** Do not list existing workspaces or
   clusters and offer the user a choice among them. The only question is *may
   I create this*.

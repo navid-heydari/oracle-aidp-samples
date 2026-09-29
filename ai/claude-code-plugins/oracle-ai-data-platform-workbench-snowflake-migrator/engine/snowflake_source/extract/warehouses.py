@@ -1,7 +1,10 @@
 """Warehouse inventory. Read-only.
 
 `SHOW WAREHOUSES` needs no special privilege and gives size, scaling policy and
-auto-suspend. Actual consumed credits live in
+auto-suspend -- but it returns only the warehouses the current role holds a
+privilege on (USAGE, MONITOR, OPERATE or OWNERSHIP), so an empty list says
+something about the role before it says anything about the account, and the
+result records that. Actual consumed credits live in
 `SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY`, which needs a grant a
 customer may refuse -- so metering is optional and its absence is recorded, never
 silently treated as zero consumption.
@@ -76,11 +79,21 @@ def extract_warehouses(run_sql: Callable[..., list[dict]], *,
         })
     warehouses.sort(key=lambda w: (-w["size_rank"], w["name"]))
 
+    visibility_note = ""
+    if not warehouses:
+        visibility_note = (
+            "0 warehouses visible to the current role: SHOW WAREHOUSES lists "
+            "only warehouses the role holds USAGE, MONITOR, OPERATE or "
+            "OWNERSHIP on, so the compute proposal covers only what this role "
+            "can see. Re-run with a role that can see every warehouse before "
+            "sizing the target.")
+
     return {
         "probed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "warehouse_count": len(warehouses),
         "max_concurrent_clusters": sum(w["max_cluster_count"] for w in warehouses),
         "metering_source": metering_source,
         "metering_note": metering_note,
+        "visibility_note": visibility_note,
         "warehouses": warehouses,
     }

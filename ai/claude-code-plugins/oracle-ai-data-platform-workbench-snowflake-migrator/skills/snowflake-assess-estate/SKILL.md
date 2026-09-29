@@ -1,6 +1,6 @@
 ---
 name: snowflake-assess-estate
-description: Read-only PREVIEW of a Snowflake environment from the operator's machine - inventory of tables and views with row counts, byte sizes and column types, plus the census of objects that are not tables or views, table-maintenance state and security posture. Use ONLY when the user wants to look at an account without migrating it - answering what is in there, how big the tables are, what the security posture looks like. This is NOT the discovery step of a migration: a migration discovers inside AIDP as a workflow (runbook S6), because a laptop-side read leaves no log and no evidence on the platform. If the user asked to migrate, route to snowflake-migrator-overview and follow S1 through S12.
+description: "Read-only PREVIEW of a Snowflake environment from the operator's machine - inventory of tables and views with row counts, byte sizes and column types, plus the census of objects that are not tables or views, table-maintenance state and security posture. Use ONLY when the user wants to look at an account without migrating it - answering what is in there, how big the tables are, what the security posture looks like. This is NOT the discovery step of a migration: a migration discovers inside AIDP as a workflow (runbook S6), because a laptop-side read leaves no log and no evidence on the platform. If the user asked to migrate, route to snowflake-migrator-overview and follow S1 through S12."
 ---
 
 # Preview the estate — from the operator's machine
@@ -62,7 +62,18 @@ decision.
 
 - object counts by type, and total rows and bytes
 - the largest objects
-- anything with `compatibility_status: blocked` and why
+- anything the Compatibility column shows as blocked, and why. `blocked`
+  alone is a column type with no Delta equivalent
+  (`compatibility_status: blocked`, reasons in `blocked_reasons`);
+  `blocked (<kind>)` is an object kind the plan refuses whatever its
+  types -- a dynamic, external, Iceberg, event or hybrid table, or a
+  secure or materialized view
+- anything whose column read failed (`compatibility_status: unassessed`,
+  `columns_read: failed`, the error in `columns_read_error`). Its types were
+  never seen, so it is neither supported nor blocked: say the read failed and
+  why (a timeout is not a missing grant), and re-run before planning it
+- any pipe or task in CENSUS.md whose detail says `writes=<table>`: that
+  table migrates, but its load does not
 - views, noting their SQL is captured verbatim and translated only as far as
   the dialect rules go — see `snowflake-migration-plan`
 
@@ -100,9 +111,13 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig security \
 
 `assess` used to look at tables and views only, so "N of N objects can move"
 was true of what had been examined and overstated the estate. `CENSUS.md` now
-counts procedures, UDFs, tasks, streams, materialized and dynamic tables,
-stages, pipes, sequences and file formats. **None of them migrate**, and no
-equivalent is generated.
+counts procedures, UDFs and UDTFs, external functions, tasks, streams, alerts,
+materialized and dynamic tables, internal and external stages, pipes,
+sequences, file formats, secrets, network rules, Streamlit apps, notebooks
+and container services, plus the account's shares, roles, network policies,
+applications and compute pools. **None of them migrate**, and no equivalent
+is generated. An outbound share is a live contract with another account:
+read that row first.
 
 Two things to carry to the user:
 

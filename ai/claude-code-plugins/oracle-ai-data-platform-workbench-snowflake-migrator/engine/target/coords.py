@@ -63,8 +63,9 @@ def resolve_target(*, datalake_ocid: str | None = None, workspace: str | None = 
     if missing:
         raise MissingTarget(
             "AIDP target coordinates not supplied: " + ", ".join(sorted(missing)) +
-            ". These are never read from the environment or a config file -- ask the "
-            "user for them and pass them explicitly.")
+            ". Pass them as flags (--datalake-ocid, --workspace, --cluster-id, "
+            "--catalog) or set them under `aidp:` in the migration config -- "
+            "ask the user for them. They are never read from the environment.")
     return Target(**{k: str(v).strip() if v else ""
                      for k, v in supplied.items()})
 

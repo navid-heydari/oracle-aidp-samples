@@ -118,8 +118,9 @@ class EmulatedAidp:
                       else [dict(f) for f in obj["fields"]])
             return {"key": key,
                     ("viewFields" if is_view else "tableFields"): fields}
-        if operation == "delete_table":
-            self.objects.pop(self._fold(catalog, kw["schema"], kw["table"]), None)
+        if operation in ("delete_table", "delete_view"):
+            name = kw.get("view") if operation == "delete_view" else kw["table"]
+            self.objects.pop(self._fold(catalog, kw["schema"], name), None)
             return {}
 
         raise ValueError(f"the emulated AIDP has no operation {operation!r}")

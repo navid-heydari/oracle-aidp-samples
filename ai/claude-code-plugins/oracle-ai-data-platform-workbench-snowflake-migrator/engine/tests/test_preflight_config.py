@@ -9,6 +9,7 @@ credential's CONTENT never appears, and a check that was not run reads as
 skipped rather than as a pass.
 """
 import json
+import os
 
 import pytest
 
@@ -18,7 +19,7 @@ from plan.preflight import (
 
 def _config(tmp_path, **overrides):
     key = tmp_path / "rsa.p8"
-    key.write_text("-----BEGIN PRIVATE KEY-----\nSUPERSECRET\n")
+    key.write_text("-----BEGIN PRIVATE KEY-----\nSUPERSECRET\n", encoding="utf-8")
     base = {"account": "ORG-ACC", "user": "SVC", "warehouse": "WH",
             "database": "SALES_DB", "role": "READER", "auth": "keypair",
             "key_path": str(key)}
@@ -153,13 +154,15 @@ def test_the_report_tells_the_reader_to_confirm_with_the_user(tmp_path):
 
 # --- the config file itself ------------------------------------------------
 
+@pytest.mark.skipif(os.name == "nt",
+                    reason="POSIX mode bits; Windows files inherit the profile ACL")
 def test_a_new_config_is_created_unreadable_to_others(tmp_path):
     """It is about to hold a password in plain text; 0644 from the default
     umask would make that world-readable on a shared host."""
     import stat
     from migration_config import write_template
     template = tmp_path / "template.yaml"
-    template.write_text("snowflake:\n  account: X\n")
+    template.write_text("snowflake:\n  account: X\n", encoding="utf-8")
     written = write_template(tmp_path / "snowmig-config.yaml",
                              template=template)
     mode = stat.S_IMODE(written.stat().st_mode)
@@ -169,26 +172,26 @@ def test_a_new_config_is_created_unreadable_to_others(tmp_path):
 def test_it_refuses_to_overwrite_a_config_that_holds_credentials(tmp_path):
     from migration_config import ConfigError, write_template
     template = tmp_path / "template.yaml"
-    template.write_text("snowflake: {}\n")
+    template.write_text("snowflake: {}\n", encoding="utf-8")
     target = tmp_path / "snowmig-config.yaml"
-    target.write_text("snowflake:\n  password: real-one\n")
+    target.write_text("snowflake:\n  password: real-one\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="refusing to overwrite"):
         write_template(target, template=template)
-    assert "real-one" in target.read_text(), "the existing file is untouched"
+    assert "real-one" in target.read_text(encoding="utf-8"), "the existing file is untouched"
     # --force is the explicit way through.
     write_template(target, template=template, overwrite=True)
-    assert "real-one" not in target.read_text()
+    assert "real-one" not in target.read_text(encoding="utf-8")
 
 
 def test_discovery_prefers_the_working_directory_over_the_plugin(tmp_path):
     from migration_config import discover_config
     cwd, plugin = tmp_path / "work", tmp_path / "plugin"
     cwd.mkdir(), plugin.mkdir()
-    (plugin / "snowmig-config.yaml").write_text("snowflake: {}\n")
+    (plugin / "snowmig-config.yaml").write_text("snowflake: {}\n", encoding="utf-8")
     # With only the plugin's copy, that is what is found.
     assert discover_config(cwd=cwd, plugin_root=plugin).parent == plugin
     # The operator's own file wins as soon as it exists.
-    (cwd / "snowmig-config.yaml").write_text("snowflake: {}\n")
+    (cwd / "snowmig-config.yaml").write_text("snowflake: {}\n", encoding="utf-8")
     assert discover_config(cwd=cwd, plugin_root=plugin).parent == cwd
 
 
@@ -219,7 +222,7 @@ def test_a_secret_is_never_rendered(tmp_path):
 def test_inline_and_path_together_are_refused_not_ranked(tmp_path):
     from migration_config import ConfigError, resolve_secret
     secret = tmp_path / "pw"
-    secret.write_text("from-file")
+    secret.write_text("from-file", encoding="utf-8")
     with pytest.raises(ConfigError, match="keep one"):
         resolve_secret({"password": "inline", "password_path": str(secret)},
                        "password", "password_path")
@@ -233,6 +236,81 @@ def test_an_unknown_aidp_key_is_reported_not_ignored():
     from migration_config import ConfigError, aidp_block
     with pytest.raises(ConfigError, match="datalake_ocid"):
         aidp_block({"aidp": {"datalake_ocd": "typo"}})
+
+
+# --- a config the parser rejects must not be quoted back ---------------------
+
+_BROKEN_SECRET = "SECRET-XYZ-123"
+
+# Each line is what a real password looks like once a YAML-special character
+# lands in it unquoted, and each drives PyYAML into a different error class.
+# A parser error quotes the offending source line; on the password line that
+# IS the password.
+_BROKEN_PASSWORD_LINES = [
+    pytest.param("password: {" + _BROKEN_SECRET, id="brace-parser-error"),
+    pytest.param("password: Pa: " + _BROKEN_SECRET, id="colon-scanner-error"),
+    pytest.param("password: [" + _BROKEN_SECRET, id="bracket-parser-error"),
+    pytest.param("password: *" + _BROKEN_SECRET, id="star-composer-error"),
+    pytest.param('password: "' + _BROKEN_SECRET, id="quote-unterminated"),
+]
+
+
+def _broken_config(tmp_path, line):
+    cfg = tmp_path / "snowmig-config.yaml"
+    cfg.write_text("snowflake:\n  account: acme\n  auth: password\n"
+                   f"  {line}\naidp:\n  workspace: ws\n", encoding="utf-8")
+    return cfg
+
+
+@pytest.mark.parametrize("line", _BROKEN_PASSWORD_LINES)
+def test_a_malformed_yaml_config_is_refused_without_echoing_the_secret(
+        tmp_path, line):
+    """`yaml.safe_load` was unguarded, and a YAMLError is not a ValueError, so
+    a password containing `{`, `: `, `[`, `*` or a leading quote escaped
+    `main()` as a traceback -- with PyYAML's snippet of the offending line,
+    i.e. the password, in it."""
+    import traceback
+    from migration_config import ConfigError, load_config
+    with pytest.raises(ConfigError) as caught:
+        load_config(_broken_config(tmp_path, line))
+    message = str(caught.value)
+    assert "not valid YAML" in message
+    assert "line 4" in message, "the operator needs to know WHERE, not what"
+    assert _BROKEN_SECRET not in message
+    # Nor may the chained cause carry it: a traceback printer walks the chain.
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert _BROKEN_SECRET not in rendered
+
+
+@pytest.mark.parametrize("line", _BROKEN_PASSWORD_LINES)
+def test_preflight_on_a_malformed_config_exits_1_with_a_redacted_message(
+        tmp_path, line, capsys):
+    """`preflight` is the documented first command, and it is where a strong
+    password first meets the YAML parser."""
+    from snowmig import main
+    cfg = _broken_config(tmp_path, line)
+    rc = main(["preflight", "--config", str(cfg),
+               "--out-dir", str(tmp_path / "out")])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "error:" in captured.err
+    assert "Traceback" not in captured.err
+    assert _BROKEN_SECRET not in captured.out
+    assert _BROKEN_SECRET not in captured.err
+
+
+def test_a_malformed_json_config_is_refused_without_echoing_the_secret(
+        tmp_path):
+    import traceback
+    from migration_config import ConfigError, load_config
+    cfg = tmp_path / "snowmig-config.json"
+    cfg.write_text('{"snowflake": {"account": "acme", "password": '
+                   + _BROKEN_SECRET + '}}', encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_config(cfg)
+    assert "not valid JSON" in str(caught.value)
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert _BROKEN_SECRET not in rendered
 
 
 # --- the first-run failure everyone hits -----------------------------------

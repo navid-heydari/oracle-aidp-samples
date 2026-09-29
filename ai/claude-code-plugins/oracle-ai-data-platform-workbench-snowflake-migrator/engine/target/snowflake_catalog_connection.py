@@ -41,7 +41,7 @@ def load_connection_config(path: str | pathlib.Path) -> dict:
     """Parse a YAML or JSON connection config file. Never guesses a location."""
     p = pathlib.Path(path).expanduser()
     try:
-        text = p.read_text()
+        text = p.read_text(encoding="utf-8")
     except OSError as exc:
         raise ConnectionConfigError(
             f"connection config not readable at {p}: {exc.strerror}") from exc
@@ -68,7 +68,7 @@ def load_connection_config(path: str | pathlib.Path) -> dict:
 def _read_secret_file(path: str, label: str) -> str:
     p = pathlib.Path(path).expanduser()
     try:
-        return p.read_text().strip()
+        return p.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise ConnectionConfigError(
             f"{label} not readable at {path}: {exc.strerror}") from exc

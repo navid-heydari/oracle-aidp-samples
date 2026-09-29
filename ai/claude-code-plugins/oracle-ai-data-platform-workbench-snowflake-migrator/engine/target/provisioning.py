@@ -34,9 +34,14 @@ import time
 from typing import Callable
 
 from retry import is_retryable, retry_call
+from migration_config import ConfigError, load_config, snowflake_block
+from plan.preflight import SECRET_PATH_FIELDS
 
 from .naming import translate_name
-from .stage_notebooks import STAGES, build_stage_notebook
+from .runner import is_active, is_conflict
+from .stage_notebooks import (
+    DIAGNOSE_NOTEBOOK_NAME, STAGES, build_diagnose_notebook,
+    build_stage_notebook, check_stage_params)
 from .provision_api import (
     build_cluster_body, build_job_body,
     build_library_items, build_provision_command, build_workspace_body,
@@ -44,7 +49,9 @@ from .provision_api import (
 
 __all__ = ["JOB_SPECS", "SCRIPTS_FOLDER", "PLAN_FOLDER", "REPORTS_FOLDER",
            "BACKUP_FOLDER", "ProvisionTransportError",
-           "make_provision_call", "provision", "render_provision"]
+           "make_provision_call", "provision", "render_provision",
+           "source_config_payload",
+           "async_operation_key", "connection_test_outcome"]
 
 
 class ProvisionTransportError(RuntimeError):
@@ -103,15 +110,30 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
     """A `call(operation, **kwargs) -> dict` over the documented API."""
     import subprocess
 
-    from .runner import _printable
-    from .executor import parse_cli_json
+    from .coords import region_from_ocid
+    from .runner import (DEFAULT_CLI_TIMEOUT, _printable, _session_expired,
+                         expired_session_message, spool_body)
+    from .executor import collect_pages, parse_cli_envelope
 
     def _run(cmd):
-        return subprocess.run(cmd, capture_output=True, text=True, check=False)
+        # A spawned CLI must not inherit variables that repoint its own
+        # interpreter; see cli_environment in snowmig.py.
+        env = dict(os.environ)
+        for name in ("PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE",
+                     "PYTHONNOUSERSITE", "PYTHONSTARTUP",
+                     "PYTHONEXECUTABLE", "PYTHONSAFEPATH"):
+            env.pop(name, None)
+        # Bounded: a child that never returns used to hold this stage
+        # open indefinitely while a cluster billed (live 2026-09-24).
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              check=False, encoding="utf-8",
+                              errors="replace", env=env,
+                              timeout=DEFAULT_CLI_TIMEOUT)
 
     runner = run_process or _run
 
-    def call(operation: str, **kwargs) -> dict:
+    def _once(operation: str, kwargs: dict) -> tuple[list[dict], dict]:
+        """One request: its rows and its response headers (lower-cased)."""
         spooled = None
         # File CONTENT never goes through this transport at all: uploads use
         # the `workspace-object` surface, which takes a local path. A body
@@ -123,6 +145,13 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
                 "this transport does not carry file content; upload through "
                 "the workspace-object operations (upload_ws_file), which take "
                 "a local path")
+        # `connectionDetails` is the Snowflake credential -- the testConnection
+        # body carries the same password or PEM the catalog registration did.
+        # It travels by file, exactly like create_catalog's body, so it is
+        # never an argv element for `ps` or process auditing to record.
+        if isinstance(body, dict) and "connectionDetails" in body:
+            spooled = spool_body(body, prefix="snowmig_testconn_")
+            kwargs = {**kwargs, "body_file": spooled}
         try:
             cmd = build_provision_command(backend, operation, platform_ocid,
                                           **kwargs)
@@ -131,6 +160,11 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
                 print("  $ " + " ".join(_printable(c) for c in cmd))
                 proc = runner(cmd)
                 if proc.returncode != 0:
+                    if _session_expired(proc.stdout, proc.stderr):
+                        raise ProvisionTransportError(
+                            f"{operation}: "
+                            + expired_session_message(
+                                None, region_from_ocid(platform_ocid)))
                     raise ProvisionTransportError(
                         f"{operation} failed (exit {proc.returncode}): "
                         f"{(proc.stderr or proc.stdout or '')[:300]}")
@@ -142,22 +176,146 @@ def make_provision_call(platform_ocid: str, *, backend: str = "oci_raw",
                 attempt, label=operation,
                 retryable=is_retryable(
                     read=operation.startswith(("get_", "list_"))))
-            stdout = proc.stdout or ""
-            # The aidp CLI prefixes its JSON with a literal "Response:" line.
-            if stdout.lstrip().startswith("Response:"):
-                stdout = stdout.lstrip()[len("Response:"):]
-            rows = parse_cli_json(stdout)
+            # The aidp CLI's literal "Response:" prefix is stripped by the
+            # parser; the headers come back with the rows because a list
+            # endpoint names its next page in one of them.
+            rows, headers = parse_cli_envelope(proc.stdout or "")
         finally:
             if spooled:
                 try:
                     os.unlink(spooled)
                 except OSError:
                     pass
+        if headers.get("opc-next-page") and cmd[0] == "aidp":
+            # The workspace-object listing rides the aidp CLI, whose paging
+            # flags are undocumented. Page one handed back as the whole would
+            # read every object past it as absent; refuse and say why.
+            raise ProvisionTransportError(
+                f"{operation}: the aidp CLI answered with a next-page token, "
+                f"so this listing is only its first page and the rest cannot "
+                f"be requested through that CLI; the listing is incomplete "
+                f"and was not used.")
+        return rows, headers
+
+    def call(operation: str, **kwargs) -> dict:
         if operation.startswith("list_"):
-            return {"items": rows}
-        return rows[0] if rows else {}
+            # A collection may span pages: `opc-next-page` is followed until
+            # the server stops sending one, so jobs.in_flight_runs and every
+            # look-first check see the whole collection.
+            def fetch(page):
+                rows, headers = _once(operation, {**kwargs, "page": page}
+                                      if page else kwargs)
+                return rows, headers.get("opc-next-page")
+
+            try:
+                items = collect_pages(fetch, operation)
+            except ProvisionTransportError:
+                raise
+            except RuntimeError as exc:
+                raise ProvisionTransportError(str(exc)) from exc
+            return {"items": items}
+        rows, headers = _once(operation, kwargs)
+        row = rows[0] if rows else {}
+        # An async action answers 202 with an EMPTY body and its operation
+        # key in a response header. The parser cannot put a header into a
+        # row, so the transport keeps them beside it, under `_headers`, for
+        # async_operation_key to read.
+        if headers and isinstance(row, dict):
+            row = dict(row, _headers=headers)
+        return row
 
     return call
+
+
+# Where the async operation key of a 202 may ride. `aidp-async-operation-key`
+# is the header live-verified on the validated deployment; the documented
+# testConnection contract names `oidl-async-operation-key` and
+# `datalake-async-operation-key`; `opc-work-request-id` is the OCI-wide
+# convention. All four are read, headers first, case-insensitively.
+_ASYNC_KEY_HEADERS = ("aidp-async-operation-key",
+                      "datalake-async-operation-key",
+                      "oidl-async-operation-key", "opc-work-request-id")
+_ASYNC_TERMINAL = ("SUCCEEDED", "SUCCESS", "FAILED", "CANCELED", "CANCELLED")
+
+
+def async_operation_key(payload: dict) -> str | None:
+    """The async operation key a 202 carried, wherever the envelope put it.
+
+    `oci raw-request` prints `{"data": <body>, "headers": {...}, "status"}`.
+    For an empty body the key rides in a HEADER, which make_provision_call
+    keeps under `_headers`; when the parser returned the whole envelope (a
+    null body) the headers sit under `headers`; a body may also carry it as
+    `key`, at the top level or under `data`. Reading it at the top level of
+    the parsed row only -- as the catalog stage once did -- found nothing in
+    any of these shapes, so the poll never ran and every test reported
+    PENDING.
+    """
+    if not isinstance(payload, dict):
+        return None
+    for headers in (payload.get("_headers"), payload.get("headers")):
+        if isinstance(headers, dict):
+            lowered = {str(k).lower(): v for k, v in headers.items()}
+            for name in _ASYNC_KEY_HEADERS:
+                if lowered.get(name):
+                    return str(lowered[name])
+    for name in _ASYNC_KEY_HEADERS:
+        if payload.get(name):
+            return str(payload[name])
+    data = payload.get("data")
+    if isinstance(data, dict) and data.get("key"):
+        return str(data["key"])
+    if payload.get("key"):
+        return str(payload["key"])
+    return None
+
+
+def connection_test_outcome(call: Callable[..., dict], probe: dict, *,
+                            delays: tuple[float, ...] = (5.0, 10.0, 15.0,
+                                                         20.0, 30.0),
+                            sleep: Callable[[float], None] | None = None
+                            ) -> dict:
+    """The verdict of a testConnection POST, read back through
+    `GET /asyncOperations/{key}` with a bounded backoff.
+
+    {requested, status, operation_key, error?, note?}. PENDING means one
+    thing: the key was found and the operation had not ended when the poll
+    budget ran out. A 202 whose envelope carries no key is reported as
+    exactly that -- the verdict cannot be read -- and a poll that fails is
+    UNREADABLE with its error. None of these is a pass.
+    """
+    sleep = sleep or time.sleep
+    key = async_operation_key(probe)
+    outcome: dict = {"requested": True, "status": "PENDING",
+                     "operation_key": key}
+    if not key:
+        outcome["note"] = (
+            "the API accepted the test request but its envelope carried no "
+            "async operation key (in a header or the body), so the verdict "
+            "cannot be read; PENDING is not a pass")
+        return outcome
+    last = "PENDING"
+    for delay in delays:
+        sleep(delay)
+        try:
+            op = call("get_async_operation", key=key)
+        except Exception as exc:
+            outcome["status"] = "UNREADABLE"
+            outcome["error"] = (f"GET asyncOperations/{key}: "
+                                f"{str(exc)[:200]}")
+            return outcome
+        last = str(op.get("status") or op.get("lifecycleState")
+                   or "PENDING").upper()
+        if last in _ASYNC_TERMINAL:
+            outcome["status"] = last
+            if op.get("errorCode") or op.get("errorMessage"):
+                outcome["error"] = (f'{op.get("errorCode")}: '
+                                    f'{op.get("errorMessage")}')
+            return outcome
+    outcome["note"] = (
+        f"the operation still reported {last} after {len(delays)} polls "
+        f"over {sum(delays):g}s, so the verdict was not readable within "
+        f"the budget; PENDING is not a pass -- re-check operation {key}")
+    return outcome
 
 
 def _match(items: list[dict], display_name: str) -> dict | None:
@@ -170,28 +328,81 @@ def _match(items: list[dict], display_name: str) -> dict | None:
     return None
 
 
-def _poll(list_fn, display_name: str, delays: tuple[float, ...]) -> dict | None:
+def _poll(list_fn, display_name: str, delays: tuple[float, ...], *,
+          require_active: bool = False) -> tuple[dict | None, str | None]:
+    """`(item, listing_error)`: the item once it is visible (and ACTIVE, when
+    asked for), else None. With `require_active`, an item that appeared but
+    was still settling when the budget ran out is returned as last seen, so
+    the caller can tell "never visible" from "visible, not yet ACTIVE".
+
+    `listing_error` is the last error when EVERY listing raised. That is
+    "could not look", not "absent": it used to be swallowed, so a 401 or 503
+    right after an accepted create was reported as "never became visible"
+    with the error recorded nowhere. One good listing is enough to make a
+    miss a real miss, so the error is then None."""
+    last, error, listed_once = None, None, False
     for attempt in range(len(delays) + 1):
         try:
             found = _match(list_fn().get("items") or [], display_name)
-        except Exception:
-            found = None
+            listed_once = True
+        except Exception as exc:
+            found, error = None, str(exc)[:200]
         if found is not None:
-            return found
+            last = found
+            if not require_active or is_active(found):
+                return found, None
         if attempt < len(delays):
             time.sleep(delays[attempt])
-    return None
+    return last, (None if listed_once else error)
 
 
 def _key(item: dict, fallback: str) -> str:
     return str(item.get("key") or item.get("id") or fallback)
 
 
+def source_config_payload(path: pathlib.Path) -> dict:
+    """What `--source-config` places on the workspace: the `snowflake:` block
+    of the operator's migration config, and nothing else.
+
+    The in-AIDP scripts read only that block (the data-plane loader unwraps
+    it), so the `aidp:` half -- the DataLake OCID and the target
+    coordinates -- has no business on the mount and is not copied. The
+    block carries the credential, which is why the upload is opt-in; a
+    copy that carries MORE than the scripts read is exposure for nothing.
+    It is written as JSON, which the loader reads without PyYAML.
+
+    A `*_path` secret is refused here, before anything is uploaded. The
+    path names a file on THIS machine; the copy is read on the cluster from
+    /Workspace/..., where that path does not exist. That failure used to
+    surface five minutes later, as a raw FileNotFoundError in the job log,
+    after `preflight` had called the path "readable" -- on the laptop.
+    """
+    block = snowflake_block(load_config(path))
+    laptop_only = [f for f in SECRET_PATH_FIELDS if block.get(f)]
+    if laptop_only:
+        raise ConfigError(
+            f"--source-config {path} carries {', '.join(laptop_only)}: a "
+            f"path to a file on this machine. The copy placed on the "
+            f"workspace is read on the cluster from /Workspace/{PLAN_FOLDER}/, "
+            f"where that path does not exist, so connector mode cannot use "
+            f"it. Inline the secret under `snowflake:` instead (private_key: "
+            f"| for a PEM, password: for a password, token: for a PAT), "
+            f"then re-run.")
+    return {"snowflake": dict(block)}
+
+
+def _credential_line(source_name: str, remote: str) -> str:
+    return (f"{source_name} -> {remote} — CARRIES THE SNOWFLAKE CREDENTIAL "
+            f"(the snowflake: block only; aidp: is not copied). Readable by "
+            f"every member of the workspace and by every cluster in it via "
+            f"/Workspace; remove it when the migration is done")
+
+
 def _pypi_from_requirements(path: pathlib.Path | None) -> list[str]:
     if path is None or not path.is_file():
         return []
     out = []
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             out.append(line)
@@ -202,6 +413,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               cluster_name: str = "migration-assets",
               scripts: list[pathlib.Path],
               plan_files: list[pathlib.Path] = (),
+              stage_params: dict | None = None,
               requirements: pathlib.Path | None = None,
               maven: list[str] = (),
               external_catalog: str | None = None,
@@ -215,7 +427,8 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
               reuse_existing: bool = False,
               warehouse_cluster_mode: str = "new",
               existing_cluster_id: str | None = None,
-              output_dir: str = "report/output") -> dict:
+              output_dir: str = "report/output",
+              refresh_notebooks: bool = False) -> dict:
     """Provision this migration's own environment inside AIDP.
 
     `reuse_existing=False` is the default and the rule: a migration creates
@@ -224,10 +437,49 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     COLLISION -- reported, and the run stops so the user can choose another
     name. Adopting a stranger's workspace silently makes the blast radius of
     the migration unknowable.
+
+    With `reuse_existing`, a stage notebook already on the workspace is KEPT
+    as it is unless `refresh_notebooks` is set: operators set schema, mode
+    and verify by editing its PARAMS cell in the console, so regenerating it
+    would discard that work without saying so. Kept notebooks are listed in
+    the result.
+
+    `stage_params` are written into the PARAMS cell of every stage that
+    declares the name, or, as `<stage key>.<name>`, of that stage only.
+    They are checked BEFORE anything is called: a name no stage declares, a
+    switch given something other than true/false, a value outside a flag's
+    choices in any stage it reaches (`mode=overwrite` reaches 01 too, which
+    rejects it), or values that would land only on a notebook this run
+    keeps are refused with a ValueError, never dropped -- a scope flag that
+    silently does nothing reads as applied.
     """
+    stage_params = dict(stage_params or {})
+    if stage_params:
+        check_stage_params(stage_params)
+        if reuse_existing and not refresh_notebooks:
+            raise ValueError(
+                "--stage-param " + ", ".join(sorted(stage_params))
+                + " with --reuse-existing needs --refresh-notebooks: a stage "
+                "notebook already on the workspace is kept as it is, so the "
+                "value would never reach its PARAMS cell. Add "
+                "--refresh-notebooks (it regenerates every stage notebook "
+                "from this run's flags, discarding console edits to PARAMS), "
+                "or edit the PARAMS cell in the console instead.")
     ws_name = translate_name(workspace_name, kind="workspace")
     cl_name = translate_name(cluster_name, kind="cluster")
     pypi = _pypi_from_requirements(requirements)
+    # The source config, when given, is the ONE credential-bearing object
+    # this stage places on the workspace. Only its `snowflake:` block goes,
+    # as JSON under the same stem; the operator's file itself never travels,
+    # whoever put it in plan_files. A laptop-only `*_path` secret is refused
+    # here, before anything -- dry run or not -- is written.
+    source_payload = None
+    credential_object = None
+    if source_config is not None:
+        source_payload = source_config_payload(source_config)
+        credential_object = f"{PLAN_FOLDER}/{source_config.stem}.json"
+        plan_files = [p for p in plan_files
+                      if pathlib.Path(p).resolve() != source_config.resolve()]
     # One cluster per Snowflake warehouse, named after it. Sizing is NOT
     # carried over: the user asked for same-name clusters on the AIDP default
     # config, and the `compute` stage's proposal stays a proposal until
@@ -259,6 +511,15 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         "external_catalog": external_catalog,
         "target_catalog": target_catalog,
         "source_mode": source_mode,
+        # Workspace objects that hold a credential, so the report can say so
+        # in one place and the operator knows what to remove afterwards.
+        "credential_objects": [credential_object] if credential_object else [],
+        # Stage notebooks left as found on the workspace (reuse_existing
+        # without refresh_notebooks), so PROVISION.md can list them.
+        "notebooks_kept": [],
+        # The explicit --stage-param values, as given, so the record says
+        # what this run wrote into PARAMS beyond the derived coordinates.
+        "stage_params": dict(stage_params),
         "steps": [],
     }
 
@@ -289,9 +550,15 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
             step("upload", "would upload", None,
                  f'{spec["notebook"]} (generated) -> '
                  f'{SCRIPTS_FOLDER}/{spec["notebook"]}')
+        step("upload", "would upload", None,
+             f"{DIAGNOSE_NOTEBOOK_NAME} (generated, no job) -> "
+             f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}")
         for path in plan_files:
             step("upload", "would upload", None,
                  f"{path.name} -> {PLAN_FOLDER}/{path.name}")
+        if credential_object:
+            step("upload", "would upload", None,
+                 _credential_line(source_config.name, credential_object))
         for spec in JOB_SPECS:
             step("job", "would create", None, spec["name"])
         return out
@@ -299,17 +566,34 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     if call is None:
         raise ValueError("execute=True requires a transport callable")
 
-    # 1 · workspace: look, create if absent, poll until visible -------------
+    # 1 · workspace: look, create if absent, poll until visible AND ACTIVE --
     found = _match(call("list_workspaces").get("items") or [], ws_name.name)
+    ws_created, ws_list_error = False, None
     if found is None:
         call("create_workspace",
              body=build_workspace_body(ws_name.name,
                                        description="snowflake-migrator "
                                                    "migration workspace",
                                        subnet_id=subnet_id))
-        found = _poll(lambda: call("list_workspaces"), ws_name.name, delays)
+        ws_created = True
+        # A workspace reports ACTIVE seconds after its POST returns, and a
+        # cluster created inside that window is a 409. So wait for ACTIVE,
+        # not just for the name to appear; a slow ACTIVE is recorded, not a
+        # stop, because the cluster POST below retries on the 409 anyway.
+        found, ws_list_error = _poll(lambda: call("list_workspaces"),
+                                     ws_name.name, delays,
+                                     require_active=True)
+        settling = found is not None and not is_active(found)
+        if ws_list_error is not None:
+            detail = f"{ws_name.name}: read_back_failed: {ws_list_error}"
+        elif settling:
+            detail = (f'{ws_name.name}: visible, but lifecycleState='
+                      f'{found.get("lifecycleState")} after the poll budget; '
+                      f'the cluster POST is retried on 409 while it settles')
+        else:
+            detail = ws_name.name
         step("workspace", "create_requested" if found is None else "created",
-             found is not None, ws_name.name)
+             found is not None, detail)
     elif reuse_existing:
         step("workspace", "reused", True, _key(found, ws_name.name))
     else:
@@ -318,25 +602,79 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
              f"a workspace named {ws_name.name!r} already exists and this "
              f"migration does not reuse what it did not create. Choose "
              f"another --workspace-name, or pass --reuse-existing if you "
-             f"really mean to migrate into someone else's workspace.")
+             f"really mean to migrate into someone else's workspace. If a "
+             f"previous run of THIS migration created it (its PROVISION.md "
+             f"lists the workspace step), --reuse-existing is the intended "
+             f"resume, not a rule violation.")
         return out
     ws_key = _key(found or {}, ws_name.name)
     out["workspace"]["key"] = ws_key
     if found is None:
-        step("halt", "stopped", False,
-             "the workspace never became visible; nothing else was attempted")
+        if ws_created and ws_list_error is not None:
+            step("halt", "stopped", False,
+                 f"the workspace {ws_name.name!r} was created (POST "
+                 f"accepted) but could not be listed to confirm it "
+                 f"({ws_list_error}); nothing else was attempted. Once "
+                 f"listing works, re-run the same command with "
+                 f"--reuse-existing to continue into it -- a plain re-run "
+                 f"would halt on name_taken")
+        else:
+            step("halt", "stopped", False,
+                 "the workspace never became visible; nothing else was "
+                 "attempted")
         return out
 
     # 2 · cluster ------------------------------------------------------------
-    found = _match(call("list_clusters", workspace=ws_key).get("items") or [],
-                   cl_name.name)
+    # From here on the workspace EXISTS, so nothing below may raise out of
+    # this function: an exception would lose the record of it, and the next
+    # run would halt on name_taken and call the operator's own workspace
+    # "someone else's". A failure is a recorded step plus a halt that says
+    # how to resume.
+    resume = (
+        f"workspace {ws_name.name!r} (key {ws_key}) WAS created by this run "
+        f"and is recorded above. Re-run the same command with "
+        f"--reuse-existing to continue into it; do not pick a new "
+        f"--workspace-name, or this one is orphaned."
+        if ws_created else
+        f"workspace {ws_name.name!r} (key {ws_key}) is the one being reused; "
+        f"fix the cause above and re-run the same command.")
+    cl_list_error = None
+    try:
+        found = _match(
+            call("list_clusters", workspace=ws_key).get("items") or [],
+            cl_name.name)
+    except Exception as exc:
+        step("cluster", "failed", False, f"list_clusters: {str(exc)[:200]}")
+        step("halt", "stopped", False, resume)
+        return out
     if found is None:
-        call("create_cluster", workspace=ws_key,
-             body=build_cluster_body(cl_name.name))
-        found = _poll(lambda: call("list_clusters", workspace=ws_key),
-                      cl_name.name, delays)
+        # A cluster POSTed before the workspace reports ACTIVE is a 409
+        # "ongoing operation". Retried with the bounded backoff, each retry
+        # on the record; anything else fails the step and halts with the
+        # record intact.
+        for attempt in range(len(delays) + 1):
+            try:
+                call("create_cluster", workspace=ws_key,
+                     body=build_cluster_body(cl_name.name))
+                break
+            except Exception as exc:
+                if is_conflict(exc) and attempt < len(delays):
+                    step("cluster", "retried", None,
+                         f"attempt {attempt + 1}: 409/ongoing operation on "
+                         f"workspace {ws_key}; waiting {delays[attempt]:g}s")
+                    time.sleep(delays[attempt])
+                    continue
+                step("cluster", "failed", False,
+                     f"create_cluster: {str(exc)[:200]}")
+                step("halt", "stopped", False, resume)
+                return out
+        found, cl_list_error = _poll(
+            lambda: call("list_clusters", workspace=ws_key), cl_name.name,
+            delays)
         step("cluster", "create_requested" if found is None else "created",
-             found is not None, cl_name.name)
+             found is not None,
+             f"{cl_name.name}: read_back_failed: {cl_list_error}"
+             if cl_list_error is not None else cl_name.name)
         if found is not None:
             # When the compute clock started, for the billing report.
             out["cluster"]["created_at"] = datetime.datetime.now(
@@ -354,10 +692,13 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     if found is None:
         # Falling through would bake the DISPLAY NAME into four job bodies as
         # a clusterKey, and they would be "created" and unrunnable.
+        seen = ("was created (POST accepted) but could not be listed to "
+                f"confirm it ({cl_list_error})" if cl_list_error is not None
+                else "never became visible")
         step("halt", "stopped", False,
-             "the cluster never became visible, so its key is unknown; jobs "
-             "would be created bound to an invalid cluster. Nothing else was "
-             "attempted")
+             f"the cluster {seen}, so its key is unknown; jobs would be "
+             f"created bound to an invalid cluster. Nothing else was "
+             f"attempted. " + resume)
         return out
     cluster_key = _key(found, cl_name.name)
     out["cluster"]["key"] = cluster_key
@@ -376,9 +717,17 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                  f'{existing_cluster_id} (not created, not resized)')
         warehouse_targets = []
     for target in warehouse_targets:
-        existing = _match(
-            call("list_clusters", workspace=ws_key).get("items") or [],
-            target["name"])
+        try:
+            existing = _match(
+                call("list_clusters", workspace=ws_key).get("items") or [],
+                target["name"])
+        except Exception as exc:
+            # Could not look is not absent: creating on a failed read is how
+            # a duplicate gets made. Recorded, and the next warehouse tried.
+            step("warehouse-cluster", "failed", False,
+                 f'{target["warehouse"]} -> {target["name"]}: '
+                 f'list_clusters: {str(exc)[:200]}')
+            continue
         if existing is not None:
             target["key"] = _key(existing, target["name"])
             step("warehouse-cluster",
@@ -397,13 +746,20 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                  f'{target["warehouse"]} -> {target["name"]}: '
                  f'{str(exc)[:200]}')
             continue
-        seen = _poll(lambda: call("list_clusters", workspace=ws_key),
-                     target["name"], delays)
+        seen, seen_error = _poll(
+            lambda: call("list_clusters", workspace=ws_key), target["name"],
+            delays)
         target["key"] = _key(seen or {}, target["name"]) if seen else None
+        if seen:
+            tail = ""
+        elif seen_error is not None:
+            tail = (" — accepted, but it could not be listed to confirm it; "
+                    f"read_back_failed: {seen_error}")
+        else:
+            tail = " — accepted, but it never became visible"
         step("warehouse-cluster",
              "created" if seen else "create_requested", seen is not None,
-             f'{target["warehouse"]} -> {target["name"]}'
-             + ("" if seen else " — accepted, but it never became visible"))
+             f'{target["warehouse"]} -> {target["name"]}' + tail)
 
     # 3 · libraries (only when a fallback needs them) ------------------------
     if pypi or maven:
@@ -445,22 +801,75 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                  f"{folder}: {str(exc)[:120]}")
 
     for folder, files in ((PLAN_FOLDER, plan_files),):
+        # Upload the folder's files, THEN read the folder back once. The
+        # read-back is the claim and is unchanged -- a 2xx never was one --
+        # but it is the same evidence gathered once instead of per file.
+        # Each listing is its own CLI process; the live run spent seven.
+        upload_errors: dict[str, str] = {}
+        for path in files:
+            try:
+                call("upload_ws_file", workspace=ws_key,
+                     path=f"{folder}/{path.name}", local_path=str(path))
+            except Exception as exc:
+                upload_errors[path.name] = str(exc)[:200]
+        if not files:
+            continue
+        try:
+            items = call("list_ws_objects", workspace=ws_key,
+                         path=folder).get("items") or []
+            listing_failure = None
+        except Exception as exc:
+            items, listing_failure = [], str(exc)[:200]
         for path in files:
             remote = f"{folder}/{path.name}"
+            if path.name in upload_errors:
+                # The upload itself raised: that is what to report, not the
+                # absence it necessarily causes in the listing.
+                step("upload", "failed", False,
+                     f"{remote}: {upload_errors[path.name]}")
+                continue
+            if listing_failure is not None:
+                step("upload", "upload_requested", None,
+                     f"{remote}: uploaded, but the folder could not be "
+                     f"listed to confirm it ({listing_failure})")
+                continue
+            found = any(
+                str(i.get("path") or "").endswith("/" + path.name)
+                or i.get("displayName") == path.name for i in items)
+            step("upload", "uploaded" if found else "upload_requested",
+                 found,
+                 remote if found else f"{remote}: not visible in listing")
+
+    if credential_object:
+        # The derived `snowflake:` block, written to a temp file for the
+        # CLI to read and removed right after -- the copy on the mount is
+        # the only one meant to outlive this call.
+        name = credential_object.rsplit("/", 1)[-1]
+        fd, local = tempfile.mkstemp(prefix="snowmig_source_", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(source_payload, fh)
             try:
-                call("upload_ws_file", workspace=ws_key, path=remote,
-                     local_path=str(path))
+                call("upload_ws_file", workspace=ws_key,
+                     path=credential_object, local_path=local)
                 items = call("list_ws_objects", workspace=ws_key,
-                             path=folder).get("items") or []
+                             path=PLAN_FOLDER).get("items") or []
                 found = any(
-                    str(i.get("path") or "").endswith("/" + path.name)
-                    or i.get("displayName") == path.name for i in items)
+                    str(i.get("path") or "").endswith("/" + name)
+                    or i.get("displayName") == name for i in items)
                 step("upload", "uploaded" if found else "upload_requested",
                      found,
-                     remote if found else f"{remote}: not visible in listing")
+                     _credential_line(source_config.name, credential_object)
+                     + ("" if found else "; not visible in listing"))
             except Exception as exc:
                 step("upload", "failed", False,
-                     f"{remote}: {str(exc)[:200]}")
+                     f"{credential_object}: {str(exc)[:200]} (it carries "
+                     f"the credential; check whether it landed)")
+        finally:
+            try:
+                os.unlink(local)
+            except OSError:
+                pass
 
     # 5 · stage notebooks + jobs ---------------------------------------------
     # Job `parameters` reach the notebook neither as argv nor as environment
@@ -469,17 +878,48 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
     # regenerated here when the defaults change.
     defaults = {"reports-dir": REPORTS_FOLDER, "source-mode": source_mode,
                 "output-dir": f"/Workspace/{output_dir}" if output_dir else ""}
+    # Written last so an explicit --stage-param wins over a derived
+    # coordinate: the operator naming a value outranks this function
+    # guessing one. Every explicit name is declared by at least one stage
+    # (checked on entry); a stage that does not declare it skips it
+    # (build_stage_notebook filters per stage).
+    explicit = dict(stage_params)
     if external_catalog:
         defaults["source-catalog"] = external_catalog
     if target_catalog:
         defaults["target-catalog"] = target_catalog
-    if source_config is not None:
-        # The scripts read the credential from this file ON THE MOUNT, so the
-        # path they receive is the /Workspace one, not the local one.
-        defaults["source-config"] = \
-            f"{REPORTS_FOLDER.rsplit('/', 1)[0]}/plan/{source_config.name}"
-    existing = call("list_jobs", workspace=ws_key).get("items") or []
+    if credential_object:
+        # The scripts read the credential from the derived copy ON THE MOUNT,
+        # so the path they receive is the /Workspace one, not the local one.
+        defaults["source-config"] = f"/Workspace/{credential_object}"
+    defaults.update(explicit)
+    try:
+        existing = call("list_jobs", workspace=ws_key).get("items") or []
+    except Exception as exc:
+        # The last bare call past the cluster. An expired session token here
+        # escaped provision() and lost the record of the workspace and
+        # cluster created seconds earlier.
+        step("job", "failed", False, f"list_jobs: {str(exc)[:200]}")
+        step("halt", "stopped", False, resume)
+        return out
     stages_by_notebook = {st.notebook_name: st for st in STAGES}
+
+    # Which stage notebooks are already on the workspace. Looked up once,
+    # and only when they are to be kept: a fresh run has nothing to keep,
+    # and --refresh-notebooks asks for the overwrite.
+    keep_existing = reuse_existing and not refresh_notebooks
+    present: set[str] = set()
+    listing_error: Exception | None = None
+    if keep_existing:
+        try:
+            listed = call("list_ws_objects", workspace=ws_key,
+                          path=SCRIPTS_FOLDER).get("items") or []
+            for item in listed:
+                present.add(str(item.get("path") or "").rsplit("/", 1)[-1])
+                present.add(str(item.get("displayName") or ""))
+        except Exception as exc:
+            listing_error = exc
+
     for spec in JOB_SPECS:
         stage = stages_by_notebook.get(spec["notebook"])
         if stage is None:
@@ -489,55 +929,128 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                  f'exist.')
             continue
         notebook_path = f'{SCRIPTS_FOLDER}/{spec["notebook"]}'
-        try:
-            # Built here, with this run's coordinates already in PARAMS, so
-            # the notebook on the workspace is ready to run unedited.
-            nb = build_stage_notebook(stage, overrides=defaults)
-            fd, local = tempfile.mkstemp(prefix="snowmig_stage_",
-                                         suffix=".ipynb")
-            with os.fdopen(fd, "w") as fh:
-                json.dump(nb, fh, indent=1)
-            try:
-                call("upload_ws_file", workspace=ws_key, path=notebook_path,
-                     local_path=local, object_type="NOTEBOOK")
-            finally:
-                os.unlink(local)
-            # Read it back, like every other upload: a 2xx is not the claim.
-            listed = call("list_ws_objects", workspace=ws_key,
-                          path=SCRIPTS_FOLDER).get("items") or []
-            name = notebook_path.rsplit("/", 1)[-1]
-            seen = any(str(i.get("path") or "").endswith("/" + name)
-                       or i.get("displayName") == name for i in listed)
-            step("notebook", "uploaded" if seen else "upload_requested", seen,
-                 notebook_path if seen
-                 else f"{notebook_path}: not visible in the listing")
-            if not seen:
-                continue
-        except Exception as exc:
+        if keep_existing and listing_error is not None:
+            # Could not look. Overwriting on that would be the guess this
+            # flag exists to prevent; creating a job for a notebook that may
+            # not exist would be the other one.
             step("notebook", "failed", False,
-                 f"{notebook_path}: {str(exc)[:200]}")
+                 f"{notebook_path}: could not list {SCRIPTS_FOLDER} to tell "
+                 f"whether it already exists ({str(listing_error)[:160]}); "
+                 f"neither overwritten nor created. Re-run, or pass "
+                 f"--refresh-notebooks to regenerate it regardless")
             continue
+        kept = keep_existing and spec["notebook"] in present
+        if kept:
+            step("notebook", "kept", True,
+                 f"{notebook_path}: already on the workspace and left as it "
+                 f"is -- its PARAMS cell (schema, mode, verify) keeps whatever "
+                 f"was set in the console. Pass --refresh-notebooks to "
+                 f"regenerate it from this run's flags")
+            out["notebooks_kept"].append(spec["notebook"])
+        else:
+            try:
+                # Built here, with this run's coordinates already in PARAMS,
+                # so the notebook on the workspace is ready to run unedited.
+                nb = build_stage_notebook(stage, overrides=defaults)
+                fd, local = tempfile.mkstemp(prefix="snowmig_stage_",
+                                             suffix=".ipynb")
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(nb, fh, indent=1)
+                try:
+                    call("upload_ws_file", workspace=ws_key,
+                         path=notebook_path, local_path=local,
+                         object_type="NOTEBOOK")
+                finally:
+                    os.unlink(local)
+                # Read it back, like every other upload: a 2xx is not the
+                # claim.
+                listed = call("list_ws_objects", workspace=ws_key,
+                              path=SCRIPTS_FOLDER).get("items") or []
+                name = notebook_path.rsplit("/", 1)[-1]
+                seen = any(str(i.get("path") or "").endswith("/" + name)
+                           or i.get("displayName") == name for i in listed)
+                step("notebook", "uploaded" if seen else "upload_requested",
+                     seen, notebook_path if seen
+                     else f"{notebook_path}: not visible in the listing")
+                if not seen:
+                    continue
+            except Exception as exc:
+                step("notebook", "failed", False,
+                     f"{notebook_path}: {str(exc)[:200]}")
+                continue
 
         if _match(existing, spec["name"]) is not None:
+            overwritten = (
+                "OVERWRITTEN from this run's flags; console edits to its "
+                "PARAMS cell are gone")
             if reuse_existing:
                 step("job", "reused", True,
-                     f'{spec["name"]} (stage notebook refreshed)')
+                     f'{spec["name"]} (stage notebook '
+                     f'{"kept" if kept else overwritten})')
             else:
                 step("job", "name_taken", False,
                      f'{spec["name"]} already exists and was NOT adopted; '
-                     f'its stage notebook was refreshed but the job itself '
-                     f'is not this migration\'s. Rename or --reuse-existing.')
+                     f'its stage notebook was {overwritten}, but the job '
+                     f'itself is not this migration\'s. Rename or '
+                     f'--reuse-existing.')
             continue
         body = build_job_body(spec["name"], notebook_path=notebook_path,
                               cluster_key=cluster_key)
         try:
             call("create_job", workspace=ws_key, body=body)
-            found = _poll(lambda: call("list_jobs", workspace=ws_key),
-                          spec["name"], delays)
+            found, job_list_error = _poll(
+                lambda: call("list_jobs", workspace=ws_key), spec["name"],
+                delays)
             step("job", "created" if found else "create_requested",
-                 found is not None, spec["name"])
+                 found is not None,
+                 f'{spec["name"]}: read_back_failed: {job_list_error}'
+                 if job_list_error is not None else spec["name"])
         except Exception as exc:
             step("job", "failed", False, f'{spec["name"]}: {str(exc)[:200]}')
+
+    # 6 · the environment diagnosis, beside the stages, with NO job --------
+    # README step 8 has the operator open it from scripts/ before the jobs;
+    # only the four job notebooks were uploaded, so it was never there. Built
+    # with this run's config path so it runs unedited, and recorded under its
+    # own step name: it is not one of the job notebooks.
+    diagnose_path = f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}"
+    if keep_existing and listing_error is not None:
+        # Same rule as the stage notebooks: could not look is not absent.
+        step("diagnose", "failed", False,
+             f"{diagnose_path}: could not list {SCRIPTS_FOLDER} to tell "
+             f"whether it already exists ({str(listing_error)[:160]}); "
+             f"neither overwritten nor created. Re-run, or pass "
+             f"--refresh-notebooks to regenerate it regardless")
+        return out
+    if keep_existing and DIAGNOSE_NOTEBOOK_NAME in present:
+        step("diagnose", "kept", True,
+             f"{diagnose_path}: already on the workspace and left as it is. "
+             f"Pass --refresh-notebooks to regenerate it from this run's "
+             f"config path")
+        out["notebooks_kept"].append(DIAGNOSE_NOTEBOOK_NAME)
+        return out
+    try:
+        nb = build_diagnose_notebook(overrides=defaults)
+        fd, local = tempfile.mkstemp(prefix="snowmig_diagnose_",
+                                     suffix=".ipynb")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(nb, fh, indent=1)
+        try:
+            call("upload_ws_file", workspace=ws_key, path=diagnose_path,
+                 local_path=local, object_type="NOTEBOOK")
+        finally:
+            os.unlink(local)
+        listed = call("list_ws_objects", workspace=ws_key,
+                      path=SCRIPTS_FOLDER).get("items") or []
+        seen = any(str(i.get("path") or "").endswith("/" + DIAGNOSE_NOTEBOOK_NAME)
+                   or i.get("displayName") == DIAGNOSE_NOTEBOOK_NAME
+                   for i in listed)
+        step("diagnose", "uploaded" if seen else "upload_requested", seen,
+             diagnose_path if seen
+             else f"{diagnose_path}: not visible in the listing")
+    except Exception as exc:
+        step("diagnose", "failed", False,
+             f"{diagnose_path}: {str(exc)[:200]}")
 
     return out
 
@@ -579,6 +1092,43 @@ def render_provision(res: dict) -> str:
                          f'`{target["name"]}` | {note} |')
         lines.append("")
 
+    if res.get("credential_objects"):
+        lines += [
+            "## Credential placed on the workspace", "",
+            "`--source-config` puts the Snowflake connection -- the "
+            "`snowflake:` block of the migration config, **credential "
+            "included**; the `aidp:` block is not copied -- on the workspace "
+            "mount so the in-AIDP scripts can reach Snowflake themselves. It "
+            "is readable by **every member of this workspace and every "
+            "cluster in it** via `/Workspace`, for as long as it stays "
+            "there:", ""]
+        lines += [f"- `{obj}`" for obj in res["credential_objects"]]
+        lines += ["",
+                  "Remove it from the workspace once the migration is done, "
+                  "and rotate the Snowflake credential if anyone who must "
+                  "not hold it can read this workspace.", ""]
+
+    if res.get("notebooks_kept"):
+        lines += [
+            "## Stage notebooks kept as found", "",
+            "`--reuse-existing` left these notebooks as they are on the "
+            "workspace, so whatever their PARAMS cells hold (schema, mode, "
+            "verify, counts) still holds. Pass `--refresh-notebooks` to "
+            "regenerate them from this run's flags -- that discards console "
+            "edits:", ""]
+        lines += [f'- `{res["scripts_folder"]}/{n}`'
+                  for n in res["notebooks_kept"]]
+        lines.append("")
+
+    if res.get("stage_params"):
+        lines += [
+            "## Stage parameters (`--stage-param`)", "",
+            "Written into the PARAMS cell of every stage notebook that "
+            "declares the name; a `<stage>.<name>` only into that "
+            "stage's:", ""]
+        lines += [f"- `{k}` = `{v}`" for k, v in res["stage_params"].items()]
+        lines.append("")
+
     lines += [
         "| Step | Action | Verified | Detail |", "|---|---|---|---|"]
     for s in res["steps"]:
@@ -589,7 +1139,9 @@ def render_provision(res: dict) -> str:
         "",
         "Pending is pending: `create_requested` means the API accepted the "
         "request and the object never became visible within the poll budget "
-        "— check the console before proceeding.",
+        "— check the console before proceeding. `read_back_failed` in its "
+        "detail means the listing itself errored: the object may well exist, "
+        "it just could not be looked at.",
         "",
         "Next: run the `snowmig_00_discover` job (or the script by hand), "
         "then structure, then copy schema-by-schema, then reconcile. Every "

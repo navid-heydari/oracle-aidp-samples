@@ -306,3 +306,121 @@ def test_an_already_qualified_schema_key_is_not_doubled():
             "--target-uri") + 1]
     assert "schemaKey=lake.DB" in uri
     assert "lake.lake" not in uri
+
+
+# --------------------------------------------------------------------------
+# Pagination. Every OCI list call may answer one PAGE and name the next one
+# in the `opc-next-page` response header, which `oci raw-request` surfaces
+# under `headers` in its envelope and which the next GET sends back as
+# `page=`. parse_cli_json threw the headers away, and no list URI carried a
+# page parameter, so every existence decision built on these lists read the
+# first page only: a table past page one "never appeared", a schema past
+# page one was re-POSTed.
+# --------------------------------------------------------------------------
+
+def test_the_envelope_exposes_the_response_headers_lower_cased():
+    from target.executor import parse_cli_envelope
+    rows, headers = parse_cli_envelope(json.dumps(
+        {"data": {"items": [{"key": "a"}]}, "status": "200 OK",
+         "headers": {"Opc-Next-Page": "T2", "opc-request-id": "r"}}))
+    assert rows == [{"key": "a"}]
+    assert headers["opc-next-page"] == "T2"
+    # parse_cli_json keeps its contract: rows only.
+    assert parse_cli_json(json.dumps(
+        {"data": {"items": [{"key": "a"}]},
+         "headers": {"opc-next-page": "T2"}})) == [{"key": "a"}]
+
+
+def test_an_envelope_without_headers_has_none():
+    from target.executor import parse_cli_envelope
+    assert parse_cli_envelope(json.dumps({"data": {"items": []}})) == ([], {})
+    assert parse_cli_envelope("[]") == ([], {})
+    assert parse_cli_envelope("") == ([], {})
+
+
+def test_the_aidp_response_prefix_is_stripped_from_the_envelope_too():
+    from target.executor import parse_cli_envelope
+    rows, headers = parse_cli_envelope(
+        'Response:\n{"data": {"items": [{"key": "gold"}]}}')
+    assert rows == [{"key": "gold"}] and headers == {}
+
+
+def _uri(cmd):
+    return cmd[cmd.index("--target-uri") + 1]
+
+
+def test_list_commands_carry_the_page_token():
+    t = _t()
+    # No query string yet: `?page=`.
+    assert _uri(build_command("oci_raw", "list_catalogs", t,
+                              page="T2")).endswith("/catalogs?page=T2")
+    # A query string already: `&page=`.
+    for op, kw in (("list_schemas", {}),
+                   ("list_tables_in", {"catalog": "lake", "schema": "DB"}),
+                   ("list_views_in", {"catalog": "lake", "schema": "DB"}),
+                   ("list_tables", {"schema": "DB"})):
+        uri = _uri(build_command("oci_raw", op, t, page="T2", **kw))
+        assert uri.endswith("&page=T2"), (op, uri)
+        assert uri.count("?") == 1
+
+
+def test_a_list_without_a_page_token_is_byte_identical_to_before():
+    t = _t()
+    for op, kw in (("list_catalogs", {}), ("list_schemas", {}),
+                   ("list_tables_in", {"catalog": "lake", "schema": "DB"}),
+                   ("list_tables", {"schema": "DB"})):
+        plain = build_command("oci_raw", op, t, **kw)
+        assert build_command("oci_raw", op, t, page=None, **kw) == plain
+        assert "page=" not in " ".join(plain)
+
+
+def test_a_page_token_is_percent_encoded():
+    uri = _uri(build_command("oci_raw", "list_catalogs", _t(), page="a&b=c/d"))
+    assert uri.endswith("?page=a%26b%3Dc%2Fd")
+
+
+def test_the_aidp_cli_list_commands_ignore_the_page_token():
+    # The CLI's paging flags are undocumented; a guessed one would be a
+    # usage error on every second page.
+    cmd = build_command("aidp_cli", "list_catalogs", _t(), page="T2")
+    assert "T2" not in " ".join(cmd)
+
+
+def test_collect_pages_follows_tokens_and_stops_without_one():
+    from target.executor import collect_pages
+    pages = {None: ([{"k": 1}], "P2"), "P2": ([{"k": 2}], "P3"),
+             "P3": ([{"k": 3}], None)}
+    asked = []
+
+    def fetch(token):
+        asked.append(token)
+        return pages[token]
+
+    assert collect_pages(fetch, "list_x") == [{"k": 1}, {"k": 2}, {"k": 3}]
+    assert asked == [None, "P2", "P3"]
+
+
+def test_collect_pages_refuses_to_loop_on_a_repeating_token():
+    from target.executor import collect_pages
+    calls = {"n": 0}
+
+    def fetch(token):
+        calls["n"] += 1
+        return [{"k": calls["n"]}], "SAME"
+
+    with pytest.raises(RuntimeError, match="list_x"):
+        collect_pages(fetch, "list_x")
+    assert calls["n"] == 2, "the second sighting of the token is enough"
+
+
+def test_collect_pages_is_bounded():
+    from target.executor import MAX_LIST_PAGES, collect_pages
+    calls = {"n": 0}
+
+    def fetch(token):
+        calls["n"] += 1
+        return [], f"P{calls['n']}"
+
+    with pytest.raises(RuntimeError, match="did not terminate"):
+        collect_pages(fetch, "list_x")
+    assert calls["n"] == MAX_LIST_PAGES

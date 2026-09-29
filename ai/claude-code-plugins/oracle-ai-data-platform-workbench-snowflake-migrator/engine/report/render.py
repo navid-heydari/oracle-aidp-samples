@@ -5,9 +5,14 @@ anything that halted or was skipped rather than burying it.
 """
 from __future__ import annotations
 
+import collections
+
+from snowflake_source.extract.census import secondary_roles_active
+from plan.build import object_kind_block
 from plan.data_movement import MAINTENANCE_TRAPS, architecture_decision
 from snowflake_source.extract.census import secondary_roles_active
-from plan.status import assess_risk, migration_status
+from plan.smoke import smoke_verdict
+from plan.status import assess_risk, deploy_failure, migration_status
 
 __all__ = ["render_stages", "render_preflight", "render_census", "census_scope",
            "render_maintenance",
@@ -15,7 +20,7 @@ __all__ = ["render_stages", "render_preflight", "render_census", "census_scope",
            "render_inventory", "render_ddl_plan", "render_planned_objects",
            "render_soft_clone_summary", "render_catalog", "render_compute",
            "render_summary",
-           "render_smoke", "render_data_options",
+           "render_smoke", "render_data_options", "DATA_OPTIONS_NOTE",
            "architecture_section"]
 
 
@@ -31,11 +36,69 @@ def _bytes(n) -> str:
     return f"{n:.1f} EB"
 
 
+# How the row counts in an inventory were obtained, keyed by `row_count_mode`.
+# One table for INVENTORY.md and SUMMARY.md, so the two cannot disagree about
+# what a number is. The label is the Rows column header.
+_ROW_COUNT_MODE_TEXT = {
+    "metadata": {
+        "label": "Rows (metadata)",
+        "described": ("Snowflake's maintained row count, read from `SHOW` at "
+                      "no cost. It agrees with `COUNT(*)` for a settled "
+                      "standard table, but it can lag very recent DML and is "
+                      "not maintained for external tables, so it is not a "
+                      "verified number."),
+        "inventory": ("Row counts are Snowflake's maintained `SHOW` count, "
+                      "**not** a verified `COUNT(*)`; views carry none. "
+                      "Re-run with `--row-counts exact` for a counted number."),
+    },
+    "exact": {
+        "label": "Rows (exact)",
+        "described": ("a `COUNT(*)` per object -- verified, and it executes "
+                      "every view to get there."),
+        "inventory": ("Row counts are **exact** (in-session `count(*)`), not "
+                      "`SHOW` estimates."),
+    },
+    "none": {
+        "label": "Rows",
+        "described": "not collected; `--row-counts` was `none`.",
+        "inventory": "Row counts were not requested (`--row-counts none`).",
+    },
+}
+
+
+def _row_count_mode(inventory: dict | None) -> tuple[str, dict]:
+    mode = (inventory or {}).get("row_count_mode", "metadata")
+    text = _ROW_COUNT_MODE_TEXT.get(mode) or {
+        "label": "Rows", "described": mode,
+        "inventory": f"Row-count mode: {mode}."}
+    return mode, text
+
+
+def _row_cell(record: dict) -> str:
+    """The Rows cell for one object. A blank always says what it is.
+
+    `None` used to render as ERROR whatever the reason, so in the default
+    metadata mode every view -- deliberately not counted -- read as an
+    extraction failure to chase.
+    """
+    rows = record.get("row_count_exact")
+    if rows is not None:
+        return str(rows)
+    source = record.get("row_count_source")
+    if source == "error":
+        return "ERROR"
+    if source == "not_counted":
+        return "not counted"
+    return "-"
+
+
 def _unreadable_databases(inv: dict) -> list[str]:
     """Databases in scope that yielded nothing because they were refused.
 
-    Matched on the extractor's own `database <name>: ` prefix rather than by
-    searching error text for the name, which would also match an object note.
+    The note is already written by the extractor; this finds it so the
+    headline can carry the same fact. Matched on the extractor's own
+    `database <name>: ` prefix rather than by searching for the name inside
+    arbitrary error text, which would also match an object in that database.
     """
     out = []
     for note in inv.get("extraction_notes") or []:
@@ -85,6 +148,12 @@ def render_inventory(inv: dict) -> str:
                 f'above covers the rest. This is a privilege result, not an '
                 f'empty database — see Extraction notes.', ""]
 
+    if refused:
+        out += [f'> **{len(refused)} database(s) in scope could not be read '
+                f'at all**: {", ".join(f"`{d}`" for d in refused)}. The count '
+                f'above covers the rest. This is a privilege result, not an '
+                f'empty database — see Extraction notes.', ""]
+
     collisions = inv.get("identifier_case_collisions") or {}
     if collisions:
         out += ["## ⚠️ HALT — identifier-case collisions", "",
@@ -94,19 +163,43 @@ def render_inventory(inv: dict) -> str:
         out += [f"- `{k}` ← {', '.join('`' + x + '`' for x in v)}"
                 for k, v in collisions.items()] + [""]
 
+    _, mode_text = _row_count_mode(inv)
+    records = inv.get("inventory", [])
     out += ["## Objects", "",
-            "Row counts are **exact** (in-session `count(*)`), not `SHOW` estimates. "
-            "Sizes are Snowflake-reported compressed bytes.", "",
-            "| Object | Type | Rows (exact) | Size | Cols | Case form | Compatibility |",
+            f'{mode_text["inventory"]} Sizes are Snowflake-reported '
+            "compressed bytes.", "",
+            f'| Object | Type | {mode_text["label"]} | Size | Cols | Case form '
+            "| Compatibility |",
             "|---|---|---:|---:|---:|---|---|"]
-    for r in inv.get("inventory", []):
-        rows = r.get("row_count_exact")
+    for r in records:
         out.append(
             f'| `{r["source_identifier"]}` | {r["object_type"]} '
-            f'| {rows if rows is not None else "ERROR"} '
+            f'| {_row_cell(r)} '
             f'| {_bytes((r.get("source_metadata") or {}).get("bytes"))} '
             f'| {len(r.get("columns") or [])} | {r.get("identifier_case_form")} '
-            f'| {r.get("compatibility_status")} |')
+            f'| {_compatibility_cell(r)} |')
+    kind_blocked = [r for r in records
+                    if r.get("compatibility_status") != "blocked"
+                    and object_kind_block(r)]
+    if kind_blocked:
+        out += ["", "`blocked (<kind>)` -- the column types map, but the "
+                "object kind has no plain Delta equivalent, so the plan "
+                "refuses it; PLANNED_OBJECTS.md says what to do instead."]
+
+    # Every blank in the Rows column carries its reason. "not counted" and
+    # ERROR are different facts, and neither is a zero.
+    not_counted = [r for r in records if r.get("row_count_source") == "not_counted"]
+    errored = [r for r in records if r.get("row_count_source") == "error"]
+    if not_counted or errored:
+        out.append("")
+    for note in sorted({r.get("row_count_note") for r in not_counted
+                        if r.get("row_count_note")}):
+        out.append(f"`not counted` -- {note}")
+    if errored:
+        out += ["", f"**{len(errored)} row count(s) FAILED** -- `ERROR` is an "
+                    "error, not a zero:", ""]
+        out += [f'- `{r["source_identifier"]}` -- '
+                f'{r.get("row_count_note") or "no detail"}' for r in errored]
 
     notes = inv.get("extraction_notes") or []
     if notes:
@@ -194,9 +287,31 @@ _CATEGORY_TITLES = {
     "unmapped_type": "Column types with no Delta equivalent",
     "snowflake_only_sql": "View SQL that is Snowflake-only",
     "unsupported_object": "Object kinds with no AIDP equivalent",
+    "dependency_not_migrated": "Depends on an object that is not migrating",
     "no_definition": "Definition could not be read",
     "unparseable_sql": "SQL could not be parsed",
+    "columns_unread": "Columns could not be read",
 }
+
+
+def _compatibility_cell(rec: dict) -> str:
+    """What the planner will do with the object, not only its column types.
+
+    `compatibility_status` is the type mapping. A dynamic table whose types
+    all map read `supported` here while the plan, from the same inventory,
+    refused it. The kind comes from the planner's own table.
+    """
+    status = rec.get("compatibility_status")
+    if status == "blocked":
+        return "blocked"
+    if status == "unassessed":
+        # The column read failed: Cols 0 here is a missing fact, and the
+        # plan refuses it under `columns_unread`.
+        return "not assessed (columns unread)"
+    block = object_kind_block(rec)
+    if block:
+        return f"blocked ({block[0]})"
+    return str(status)
 
 
 def render_planned_objects(plan: dict) -> str:
@@ -214,16 +329,55 @@ def render_planned_objects(plan: dict) -> str:
     if plan.get("restrictions_applied"):
         out += ["## Restrictions in force", "",
                 "Applied at your request, before planning:", ""]
-        out += [f"- `{k}`: {v}" for k, v in plan["restrictions_applied"].items()]
+        # With the per-entry counts (an older plan.json has none), an entry
+        # that matched nothing is flagged: it was listed here as in force
+        # while the object it meant was planned, deployed and copied.
+        matches = plan.get("restriction_matches") or {}
+        for key, value in plan["restrictions_applied"].items():
+            counts = matches.get(key)
+            if counts is None or not isinstance(value, list):
+                out.append(f"- `{key}`: {value}")
+                continue
+            out.append(f"- `{key}`: " + ", ".join(
+                f"`{e}` (**matched nothing -- check the spelling**)"
+                if not counts.get(e) else
+                f"`{e}` ({counts[e]} object{'s' if counts[e] != 1 else ''})"
+                for e in value))
         out.append("")
 
-    out += ["## Target structure to exist first", "",
-            "Catalogs (create these, or confirm they exist and are INTERNAL): "
-            + ", ".join(f'`{c}`' for c in plan.get("catalogs_to_create") or []),
-            "",
-            "Schemas the clone will create: "
-            + ", ".join(f'`{a}.{b}`' for a, b in plan.get("schemas_to_create") or []),
-            ""]
+    out += ["## Target structure to exist first", ""]
+    catalogs = ", ".join(f'`{c}`' for c in plan.get("catalogs_to_create") or [])
+    schemas = ", ".join(f'`{a}.{b}`'
+                        for a, b in plan.get("schemas_to_create") or [])
+    note = plan.get("target_catalog_note")
+    if not note:
+        # An older plan.json carries no note; its two lines stay as they were.
+        out += ["Catalogs (create these, or confirm they exist and are "
+                f"INTERNAL): {catalogs}", "",
+                f"Schemas the clone will create: {schemas}", ""]
+    else:
+        # The structure job (S10) and `deploy` both create the plan's names
+        # as they stand, and S10 refuses a --target-catalog that is not the
+        # plan's catalog. This section once said S10 kept the SOURCE schema
+        # (`core`) while the job ran CREATE SCHEMA lake.snowdb_core, and with
+        # no prefix it sent the reader to a --target-catalog S10 refuses.
+        if plan.get("bronze_catalog_prefix") is None:
+            out += [f"Catalogs: the Target column's catalog part ({catalogs}) "
+                    "is the source database mirrored, not a catalog to create "
+                    "-- under the runbook that name is the EXTERNAL pointer "
+                    "at Snowflake.", "",
+                    note, "",
+                    f"Schemas the plan names: {schemas}. The structure job "
+                    "(S10) creates them only under a `--target-catalog` "
+                    "equal to the plan's catalog, so re-run `plan "
+                    "--bronze-catalog-prefix <the INTERNAL catalog created "
+                    "at S4>` and `ddl` before S10.", ""]
+        else:
+            out += ["Catalogs (create these, or confirm they exist and are "
+                    f"INTERNAL): {catalogs}", "",
+                    note, "",
+                    "Schemas the structure job (S10) creates, and `deploy` "
+                    f"too: {schemas}", ""]
 
     out += ["## Can migrate", "",
             "| Object | Type | Target | Rows | Cols |", "|---|---|---|---:|---:|"]
@@ -232,6 +386,29 @@ def render_planned_objects(plan: dict) -> str:
                    f'| `{c["target"]}` | {c.get("rows") if c.get("rows") is not None else "-"} '
                    f'| {c.get("columns", "-")} |')
     out.append("")
+
+    # TRANSIENT/TEMPORARY tables planned as permanent Delta tables. An older
+    # plan.json carries no list and renders unchanged.
+    kinds = plan.get("table_kind_warnings") or []
+    if kinds:
+        out += ["## Planned, but not as what they were", "",
+                "These migrate as permanent Delta tables; confirm each is "
+                "meant to persist.", ""]
+        out += [f'- `{w["source_identifier"]}` ({w.get("kind")}) — {w["warning"]}'
+                for w in kinds]
+        out.append("")
+
+    # Migrating tables that a pipe or task keeps filling in Snowflake. An
+    # older plan.json carries no list and renders unchanged.
+    loads = plan.get("loads_that_stop") or []
+    if loads:
+        out += ["## Planned, but loaded by something that does not move", "",
+                "The structure and today's rows migrate. The load does not: "
+                "after cutover these tables stop receiving rows until each "
+                "load is rebuilt on AIDP.", ""]
+        out += [f'- `{x["table"]}` <- {x["kind"]} `{x["source_identifier"]}`'
+                for x in loads]
+        out.append("")
 
     cannot = plan.get("cannot_migrate") or []
     if cannot:
@@ -251,10 +428,31 @@ def render_planned_objects(plan: dict) -> str:
                 "Excluded from the ordering; they need a human decision rather than "
                 "an arbitrary broken edge.", ""]
         out += [f'- {", ".join(f"`{n}`" for n in c)}' for c in plan["cycles"]] + [""]
+        # In no cycle, but depending on one: held back for the same reason,
+        # and labelled apart so nobody hunts for a cycle it is not in.
+        behind = plan.get("blocked_behind_cycle") or {}
+        if behind:
+            out += ["Blocked behind a cycle (not members; each depends on "
+                    "the cycle named):", ""]
+            out += [f'- `{n}` behind {", ".join(f"`{m}`" for m in c)}'
+                    for n, c in sorted(behind.items())] + [""]
 
-    out += ["## Order of creation", "",
-            "Dependencies land before their dependents, so views follow their base "
-            "tables.", ""]
+    out += ["## Order of creation", ""]
+    unordered = plan.get("views_without_dependency_edge") or []
+    if unordered:
+        # A view with no edge from either source sorts by size and can land
+        # in wave 1 ahead of its base table; the plan must not assert an
+        # order it does not have.
+        out += ["Objects are ordered by dependency where an edge is known. "
+                "These views have no edge from ACCOUNT_USAGE or parsed DDL, are "
+                "ordered by size only, and are NOT guaranteed to follow their "
+                "base tables: " + ", ".join(f"`{v}`" for v in unordered) + ".",
+                ""]
+        if plan.get("dependency_warning"):
+            out += [plan["dependency_warning"], ""]
+    else:
+        out += ["Dependencies land before their dependents, so views follow "
+                "their base tables.", ""]
     for i, wave in enumerate(plan.get("waves") or [], 1):
         out.append(f'### Wave {i} — {len(wave)} object(s)')
         out += [f'- `{n}` → `{plan.get("target_names", {}).get(n, "?")}`'
@@ -275,9 +473,11 @@ def render_planned_objects(plan: dict) -> str:
     out += architecture_section(plan)
 
     if plan.get("dependency_source"):
-        out += [f'---', "",
+        out += ['---', "",
                 f'Lineage source: **{plan["dependency_source"]}** — '
                 f'{plan.get("dependency_coverage_note") or ""}']
+        if plan.get("dependency_warning"):
+            out += ["", plan["dependency_warning"]]
     return "\n".join(out) + "\n"
 
 
@@ -294,9 +494,9 @@ def render_catalog(res: dict) -> str:
         headline = (f'Would register an **EXTERNAL** catalog of source type '
                     f'**{res.get("source_type")}**'
                     if is_external else
-                    f'Would create the **STANDARD** catalog **container**, and '
-                    f'nothing inside it — its schemas and tables are created '
-                    f'on AIDP compute by the structure workflow (runbook S10)')
+                    'Would create the **STANDARD** catalog **container**, and '
+                    'nothing inside it — its schemas and tables are created '
+                    'on AIDP compute by the structure workflow (runbook S10)')
         out = [f"# Target catalog `{name}` — DRY RUN", "",
                f'{headline}; **nothing was created**.', ""]
         if not is_external:
@@ -350,6 +550,28 @@ def render_catalog(res: dict) -> str:
                 "live Snowflake source. It holds no managed tables of its own "
                 "and copies no data, so there is nothing here to keep in "
                 "sync.", ""]
+
+    # `--test-connection` is the one step that catches a wrong role or a
+    # rotated password before the live run, so its verdict belongs here and
+    # not only in the JSON. PENDING is a budget that ran out, not a pass.
+    test = res.get("test_connection")
+    if test:
+        status = str(test.get("status") or "PENDING").upper()
+        out += ["## Connection test", ""]
+        if status in ("SUCCEEDED", "SUCCESS"):
+            out += [f"**{status}** — the API reached Snowflake with the "
+                    f"registered connection details.", ""]
+        elif status in ("FAILED", "CANCELED", "CANCELLED"):
+            out += [f"**{status}**"
+                    + (f" — {test.get('error')}" if test.get("error") else "")
+                    + ". The registered connection does not work as it "
+                      "stands; fix the credential or role before relying on "
+                      "this catalog.", ""]
+        else:
+            out += [f"**{status}** — "
+                    + str(test.get("error") or test.get("note")
+                          or "the verdict was not read")
+                    + ". **PENDING is not a pass.**", ""]
     return "\n".join(out)
 
 
@@ -383,7 +605,19 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
         out += [f"- {v} {k.lower()}(s)" for k, v in sorted(by_type.items())]
         out.append("")
 
-    if res.get("out_of_scope_count"):
+    if res.get("matched_nothing"):
+        out += ["## ⛔ Nothing in the plan belongs to this catalog", "",
+                f'Every one of the {res.get("out_of_scope_count", 0)} planned '
+                f'object(s) targets '
+                + ", ".join(f'`{c}`' for c in
+                            res.get("out_of_scope_catalogs") or [])
+                + f', and this run was pointed at '
+                  f'`{res.get("catalog_in_scope")}`. **Nothing was created, '
+                  f'and nothing was wrong with the plan** — the catalog name '
+                  f'does not match it.', "",
+                "Point the run at the catalog the plan targets, or re-run "
+                "`plan --bronze-catalog-prefix` to target this one.", ""]
+    elif res.get("out_of_scope_count"):
         out += ["## Not deployed in this run", "",
                 f'{res["out_of_scope_count"]} object(s) belong to other catalogs: '
                 + ", ".join(f'`{c}`' for c in res.get("out_of_scope_catalogs") or []),
@@ -393,6 +627,17 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
     if res.get("blocked_count"):
         out += [f'{res["blocked_count"]} object(s) were blocked before deployment '
                 "and never attempted. See the planned-objects report.", ""]
+
+    if res.get("schemas_not_active"):
+        out += ["## Schema still settling — nothing was posted into it", "",
+                "These schemas had not reported ACTIVE when the wait ran out. "
+                "A create against a settling schema is accepted and then "
+                "silently dropped, so none was sent: **no name was burned**, "
+                "and the objects below are failed only because they were not "
+                "attempted. Re-run once the schema reports ACTIVE.", ""]
+        out += [f"- `{name}` — {state}"
+                for name, state in sorted(res["schemas_not_active"].items())]
+        out.append("")
 
     if res.get("mismatches"):
         out += ["## Structure differs — left as found, NOT cloned", "",
@@ -448,16 +693,41 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
                 for u in res["unverified_structure"]]
         out.append("")
 
+    if res.get("properties_not_applied"):
+        out += ["## Properties this transport cannot carry", "",
+                "The reviewed DDL declares these. The catalog API body has no "
+                "field for them, so the objects were created without them; the "
+                "plan names the same gap per object (rule R21).", ""]
+        out += [f'- `{p["target_fqn"]}` — {p["property"]}: {p["reason"]}'
+                for p in res["properties_not_applied"]]
+        out.append("")
+
+    if res.get("description_drift"):
+        out += ["## Descriptions the target dropped", "",
+                "The structure matches the plan; the documentation the plan "
+                "showed did not survive the create.", ""]
+        out += [f'- `{d["target_fqn"]}` — {d["reason"]}'
+                for d in res["description_drift"]]
+        out.append("")
+
     if res.get("failed"):
         out += ["## Failed verification", ""]
         out += [f'- `{f["target_fqn"]}` — {f["reason"]}' for f in res["failed"]]
         out.append("")
     if res.get("chunk_errors"):
         out += ["## Batch errors", ""] + [f"- {e}" for e in res["chunk_errors"]] + [""]
+    if res.get("errors"):
+        # Everything the run recorded as an error: a schema that never
+        # settled, a listing that failed mid-poll, each refused create. It
+        # used to live only in deploy_result.json, so the summary could
+        # blame a burned name for what the errors said was the schema.
+        out += ["## Errors recorded during the run", ""]
+        out += [f"- {e}" for e in res["errors"]]
+        out.append("")
 
     jobs = plan.get("silver_gold_jobs") or []
     if jobs and not res.get("dry_run"):
-        out += [f"## Silver/Gold jobs", "",
+        out += ["## Silver/Gold jobs", "",
                 f"{len(jobs)} job(s) defined in the plan, disabled and never "
                 "triggered. Creating them on AIDP is a separate step.", ""]
     return "\n".join(out).rstrip() + "\n"
@@ -537,28 +807,18 @@ def _row_count_provenance(inventory: dict | None) -> list[str]:
     records = (inventory or {}).get("inventory") or []
     if not records:
         return []
-    mode = (inventory or {}).get("row_count_mode", "metadata")
-    described = {
-        "metadata": "Snowflake's maintained row count, read from `SHOW` at no "
-                    "cost. It agrees with `COUNT(*)` for a settled standard "
-                    "table, but it can lag very recent DML and is not "
-                    "maintained for external tables, so it is not a verified "
-                    "number.",
-        "exact": "a `COUNT(*)` per object — verified, and it executes every "
-                 "view to get there.",
-        "none": "not collected; `--row-counts` was `none`.",
-    }.get(mode, mode)
+    mode, mode_text = _row_count_mode(inventory)
 
     out = ["## Row counts", "",
-           f"Mode: **{mode}** — {described}", ""]
+           f'Mode: **{mode}** — {mode_text["described"]}', ""]
 
     not_counted = [r for r in records if r.get("row_count_source") == "not_counted"]
     errored = [r for r in records if r.get("row_count_source") == "error"]
 
     if not_counted:
         notes = {r.get("row_count_note") for r in not_counted if r.get("row_count_note")}
-        out.append(f"**{len(not_counted)} object(s) show `-` because they were "
-                   f"not counted**, not because they are empty:")
+        out.append(f"**{len(not_counted)} object(s) have no row count because "
+                   f"they were not counted**, not because they are empty:")
         out.append("")
         out += [f'- `{r["source_identifier"]}`' for r in not_counted[:20]]
         if len(not_counted) > 20:
@@ -733,6 +993,14 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
     for c in plan.get("can_migrate") or []:
         level, note = assess_risk(c)
         status = migration_status(c["source_identifier"], deployed=deployed)
+        failure = deploy_failure(c["source_identifier"], deployed)
+        if failure:
+            # The failure leads: the planning notes are about an object that
+            # does not exist on the target. LOW means the note is only
+            # "structure clones cleanly", which a failed create contradicts.
+            note = (failure[0].upper() + failure[1:] + "."
+                    + ("" if level == "LOW" else " " + note))
+            level = "HIGH"
         rows.append((c["source_identifier"], c["object_type"],
                      "-" if c.get("rows") is None else f'{c["rows"]:,}',
                      level, status, note))
@@ -771,9 +1039,13 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
             "",
             "Status vocabulary: `NOT_YET_DONE` → `IN_PROGRESS` → `SHALLOW_CLONE` → "
             "`DATA_CLONE` → `DONE`, or `BLOCKED`.", "",
-            "**`DATA_CLONE` and `DONE` are unreachable in this version: the plugin "
-            "copies structure only and moves no data.** Every object that reports "
-            "`SHALLOW_CLONE` exists in AIDP with its columns and zero rows.", ""]
+            "**`DATA_CLONE` and `DONE` are not reported by this summary.** It "
+            "reads only the control-plane deploy result -- structure, not rows; "
+            "whether rows were copied by the in-AIDP job "
+            "`snowmig_02_copy_schema` is reported by `snowmig_03_reconcile` in "
+            "`MIGRATION_REPORT.md` / `reconciliation.json`. `SHALLOW_CLONE` "
+            "means the object exists in AIDP with its columns; it says nothing "
+            "about rows.", ""]
 
     out += _row_count_provenance(inventory)
 
@@ -781,7 +1053,7 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
         out += [f'Deployed against catalog '
                 f'`{deployed.get("catalog_in_scope")}`; '
                 f'{len(deployed.get("verified_targets") or [])} verified, '
-                f'{len(deployed.get("failed_targets") or [])} unverified.', ""]
+                f'{len(deployed.get("failed_targets") or [])} failed.', ""]
     elif deployed:
         out += ["Last run was a **dry run** — nothing was created.", ""]
     else:
@@ -797,8 +1069,14 @@ def render_summary(plan: dict, inventory: dict, deployed: dict | None,
 
 def render_smoke(result: dict) -> str:
     src, dest = result.get("source", {}), result.get("destination", {})
-    out = ["# Smoke test — connectivity and permissions", "",
-           f'Verdict: **{"PASS" if result.get("ok") else "FAIL"}**', "",
+    verdict = smoke_verdict(result)
+    header = {
+        "PASS": "Verdict: **PASS**",
+        "FAIL": "Verdict: **FAIL**",
+        "PARTIAL": ("Verdict: **PARTIAL** — the Snowflake source was checked; the "
+                    "AIDP destination was not. This is not a pass."),
+    }[verdict]
+    out = ["# Smoke test — connectivity and permissions", "", header, "",
            "## Source (Snowflake)", ""]
     if not src.get("reachable"):
         out += [f'**Unreachable.** {src.get("error", "")}', ""]
@@ -831,13 +1109,24 @@ def render_smoke(result: dict) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+# What data_options.json says in its `note`, and what DATA_MOVEMENT_OPTIONS.md
+# opens with. One constant, because the two artifacts of one run disagreed:
+# the markdown named the implemented path while a note hard-coded where the
+# JSON was written said the plugin "implements no transfer path".
+DATA_OPTIONS_NOTE = (
+    "Proposal only. The control-plane CLI moves no bytes. One path is "
+    "implemented by the data plane: in-AIDP INSERT-SELECT from the EXTERNAL "
+    "catalog, run schema by schema by the `snowmig_02_copy_schema` job. The "
+    "other options are not implemented.")
+
+
 def render_data_options(options: list[dict]) -> str:
+    _, headline, rest = DATA_OPTIONS_NOTE.split(". ", 2)
     out = ["# Data-movement options — for you to choose", "",
-           "**This plugin moves no bytes, and nothing below is implemented.** "
-           "These are the realistic ways data could move in a later phase, with "
-           "the trade-offs and the open unknowns attached, so the choice is made "
-           "deliberately rather than defaulting to whichever path got built "
-           "first.", "",
+           f"**{headline}.** {rest} They are the realistic ways data "
+           "could move, with the trade-offs and the open unknowns attached, so "
+           "the choice is made deliberately rather than defaulting to whichever "
+           "path got built first.", "",
            "| Option | Catalog | Moves bytes | Phase |", "|---|---|---|---|"]
     for o in options:
         out.append(f'| **{o["id"]}** — {o["name"]} | {o["catalog_type"]} '
@@ -877,8 +1166,9 @@ def architecture_section(plan: dict) -> list[str]:
     """
     decision = architecture_decision(plan.get("architecture_choice"))
     out = ["## Data-movement architecture", "",
-           "**This plugin moves no bytes.** None of the paths below is "
-           "implemented; they are the ways data could move in a later phase.", "",
+           "**The control-plane CLI moves no bytes.** Rows move only through "
+           "the in-AIDP job `snowmig_02_copy_schema`, when the operator runs "
+           "it; none of the other paths below is implemented.", "",
            decision["statement"], ""]
 
     if decision["decided"]:
@@ -1085,9 +1375,11 @@ def render_maintenance(maint: dict) -> str:
 _NO_CENSUS_SCOPE = (
     "**Scope: tables and views only.** No census of the rest of the estate was "
     "run, so this count is not the size of the estate — procedures, UDFs, "
-    "tasks, streams, materialized and dynamic tables, stages, pipes, sequences "
-    "and file formats were not examined. Run `assess` with the census enabled "
-    "to find out what else is there."
+    "tasks, streams, materialized and dynamic tables, stages, pipes, sequences, "
+    "file formats, alerts, secrets, network rules, Streamlit apps, notebooks "
+    "and services, and the account's shares, roles, network policies, "
+    "applications and compute pools, were not examined. Run `assess` with the "
+    "census enabled to find out what else is there."
 )
 
 
@@ -1097,6 +1389,15 @@ def census_scope(plan_or_inventory: dict) -> str:
     if not census:
         return _NO_CENSUS_SCOPE
     return census.get("scope_statement") or _NO_CENSUS_SCOPE
+
+
+# `.title()` turns UDTF into "Udtf". Acronyms get spelled the way the source
+# spells them; everything else keeps the generic rule.
+_CENSUS_KIND_LABELS = {"UDTF": "UDTF", "STREAMLIT": "Streamlit"}
+
+
+def _census_kind_label(kind: str) -> str:
+    return _CENSUS_KIND_LABELS.get(kind, kind.replace("_", " ").title())
 
 
 def render_census(census: dict) -> str:
@@ -1112,14 +1413,38 @@ def render_census(census: dict) -> str:
            "plausible-but-wrong procedure translation is worse than an honest "
            "gap.", ""]
 
+    if census.get("visibility_note"):
+        out += [census["visibility_note"], ""]
+
     if kinds:
-        out += ["## Counts by kind", "", "| Kind | Count | Read |", "|---|---:|---|"]
+        out += ["## Counts by kind", "",
+                "| Kind | Count | Read | Scope |", "|---|---:|---|---|"]
         for kind, info in sorted(kinds.items()):
             count = info.get("count")
-            out.append(f'| {kind.replace("_", " ").title()} | '
+            if info.get("capped"):
+                # Answered, but truncated: "yes" would call it complete.
+                read = "**capped** — SHOW row limit reached; lower bound"
+            elif info.get("readable"):
+                read = "yes" if count else "yes (0 visible; lower bound)"
+            elif info.get("unread") == "partial":
+                # A real count that is also incomplete. Calling this denied
+                # would contradict the objects listed below it.
+                missing = ", ".join(info.get("denied_databases") or [])
+                read = f"**partial** — denied in {missing}; lower bound"
+            elif info.get("unread") == "degraded":
+                # The rows were read and counted under another kind. Saying
+                # "not visible" would be a different, and false, claim.
+                read = "**not distinguishable**"
+            else:
+                read = "**not visible to this role**"
+            out.append(f'| {_census_kind_label(kind)} | '
                        f'{count if count is not None else "*not measured*"} | '
-                       f'{"yes" if info.get("readable") else "**denied**"} |')
-        out.append("")
+                       f'{read} | {info.get("scope") or "database"} |')
+        out += ["", "Scope says where the read was aimed: a *database* kind is "
+                "asked for once per database in scope, an *account* kind once "
+                "for the whole account. A kind the role cannot read reports "
+                "*not visible to this role* — never 0, because *we could not "
+                "look* and *there are none* lead to opposite decisions.", ""]
 
     by_effort = census.get("by_effort") or {}
     if by_effort:
@@ -1145,12 +1470,33 @@ def render_census(census: dict) -> str:
         out.append("")
 
         out += ["## Why each kind cannot move, and where it would go", ""]
-        seen: set[str] = set()
+        # One paragraph per DISTINCT VERDICT, not per kind. `refine` gives
+        # objects of one kind different reasons -- an internal stage needs
+        # its files unloaded, an external one does not; an inbound share is
+        # someone else's data, an outbound one is a live consumer contract.
+        # Keeping the first per kind covered the second case with the
+        # first's text, in the section a reader goes to for the verdict.
+        seen: set[tuple[str, str]] = set()
+        variants: dict[str, int] = collections.Counter(
+            (o["kind"], o["reason"]) for o in objects)
+        kinds_with_variants = {k for (k, _r), n in variants.items()
+                               if sum(1 for (k2, _) in variants if k2 == k) > 1}
         for o in objects:
-            if o["kind"] in seen:
+            key = (o["kind"], o["reason"])
+            if key in seen:
                 continue
-            seen.add(o["kind"])
-            out += [f'**{o["kind"]}** — {o["reason"]}', ""]
+            seen.add(key)
+            heading = f'**{o["kind"]}**'
+            if o["kind"] in kinds_with_variants:
+                # Say which objects this paragraph is about, or two STAGE
+                # paragraphs are indistinguishable.
+                members = [m["source_identifier"] for m in objects
+                           if (m["kind"], m["reason"]) == key]
+                shown = ", ".join(f"`{m}`" for m in members[:4])
+                if len(members) > 4:
+                    shown += f" and {len(members) - 4} more"
+                heading += f" ({shown})"
+            out += [f'{heading} — {o["reason"]}', ""]
             if o.get("aidp_path"):
                 out += [f'AIDP path: {o["aidp_path"]}', ""]
 
@@ -1185,15 +1531,41 @@ def render_security(sec: dict) -> str:
                 "does not fail, it succeeds without the protection. Anyone who "
                 "can read the target table sees what Snowflake was hiding.", ""]
 
+    live = sec.get("live_attachments") or {}
+    if sec.get("attachment_source"):
+        out += [f'Attachment source: `{sec["attachment_source"]}`.', ""]
+    if live.get("attempted"):
+        if live.get("failed"):
+            out += [f'> **{len(live["failed"])} of {live["objects"]} object(s) '
+                    "could not be read directly.** Nothing in this report is a "
+                    "verdict about them; the ~2 h-stale account view is all "
+                    "there is for those. They are listed under *Could not be "
+                    "read* below.", ""]
+        else:
+            out += [f'Every one of the {live["objects"]} in-scope object(s) '
+                    "was read directly, so this is current rather than "
+                    "subject to the ~2 h `ACCOUNT_USAGE` lag.", ""]
+    elif live.get("reason"):
+        out += [f'> **Attachments were not read per object.** '
+                f'{live["reason"]}', ""]
+
     if exposures:
         out += ["## Policies that do not travel", "",
-                "| Object | Column | Policy | Kind | Severity |",
-                "|---|---|---|---|---|"]
+                "| Object | Column | Policy | Kind | Seen by | Severity |",
+                "|---|---|---|---|---|---|"]
         for e in exposures:
+            seen = ("per-object read" if e.get("source") == "live"
+                    else "stale account view")
+            if e.get("needs_confirmation"):
+                seen += " — **confirm**"
             out.append(f'| `{e["object"]}` | '
                        f'{("`" + e["column"] + "`") if e.get("column") else "*whole table*"} | '
-                       f'`{e["policy"]}` | {e["policy_kind"]} | **{e["severity"]}** |')
+                       f'`{e["policy"]}` | {e["policy_kind"]} | {seen} '
+                       f'| **{e["severity"]}** |')
         out.append("")
+        flagged = [e for e in exposures if e.get("needs_confirmation")]
+        if flagged:
+            out += [flagged[0]["needs_confirmation"], ""]
         seen: set[str] = set()
         for e in exposures:
             if e["policy_kind"] in seen:
@@ -1211,17 +1583,81 @@ def render_security(sec: dict) -> str:
 
     pol = sec.get("policies") or {}
     if pol:
-        out += ["## Policy objects defined in the source", "",
-                "Defined is not the same as attached — an unattached policy "
-                "protects nothing, and an attached one is listed above.", "",
+        unattached = sec.get("policies_defined_without_attachment") or 0
+        if unattached:
+            lead = (f"> **Defined, but not seen attached.** {unattached} policy "
+                    "object(s) exist and `ACCOUNT_USAGE.POLICY_REFERENCES` "
+                    "(up to ~2 h stale) shows no attachment to anything. Do "
+                    "not read the table below as an all-clear.")
+        else:
+            lead = ("Defined is not the same as attached — an unattached "
+                    "policy protects nothing, and an attached one is listed "
+                    "above.")
+        out += ["## Policy objects defined in the source", "", lead, "",
                 "| Kind | Count | Read |", "|---|---:|---|"]
         for label, key in (("Masking", "masking"),
-                           ("Row access", "row_access"), ("Tags", "tags")):
+                           ("Row access", "row_access"),
+                           ("Aggregation", "aggregation"),
+                           ("Projection", "projection"),
+                           ("Tags", "tags")):
+            # Three different facts, three different cells. A kind that was
+            # never asked for, a kind the role cannot see, and a kind that
+            # answered zero are not interchangeable, and only the last one is
+            # a zero.
+            if key not in pol:
+                out.append(f"| {label} | *not enumerated* | **not asked** |")
+                continue
             info = pol.get(key) or {}
             c = info.get("count")
+            if not info.get("readable"):
+                out.append(f"| {label} | *not visible to this role* "
+                           f"| **denied** |")
+                continue
+            read = ("**capped** — SHOW row limit reached; lower bound"
+                    if info.get("capped") else "yes")
             out.append(f'| {label} | {c if c is not None else "*not measured*"} '
-                       f'| {"yes" if info.get("readable") else "**denied**"} |')
+                       f"| {read} |")
         out.append("")
+        missing = [label for label, key in (("aggregation", "aggregation"),
+                                            ("projection", "projection"))
+                   if key not in pol]
+        if missing:
+            out += [f'> This artefact predates {" and ".join(missing)} policy '
+                    "enumeration, so those kinds were never asked for. Re-run "
+                    "`security` before treating the statement above as "
+                    "covering them.", ""]
+
+    # A tag count with no attachment list is a number with no verdict, so the
+    # attachments get their own section with the same unreadable handling and
+    # the same latency caveat as the policy attachments above.
+    tags = sec.get("tag_references")
+    if tags is not None:
+        out += ["## Tag attachments", ""]
+        if not tags.get("measured"):
+            out += [f'**Not measured** — {tags.get("note", "unknown")}. '
+                    "Whether any migrated object carries a classification tag "
+                    "is UNKNOWN, which is not the same as none.", ""]
+        else:
+            attached = tags.get("attachments") or []
+            out += [f'Source: `{tags.get("source", "-")}`.', ""]
+            if attached:
+                out += [f"{len(attached)} tag attachment(s) on objects being "
+                        "migrated. **No tag is recreated on the target.**", "",
+                        "| Object | Column | Tag | Value |",
+                        "|---|---|---|---|"]
+                for a in attached:
+                    col = (f'`{a["column"]}`' if a.get("column")
+                           else "*whole object*")
+                    out.append(f'| `{a["object"]}` | {col} '
+                               f'| `{a.get("tag")}` | {a.get("value") or "-"} |')
+                out += ["", attached[0].get("consequence", ""), "",
+                        attached[0].get("aidp_path", ""), ""]
+            else:
+                out += ["No tag is attached to anything being migrated, as of "
+                        "the lag named above.", ""]
+            if tags.get("out_of_scope"):
+                out += [f'{tags["out_of_scope"]} tag attachment(s) exist on '
+                        "objects outside this migration. Context only.", ""]
 
     grants = sec.get("grants") or {}
     if grants.get("measured"):
@@ -1231,6 +1667,26 @@ def render_security(sec: dict) -> str:
                 "**No grant is replayed on the target** — AIDP roles and "
                 "per-resource permissions are a separate model, so access has "
                 "to be re-granted deliberately rather than copied.", ""]
+        requested = grants.get("classes_requested") or []
+        if requested:
+            out += ["Object classes asked for in "
+                    "`ACCOUNT_USAGE.GRANTS_TO_ROLES`: "
+                    + ", ".join(f"`{c}`" for c in requested)
+                    + ". A class that is absent from the table below was "
+                    "asked for and returned nothing; a class absent from this "
+                    "list was never asked for.", ""]
+        by_class = grants.get("by_class") or {}
+        if by_class:
+            out += ["| Granted on | Privileges | Objects | Roles |",
+                    "|---|---:|---:|---|"]
+            for cls, info in sorted(by_class.items()):
+                roles = info.get("roles") or []
+                shown = ", ".join(f"`{r}`" for r in roles[:6])
+                if len(roles) > 6:
+                    shown += f" …and {len(roles) - 6} more"
+                out.append(f'| {cls} | {info.get("grants", 0)} '
+                           f'| {info.get("objects", 0)} | {shown or "-"} |')
+            out.append("")
         if by_obj:
             out += ["| Object | Roles |", "|---|---|"]
             for ident, entries in sorted(by_obj.items()):
@@ -1274,7 +1730,6 @@ def render_security(sec: dict) -> str:
 
 def render_preflight(plan: dict, *, source: dict | None = None,
                      target: dict | None = None) -> str:
-    s = plan.get("summary") or {}
     can = plan.get("can_migrate") or []
     cannot = plan.get("cannot_migrate") or []
     schemas = plan.get("schemas_to_create") or []
@@ -1369,18 +1824,22 @@ def render_stages(board: dict) -> str:
     out = ["# Stages — what runs, what has run, what it found", "",
            f'Artifacts read from `{board.get("out_dir")}`. This board makes no '
            f'decisions and touches nothing.', "",
-           "**Three stages write to AIDP from here: `provision`** (workspace, "
+           "**Seven stages write to AIDP. Three from here: `provision`** (workspace, "
            "cluster, scripts, jobs), **`catalog`** (registers the target "
            "catalog) **and `deploy`** (creates schemas, tables and views). "
            "All three are a dry run unless `--execute` is passed with the "
            "target coordinates. **Two AIDP workflows write too, when a human "
            "runs them: `structure-workflow`** (S10, creates the structure) "
            "**and `copy-workflow`** (S11, copies rows — registered, never run "
-           "by the migrator). **`publish`** copies the finished report into "
+           "by the migrator). **A workflow has no dry run**: `run` takes no "
+           "`--execute`, so invoking it IS the write. **`publish`** copies the finished report into "
            "the workspace and **`teardown`** stops (or deletes) the clusters "
            "this migration allocated, both dry runs unless `--execute`. "
-           "Every other stage is read-only, except the "
-           "narrow opt-ins `smoke --write-probe` and `notebook --upload`.", "",
+           "Every other stage is read-only. The one further write is "
+           "`smoke --write-probe --execute`, which creates one probe schema "
+           "and removes it again; `--write-probe` alone is a dry run. "
+           "`notebook --upload` sends nothing: without `--execute` it is a "
+           "dry run, with `--execute` it is refused (GAPS.md 13).", "",
            "| Stage | Needs | Runs on | Status | What it found |",
            "|---|---|---|---|---|"]
     for r in rows:

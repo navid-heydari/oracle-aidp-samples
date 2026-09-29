@@ -12,9 +12,14 @@ Thin wrapper over [`snowflake-medallion-clone`](../skills/snowflake-medallion-cl
    discovered and printed.
 3. Confirm, then register the **EXTERNAL/SNOWFLAKE** catalog with
    `snowmig.py catalog --execute`. It copies nothing and creates no tables.
-4. **Only if the user explicitly asked for a Standard catalog:** generate DDL,
-   show `DDL_PLAN.md`, then hand over the table-creation script via
-   [`snowflake-clone-notebook`](../skills/snowflake-clone-notebook/SKILL.md) —
-   it lands in `/Workspace/Shared/` and runs on AIDP compute.
-5. Report the registered catalog, or `verified/total` for a Standard clone —
-   never `executed`.
+4. **Only if the user explicitly asked for a Standard catalog:** create the
+   container with `snowmig.py catalog --catalog <name> --catalog-type standard
+   --execute` (S4; `catalog_result.json` says `container_only: true`), then
+   generate DDL and show `DDL_PLAN.md`, then create the structure on AIDP
+   compute with `snowmig.py run --job snowmig_01_structure` (S10), one
+   workflow per schema, reading the approved `ddl_plan.json` from the
+   workspace. Not through the control-plane API (a `202 Accepted` can create
+   nothing) and not through the notebook upload path (its transport is
+   known-bad — GAPS 13).
+5. Report the registered catalog, or `verified/total` from the structure
+   run's report for a Standard clone — never `executed`.

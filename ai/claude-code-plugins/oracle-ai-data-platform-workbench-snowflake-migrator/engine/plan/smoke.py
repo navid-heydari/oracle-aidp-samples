@@ -12,10 +12,10 @@ probe schema there is correct rather than forbidden. An earlier version applied
 the source rule to the destination and therefore could not clean up, which is
 why the probe had to stay off.
 
-It is still opt-in, because it writes. The DROP names exactly one constant
-schema, is never CASCADE, and is skipped if the schema was already there -- a
-pre-existing schema is not ours to remove. If cleanup fails, the report names
-what was left.
+It is still opt-in, because it writes. The DROP names exactly the one schema
+this run created, under a per-run unique name (a failed create permanently
+poisons the name, and DELETE does not recover it), and is never CASCADE. If
+cleanup fails, the report names what was left.
 
 The probe is also skipped, with a note, when the target catalog is EXTERNAL:
 a read-only pointer at the live Snowflake source accepts no writes by design,
@@ -24,12 +24,20 @@ and probing it would report FAIL against a destination that works.
 Both ends take an injected run_sql, so this is unit-testable with no connection.
 Every check captures its own failure: one denied privilege should not hide the
 result of the others.
+
+The verdict is three-valued. PASS means both ends were checked and every check
+passed. FAIL means a check that ran failed. PARTIAL means no executed check
+failed but the destination was never checked -- the target coordinates were
+not all supplied -- and that is not a pass: it is the default first run with
+the example config, and it used to render as PASS everywhere. `ok` keeps its
+narrower meaning, "no executed check failed", so skipped and failed stay the
+opposite findings they are.
 """
 from __future__ import annotations
 
 import uuid
 
-__all__ = ["PROBE_SCHEMA", "run_smoke"]
+__all__ = ["PROBE_SCHEMA", "run_smoke", "smoke_verdict"]
 
 PROBE_SCHEMA = "snowmig_permission_probe"
 
@@ -65,6 +73,17 @@ def _check(name: str, fn) -> dict:
         return {"name": name, "ok": False, "detail": str(exc)[:300]}
 
 
+def smoke_verdict(result: dict) -> str:
+    """PASS | PARTIAL | FAIL for a smoke result, including one written before
+    the `verdict` key existed: ok + a skipped destination was never a pass."""
+    verdict = result.get("verdict")
+    if verdict:
+        return verdict
+    if not result.get("ok"):
+        return "FAIL"
+    return "PARTIAL" if (result.get("destination") or {}).get("skipped") else "PASS"
+
+
 def run_smoke(*, source_run_sql, target=None, dest_call=None,
               write_probe: bool = False, database: str | None = None) -> dict:
     source: dict = {"reachable": False, "checks": []}
@@ -76,7 +95,8 @@ def run_smoke(*, source_run_sql, target=None, dest_call=None,
                       region=ident.get("R"), role=ident.get("ROLE"))
     except Exception as exc:
         source["error"] = str(exc)[:300]
-        return {"ok": False, "source": source,
+        return {"ok": False, "complete": False, "verdict": "FAIL",
+                "source": source,
                 "destination": {"skipped": True,
                                 "reason": "source is unreachable"}}
 
@@ -147,7 +167,7 @@ def run_smoke(*, source_run_sql, target=None, dest_call=None,
             destination["write_note"] = (
                 "not verified: the write probe is opt-in because it writes. It "
                 "creates one schema and removes it again. Re-run with "
-                "--write-probe to prove write access.")
+                "--write-probe --execute to prove write access.")
         elif catalog_type == "EXTERNAL":
             destination["write_note"] = (
                 f"not applicable: {target.catalog} is an EXTERNAL catalog — a "
@@ -218,5 +238,8 @@ def run_smoke(*, source_run_sql, target=None, dest_call=None,
                          "detail": str(exc)[:200]})
 
     all_checks = source["checks"] + destination.get("checks", [])
-    return {"ok": bool(all_checks) and all(c["ok"] for c in all_checks),
+    ok = bool(all_checks) and all(c["ok"] for c in all_checks)
+    complete = not destination["skipped"]
+    verdict = "FAIL" if not ok else ("PASS" if complete else "PARTIAL")
+    return {"ok": ok, "complete": complete, "verdict": verdict,
             "source": source, "destination": destination}

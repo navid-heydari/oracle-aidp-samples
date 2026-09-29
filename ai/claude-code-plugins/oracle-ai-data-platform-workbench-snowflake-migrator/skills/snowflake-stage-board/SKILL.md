@@ -1,6 +1,6 @@
 ---
 name: snowflake-stage-board
-description: Show the Snowflake-to-AIDP migration as a stage table before running it - which stages are supposed to run, which have run, and what each one found, with the single writing stage marked. Use when the user asks what the plugin will do, what stage comes next, where a run got to, why something was skipped, or wants an overview before approving a migration - AND proactively after any stage finishes during a migration session, to report status and the next stage without waiting to be asked. Read-only; touches no environment.
+description: Show the Snowflake-to-AIDP migration as a stage table before running it - which stages are supposed to run, which have run, and what each one found, with the writing stages marked. Use when the user asks what the plugin will do, what stage comes next, where a run got to, why something was skipped, or wants an overview before approving a migration - AND proactively after any stage finishes during a migration session, to report status and the next stage without waiting to be asked. Read-only; touches no environment.
 ---
 
 # Stage board — read the run before you execute it
@@ -21,11 +21,15 @@ and **what it found**.
 
 Then say three things out loud:
 
-1. **Three stages write to AIDP — `provision`, `catalog` and `deploy`** — and each is a dry
-   run unless `--execute` is passed with all four AIDP coordinates. Everything
-   else is read-only, apart from two narrow opt-ins that say so themselves
-   (`smoke --write-probe`, `notebook --upload`). If someone is nervous about
-   running the pipeline, this is the sentence that answers them.
+1. **Four stages write to AIDP.** `provision`, `catalog` and `deploy` are each a dry
+   run unless `--execute` is passed with all four AIDP coordinates. **`run` has
+   no dry run**: invoking it starts an in-AIDP job — `snowmig_01_structure`
+   creates schemas and tables, `snowmig_02_copy_schema` copies rows — so ask
+   before every `run`. Everything
+   else is read-only, apart from one narrow opt-in that is itself gated by
+   `--execute` (`smoke --write-probe --execute`); `notebook --upload` writes
+   nothing (dry run, refused with `--execute`, GAPS.md 13). If someone is
+   nervous about running the pipeline, this is the sentence that answers them.
 2. **Read out every ⚠️ row.** A flagged stage either found something or could
    not look, and those are not the same. `0 policy exposures` means the check
    ran and found none; *"policy attachments unreadable — exposure UNKNOWN, not

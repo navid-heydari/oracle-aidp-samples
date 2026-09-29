@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 
 __all__ = ["ConfigError", "CONFIG_NAMES", "SECRET_FIELDS", "TEMPLATE_NAME",
            "discover_config", "load_config", "redact", "resolve_secret",
@@ -61,7 +62,7 @@ _REDACTED = "<redacted>"
 # typo cannot silently leave a destination unset.
 AIDP_FIELDS = ("datalake_ocid", "workspace", "cluster_id", "catalog",
                "external_catalog", "target_catalog", "oci_profile",
-               "subnet_id")
+               "oci_auth", "subnet_id")
 
 
 # Type-mapping decisions, under `mapping:`. These are the defaults of the
@@ -164,8 +165,8 @@ def write_template(destination: pathlib.Path, *,
     # Create it closed, THEN fill it: a chmod after the write leaves a window
     # where the secret-bearing file is readable by everyone.
     fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(pathlib.Path(template).read_text())
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(pathlib.Path(template).read_text(encoding="utf-8"))
     os.chmod(destination, 0o600)
     return destination
 
@@ -174,7 +175,7 @@ def load_config(path: str | pathlib.Path) -> dict:
     """Parse the migration config. Never guesses a location."""
     p = pathlib.Path(path).expanduser()
     try:
-        text = p.read_text()
+        text = p.read_text(encoding="utf-8")
     except OSError as exc:
         raise ConfigError(
             f"config not readable at {p}: {exc.strerror}") from exc
@@ -186,7 +187,13 @@ def load_config(path: str | pathlib.Path) -> dict:
             raise ConfigError(
                 f"{p} is YAML but PyYAML is not installed; `pip install "
                 f"pyyaml` or write the config as JSON") from exc
-        data = yaml.safe_load(text) or {}
+        try:
+            data = yaml.safe_load(text) or {}
+        except yaml.YAMLError as exc:
+            # `from None`, deliberately: the parser's own exception carries a
+            # snippet of the offending line, and a traceback printer would
+            # render the chained cause along with this one.
+            raise ConfigError(_yaml_refusal(p, exc)) from None
     else:
         try:
             data = json.loads(text) if text.strip() else {}
@@ -196,6 +203,51 @@ def load_config(path: str | pathlib.Path) -> dict:
     if not isinstance(data, dict):
         raise ConfigError(f"{p}: expected a mapping at the top level")
     return data
+
+
+# What PyYAML quotes inside its problem text. A token kind reads `'<scalar>'`
+# or is one character (`':'`); anything longer is lifted from the file.
+_QUOTED = re.compile(r"'([^']*)'|\"([^\"]*)\"")
+
+
+def _quotes_the_file(text: str) -> bool:
+    for match in _QUOTED.finditer(text):
+        quoted = match.group(1) if match.group(1) is not None else match.group(2)
+        if len(quoted) > 1 and not (quoted.startswith("<")
+                                    and quoted.endswith(">")):
+            return True
+    return False
+
+
+def _yaml_refusal(path: pathlib.Path, exc: Exception) -> str:
+    """Say WHERE the YAML broke, never WHAT was there.
+
+    This file holds the password in plain text, and a password containing
+    `{`, `[`, `*`, `: ` or a leading quote is exactly what breaks the parser
+    -- so the line PyYAML would quote back is the password. Only the position
+    travels. The parser's problem text is kept when it names token kinds
+    (`expected ',' or '}', but got ':'`) and withheld when it quotes the file
+    (a composer error names the alias it could not resolve, and that alias is
+    the value on the password line).
+    """
+    marks = [m for m in (getattr(exc, "context_mark", None),
+                         getattr(exc, "problem_mark", None)) if m is not None]
+    lines = sorted({m.line + 1 for m in marks})
+    if not lines:
+        where = ""
+    elif len(lines) == 1:
+        where = f" at line {lines[0]}"
+    else:
+        where = f" between line {lines[0]} and line {lines[-1]}"
+    parts = [str(getattr(exc, attr, None) or "")
+             for attr in ("context", "problem")]
+    said = ", ".join(p for p in parts if p)
+    detail = (f" ({said})" if said and not _quotes_the_file(said)
+              else " (the parser's message is withheld: it quotes the file)")
+    return (f"{path}: not valid YAML{where}{detail}. The offending line is "
+            f"not shown because this file holds a credential. A value that "
+            f"contains ':', '#', '{{', '[', '*' or '&', or starts with a "
+            f"quote, must be wrapped in single quotes.")
 
 
 def snowflake_block(config: dict) -> dict:
@@ -279,7 +331,7 @@ def resolve_secret(block: dict, inline: str, path_field: str) -> str | None:
         return None
     p = pathlib.Path(str(path)).expanduser()
     try:
-        return p.read_text().strip()
+        return p.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise ConfigError(
             f"`{path_field}` points at {p}, which is not readable: "

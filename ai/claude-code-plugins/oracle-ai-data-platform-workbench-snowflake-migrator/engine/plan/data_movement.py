@@ -414,11 +414,12 @@ def architecture_decision(recorded_choice: dict | None) -> dict:
         return {
             "decided": False, "deferred": False, "chosen": None,
             "options": options, "unknowns_outstanding": [],
-            "statement": ("No architecture has been chosen for moving data. This "
-                          "plugin moves no bytes, so nothing is blocked today -- "
-                          "but the choice drives cost, wall-clock and whether a "
-                          "later migration can run unattended, so it belongs to "
-                          "the customer rather than to whoever builds first."),
+            "statement": ("No architecture has been chosen for moving data. The "
+                          "control-plane CLI moves no bytes, so nothing is "
+                          "blocked today -- but the choice drives cost, "
+                          "wall-clock and whether a later migration can run "
+                          "unattended, so it belongs to the customer rather "
+                          "than to whoever builds first."),
         }
 
     option_id = recorded_choice.get("option_id")

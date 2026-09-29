@@ -15,6 +15,7 @@ a catalog other than --target-catalog is refused.
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 import types
 
@@ -24,16 +25,57 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "dataplane"
 
 
 class _DF:
+    def __init__(self, rows=None):
+        self._rows = rows or []
+
     def collect(self):
-        return []
+        return self._rows
 
 
 class _Spark:
+    """Enough of Spark to exercise S10's create-then-verify path.
+
+    The stage DESCRIBEs before creating (absent table -> create) and again
+    afterwards (the read-back that must match the plan), so a fake that
+    always answers "no columns" reads as a table that exists and is empty,
+    which is TYPE DRIFT. This one remembers what it created.
+    """
+
     def __init__(self):
         self.statements = []
+        self.tables: dict[str, list[tuple[str, str]]] = {}
 
     def sql(self, statement):
-        self.statements.append(" ".join(statement.split()))
+        s = " ".join(statement.split())
+        self.statements.append(s)
+        if s.upper().startswith("DESCRIBE "):
+            fqn = s.split(None, 1)[1].strip()
+            if fqn not in self.tables:
+                raise RuntimeError(f"Table or view not found: {fqn}")
+            return _DF([{"col_name": n, "data_type": ty}
+                        for n, ty in self.tables[fqn]])
+        m = re.match(r"(?is)CREATE TABLE IF NOT EXISTS (\S+) \((.*?)\) "
+                     r"USING DELTA", s)
+        if m:
+            cols = []
+            # Split on top-level commas only: DECIMAL(38,0) carries one.
+            depth, part, parts = 0, "", []
+            for ch in m.group(2):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                if ch == "," and depth == 0:
+                    parts.append(part); part = ""
+                else:
+                    part += ch
+            parts.append(part)
+            for raw in parts:
+                bits = raw.strip().split(None, 1)
+                if bits:
+                    cols.append((bits[0].strip("`"),
+                                 bits[1].strip() if len(bits) > 1 else ""))
+            self.tables[m.group(1)] = cols
         return _DF()
 
 

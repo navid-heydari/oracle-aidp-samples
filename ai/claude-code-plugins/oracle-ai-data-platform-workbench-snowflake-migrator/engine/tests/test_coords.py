@@ -40,7 +40,7 @@ def test_environment_variables_are_ignored(monkeypatch):
 
 def test_module_contains_no_environment_or_file_reads():
     # Enforced by inspection so a future edit cannot quietly add a lookup.
-    text = (pathlib.Path(__file__).resolve().parents[1] / "target/coords.py").read_text()
+    text = (pathlib.Path(__file__).resolve().parents[1] / "target/coords.py").read_text(encoding="utf-8")
     for forbidden in ("os.environ", "getenv", "open(", "read_text", "Path("):
         assert forbidden not in text, f"coords.py must not use {forbidden}"
 

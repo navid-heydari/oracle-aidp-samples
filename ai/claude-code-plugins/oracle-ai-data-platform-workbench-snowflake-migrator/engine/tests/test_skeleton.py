@@ -81,6 +81,6 @@ def test_no_websocket_transport_remains():
     for path in ENGINE.rglob("*.py"):
         if "corpus" in path.parts or "tests" in path.parts:
             continue
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         for token in ("websocket", "asyncio", "wss://"):
             assert token not in text.lower(), f"{path.name} still mentions {token}"

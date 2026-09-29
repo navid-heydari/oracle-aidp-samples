@@ -74,8 +74,11 @@ def note_retry(label: str, attempt: int, max_attempts: int, delay: float,
                error: BaseException | str) -> None:
     """Say, as a retry, that `label` failed and will be tried again."""
     text = " ".join(str(error).split())[:200]
+    # stdout, with the rest of the progress output: a retry is not a
+    # failure, and putting it on stderr buried the one-line `error:` a
+    # caller reads when the retries are finally exhausted.
     print(f"  RETRY {label}: attempt {attempt + 1}/{max_attempts} in "
-          f"{delay:.1f}s after: {text}", file=sys.stderr)
+          f"{delay:.1f}s after: {text}", flush=True)
     _EVENTS.append({"label": label, "attempt": attempt + 1,
                     "max_attempts": max_attempts, "delay_seconds": delay,
                     "error": text,

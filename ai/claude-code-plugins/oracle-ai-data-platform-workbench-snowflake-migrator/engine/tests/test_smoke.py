@@ -268,3 +268,65 @@ def test_an_unresolvable_catalog_type_reads_unknown_and_still_probes():
                   write_probe=True)
     assert r["destination"]["catalog_type"] == "unknown"
     assert any(op == "create_schema" for op, _ in dest.ops)
+
+
+# ==========================================================================
+# The verdict is three-valued. `ok` means "no executed check failed"; it is
+# not the claim that both ends were checked. Without target coordinates the
+# destination never ran, and that used to render as PASS in the CLI, in
+# SMOKE_TEST.md and on the stage board -- on the one stage whose job is to
+# prove both ends before anything writes. A skipped check is not a pass.
+# ==========================================================================
+
+def test_a_skipped_destination_is_partial_not_pass():
+    r = run_smoke(source_run_sql=sf_ok, target=None, dest_call=None)
+    assert r["verdict"] == "PARTIAL"
+    assert r["complete"] is False
+    assert r["ok"] is True, "no executed check failed; skipped is not failed"
+    assert r["destination"]["skipped"] is True
+
+
+def test_a_skipped_destination_with_write_probe_is_still_partial():
+    r = run_smoke(source_run_sql=sf_ok, target=None, dest_call=None,
+                  write_probe=True)
+    assert r["verdict"] == "PARTIAL"
+    assert r["destination"]["write_verified"] is False
+
+
+def test_a_source_failure_beats_partial():
+    def broken(sql, params=None):
+        if "information_schema" in sql.lower():
+            raise RuntimeError("insufficient privileges")
+        return sf_ok(sql, params)
+
+    r = run_smoke(source_run_sql=broken, target=None)
+    assert r["verdict"] == "FAIL" and r["ok"] is False
+
+
+def test_an_unreachable_source_is_fail_not_partial():
+    def down(sql, params=None):
+        raise RuntimeError("network unreachable")
+
+    r = run_smoke(source_run_sql=down)
+    assert r["verdict"] == "FAIL"
+    assert r["complete"] is False
+
+
+def test_both_ends_checked_and_clean_is_pass():
+    r = run_smoke(source_run_sql=sf_ok, target=_target(), dest_call=DestCall())
+    assert r["verdict"] == "PASS"
+    assert r["complete"] is True and r["ok"] is True
+
+
+def test_a_denied_destination_read_is_fail_not_partial():
+    r = run_smoke(source_run_sql=sf_ok, target=_target(),
+                  dest_call=DestCall(fail={"list_schemas"}))
+    assert r["verdict"] == "FAIL"
+
+
+def test_the_default_write_note_names_the_execute_gate():
+    # The CLI runs the probe only with `--write-probe --execute`; a plain
+    # `smoke` run must not tell the reader that `--write-probe` alone proves
+    # write access.
+    r = run_smoke(source_run_sql=sf_ok, target=_target(), dest_call=DestCall())
+    assert "--write-probe --execute" in r["destination"]["write_note"]

@@ -41,8 +41,8 @@ class ManifestShapeError(ValueError):
 
 # The fields a manifest must carry beyond type and nullability, because the
 # planning stages report on them. A manifest that carries none of them was
-# written by an older discovery, which is a different fact from a column that
-# genuinely has no default.
+# written by an older discovery, which is a different fact from a column
+# that genuinely has no default -- see `facts_recorded` below.
 FACT_KEYS = ("column_default", "identity_start", "identity_increment",
              "comment")
 
@@ -50,8 +50,8 @@ FACT_KEYS = ("column_default", "identity_start", "identity_increment",
 def manifest_records_column_facts(manifest: dict) -> bool:
     """Did the discovery that wrote this manifest read the fact columns?
 
-    True when any column says so with `facts_recorded` or carries any of them.
-    False means UNKNOWN, never "none".
+    True when any column carries any of them, or when discovery said so
+    outright with `facts_recorded`. False means UNKNOWN, never "none".
     """
     for schema in manifest.get("schemas") or []:
         for key in ("tables", "views"):
@@ -81,14 +81,24 @@ def _column_record(col: dict, *, semi_structured: str, geospatial: str,
                  char_length=col.get("character_maximum_length"),
                  semi_structured=semi_structured,
                  geospatial=geospatial,
-                 timestamp_ntz=timestamp_ntz)
+                 timestamp_ntz=timestamp_ntz,
+                 collation=col.get("collation"),
+                 datetime_precision=col.get("datetime_precision"))
     enriched = {
         "COLUMN_NAME": col.get("name"),
+        # ddl sorts on it; absent (an older manifest), the manifest's own
+        # order stands, which discovery wrote by ORDINAL_POSITION anyway.
+        "ORDINAL_POSITION": col.get("ordinal_position"),
         "DATA_TYPE": col.get("data_type"),
         "NUMERIC_PRECISION": col.get("numeric_precision"),
         "NUMERIC_SCALE": col.get("numeric_scale"),
         "CHARACTER_MAXIMUM_LENGTH": col.get("character_maximum_length"),
+        "COLLATION_NAME": col.get("collation"),
+        "DATETIME_PRECISION": col.get("datetime_precision"),
         "IS_NULLABLE": "YES" if col.get("nullable", True) else "NO",
+        # Reported on by R22/R23 and carried into the CREATE TABLE. Absent
+        # from an older manifest, which the caller records as unknown rather
+        # than letting it read as "no default".
         "COLUMN_DEFAULT": col.get("column_default"),
         "IDENTITY_START": col.get("identity_start"),
         "IDENTITY_INCREMENT": col.get("identity_increment"),
@@ -98,9 +108,40 @@ def _column_record(col: dict, *, semi_structured: str, geospatial: str,
     return enriched, m
 
 
+def _yn(value) -> str:
+    """INFORMATION_SCHEMA's YES/NO as SHOW spells it. The planner reads `N`
+    as unset and would report a raw `NO` as a dropped property."""
+    return "Y" if str(value).strip().upper() in ("YES", "Y", "TRUE") else "N"
+
+
+def _kind_metadata(kind: str, obj: dict) -> dict:
+    """The `source_metadata` kind keys a live `assess` takes from SHOW.
+
+    `object_kind_block` and the TRANSIENT/TEMPORARY warning read these. From
+    a manifest they were never set, so an event or external table planned
+    can_migrate here while the laptop path refused it. A manifest from an
+    older discovery carries no `table_type`, and then nothing is claimed.
+    """
+    table_type = str(obj.get("table_type") or "").upper()
+    if not table_type:
+        return {}
+    if kind == "VIEW":
+        return {"is_materialized": _yn(table_type == "MATERIALIZED VIEW")}
+    meta = {"kind": ("TEMPORARY" if table_type == "TEMPORARY TABLE"
+                     else "TRANSIENT" if _yn(obj.get("is_transient")) == "Y"
+                     else "TABLE"),
+            "is_external": _yn(table_type == "EXTERNAL TABLE"),
+            "is_event": _yn(table_type == "EVENT TABLE")}
+    # Only where discovery read them: an unread flag is unknown, not "N".
+    for flag in ("is_dynamic", "is_iceberg", "is_hybrid"):
+        if obj.get(flag) is not None:
+            meta[flag] = _yn(obj[flag])
+    return meta
+
+
 def _record(db: str, schema: str, kind: str, obj: dict, *,
             semi_structured: str, geospatial: str, timestamp_ntz: str,
-            notes: list[str]) -> dict:
+            notes: list[str], read_error: str | None = None) -> dict:
     name = obj["name"]
     blocked_reasons: list[str] = []
     warnings: list[str] = []
@@ -119,6 +160,11 @@ def _record(db: str, schema: str, kind: str, obj: dict, *,
             type_notes.append(m.note)
         enriched.append(col_rec)
 
+    # Discovery records an object whose columns it could not read in the
+    # schema's `errors`. With no column here and such an error, the verdict
+    # below would be computed over nothing -- the same `unassessed` case as
+    # a failed column read in a live assess.
+    unread = read_error if not enriched and read_error else None
     if not enriched:
         # Discovery records this as an error too; carrying it forward keeps
         # "we read it and it has no columns" distinct from "we never read it".
@@ -132,15 +178,29 @@ def _record(db: str, schema: str, kind: str, obj: dict, *,
         "source_schema": schema,
         "identifier_case_form": case_form(name),
         "migration_status": "discovered",
-        "compatibility_status": "blocked" if blocked_reasons else "supported",
+        "compatibility_status": ("unassessed" if unread else
+                                 "blocked" if blocked_reasons else
+                                 "supported"),
         "blocked_reasons": blocked_reasons,
         "warnings": warnings,
         "type_notes": type_notes,
         "evidence_location": "discovery_manifest.json (in-AIDP workflow)",
+        "columns_read": "failed" if unread else "ok",
         "columns": enriched,
-        "source_metadata": {k: v for k, v in (
-            ("BYTES", obj.get("source_bytes")),) if v is not None},
+        # The keys are catalog._META_KEYS, spelled exactly as a live `assess`
+        # writes them: restrictions.max_bytes, render_inventory, maintenance
+        # and ddl all read the lowercase form. Under any other spelling the
+        # size is invisible to every consumer and a size cap excludes nothing
+        # while plan.json records it as applied.
+        "source_metadata": {**{k: v for k, v in (
+            ("rows", obj.get("source_rows")),
+            ("bytes", obj.get("source_bytes")),
+            # The table COMMENT: R24 carries it onto the CREATE TABLE.
+            ("comment", obj.get("comment"))) if v is not None},
+            **_kind_metadata(kind, obj)},
     }
+    if unread:
+        rec["columns_read_error"] = str(unread)[:300]
 
     rows = obj.get("source_rows")
     if rows is None:
@@ -201,22 +261,32 @@ def inventory_from_manifest(manifest: dict, *, database: str,
 
     # A manifest from an older discovery carries no DEFAULT, IDENTITY or
     # COMMENT at all. Rendering that as "this column has no default" is the
-    # quiet kind of false negative: the plan simply omits the warning.
+    # same false negative the census rule exists to prevent, and it is the
+    # quiet kind: the plan simply omits the warning.
     facts_known = manifest_records_column_facts(manifest)
     if not facts_known:
         notes.append(
-            "column DEFAULT, IDENTITY and COMMENT are UNKNOWN for every object "
-            "here, not absent: this manifest was written by a discovery that "
-            "did not read them. R22/R23 cannot fire and no column comment can "
-            "travel. Re-run 00_discover_snowflake.py to capture them, or plan "
-            "these objects from a live `assess`.")
+            "column DEFAULT, IDENTITY and COMMENT are UNKNOWN for every "
+            "object here, not absent: this manifest was written by a "
+            "discovery that did not read them. R22/R23 cannot fire and no "
+            "column comment can travel. Re-run "
+            "00_discover_snowflake.py to capture them, or plan these "
+            "objects from a live `assess`.")
 
+    flags_unread: collections.Counter = collections.Counter()
     for schema in manifest.get("schemas") or []:
         sname = schema.get("name")
         if not sname:
             notes.append("a schema entry in the manifest carries no name and "
                          "was skipped rather than guessed")
             continue
+        # The entry is the failure, not its text: discovery writes
+        # str(exc)[:300], which is empty for an exception with no message,
+        # and dropping such an entry marked the object supported.
+        read_errors = {str(e.get("object")): str(e.get("error") or "")
+                       or "discovery recorded an error with no message"
+                       for e in schema.get("errors") or []
+                       if e.get("object")}
         for kind, key in (("TABLE", "tables"), ("VIEW", "views")):
             for obj in schema.get(key) or []:
                 if not obj.get("name"):
@@ -226,9 +296,12 @@ def inventory_from_manifest(manifest: dict, *, database: str,
                 record = _record(
                     database, sname, kind, obj,
                     semi_structured=semi_structured, geospatial=geospatial,
-                    timestamp_ntz=timestamp_ntz, notes=notes)
+                    timestamp_ntz=timestamp_ntz, notes=notes,
+                    read_error=read_errors.get(str(obj["name"])))
                 if not facts_known:
                     record["column_facts_unknown"] = True
+                if obj.get("kind_flags_unread"):
+                    flags_unread[obj["kind_flags_unread"]] += 1
                 inventory.append(record)
         # Discovery's own per-schema errors are extraction notes here: an
         # object it could not read is absent from the inventory, and absence
@@ -236,6 +309,13 @@ def inventory_from_manifest(manifest: dict, *, database: str,
         for err in schema.get("errors") or []:
             notes.append(f'{database}.{sname}.{err.get("object")}: '
                          f'{err.get("error")}')
+
+    for error, count in flags_unread.items():
+        notes.append(
+            f"{count} object(s): discovery could not read IS_DYNAMIC / "
+            f"IS_ICEBERG / IS_HYBRID ({error}), so a dynamic, Iceberg or "
+            f"hybrid table among them is UNKNOWN and plans as a base table. "
+            f"Plan them from a live `assess`, which reads SHOW TABLES.")
 
     collisions = detect_collisions([r["source_identifier"] for r in inventory])
     return {

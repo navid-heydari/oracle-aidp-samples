@@ -1,14 +1,17 @@
 """Per-object migration status and migration risk. Pure, zero I/O.
 
 The status vocabulary is deliberately closed, and two of its values --
-DATA_CLONE and DONE -- are UNREACHABLE in this version. The plugin moves no data,
-so no code path may report that it did. They exist so the vocabulary does not
-have to change when a data phase is added.
+DATA_CLONE and DONE -- are never produced here. This module sees only the
+control-plane deploy result, which copies no data; whether rows were copied
+by the in-AIDP job snowmig_02_copy_schema is known to snowmig_03_reconcile
+(MIGRATION_REPORT.md), not to this module, so claiming either value would be
+a report of something it cannot see. They exist so the vocabulary does not
+have to change if that result is ever ingested.
 """
 from __future__ import annotations
 
-__all__ = ["MIGRATION_STATUS", "RISK_LEVELS", "assess_risk", "migration_status",
-           "pipeline_status"]
+__all__ = ["MIGRATION_STATUS", "RISK_LEVELS", "assess_risk", "deploy_failure",
+           "migration_status", "pipeline_status"]
 
 MIGRATION_STATUS = ("NOT_YET_DONE", "IN_PROGRESS", "SHALLOW_CLONE",
                     "DATA_CLONE", "DONE", "BLOCKED")
@@ -16,6 +19,14 @@ RISK_LEVELS = ("LOW", "MEDIUM", "HIGH")
 
 # Above this, the later data phase needs a wave/staging plan of its own.
 _LARGE_ROWS = 100_000_000
+
+_RISK_ORDER = {level: i for i, level in enumerate(RISK_LEVELS)}
+
+
+def _raise(level: str, to: str) -> str:
+    """Risk only ever goes up. A VIEW is HIGH; a column warning on the same
+    view is a lesser fact and used to overwrite it down to MEDIUM."""
+    return to if _RISK_ORDER[to] > _RISK_ORDER[level] else level
 
 
 def migration_status(identifier: str, *, deployed: dict | None,
@@ -29,9 +40,16 @@ def migration_status(identifier: str, *, deployed: dict | None,
         # CREATE IF NOT EXISTS, so it was left exactly as it was found. This is
         # BLOCKED, not cloned: something else owns that name.
         return "BLOCKED"
+    if identifier in set(deployed.get("failed_targets") or []):
+        # The create failed -- refused, or accepted and never appeared, or a
+        # burned name. It was also attempted, so it used to fall through to
+        # IN_PROGRESS below: a permanent failure read as work under way while
+        # STAGES.md, from the same result, counted it failed.
+        return "BLOCKED"
     if identifier in set(deployed.get("verified_targets") or []):
-        # Structure only. DATA_CLONE/DONE are never returned here: this plugin
-        # copies no rows, and claiming otherwise would be a false report.
+        # Structure only. DATA_CLONE/DONE are never returned here: the deploy
+        # result says nothing about rows (the copy job's outcome lives in
+        # 03_reconcile), and claiming otherwise would be a false report.
         return "SHALLOW_CLONE"
     if identifier in set(deployed.get("derived_type_drift_targets") or []):
         # The view exists and is ours; the target derived some column types
@@ -47,11 +65,42 @@ def migration_status(identifier: str, *, deployed: dict | None,
     return "NOT_YET_DONE"
 
 
+def deploy_failure(identifier: str, deployed: dict | None) -> str | None:
+    """The deploy result's own sentence for a failed create, or None.
+
+    A burned name gets the short form: its full reason is a paragraph, and
+    the one thing the row must say is that only a fresh schema recovers it.
+    """
+    if not deployed or deployed.get("dry_run"):
+        return None
+    if identifier not in set(deployed.get("failed_targets") or []):
+        return None
+    entry = next((f for f in deployed.get("failed") or []
+                  if f.get("source_identifier") == identifier), {})
+    target = entry.get("target_fqn")
+    if target and target in set(deployed.get("poisoned_names") or []):
+        return (f"deploy failed and the name `{target}` is burned: a create "
+                f"that failed there once is refused for ever after, so only "
+                f"a retry into a fresh schema recovers it")
+    reason = " ".join(str(entry.get("reason") or "no reason recorded").split())
+    return "deploy failed: " + (reason if len(reason) <= 300
+                                else reason[:297] + "...")
+
+
 def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
     """Return (level, one-sentence note) for one object."""
     if blocked:
         reason = obj.get("reason") or "cannot be migrated"
         return "HIGH", f"Cannot migrate: {reason}"
+    if (obj.get("compatibility_status") == "unassessed"
+            or obj.get("columns_read") == "failed"):
+        # No column facts is not good column facts. Falling through below
+        # rated a table whose column read timed out LOW, "structure clones
+        # cleanly". The planner refuses these (`columns_unread`); this is
+        # the guard for any caller that scores the record itself.
+        error = obj.get("columns_read_error") or "no error text was recorded"
+        return "HIGH", (f"Columns were not read, so nothing was assessed: "
+                        f"{error}.")
 
     notes: list[str] = []
     level = "LOW"
@@ -68,13 +117,13 @@ def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
 
     omitted = obj.get("omitted_properties") or []
     if omitted:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append("source properties dropped with no AIDP equivalent: "
                      + ", ".join(omitted))
 
     deferred = obj.get("deferred_properties") or []
     if deferred:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append(
             "source maintenance/layout settings not applied on the target: "
             + ", ".join(f'{d["property"]}={d["value"]}' for d in deferred))
@@ -82,16 +131,30 @@ def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
     warnings = obj.get("warnings") or []
     tz = [w for w in warnings if "timezone" in w.lower()]
     if tz:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append("timezone semantics differ for one or more columns")
     other = [w for w in warnings if w not in tz]
     if other:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append(f"{len(other)} column warning(s) recorded")
+
+    for load_warning in obj.get("load_warnings") or []:
+        # A pipe or task that fills this table stays behind. Named, not
+        # counted: the note has to say which load to rebuild.
+        level = _raise(level, "MEDIUM")
+        notes.append(load_warning)
+
+    kind_warning = obj.get("kind_warning")
+    if kind_warning:
+        # A TRANSIENT/TEMPORARY table planned as a permanent Delta table. The
+        # sentence itself travels, not a count: the row must say what to
+        # confirm.
+        level = _raise(level, "MEDIUM")
+        notes.append(kind_warning)
 
     rows = obj.get("rows")
     if rows is not None and rows >= _LARGE_ROWS:
-        level = "MEDIUM"
+        level = _raise(level, "MEDIUM")
         notes.append(f"{rows:,} rows: the later data phase will need its own "
                      "staging and wave plan")
 
@@ -115,7 +178,15 @@ def pipeline_status(board: dict) -> dict:
     complete = [r["stage"] for r in rows
                 if r["status"] in ("DONE", "SATISFIED")
                 and not r.get("attention") and not r.get("dry_run")]
-    done = set(complete)
+    # Unblocking asks "did it run", which is not the same question as "is it
+    # clean". `deps` over a manifest is `not_extracted` -- flagged on
+    # purpose, because "did not look" must not read as "looked and found
+    # nothing" -- and treating that flag as "did not run" would block the
+    # documented ingest path forever. Attention is a review marker; it is
+    # reported, and it does not stop the pipeline.
+    done = {r["stage"] for r in rows
+            if r["status"] in ("DONE", "SATISFIED")
+            and not r.get("dry_run") and not r.get("failed")}
     unblocked, blocked = [], {}
     for r in rows:
         if r["stage"] in done:

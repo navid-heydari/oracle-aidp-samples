@@ -20,6 +20,12 @@ Thin wrapper over the registration phase of
 4. Report `action` and `verified` from `catalog_result.json` — never
    `executed`. `create_requested` means the create was accepted but the
    catalog never became visible: say it is pending, not done.
-5. A **Standard** catalog is refused here by design; its tables are created on
-   AIDP compute via `snowmig.py notebook`, and only when the user explicitly
-   asked for one.
+5. A **Standard** catalog is created here too, but only when the user
+   explicitly asked for one, and only as the CONTAINER (runbook S4):
+   `snowmig.py catalog --catalog <name> --catalog-type standard --execute`.
+   `catalog_result.json` then carries `container_only: true` — pass that on,
+   so nobody reads a created container as created structure. Its schemas and
+   tables come later, at S10, from
+   `snowmig.py run --job snowmig_01_structure` (one workflow per schema on
+   AIDP compute), never through this command and never through the
+   control-plane API, which can return `202 Accepted` and create nothing.

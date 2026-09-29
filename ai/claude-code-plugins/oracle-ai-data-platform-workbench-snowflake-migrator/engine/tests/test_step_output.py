@@ -8,6 +8,7 @@ publishes after every stage. `--output-dir ''` switches it off.
 """
 import importlib.util
 import json
+import re
 import pathlib
 import sys
 
@@ -63,9 +64,51 @@ def test_the_structure_stage_writes_s10_with_its_counts(tmp_path, monkeypatch):
     import types
     mod = _load("01_create_structure")
 
+    class _DF:
+        def __init__(self, rows=None):
+            self._rows = rows or []
+
+        def collect(self):
+            return self._rows
+
     class Spark:
+        """S10 DESCRIBEs before creating and again after, so the fake has
+        to remember: always answering "no columns" reads as a table that
+        exists and is empty, which is drift, not a create."""
+
+        def __init__(self):
+            self.made = {}
+
         def sql(self, s):
-            return None
+            s = " ".join(s.split())
+            if s.upper().startswith("DESCRIBE "):
+                fqn = s.split(None, 1)[1].strip()
+                if fqn not in self.made:
+                    raise RuntimeError(f"Table or view not found: {fqn}")
+                return _DF([{"col_name": n, "data_type": ty}
+                            for n, ty in self.made[fqn]])
+            m = re.match(r"(?is)CREATE TABLE IF NOT EXISTS (\S+) \((.*?)\) "
+                         r"USING DELTA", s)
+            if m:
+                depth, part, parts = 0, "", []
+                for ch in m.group(2):
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                    if ch == "," and depth == 0:
+                        parts.append(part); part = ""
+                    else:
+                        part += ch
+                parts.append(part)
+                cols = []
+                for raw in parts:
+                    bits = raw.strip().split(None, 1)
+                    if bits:
+                        cols.append((bits[0].strip("`"),
+                                     bits[1].strip() if len(bits) > 1 else ""))
+                self.made[m.group(1)] = cols
+            return _DF()
     fake = types.ModuleType("pyspark.sql")
     fake.SparkSession = types.SimpleNamespace(
         builder=types.SimpleNamespace(getOrCreate=lambda: Spark()))
