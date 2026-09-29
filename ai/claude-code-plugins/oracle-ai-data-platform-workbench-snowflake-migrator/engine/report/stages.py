@@ -9,10 +9,14 @@ Two rules it holds to, both learned the hard way elsewhere in this plugin:
   * A stage that could not look is FLAGGED, never shown as clean. "0
     exposures" and "we could not read the policy references" are opposite
     findings and must not render the same.
-  * Four stages write to AIDP, and the board says which: `provision`,
-    `catalog` and `deploy`, each a dry run without `--execute`, and `run`,
-    which has no dry run -- it starts an in-AIDP job that creates tables or
-    copies rows. The one further write is `smoke --write-probe --execute`:
+  * Seven stages write to AIDP, and the board says which (every STAGES
+    entry with `writes: True`): `provision`, `catalog` and `deploy`, each a
+    dry run without `--execute`; `structure-workflow` and `copy-workflow`,
+    the in-AIDP jobs `run` starts, which have no dry run -- one creates the
+    structure, the other (snowmig_02_copy_<schema>) copies rows; `publish`,
+    into the workspace; and `teardown`, destructive (it stops or deletes
+    the migration's clusters), both dry runs without `--execute`. The one
+    further write is `smoke --write-probe --execute`:
     one probe schema, created and removed; `--write-probe` alone is a dry
     run. `notebook --upload` sends nothing -- a dry run without `--execute`,
     refused with it (GAPS.md 13).
@@ -27,7 +31,7 @@ import re
 from plan.smoke import smoke_verdict
 
 __all__ = ["RUNS_ON", "STAGES", "UTILITY_COMMANDS", "build_stage_board", "phase_report",
-           "stage_for"]
+           "run_verdict", "stage_for"]
 
 # THE ordered pipeline. Every other view of a run -- the board, the phase
 # report, the diagram, the token roll-up, "what can run now" -- reads this,
@@ -41,6 +45,8 @@ __all__ = ["RUNS_ON", "STAGES", "UTILITY_COMMANDS", "build_stage_board", "phase_
 #   alternative_to  another stage that produces the same result; having
 #            done either satisfies both, so the board never stalls on the
 #            path that was not taken
+#   job / job_prefix  the AIDP job a `run` stage starts, or the prefix of a
+#            job per schema; its artifact is then a glob, one file per job
 # Where a phase's work actually executes. Traced from each command's
 # transport: the catalog API is a control-plane call and uses no cluster;
 # `deploy --transport sql` runs on the configured aidp.cluster_id; the
@@ -146,12 +152,17 @@ STAGES: tuple[dict, ...] = (
      "purpose": "create schemas, tables and views in a STANDARD catalog. "
                 "Refuses an EXTERNAL target. Dry-run unless --execute"},
     # Registered by provision and NEVER run by the migrator: moving rows is
-    # the customer's later decision.
+    # the customer's later decision. Once a plan is pushed there is one job
+    # per schema, snowmig_02_copy_<schema> (target.provisioning's
+    # COPY_JOB_PREFIX), and no generic snowmig_02_copy_schema job; each run
+    # writes run_<job>.json, so the stage is every artifact the prefix names.
     {"stage": "copy-workflow", "requires": [['structure-workflow', 'deploy'], ['data-options']], "runs_on": RUNS_ON["migration_cluster"], "command": "run", "job": "snowmig_02_copy_schema",
+     "job_prefix": "snowmig_02_copy_",
      "phase": "target", "runbook": "S11", "needs": "an architecture decision",
      "writes": True, "optional": True,
-     "artifact": "run_snowmig_02_copy_schema.json",
-     "purpose": "copy one schema's rows. Registered, never run by the "
+     "artifact": "run_snowmig_02_copy_*.json",
+     "purpose": "copy one schema's rows, one job per schema "
+                "(snowmig_02_copy_<schema>). Registered, never run by the "
                 "migrator"},
     {"stage": "reconcile-workflow", "requires": [['copy-workflow']], "runs_on": RUNS_ON["migration_cluster"], "command": "run",
      "job": "snowmig_03_reconcile", "phase": "target", "runbook": "S11",
@@ -197,14 +208,30 @@ UTILITY_COMMANDS = ("stages", "demo", "databases", "catalogs", "clean",
 _UNKNOWN = "could not be determined"
 
 
+def _artifact_paths(out_dir: pathlib.Path, name: str) -> list[pathlib.Path]:
+    """The files a stage's artifact names: one, or every match of a glob."""
+    if "*" in name:
+        return sorted(p for p in out_dir.glob(name) if p.is_file())
+    path = out_dir / name
+    return [path] if path.exists() else []
+
+
 def _load(out_dir: pathlib.Path, name: str):
     if "*" in name:
         # One artifact per invocation target (run_<job>.json): the stage has
-        # run if any exists, and each is reported.
-        paths = sorted(out_dir.glob(name))
+        # run if any exists, and each is reported. A record that does not
+        # name its job is named by its file, never left as "?".
+        paths = _artifact_paths(out_dir, name)
         if not paths:
             return None
-        return {"_many": [_load(out_dir, p.name) for p in paths]}
+        many = []
+        for p in paths:
+            run = _load(out_dir, p.name)
+            if isinstance(run, dict) and not run.get("job"):
+                run = {**run, "job": run.get("job_key")
+                       or p.stem.removeprefix("run_")}
+            many.append(run)
+        return {"_many": many}
     path = out_dir / name
     if not path.exists():
         return None
@@ -214,6 +241,47 @@ def _load(out_dir: pathlib.Path, name: str):
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {"_unreadable": True}
+
+
+def run_verdict(run: dict) -> tuple[str, str]:
+    """(verdict, kind) for one job-run record -- the ONE reading of a run,
+    for every workflow row and the phase report alike.
+
+    Checked in the order cmd_run and RUN.md check them, so the three never
+    disagree: a status that could not be read, the cold-start attempts
+    exhausted (nothing ran), a state this plugin does not classify, a
+    cancel that never confirmed (nothing was resubmitted), a poll budget
+    that ran out with the job going (STILL RUNNING, never rounded to a
+    verdict), then the terminal status. Only a restart that actually
+    resubmitted (`new_run` set) is counted as one.
+
+    kind is success, failed, running or unknown. A record written before
+    `terminal` existed is read as terminal.
+    """
+    status = run.get("status") or _UNKNOWN
+    terminal = run.get("terminal", True)
+    resubmitted = sum(1 for r in run.get("restarts") or []
+                      if isinstance(r, dict) and r.get("new_run"))
+    after = (f" after {resubmitted} cold-start restart(s)"
+             if resubmitted else "")
+    if run.get("status_unreadable"):
+        return ("**STATUS UNREADABLE** — the run was submitted and may still "
+                "be going; check it in the console before starting another",
+                "unknown")
+    if not terminal and run.get("cold_start_exhausted"):
+        tried = len(run.get("restarts") or []) + 1
+        return (f"**COLD START — none of {tried} run(s) was picked up; "
+                "nothing ran**", "failed")
+    if not terminal and run.get("unrecognised"):
+        return (f"**UNRECOGNISED STATE {status}**", "unknown")
+    if not terminal and run.get("cancel_unconfirmed"):
+        return ("**cold start suspected; cancel unconfirmed — nothing was "
+                "resubmitted**" + after, "unknown")
+    if not terminal:
+        return ("STILL RUNNING" + after, "running")
+    if run.get("ok"):
+        return ((run.get("status") or "SUCCESS") + after, "success")
+    return (f'**{run.get("status") or "FAILED"}**' + after, "failed")
 
 
 def _finding(stage: str, data: dict) -> tuple[str, bool]:
@@ -410,28 +478,18 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
             text += f', {errors} error(s)'
         return (text, bool(bad or unverified or drift or errors))
 
-    if stage == "run":
-        # The last recorded result per job. A run whose budget ran out is
-        # STILL RUNNING, never rounded to either verdict. A status watch_job
-        # does not classify (`unrecognised`) is neither done nor running;
-        # cmd_run says so and exits 1, and the board must not round it up.
+    if "_many" in data:
+        # The last recorded result per job (one job per schema).
         parts, attention = [], False
         for run in data.get("_many") or []:
             if run.get("_unreadable"):
                 parts.append("a run artifact is unreadable")
                 attention = True
                 continue
-            job = run.get("job") or run.get("job_key") or "?"
-            if not run.get("terminal") and run.get("unrecognised"):
-                verdict = f'**UNRECOGNISED STATE {run.get("status") or "?"}**'
-            elif not run.get("terminal"):
-                verdict = "STILL RUNNING"
-            elif run.get("ok"):
-                verdict = "SUCCESS"
-            else:
-                verdict = f'**{run.get("status") or "FAILED"}**'
-            attention = attention or verdict != "SUCCESS"
-            parts.append(f"{job}: {verdict}")
+            verdict, kind = run_verdict(run)
+            attention = attention or kind != "success"
+            parts.append(f'{run.get("job") or run.get("job_key") or "?"}: '
+                         f'{verdict}')
         return ("; ".join(parts) or "written", attention)
 
     if stage == "data-options":
@@ -440,54 +498,91 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
                  "options presented; none chosen"), False)
 
     if "run_key" in data or stage.endswith("-workflow"):
-        status = data.get("status") or _UNKNOWN
-        restarts = len(data.get("restarts") or [])
-        text = f"job run {status}" + (
-            f" after {restarts} cold-start restart(s)" if restarts else "")
-        return (text, not data.get("ok"))
+        verdict, kind = run_verdict(data)
+        return (f"job run {verdict}", kind != "success")
 
     return ("written", False)
+
+
+def _satisfies(row: dict | None) -> bool:
+    """Whether a stage's row did the work its twin would have done: it ran,
+    for real, did not fail, and its artifact could be read. Existence alone
+    is not enough -- a dry run, a failed or unrecognised job run and an
+    unreadable artifact all exist and created nothing that can be relied
+    on."""
+    return bool(row and row["status"] == "DONE" and not row.get("dry_run")
+                and not row.get("failed") and not row.get("unreadable"))
+
+
+def _unsatisfied(twin: dict) -> str:
+    if twin.get("dry_run"):
+        return f"not satisfied: `{twin['stage']}` was a dry run"
+    if twin.get("unreadable"):
+        return f"not satisfied: `{twin['stage']}` artifact unreadable"
+    return f"not satisfied: `{twin['stage']}` {twin['found']}"
 
 
 def build_stage_board(out_dir) -> dict:
     out_dir = pathlib.Path(out_dir)
     rows: list[dict] = []
     next_stage = None
-    present = {spec["stage"] for spec in STAGES
-               if (out_dir / spec["artifact"]).exists()}
+    # First every stage that wrote an artifact, so a twin is judged by what
+    # its artifact says, not by the file being there.
+    ran = {}
     for spec in STAGES:
         data = _load(out_dir, spec["artifact"])
-        twin = spec.get("alternative_to")
-        if data is None and twin in present:
+        if data is not None:
+            ran[spec["stage"]] = _done_row(spec, data)
+    for spec in STAGES:
+        if spec["stage"] in ran:
+            rows.append(ran[spec["stage"]])
+            continue
+        twin = ran.get(spec.get("alternative_to"))
+        if _satisfies(twin):
             rows.append({**spec, "status": "SATISFIED",
-                         "found": f"satisfied by `{twin}`", "attention": False})
-            continue
-        if data is None:
-            rows.append({**spec, "status": "NOT_RUN", "found": "—",
+                         "found": f"satisfied by `{twin['stage']}`",
                          "attention": False})
-            # An optional stage that has not run is not "next": the pipeline
-            # proceeds without it.
-            if next_stage is None and not spec.get("optional"):
-                next_stage = spec["stage"]
             continue
-        found, attention = _finding(spec["stage"], data)
-        rows.append({**spec, "status": "DONE", "found": found,
-                     "attention": attention,
-                     # A caveat and a failure both raise `attention`, and
-                     # they are not the same for what comes next: `deps`
-                     # over a manifest is flagged `not_extracted` on
-                     # purpose and planning still proceeds, while a job run
-                     # that answered `ok: false` did not do its work. Only
-                     # the second one blocks.
-                     "failed": bool(isinstance(data, dict)
-                                    and (data.get("ok") is False
-                                         or data.get("failed"))),
-                     # A dry run wrote its artifact and created nothing, so
-                     # it satisfies no prerequisite.
-                     "dry_run": bool(isinstance(data, dict)
-                                     and data.get("dry_run"))})
+        rows.append({**spec, "status": "NOT_RUN",
+                     "found": _unsatisfied(twin) if twin else "—",
+                     # A twin that failed or could not be read is a finding;
+                     # a dry run is only a note.
+                     "attention": bool(twin and not twin.get("dry_run"))})
+        # An optional stage that has not run is not "next": the pipeline
+        # proceeds without it.
+        if next_stage is None and not spec.get("optional"):
+            next_stage = spec["stage"]
     return {"out_dir": str(out_dir), "stages": rows, "next_stage": next_stage,
             "needs_attention": [r["stage"] for r in rows if r["attention"]]}
+
+
+def _done_row(spec: dict, data) -> dict:
+    found, attention = _finding(spec["stage"], data)
+    return {**spec, "status": "DONE", "found": found,
+           "attention": attention,
+           # A caveat and a failure both raise `attention`, and
+           # they are not the same for what comes next: `deps`
+           # over a manifest is flagged `not_extracted` on
+           # purpose and planning still proceeds, while a job run
+           # that answered `ok: false` did not do its work. Only
+           # the second one blocks.
+           "failed": bool(isinstance(data, dict)
+                          and (data.get("ok") is False
+                               or data.get("failed")
+                               or any(r.get("ok") is False
+                                      for r in _job_runs(data)))),
+           # Present and unreadable: nothing it says can be relied
+           # on, so it satisfies no twin.
+           "unreadable": bool(isinstance(data, dict)
+                              and (data.get("_unreadable")
+                                   or any(isinstance(r, dict)
+                                          and r.get("_unreadable")
+                                          for r in data.get("_many")
+                                          or []))),
+           # A dry run wrote its artifact and created nothing, so
+           # it satisfies no prerequisite.
+           "dry_run": bool(isinstance(data, dict)
+                           and data.get("dry_run"))}
 
 
 def stage_for(command: str, job: str | None = None) -> str:
@@ -499,6 +594,9 @@ def stage_for(command: str, job: str | None = None) -> str:
         if spec.get("job") is None and command != "run":
             return spec["stage"]
         if job and spec.get("job") == job:
+            return spec["stage"]
+        # A job per schema (snowmig_02_copy_<schema>) is the same stage.
+        if job and spec.get("job_prefix") and job.startswith(spec["job_prefix"]):
             return spec["stage"]
     return command
 
@@ -519,8 +617,9 @@ def _legacy_run_stage(run: dict, out_dir: pathlib.Path) -> str:
     for spec in STAGES:
         if not spec.get("job"):
             continue
-        art = out_dir / spec["artifact"]
-        if art.is_file():
+        for art in _artifact_paths(out_dir, spec["artifact"]):
+            if not art.is_file():
+                continue
             written = datetime.datetime.fromtimestamp(
                 art.stat().st_mtime, datetime.timezone.utc)
             if lo <= written <= hi + datetime.timedelta(seconds=5):
@@ -532,29 +631,87 @@ def _legacy_run_stage(run: dict, out_dir: pathlib.Path) -> str:
 _RETRY_LINE = re.compile(r"^\s*(?:\[[\w-]+\]\s+)?RETRY\s")
 
 
+def _job_runs(art) -> list[dict]:
+    """The job-run records behind a workflow artifact: one, or one per job."""
+    if not isinstance(art, dict):
+        return []
+    many = art.get("_many")
+    runs = many if many is not None else [art]
+    return [r for r in runs if isinstance(r, dict)]
+
+
+# A run logged with no exit code raised out of main() or was interrupted
+# (Ctrl-C): it neither passed nor failed, and it is never rounded to either.
+UNKNOWN_RESULT = "UNKNOWN (no exit code: crashed or interrupted)"
+
+
 def _verdict(code) -> str:
     if code is None:
-        return "UNKNOWN"
+        return UNKNOWN_RESULT
     return {0: "PASS", 3: "HALT"}.get(int(code), "FAIL")
+
+
+def _job_result(art) -> str | None:
+    """The phase-report result a workflow artifact decides, else None.
+
+    FAIL when a job did not do its work, UNKNOWN when its state is not
+    established (unreadable, unrecognised, cancel unconfirmed), STILL
+    RUNNING when the poll budget ran out with it going -- the same reading
+    as the board (run_verdict). Applies whether or not the run was logged.
+    A workflow's exit code is not the finer statement: cmd_run exits 0 for
+    a run still going and 1 for one it cannot classify."""
+    runs = _job_runs(art)
+    if not runs:
+        return None
+    many = "_many" in art
+    graded = []
+    for run in runs:
+        if run.get("_unreadable"):
+            graded.append((run, "artifact unreadable", "unknown"))
+            continue
+        verdict, kind = run_verdict(run)
+        # "STILL RUNNING (job STILL RUNNING)" says nothing: name the status.
+        graded.append((run, (str(run.get("status") or _UNKNOWN)
+                             if kind == "running"
+                             else verdict.replace("**", "")), kind))
+    for kind, head in (("failed", "FAIL"), ("unknown", "UNKNOWN"),
+                       ("running", "STILL RUNNING")):
+        hits = [(r, v) for r, v, k in graded if k == kind]
+        if hits:
+            # One job per schema: name the ones behind the verdict.
+            return f"{head} (" + ", ".join(
+                (f'job {r.get("job") or "?"} {v}' if many else f"job {v}")
+                for r, v in hits) + ")"
+    return None
 
 
 def _phase_summary(rows: list[dict]) -> list[dict]:
     """Stage rows rolled up into their phases, in pipeline order.
 
     A phase FAILS if any of its stages' last run failed or halted; it is
-    NOT_RUN while any required stage in it has not run; SKIPPED when every
-    stage in it is optional and none ran; otherwise it PASSES."""
+    UNKNOWN if any stage's outcome was not established (a crash or an
+    interrupt logs no exit code) -- never PASS; STILL RUNNING while a job
+    it started is still going; it is NOT_RUN while any
+    required stage in it has not run; SKIPPED when every stage in it is
+    optional and none ran; otherwise it PASSES."""
     out = []
     for phase in dict.fromkeys(r["phase"] for r in rows):
         mine = [r for r in rows if r["phase"] == phase]
         optional = {s["stage"] for s in STAGES if s.get("optional")}
         res = [r["result"] for r in mine]
-        passed = sum(1 for x in res if x == "PASS" or x.startswith("DONE"))
+        passed = sum(1 for x in res if x == "PASS"
+                     or x.startswith(("DONE", "SATISFIED")))
         failed = sum(1 for x in res if x.startswith(("FAIL", "HALT")))
+        unknown = sum(1 for x in res if x.startswith("UNKNOWN"))
+        running = sum(1 for x in res if x.startswith("STILL RUNNING"))
         not_run = [r["stage"] for r in mine if r["result"] == "NOT_RUN"]
         skipped = sum(1 for x in res if x.startswith("SKIPPED"))
         if failed:
             verdict = "FAIL"
+        elif unknown:
+            verdict = "UNKNOWN"
+        elif running:
+            verdict = "STILL RUNNING"
         elif not_run:
             verdict = "NOT_RUN" if not passed else "PARTIAL"
         elif not passed and skipped == len(mine):
@@ -563,7 +720,9 @@ def _phase_summary(rows: list[dict]) -> list[dict]:
             verdict = "PASS"
         out.append({
             "phase": phase, "stages": len(mine), "passed": passed,
-            "failed": failed, "not_run": len(not_run), "skipped": skipped,
+            "failed": failed, "unknown": unknown, "running": running,
+            "not_run": len(not_run),
+            "skipped": skipped,
             "duration_seconds": round(sum(r["duration_seconds"] or 0
                                           for r in mine), 1),
             "retries": sum(r.get("retries", 0) for r in mine),
@@ -579,8 +738,9 @@ def phase_report(out_dir) -> dict:
 
     Read from run_log.jsonl. A phase that never ran is listed as NOT_RUN (or
     SKIPPED for an optional one) rather than left out; an artifact with no
-    logged run is DONE (not logged), never given a time it was not measured
-    at. The LAST run of a phase decides its verdict, and earlier failures
+    logged run is DONE (not logged) -- or FAIL when its job answered ok:
+    false -- never given a time it was not measured at. A run logged with
+    no exit code is UNKNOWN. The LAST run of a phase decides its verdict, and earlier failures
     are counted, not forgotten.
     """
     out_dir = pathlib.Path(out_dir)
@@ -598,6 +758,7 @@ def phase_report(out_dir) -> dict:
                          else _legacy_run_stage(rec, out_dir))
             runs.setdefault(stage, []).append(rec)
 
+    board = {r["stage"]: r for r in build_stage_board(out_dir)["stages"]}
     phases = []
     for spec in STAGES:
         mine = sorted(runs.get(spec["stage"], []),
@@ -607,8 +768,15 @@ def phase_report(out_dir) -> dict:
                "runs": len(mine),
                "failed_runs": sum(1 for r in mine
                                   if r.get("exit_code") not in (0, None)),
+               # Logged with no exit code: crashed or interrupted. Counted
+               # apart -- not a failure the stage reported, not a pass.
+               "unknown_runs": sum(1 for r in mine
+                                   if r.get("exit_code") is None),
                "started_at": None, "ended_at": None,
                "duration_seconds": None, "retries": 0}
+        # A workflow can exit 0 locally with a job that did not succeed.
+        art = _load(out_dir, spec["artifact"]) if spec.get("job") else None
+        job_result = _job_result(art)
         if mine:
             last = mine[-1]
             lo, hi = _ts(last.get("started_at")), _ts(last.get("ended_at"))
@@ -619,18 +787,20 @@ def phase_report(out_dir) -> dict:
                                      if lo and hi else None),
                 "result": _verdict(last.get("exit_code")),
                 "retries": sum(int(r.get("retries") or 0) for r in mine)})
-            # A workflow can exit 0 locally with a job that did not succeed.
-            art = _load(out_dir, spec["artifact"])
             # Retries inside an AIDP job are in its own output, one RETRY
             # line each (the copy notebook writes them).
-            if spec.get("job") and isinstance(art, dict):
+            for run in _job_runs(art):
                 row["retries"] += sum(
-                    1 for line in str(art.get("output") or "").splitlines()
+                    1 for line in str(run.get("output") or "").splitlines()
                     if _RETRY_LINE.search(line))
-            if spec.get("job") and isinstance(art, dict) and art.get("ok") is False:
-                row["result"] = f'FAIL (job {art.get("status", "?")})'
-        elif (out_dir / spec["artifact"]).exists():
-            row["result"] = "DONE (not logged)"
+            if job_result:
+                row["result"] = job_result
+        elif _artifact_paths(out_dir, spec["artifact"]):
+            row["result"] = job_result or "DONE (not logged)"
+        elif board[spec["stage"]]["status"] == "SATISFIED":
+            # The board's reading, so the two reports agree: the twin ran
+            # for real and did the work this stage would have done.
+            row["result"] = (f'SATISFIED (by `{spec["alternative_to"]}`)')
         else:
             row["result"] = ("SKIPPED (optional)" if spec.get("optional")
                              else "NOT_RUN")

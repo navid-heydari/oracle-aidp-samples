@@ -1999,10 +1999,18 @@ def cmd_tokens(args) -> int:
         print(f'  tokens: not measured -- {rep["reason"]}', file=sys.stderr)
         return 0
     for stage, b in rep["by_stage"].items():
+        if b.get("measured") is False:
+            print(f'  {stage:<14} {"not measured":>12}')
+            continue
         print(f'  {stage:<14} {b["total"]:>12,} tokens  ({b["messages"]} call(s))')
     for phase, b in rep["by_phase"].items():
+        if b.get("measured") is False:
+            print(f'  phase {phase:<10} {"not measured":>10}')
+            continue
         print(f'  phase {phase:<10} {b["total"]:>10,} tokens')
-    print(f'  TOTAL          {rep["totals"]["total"]:>12,} tokens')
+    print(f'  TOTAL          {rep["totals"]["total"]:>12,} tokens'
+          + (f'  (partial: {rep["unmeasured_runs"]} stage run(s) not '
+             f'measured)' if rep.get("partial") else ""))
     return 0
 
 

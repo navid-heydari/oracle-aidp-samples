@@ -167,8 +167,10 @@ def assess_risk(obj: dict, *, blocked: bool = False) -> tuple[str, str]:
 def pipeline_status(board: dict) -> dict:
     """What can run now, from a stage board.
 
-    A phase is COMPLETE when it ran (or its alternative did), found nothing
-    needing attention, and was not a dry run. It is UNBLOCKED when it is not
+    A phase is COMPLETE when it ran (or its alternative did -- for real:
+    the board marks a twin SATISFIED only when the alternative is DONE, not
+    a dry run, not failed and readable), found nothing needing attention,
+    and was not a dry run. It is UNBLOCKED when it is not
     complete and every one of its `requires` groups has a complete member --
     so a run whose source was already extracted in AIDP (discovery workflow
     + ingest) unblocks planning without a laptop assess. `next` is the first
@@ -183,10 +185,13 @@ def pipeline_status(board: dict) -> dict:
     # purpose, because "did not look" must not read as "looked and found
     # nothing" -- and treating that flag as "did not run" would block the
     # documented ingest path forever. Attention is a review marker; it is
-    # reported, and it does not stop the pipeline.
+    # reported, and it does not stop the pipeline. An unreadable artifact
+    # is neither: nothing it says can be relied on, so -- as for a twin --
+    # it unblocks nothing.
     done = {r["stage"] for r in rows
             if r["status"] in ("DONE", "SATISFIED")
-            and not r.get("dry_run") and not r.get("failed")}
+            and not r.get("dry_run") and not r.get("failed")
+            and not r.get("unreadable")}
     unblocked, blocked = [], {}
     for r in rows:
         if r["stage"] in done:

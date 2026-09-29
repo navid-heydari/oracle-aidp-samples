@@ -21,11 +21,16 @@ and **what it found**.
 
 Then say three things out loud:
 
-1. **Four stages write to AIDP.** `provision`, `catalog` and `deploy` are each a dry
-   run unless `--execute` is passed with all four AIDP coordinates. **`run` has
-   no dry run**: invoking it starts an in-AIDP job — `snowmig_01_structure`
-   creates schemas and tables, `snowmig_02_copy_schema` copies rows — so ask
-   before every `run`. Everything
+1. **Seven stages write to AIDP** — the rows marked **(writes)** on the
+   board. `provision`, `catalog` and `deploy` are each a dry run unless
+   `--execute` is passed with all four AIDP coordinates. Two AIDP workflows
+   write when `run` starts them, and **`run` has no dry run**: invoking it IS
+   the write — `structure-workflow` (`snowmig_01_structure`) creates schemas
+   and tables, `copy-workflow` (`snowmig_02_copy_<schema>`, one job per schema
+   of the pushed plan) copies rows — so ask before every `run`. `publish`
+   copies the finished report into the workspace, and `teardown` is
+   **destructive**: it stops the clusters this migration allocated, or
+   deletes them when asked. Both are dry runs unless `--execute`. Everything
    else is read-only, apart from one narrow opt-in that is itself gated by
    `--execute` (`smoke --write-probe --execute`); `notebook --upload` writes
    nothing (dry run, refused with `--execute`, GAPS.md 13). If someone is
@@ -78,8 +83,11 @@ tokens spent after the previous stage ended. Local files only; nothing is
 sent anywhere. Say what the numbers are: **the engine calls no model — these
 are the tokens the agent spent driving it.** Tokens outside the run are
 excluded and counted, not folded in; `--since <ISO time>` credits setup
-work to the first stage. A stage run outside a Claude Code session is
-reported as *not measured*, never as zero.
+work to the first stage. A stage whose own session transcript was not read
+— run outside a Claude Code session, or under a session whose transcript is
+gone — is reported as *not measured*, never as zero, and the report then
+says **Partial: N stage run(s) not measured**: say so when you quote a
+total.
 
 ## Publish the finished report into the workspace
 
