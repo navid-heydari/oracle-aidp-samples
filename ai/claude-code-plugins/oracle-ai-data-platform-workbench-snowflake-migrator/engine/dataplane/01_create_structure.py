@@ -75,6 +75,8 @@ import datetime
 import json
 import pathlib
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from snowmig_source import (  # noqa: E402
@@ -303,10 +305,52 @@ def _column_sql(col: dict) -> str:
     return piece
 
 
+def _existing_tables(spark, catalog: str, schema: str) -> set[str] | None:
+    """Lower-cased table names in the target schema, from one SHOW TABLES;
+    None when it could not be read (then every table is DESCRIBEd, as
+    before)."""
+    try:
+        rows = spark.sql(f"SHOW TABLES IN {q(catalog)}.{q(schema)}").collect()
+    except Exception:
+        return None
+    out = set()
+    for r in rows:
+        d = {k.lower(): v for k, v in r.asDict().items()}
+        out.add(str(d.get("tablename") or d.get("name") or "").lower())
+    return out
+
+
+class _Flusher:
+    """Writes a schema's report at most every FLUSH_SECONDS, and on now().
+
+    The whole report used to be rewritten to /Workspace after EVERY table --
+    the 90 a reduced plan leaves out included. A resume still finds all but
+    the last few seconds' records, and the end of every schema is written.
+    """
+
+    FLUSH_SECONDS = 5.0
+
+    def __init__(self, path: pathlib.Path, report: dict):
+        self.path, self.report = path, report
+        self.last = time.monotonic()
+
+    def now(self) -> None:
+        self.report["updated_at"] = datetime.datetime.now(
+            datetime.timezone.utc).isoformat()
+        self.path.write_text(json.dumps(self.report, indent=2),
+                             encoding="utf-8")
+        self.last = time.monotonic()
+
+    def maybe(self) -> None:
+        if time.monotonic() - self.last >= self.FLUSH_SECONDS:
+            self.now()
+
+
 def create_table_from_columns(spark, columns: list[dict],
                               target_catalog: str, target_schema: str,
                               name: str, description: str = "",
-                              notes: list | None = None) -> str:
+                              notes: list | None = None,
+                              exists: bool | None = None) -> str:
     """CREATE TABLE from an explicit column list, then READ IT BACK.
 
     Types are used verbatim, and so are the plan's `nullable` and
@@ -324,7 +368,10 @@ def create_table_from_columns(spark, columns: list[dict],
         raise ValueError("no column list for this table; rediscover it or "
                          "use --mode ctas")
     fqn = three(target_catalog, target_schema, name)
-    before = _describe_columns(spark, fqn)
+    # `exists=False` comes from the schema's own listing: the table is known
+    # to be absent, so the DESCRIBE that would fail for it is skipped. The
+    # CREATE is still read back below, whatever the listing said.
+    before = None if exists is False else _describe_columns(spark, fqn)
     if before is None:
         cols = ", ".join(_column_sql(c) for c in columns)
         spark.sql(f"CREATE TABLE IF NOT EXISTS {fqn} ({cols}) USING DELTA"
@@ -615,6 +662,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="where this step saves its values (report/output in "
                          "the workspace); '' to skip")
     ap.add_argument("--reports-dir", default=DEFAULT_REPORTS_DIR)
+    ap.add_argument("--parallel", type=int, default=4,
+                    help="tables created at a time within a schema, each "
+                         "still read back on its own (ddl-plan and manifest "
+                         "modes; ctas and dry runs are one at a time). "
+                         "1 creates them one by one")
     ap.add_argument("--dry-run", action="store_true",
                     help="print every statement; execute nothing")
     ap.add_argument("--force", action="store_true",
@@ -759,9 +811,20 @@ def main(argv: list[str] | None = None) -> int:
         else:
             spark.sql(schema_sql)
 
+        # Which target tables are already there, from ONE listing for the
+        # schema: a table known to be absent skips its before-DESCRIBE, the
+        # call that fails -- slowly -- for every table a first run creates.
+        # None (listing unreadable, or a dry run) keeps the per-table look.
+        existing = (None if args.dry_run else
+                    _existing_tables(spark, args.target_catalog,
+                                     target_schema))
+        flush = _Flusher(path, report)
+
+        # 1 · decided here, cheaply and in order: skips, and tables the plan
+        # does not carry. Only real creates go on to step 2.
+        work = []
         for table in record["tables"]:
             name = table["name"]
-            notes: list[str] = []
             prior = report["objects"].get(name, {})
             done = prior.get("status") in ("created", "already_existed")
             # Every report this stage writes names its mode; one that does
@@ -777,6 +840,29 @@ def main(argv: list[str] | None = None) -> int:
                 # here as done, with the plan saying DOUBLE.
                 log(f"re-check {schema}.{name}: recorded {prior['status']} "
                     f"by --mode {recorded_by}, not {args.mode}")
+            if (args.mode == "ddl-plan" and not args.dry_run
+                    and not planned_columns.get((schema, name))):
+                report["objects"][name] = {
+                    "status": "not_in_plan",
+                    "reason": "the approved ddl_plan carries no "
+                              "columns for this table -- the engine "
+                              "either blocked it or it was outside "
+                              "the plan's scope. NOT created."}
+                flush.maybe()
+                log(f"{schema}.{name}: not in the approved plan")
+                not_in_plan_total += 1
+                continue
+            work.append(table)
+
+        def create_one(table: dict) -> tuple[str, dict, str]:
+            """One table's create and read-back: (name, record, outcome).
+            Touches no shared state; the caller applies the record."""
+            name = table["name"]
+            notes: list[str] = []
+            tgt_name = (planned_targets.get((schema, name))
+                        or (target_schema, name))[1]
+            exists = (None if existing is None
+                      else tgt_name.lower() in existing)
             try:
                 if args.dry_run:
                     log(f"DRY RUN: would create "
@@ -788,30 +874,16 @@ def main(argv: list[str] | None = None) -> int:
                                                args.target_catalog,
                                                target_schema)
                 elif args.mode == "ddl-plan":
-                    columns = planned_columns.get((schema, name))
-                    if not columns:
-                        report["objects"][name] = {
-                            "status": "not_in_plan",
-                            "reason": "the approved ddl_plan carries no "
-                                      "columns for this table -- the engine "
-                                      "either blocked it or it was outside "
-                                      "the plan's scope. NOT created."}
-                        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-                        log(f"{schema}.{name}: not in the approved plan")
-                        not_in_plan_total += 1
-                        continue
                     # The plan names the target TABLE as well as the
                     # schema: a source `ORDERS` planned as `orders` has to
                     # land as `orders`, or the copy addresses a table that
                     # is not there.
-                    tgt_name = (planned_targets.get((schema, name))
-                                or (target_schema, name))[1]
                     status = create_table_from_columns(
-                        spark, columns, args.target_catalog, target_schema,
-                        tgt_name,
+                        spark, planned_columns[(schema, name)],
+                        args.target_catalog, target_schema, tgt_name,
                         description=planned_descriptions.get((schema, name),
                                                              ""),
-                        notes=notes)
+                        notes=notes, exists=exists)
                 else:
                     columns = table.get("columns") or []
                     if _looks_like_snowflake_types(columns):
@@ -822,47 +894,67 @@ def main(argv: list[str] | None = None) -> int:
                             "translated types) or --mode ctas.")
                     status = create_table_from_columns(
                         spark, columns, args.target_catalog, target_schema,
-                        name, notes=notes)
-                tgt_name = (planned_targets.get((schema, name))
-                            or (target_schema, name))[1]
-                report["objects"][name] = {
-                    "status": status, "mode": args.mode,
-                    "target_fqn": f"{args.target_catalog}."
-                                  f"{target_schema}.{tgt_name}"}
+                        name, notes=notes, exists=exists)
+                entry = {"status": status, "mode": args.mode,
+                         "target_fqn": f"{args.target_catalog}."
+                                       f"{target_schema}.{tgt_name}"}
                 if notes:
                     # Properties that could NOT be read back. Recorded next
                     # to the status so "created" never implies "and every
                     # property was checked".
-                    report["objects"][name]["unverified_properties"] = notes
+                    entry["unverified_properties"] = notes
                 if args.mode == "ctas" and status == "already_existed":
                     # CTAS has no plan to compare the layout with: the
                     # table was there before this run and nobody has
                     # checked it. Said here, so the copy scope and the
                     # reconcile report carry it rather than a bare pass.
-                    report["objects"][name]["reason"] = (
+                    entry["reason"] = (
                         "there before this run; --mode ctas has no plan "
                         "to compare its layout with, so the layout was "
                         "NOT compared")
                 log(f"{schema}.{name}: {status}")
-                if status in ("created", "already_existed"):
-                    created_total += 1
+                return name, entry, ("created" if status in
+                                     ("created", "already_existed")
+                                     else "other")
             except TypeDrift as exc:
                 # A problem state, not a failure of THIS run: the table is
                 # there, it is not what the plan says, and a positional copy
                 # into it would land rows in the wrong columns with matching
                 # counts. Re-checked on every run until it matches.
-                failures += 1
-                report["objects"][name] = {"status": "type_drift",
-                                           "reason": str(exc)[:400]}
                 log(f"{schema}.{name}: TYPE DRIFT — {str(exc)[:200]}")
+                return name, {"status": "type_drift",
+                              "reason": str(exc)[:400]}, "failed"
             except Exception as exc:
-                failures += 1
-                report["objects"][name] = {"status": "failed",
-                                           "reason": str(exc)[:400]}
                 log(f"{schema}.{name}: FAILED — {str(exc)[:200]}")
-            report["updated_at"] = datetime.datetime.now(
-                datetime.timezone.utc).isoformat()
-            path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+                return name, {"status": "failed",
+                              "reason": str(exc)[:400]}, "failed"
+
+        # 2 · the creates. Each is metastore round trips (a CREATE and its
+        # read-backs), so they run concurrently within the schema -- every
+        # table still verified on its own. CTAS reads Snowflake per table
+        # and a dry run creates nothing: those stay one at a time.
+        workers = (1 if args.mode == "ctas" or args.dry_run
+                   else max(1, args.parallel))
+        if workers > 1 and len(work) > 1:
+            log(f"{schema}: creating {len(work)} table(s), {workers} at a "
+                f"time (--parallel)")
+            pool = ThreadPoolExecutor(max_workers=workers)
+            results = (f.result() for f in as_completed(
+                [pool.submit(create_one, t) for t in work]))
+        else:
+            pool, results = None, (create_one(t) for t in work)
+        try:
+            for name, entry, outcome in results:
+                report["objects"][name] = entry
+                if outcome == "created":
+                    created_total += 1
+                elif outcome == "failed":
+                    failures += 1
+                flush.maybe()
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True)
+        flush.now()
 
         # Views: kept apart from `objects` so the table tally, the resume
         # logic and the copy scope stay table-only. In --mode ddl-plan the

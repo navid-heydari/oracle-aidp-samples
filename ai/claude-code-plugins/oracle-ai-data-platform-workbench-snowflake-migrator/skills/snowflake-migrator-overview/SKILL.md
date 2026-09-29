@@ -447,6 +447,15 @@ refused rather than dropped. To narrow what S10 creates, narrow the **plan** it
 reads — that is the input — and never edit the stage logic to make it cover
 less.
 
+**Creation speed.** A table's create is metastore round trips, not work:
+live, ~25 s per table. The structure job lists the schema once (`SHOW
+TABLES`) so a table known to be absent skips its failing before-DESCRIBE,
+creates `parallel` tables at a time within a schema (default 4; each still
+read back on its own; CTAS and dry runs one at a time), and writes its
+report every few seconds rather than after every table. If the metastore
+objects to concurrent creates, set the job's task parameter `parallel=1` —
+no notebook edit, no re-provision.
+
 Monitor the runs and report progress. Report `verified`, never `executed` — a
 batch can report success while statements inside it failed.
 

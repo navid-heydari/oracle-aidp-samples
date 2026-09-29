@@ -10,6 +10,14 @@ first release.
 
 ## [Unreleased]
 
+### Changed — faster structure creation, and the follow-ups of the round-4 review
+- **Structure:** one `SHOW TABLES` per schema replaces the failing before-DESCRIBE for tables known to be absent; creates run `--parallel` (default 4) at a time within a schema, each read back on its own; the schema report is written every few seconds and at the end of the schema instead of after every table. `parallel=1` restores one at a time.
+- **Reconcile:** a view the structure report calls created is looked for in the target (SHOW TABLES, SHOW VIEWS, DESCRIBE); absent is `VIEW_MISSING_DESPITE_REPORT` (a problem verdict), unlookable is `TARGET_UNREADABLE`.
+- **Run verdicts:** `run_case()` is the one decision behind the console, RUN.md and the stage board.
+- **`run --refresh` / `--run-key`:** re-read a run from AIDP and rewrite its record, submitting nothing -- for a record whose poll budget ran out, or a run started from the console.
+- **`provision --delete-stale-copy-jobs`:** deletes copy jobs the plan no longer names (and the schemaless generic job), each delete read back. Off by default.
+- **`run` checks task parameters** before submitting: a name no spelling of a stage parameter matches, or a value the stage refuses, is refused before a job start-up is paid for.
+
 ### Fixed — teardown acts only on clusters this migration created
 - `provision_result.json` now records provenance positively. `created: true` is written only on the create path, and a re-push into the same workspace carries it forward.
 - `teardown` no longer stops or deletes the pre-existing cluster that `compute.warehouse_clusters: existing` points at, or clusters adopted with `--reuse-existing`. TEARDOWN.md lists them as "not this migration's, left alone".
