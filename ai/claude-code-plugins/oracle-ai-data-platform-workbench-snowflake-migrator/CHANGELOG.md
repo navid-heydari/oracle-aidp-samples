@@ -4,7 +4,7 @@ Release notes for the Oracle AI Data Platform (AIDP) Workbench Snowflake
 migrator plugin, newest first. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.28.0] — 2026-09-30
 
 ### Added
 - The copy reads each table with one qualified pushdown built from the plan's
@@ -15,8 +15,8 @@ migrator plugin, newest first. The format loosely follows
   of 50, and `--verify counts+sums`, which sums the source in Snowflake exactly.
   A decimal total past 38 digits is reported `sum_not_comparable`.
 - Liquid CLUSTER BY (plain-column keys), retention and change tracking are
-  carried into the reviewed CREATE TABLE. DEFAULT, IDENTITY and PRIMARY KEY
-  warnings name the AIDP refusal.
+  carried into the reviewed CREATE TABLE. DEFAULT, IDENTITY and PRIMARY KEY are
+  reported with the reason they are not emitted.
 - Dynamic tables and materialized views migrate as table snapshots, created,
   copied and reconciled as tables. `snowmig jobs` generates refresh notebooks
   for them and MANUAL job specs for Snowflake task graphs; `--register` creates
@@ -30,8 +30,8 @@ migrator plugin, newest first. The format loosely follows
   masking at scale).
 
 ### Changed
-- Structure creates run 8 at a time by default (measured: ~5 s a table one at a
-  time, ~2 s at 8, ~1.7 s at 16; AIDP's CREATE TABLE is the floor).
+- Structure creates run 8 at a time by default (about 2 s a table); `--mode
+  ctas` creates one at a time unless `--parallel` is given.
 - A plan file over 16 MiB is pushed gzipped (`<name>.gz`), with a pointer under
   the plain name that the structure, copy and reconcile stages follow and check
   by sha256. JSON plans compress 49-75x.
@@ -53,11 +53,19 @@ migrator plugin, newest first. The format loosely follows
 - A plan file that is not valid JSON fails naming the file and the remedy.
 - `run` fetches this run's discovery manifest, from the reports-dir it was
   provisioned with, and a Windows drive path is refused as a stage parameter.
-- CLUSTER BY keys are written bare (AIDP keeps backticks as part of the name). A
-  view's column list is carried as `SELECT * FROM (...) AS named_columns(...)`
-  (a view column list is unreadable on AIDP).
+- CLUSTER BY keys are written bare, and a view's column list is carried as
+  `SELECT * FROM (...) AS named_columns(...)`, the forms AIDP reads.
 - A `cluster by (...)` before the column list in `GET_DDL` is skipped when its
   columns are read.
+- Task bodies and dynamic-table / materialized-view queries are kept only with
+  `--capture-definitions`; without it, the generated job or refresh names the
+  flag that keeps the body.
+- `--mode append` refuses to start after an unfinished copy run of another
+  mode, and `--tables` is deduplicated before the parallel copy.
+- One rule resolves the source database name for every statement, GET_DDL
+  included; a quoted, mixed-case database name is supported.
+- `teardown --scope all` also removes the jobs and notebooks `jobs --register`
+  created.
 
 ## [0.27.0] — 2026-09-29
 
