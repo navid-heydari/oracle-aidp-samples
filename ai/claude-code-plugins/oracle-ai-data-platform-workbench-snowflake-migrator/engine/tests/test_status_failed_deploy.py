@@ -30,7 +30,7 @@ def test_a_failed_create_is_not_in_progress():
 def test_a_burned_name_is_blocked_and_says_so():
     dep = dict(_FAILED, poisoned_names=["d.s.t"])
     assert migration_status("D.S.T", deployed=dep) == "BLOCKED"
-    assert "burned" in deploy_failure("D.S.T", dep)
+    assert "cannot be reused" in deploy_failure("D.S.T", dep)
     assert "fresh schema" in deploy_failure("D.S.T", dep)
 
 
@@ -64,5 +64,5 @@ def test_the_demo_summary_agrees_with_stages_about_legacy_audit(demo):
     md = (demo / "SUMMARY.md").read_text(encoding="utf-8")
     row = next(l for l in md.splitlines() if "LEGACY_AUDIT" in l)
     assert "IN_PROGRESS" not in row
-    assert "BLOCKED" in row and "burned" in row
+    assert "BLOCKED" in row and "cannot be reused" in row
     assert "1 unverified" not in md and "1 failed" in md

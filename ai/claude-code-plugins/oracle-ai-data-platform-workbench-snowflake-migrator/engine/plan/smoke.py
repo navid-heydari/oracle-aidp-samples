@@ -215,7 +215,8 @@ def run_smoke(*, source_run_sql, target=None, dest_call=None,
                     destination["write_note"] = (
                         f"not verified: the create returned but {probe_fqn} is "
                         f"not visible, so write is unproven. Creates are "
-                        f"asynchronous and can fail without reporting it.")
+                        f"asynchronous, so write access is confirmed only "
+                        f"once the created object is read back.")
                     destination["checks"].append(
                         {"name": "write probe schema", "ok": False,
                          "detail": "created without error but not visible"})

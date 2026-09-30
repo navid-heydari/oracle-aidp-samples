@@ -193,7 +193,7 @@ def test_the_rendered_table_shows_the_real_owner_per_option():
 def test_the_rendered_per_option_note_is_not_empty():
     text = "\n".join(architecture_section({}))
     section = text.split("### What each choice does to maintenance")[1]
-    for line in section.split("### The three traps")[0].strip().split("\n"):
+    for line in section.split("### Three maintenance points to plan for")[0].strip().split("\n"):
         if line.startswith("- **A"):
             body = line.split("—", 1)[1]
             assert len(body.strip(" .()")) > 40, f"empty note: {line}"

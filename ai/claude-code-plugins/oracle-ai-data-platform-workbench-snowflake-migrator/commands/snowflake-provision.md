@@ -10,11 +10,17 @@ Thin wrapper over
 1. Ask for the aiDataPlatform OCID and the workspace name **in this turn**;
    the external/target catalog names if already decided.
 2. Dry-run `snowmig.py provision` and show `PROVISION.md` — including any
-   name translation and the unverified-contract warning.
+   name translation and the API-contract note.
 3. On the user's go-ahead, re-run with `--execute`.
 4. Report each step's `verified` from `provision_result.json` — pending is
    pending, never rounded up.
-5. Hand-off: read `workspace.key` and `cluster.key` from
-   `provision_result.json` (`PROVISION.md` shows display names, not keys)
-   and have the user put them in the config's `aidp:` block before
+5. Hand-off: the CLI and `PROVISION.md` print the workspace and cluster
+   keys (recorded as `workspace.key` and `cluster.key` in
+   `provision_result.json`; the display names are not keys). Pass them as
+   `--workspace` / `--cluster-id` on every later command, or have the user
+   put them in the config's `aidp:` block — one or the other — before
    `/snowflake-catalog`.
+6. The plan push (S9/S10) re-runs this stage against the same workspace:
+   `provision --execute --reuse-existing --workspace-name <the S1 name>
+   --plan-label FULL|REDUCED`. Report any copy job listed as `stale` (exit 1)
+   and offer `--delete-stale-copy-jobs` to remove it.

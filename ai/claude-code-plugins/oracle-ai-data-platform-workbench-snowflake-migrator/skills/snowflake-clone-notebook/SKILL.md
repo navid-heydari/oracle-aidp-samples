@@ -1,6 +1,6 @@
 ---
 name: snowflake-clone-notebook
-description: Generate the table-creation script for a Standard AIDP catalog as an executable notebook, locally and offline. --upload is a dry run and is refused with --execute (GAPS 13); the structure itself is created by the snowmig_01_structure workflow at S10. The script creates schemas, then tables, then views in dependency order, prints per-object progress with elapsed time so a long run stays visible, and verifies each object individually at the end. This script creates structure only and copies no data - every table arrives with zero rows; rows are copied only by the snowmig_02_copy_schema job, when the operator runs it. Use when the user has explicitly asked for a Standard catalog, or wants the migration delivered as a runnable script rather than executed straight from the CLI.
+description: Generate the table-creation script for a Standard AIDP catalog as an executable notebook, locally and offline. --upload is a dry run and is refused with --execute; the structure itself is created by the snowmig_01_structure workflow at S10. The script creates schemas, then tables, then views in dependency order, prints per-object progress with elapsed time so a long run stays visible, and verifies each object individually at the end. This script creates structure only and copies no data - every table arrives with zero rows; rows are copied only by the snowmig_02_copy_schema job, when the operator runs it. Use when the user has explicitly asked for a Standard catalog, or wants the migration delivered as a runnable script rather than executed straight from the CLI.
 ---
 
 # Standard-catalog table-creation script
@@ -10,13 +10,13 @@ explicitly asked for.** The default target is an EXTERNAL/SNOWFLAKE catalog,
 which needs no tables at all — see `snowflake-medallion-clone` Phase A. Do not
 reach for this skill just because a migration is in progress.
 
-Why a script on compute rather than the control-plane API: it runs **inside AIDP
-compute**, so every statement's success, failure and elapsed time appears in the
-cluster's own output. The catalog CRUD API returns 202 Accepted over OCI/HTTP
-and then fails silently, which is far harder to track down.
+Why a script on compute: it runs **inside AIDP compute**, so every
+statement's success, failure and elapsed time appears in the cluster's own
+output, and each object is read back. The control-plane catalog API is used
+for the catalog container only.
 
-Generate locally; `--upload` is a dry run and is refused with `--execute`
-(GAPS 13); the structure itself is created by `run --job snowmig_01_structure`
+Generate locally. `notebook --upload` is a dry run and is refused with
+`--execute`; the structure is created by `run --job snowmig_01_structure`
 (S10).
 
 **The script creates empty structure and moves no data.** Every table it
@@ -43,13 +43,10 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig notebook \
 
 `--upload` is a **dry run** without `--execute`: it prints where the notebook
 would land and sends nothing. With `--execute` the upload is **refused**, and
-the command says so: its only transport is the Jupyter contents API, which
-the validated build answers with a 200 and then cannot read the file back
-(GAPS.md 13), so an upload could not be reported honestly. The verified way to
-create the structure is `snowmig provision --execute` (which places the stage
-notebooks in the workspace) followed by `snowmig run --job
-snowmig_01_structure`. Ask the user for the four coordinates in this turn;
-nothing is stored.
+the command says so. The structure is created by `snowmig provision --execute`
+(which places the stage notebooks in the workspace) followed by `snowmig run
+--job snowmig_01_structure` (S10). Ask the user for the four coordinates in
+this turn; nothing is stored.
 
 Nothing lands there from this command. `NOTEBOOK.md` records
 `/Workspace/Shared/snowmig_shallow_clone_<catalog>.ipynb` as the intended

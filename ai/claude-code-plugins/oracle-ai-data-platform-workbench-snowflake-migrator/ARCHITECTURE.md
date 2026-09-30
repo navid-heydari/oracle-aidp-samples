@@ -1,8 +1,8 @@
 # Stage-level design
 
-How the Snowflake → AIDP migrator is put together, and how a run actually
-executes. `GAPS.md` is the ranked list of where the code does not yet match
-this design; every such divergence is cross-referenced below as **[GAP n]**.
+How the Snowflake → AIDP migrator is put together, and how a run executes.
+`MIGRATION-ARCHITECTURE.md` is the companion migration design: what maps to
+what, and the order a migration follows.
 
 ---
 
@@ -36,15 +36,15 @@ Three consequences, all deliberate:
 | Rendering | `report/` | Pure. Reads artifacts, writes markdown |
 | Target | `target/` | The only layer that can write to AIDP. All I/O injected as `call` / `run_sql` |
 
-The injected-callable convention is what makes the whole target layer
-unit-testable with no environment — 1032 offline tests, and every behaviour a
-live AIDP taught us is regression-tested without one.
+The injected-callable convention makes the whole target layer unit-testable
+offline: every AIDP behaviour the plugin relies on is covered by a regression
+test that needs no environment.
 
 ---
 
 ## 2. Stage inventory
 
-Sixteen stages. `needs` is what must be reachable; `writes` means it can
+The stages. `needs` is what must be reachable; `writes` means it can
 change the destination.
 
 | # | Stage | Needs | Reads | Produces | Writes to AIDP |
@@ -59,35 +59,48 @@ change the destination.
 | 7 | `plan` | offline | `inventory.json`, `dependencies.json`, *(`data_options.json`)* | `plan.json`, `PLANNED_OBJECTS.md` | no |
 | 8 | `ddl` | offline | `inventory.json`, `plan.json` | `ddl_plan.json`, `DDL_PLAN.md` | no |
 | 9 | `smoke` | Snowflake + AIDP | — | `smoke.json`, `SMOKE_TEST.md` | **only with `--write-probe --execute`** |
-| 10 | `catalog` | AIDP | — | `catalog_result.json`, `CATALOG.md` | **yes, with `--execute`** |
+| 10 | `catalog` | AIDP | — | `catalog_result_<name>.json`, `CATALOG_<name>.md` per catalog (S3 and S4 each keep theirs); `catalog_result.json`, `CATALOG.md` = the latest executed, listing every catalog registered | **yes, with `--execute`** |
 | 11 | `deploy` | AIDP | `ddl_plan.json`, `plan.json`, `inventory.json` | `PREFLIGHT.md`, `deploy_result.json`, `SOFT_CLONE_SUMMARY.md` | **yes, with `--execute`** |
-| 12 | `notebook` | offline | `ddl_plan.json`, `plan.json`, `inventory.json` | `*.ipynb`, `NOTEBOOK.md` | no — `--upload` is a dry run, refused with `--execute` **[GAP 13]** |
+| 12 | `notebook` | offline | `ddl_plan.json`, `plan.json`, `inventory.json` | `*.ipynb`, `NOTEBOOK.md` | no — `--upload` is a dry run and is refused with `--execute`; the structure is created by `run --job snowmig_01_structure` |
 | 13 | `summary` | offline | `plan.json`, `inventory.json`, *(`deploy_result.json`)* | `SUMMARY.md` | no |
 | 14 | `provision` | AIDP | the scripts + whatever plan artifacts exist | `provision_result.json`, `PROVISION.md`, and the AIDP-side folder, drivers and jobs | **yes, with `--execute`** |
+| 15 | `ingest` | offline | the S6 discovery manifest | `inventory.json` (marked as from the manifest), `dependencies.json` (`not_extracted`), `ingest_result.json` | no |
+| 16 | `run` | AIDP | a job `provision` created | `run_<job>.json` (written as RUNNING at submit, rewritten at the end), `RUN_<job>.md` | **yes — no dry run: running IS the write** |
+| 17 | `teardown` | AIDP | `provision_result.json`, the catalog ledger | `teardown_result.json`, `TEARDOWN.md` | **yes, with `--execute`**: clusters by default; `--scope credential` the workspace credential; `--scope all` everything the record proves this migration created (INTERNAL catalog only with `--include-data`) |
 | — | `stages` | offline | everything present | `STAGES.md` | no |
 | — | `demo` | offline | — | every artifact above, emulated, + `DEMO.md` | no |
 
-Past `provision`, the work moves INSIDE AIDP: 3 + N jobs (one copy job per
-schema of the approved plan, each passing `schema` as a task parameter) run
-the scripts in
-`data-migration-scripts/` — self-contained `.ipynb`, generated from
-`engine/dataplane/` (discover → structure → copy, schema by schema →
-reconcile), and their reports land in the workspace, not in `--out-dir`.
+Past `provision`, the work moves inside AIDP: 3 + N jobs (discover, structure,
+reconcile, and one copy job per schema of the approved plan, each passing
+`schema` as a task parameter) run the scripts in `data-migration-scripts/` —
+self-contained `.ipynb`, generated from `engine/dataplane/` (discover →
+structure → copy, schema by schema → reconcile) — and their reports land in
+the workspace, not in `--out-dir`.
 
 `stages` is not a pipeline step; it is the read-out of one.
 
-**Seven stages write — `provision`, `catalog` and `deploy`, each a dry run
-without `--execute`; the two workflows `run` starts, which have no dry run
-(`structure-workflow`, `snowmig_01_structure`, creates the structure;
-`copy-workflow`, `snowmig_02_copy_<schema>`, one job per schema of the
-pushed plan, copies rows); `publish`, which copies the report into the
-workspace; and `teardown`, which is destructive (it stops the clusters this
-migration allocated, or deletes them when asked) — the last two dry runs
-without `--execute`. Plus, narrowly and opt-in, `smoke --write-probe
---execute`.** The stage board
-says exactly that, lists `provision` and `catalog` in their dependency
-positions, and reads their artifacts (a `create_requested` that never became
-visible is flagged as pending, not success).
+**Seven stages write:**
+- `provision`, `catalog` and `deploy` — each a dry run without `--execute`.
+- The two workflows `run` starts, which have no dry run (running is the
+  write): `structure-workflow` (`snowmig_01_structure`) creates the
+  structure; `copy-workflow` (`snowmig_02_copy_<schema>`, one job per schema
+  of the pushed plan) copies rows.
+- `publish` — copies the report into the workspace; a dry run without
+  `--execute`.
+- `teardown` — destructive, and a dry run without `--execute`. It stops the
+  clusters this migration allocated, or deletes them when asked; with
+  `--scope credential` it removes the workspace credential, and with
+  `--scope all` everything the migration created.
+- Plus, narrowly and opt-in, `smoke --write-probe --execute`.
+
+The stage board says exactly that, lists `provision` and `catalog` in their
+dependency positions, and reads their artifacts (a `create_requested` that
+has not yet become visible is flagged as pending, not success). Once a
+migration is on the runbook (a provision executed, or no laptop `assess`),
+its "next" follows the runbook's order (S1, S3/S4, S6, S7, S10, S12) and
+never proposes a copy; a job run is recorded as RUNNING the moment it is
+submitted, so the board waits on it instead of offering it, or its `deploy`
+twin, again.
 
 ---
 
@@ -133,9 +146,8 @@ visible is flagged as pending, not success).
          │                                └──────┬───────┘
          │                                       ▼
          │                                run --job snowmig_01_structure
-         │                                (Spark reports real errors;
-         │                                 the CRUD API returns 202 and
-         │                                 can silently create nothing)
+         │                                (on AIDP compute; Spark
+         │                                 reports each statement)
          │                                       │
          └───────────────┬───────────────────────┘
                          ▼
@@ -144,13 +156,105 @@ visible is flagged as pending, not success).
                    └───────────┘
 ```
 
-`deploy` is the legacy third branch: control-plane CRUD straight into a
-Standard catalog. It is live-proven (7 objects) but is no longer the
-recommended path for Standard catalogs, because a 202 Accepted can silently
-create nothing and Spark cannot. It resolves the target's `catalogType`
-before its first create and **refuses an EXTERNAL target** — and equally an
-absent catalog or an unreadable listing, because "could not look" is not
-"safe to write".
+`deploy` is a third branch, reached only when the user asks for it by name:
+control-plane CRUD straight into a Standard catalog, with every create read
+back. For a Standard catalog the recommended path is the structure workflow,
+where Spark reports each statement's result directly. `deploy` resolves the
+target's `catalogType` before its first create and **refuses an EXTERNAL
+target** — and equally an absent catalog or an unreadable listing, because
+"could not look" is not "safe to write".
+
+### Phase diagram
+
+Generated from the stage list in the engine (`bin/snowmig stages --write-diagram` refreshes it). Solid arrow = next phase, thick = into a phase that writes to AIDP, dotted = alternative path.
+
+<!-- phase-diagram:begin -->
+```mermaid
+flowchart TB
+
+  subgraph SETUP["Setup &nbsp;&#40;environment and catalogs&#41;"]
+    direction TB
+    PREFLIGHT["<b>preflight</b><br/><i>operator machine -> Snowflake + AIDP control plane</i>"]
+    PROVISION["<b>provision</b><br/>runbook S1 S2 S5<br/><i>AIDP control-plane API (no cluster)</i>"]
+    CATALOG["<b>catalog</b><br/>runbook S3 S4<br/><i>AIDP control-plane API (no cluster)</i>"]
+  end
+
+  subgraph DISCOVERY["Discovery &nbsp;&#40;read-only against Snowflake&#41;"]
+    direction TB
+    ASSESS["<b>assess</b><br/>runbook S7 (views)<br/><i>operator machine -> Snowflake (read-only)</i>"]
+    INGEST["<b>ingest</b><br/>runbook S7<br/><i>operator machine (offline)</i>"]
+    DEPS["<b>deps</b><br/><i>operator machine -> Snowflake (read-only)</i>"]
+    MAINTENANCE["<b>maintenance</b><br/><i>operator machine -> Snowflake (read-only)</i>"]
+    SECURITY["<b>security</b><br/><i>operator machine -> Snowflake (read-only)</i>"]
+    COMPUTE["<b>compute</b><br/>runbook S12<br/><i>operator machine -> Snowflake (read-only)</i>"]
+    DISCOVER_WORKFLOW["<b>discover-workflow</b><br/>runbook S6<br/><i>migration cluster (provisioned at S2)</i>"]
+  end
+
+  subgraph PLANNING["Planning &nbsp;&#40;offline, no network&#41;"]
+    direction TB
+    DATA_OPTIONS["<b>data-options</b><br/>runbook S11<br/><i>operator machine (offline)</i>"]
+    PLAN["<b>plan</b><br/>runbook S7-S9<br/><i>operator machine (offline)</i>"]
+    DDL["<b>ddl</b><br/>runbook S7<br/><i>operator machine (offline)</i>"]
+  end
+
+  subgraph TARGET["Target &nbsp;&#40;AIDP structure and data plane&#41;"]
+    direction TB
+    SMOKE["<b>smoke</b><br/><i>AIDP control-plane API (no cluster)</i>"]
+    STRUCTURE_WORKFLOW["<b>structure-workflow</b><br/>runbook S10<br/><i>migration cluster (provisioned at S2)</i>"]
+    DEPLOY["<b>deploy</b><br/>runbook S10 (catalog API)<br/><i>AIDP control-plane API; --transport sql uses the configured aidp.cluster_id</i>"]
+    COPY_WORKFLOW["<b>copy-workflow</b><br/>runbook S11<br/><i>migration cluster (provisioned at S2)</i>"]
+    RECONCILE_WORKFLOW["<b>reconcile-workflow</b><br/>runbook S11<br/><i>migration cluster (provisioned at S2)</i>"]
+    NOTEBOOK["<b>notebook</b><br/><i>operator machine (offline)</i>"]
+  end
+
+  subgraph REPORTING["Reporting"]
+    direction TB
+    SUMMARY["<b>summary</b><br/>runbook S9 S12<br/><i>operator machine (offline)</i>"]
+    PUBLISH["<b>publish</b><br/><i>AIDP control-plane API (no cluster)</i>"]
+    TOKENS["<b>tokens</b><br/><i>operator machine (offline)</i>"]
+  end
+
+  subgraph TEARDOWN["Teardown &nbsp;&#40;release the migration's compute&#41;"]
+    direction TB
+    TEARDOWN["<b>teardown</b><br/><i>AIDP control-plane API (no cluster)</i>"]
+  end
+
+  PREFLIGHT --> ASSESS
+  ASSESS --> INGEST
+  INGEST --> DEPS
+  DEPS --> MAINTENANCE
+  MAINTENANCE --> SECURITY
+  SECURITY --> COMPUTE
+  COMPUTE --> DATA_OPTIONS
+  DATA_OPTIONS --> PLAN
+  PLAN --> DDL
+  DDL --> SMOKE
+  SMOKE ==> PROVISION
+  PROVISION ==> CATALOG
+  CATALOG --> DISCOVER_WORKFLOW
+  DISCOVER_WORKFLOW ==> STRUCTURE_WORKFLOW
+  STRUCTURE_WORKFLOW ==> DEPLOY
+  DEPLOY ==> COPY_WORKFLOW
+  COPY_WORKFLOW --> RECONCILE_WORKFLOW
+  RECONCILE_WORKFLOW --> NOTEBOOK
+  NOTEBOOK --> SUMMARY
+  SUMMARY ==> PUBLISH
+  PUBLISH --> TOKENS
+  TOKENS ==> TEARDOWN
+  ASSESS -. or .- INGEST
+  STRUCTURE_WORKFLOW -. or .- DEPLOY
+
+  classDef local fill:#eef6ff,stroke:#5b8dd9,color:#12314f
+  classDef writer fill:#fff1e6,stroke:#d98b3a,color:#5a3410
+  classDef optional fill:#f2f2f2,stroke:#888,color:#222,stroke-dasharray: 4 3
+  classDef done fill:#e8f6ea,stroke:#3c9a4c,color:#173d1e
+  classDef attention fill:#fdeaea,stroke:#c94343,color:#4d1414
+
+  class ASSESS,DEPS,MAINTENANCE,SECURITY,COMPUTE,PLAN,DDL,SMOKE,NOTEBOOK,SUMMARY local
+  class PROVISION,CATALOG,STRUCTURE_WORKFLOW,DEPLOY,COPY_WORKFLOW,PUBLISH,TEARDOWN writer
+  class PREFLIGHT,INGEST,DATA_OPTIONS,DISCOVER_WORKFLOW,RECONCILE_WORKFLOW,TOKENS optional
+```
+<!-- phase-diagram:end -->
 
 ### Why the fork exists
 
@@ -169,33 +273,20 @@ never assumed, and only ever built when the user has asked for one in words.
 
 ## 4. The invariants
 
-Six rules the design holds everywhere. Each was a real failure first.
+The rules the design holds everywhere.
 
 **I1 — The source is read-only, at the transport.** Not by grant, not by
 convention. `snowflake_source/conn.py` refuses a non-read verb, so no skill,
 prompt or bug can write to the customer's Snowflake.
 
-**I2 — Read back and compare; a 2xx is not the claim.** AIDP creates are
-asynchronous and return **202 Accepted with an empty body and no work-request
-id**, so there is no waiter and a failure reports nothing. Six tables once
-returned 202 and not one existed. Verification is therefore: poll with a
-bounded backoff, resolve the key from the server, `GET` the object, compare
-the field list. "The planned columns are there" is the claim. `ensure_catalog`
-polls the same way; a listing that fails mid-poll counts as "not visible yet",
-because it is not evidence either way.
-
-**I3a — ask the source that can answer, not the one that is convenient.**
-Two sources answer "what is attached to this object": the account-wide
-`ACCOUNT_USAGE` views, one statement for the estate but up to ~2 hours stale
-and gated behind `IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE`; and the
-`INFORMATION_SCHEMA` table functions, one round trip per object, current, and
-needing no extra grant. A hedge about staleness is not a substitute for the
-read that is not stale. Both are read and UNIONed, each attachment says which
-source saw it, and a row only the stale one has is marked for confirmation
-rather than believed or dropped. Where the per-object read cannot run --
-denied, or an estate over the budget for one round trip per object -- the
-older verdict and its hedge stand, and the report says which case produced
-the number.
+**I2 — Read back and compare; a 2xx is not the claim.** AIDP catalog creates
+are asynchronous: they return **202 Accepted** with an empty body and no
+work-request id to wait on, and the object becomes visible once the work
+completes. Verification is therefore: poll with a bounded backoff, resolve the
+key from the server, `GET` the object, compare the field list. "The planned
+columns are there" is the claim. `ensure_catalog` polls the same way; a
+listing that fails mid-poll counts as "not visible yet", because it is not
+evidence either way.
 
 **I3 — "Could not look" never renders as zero.** An unreadable `ACCOUNT_USAGE`
 reports `measured: false` with null counts, because *0 reclustering credits*
@@ -210,6 +301,18 @@ and unreadable: *not distinguishable*, when rows were read and counted
 under their parent kind but the column that tells a UDTF from a UDF, or
 an external stage from an internal one, could not be read. That is
 reported as such, never folded into either neighbour.
+
+**I3a — Ask the source that can answer, not the one that is convenient.**
+Two sources answer "what is attached to this object": the account-wide
+`ACCOUNT_USAGE` views, one statement for the estate but up to ~2 hours stale
+and gated behind `IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE`; and the
+`INFORMATION_SCHEMA` table functions, one round trip per object, current, and
+needing no extra grant. Both are read and UNIONed, each attachment says which
+source saw it, and a row only the stale one has is marked for confirmation
+rather than believed or dropped. Where the per-object read cannot run —
+denied, or an estate over the budget for one round trip per object — the
+account-wide verdict and its staleness note stand, and the report says which
+case produced the number.
 
 **I4 — Refuse rather than guess.** An unmappable type, an unknown OCI region,
 a `LISTAGG … WITHIN GROUP`, a `::` cast over an expression: all raise. A
@@ -239,29 +342,41 @@ A gate is a point where the run stops and does not proceed on its own.
 
 | Gate | Where | Condition |
 |---|---|---|
-| **Target collision** | `plan` | Two source objects fold to one target name (`ORDERS` / `"orders"`). Exits `HALT`. AIDP lower-cases identifiers, so the two would silently merge |
-| **Unmappable type** | `ddl` | `VARIANT`/`OBJECT`/`ARRAY`/`GEOGRAPHY` block their table unless the operator opts into `string`, which defers rather than solves |
-| **`timestamp_ntz`** | `ddl` | The catalog API silently rejects it. Blocked by default; `--timestamp-ntz timestamp` accepts the timezone-semantics change and records the caveat on the field |
+| **Target collision** | `plan` | Two source objects fold to one target name (`ORDERS` / `"orders"`). Exits `HALT`. AIDP stores identifiers in lower case, so the two would map to one object |
+| **Unmappable type** | `ddl` | `VARIANT`/`OBJECT`/`ARRAY`/`GEOGRAPHY` block their table unless the operator opts into `string`, which defers the typed design rather than replacing it |
+| **`timestamp_ntz`** | `ddl` | The target catalog does not take `timestamp_ntz` as a column type. Blocked by default; `--timestamp-ntz timestamp` accepts the timezone-semantics change and records the caveat on the field |
 | **Connectivity** | `smoke` | Both ends reachable with the permissions the next stage needs. The write probe is skipped, with a note, against an EXTERNAL catalog — read-only by design is not a FAIL |
-| **`--execute`** | `catalog`, `deploy`, `provision`, `smoke --write-probe`, `notebook --upload` | Dry run otherwise. Nothing reaches AIDP without it (and `notebook --upload --execute` is then refused — **[GAP 13]**) |
+| **`--execute`** | `catalog`, `deploy`, `provision`, `teardown`, `publish`, `smoke --write-probe`, `notebook --upload` | Dry run otherwise. Nothing reaches AIDP without it. `notebook --upload` stays a dry run: with `--execute` it is refused, and the structure is created by `run --job snowmig_01_structure` |
 | **EXTERNAL target** | `deploy` | The target's `catalogType` is resolved before the first create; EXTERNAL, absent, or unreadable → **refused** |
-| **Managed catalog** | `catalog` | `--catalog-type standard` creates the CONTAINER only (as `INTERNAL`; `STANDARD` is an alias the API rejects) and returns `container_only`. Its **tables** are still refused here, with a pointer to the structure workflow (`run --job snowmig_01_structure`, S10) |
+| **Managed catalog** | `catalog` | `--catalog-type standard` creates the CONTAINER only (sent as `INTERNAL`; `STANDARD` is accepted as an alias and normalised) and returns `container_only`. Its **tables** are created by the structure workflow (`run --job snowmig_01_structure`, S10), not here |
 | **Explicit request** | skill layer | A Standard catalog requires the user to have asked, in words |
+| **Provenance** | `teardown` | Only what `provision_result.json` (`created: true`) and the catalog ledger (`action: created`) prove this migration created is stopped or deleted; an adopted workspace or cluster and a reused catalog are listed as left alone |
+| **Data loss** | `teardown --scope all` | The INTERNAL catalog holds the migrated rows: it is deleted only with `--include-data`, and listed as kept otherwise |
 
 ### Failure semantics
 
-- **A failed async create poisons the object name in that schema, permanently.**
-  Every later create for that name returns 202 and is silently dropped, and
-  `DELETE` does not recover it. The plugin detects the signature — a novel name
-  in the same schema succeeds — and says which situation the user is in. The
-  only known recovery is a different schema.
-- **A 409 "ongoing operation" is retried** with a bounded backoff, and the
-  retry is recorded: a run that needed three attempts is worth knowing about.
-- **An existing schema is never re-created.** POSTing one that is already there
-  re-triggers async work, and tables created during that window are accepted
-  and then dropped.
-- **`oci raw-request` exits 0 on an HTTP error.** The status is in the response
-  body, so exit code proves nothing; any non-2xx raises.
+- **Every create is read back.** An object is reported created only once a
+  `GET` returns it with the planned fields; one not yet visible is reported
+  as pending.
+- **A 409 while a workspace or an ongoing operation settles is retried** with
+  a bounded backoff, and the retry is recorded in the result.
+- **A create that never becomes visible is diagnosed.** `deploy` creates one
+  probe object with a new name in the same schema (once per schema;
+  `--no-diagnose` turns it off, since the probe writes) and reports whether
+  the planned name cannot be reused in that schema or the request itself is
+  wrong. For the first case, the recovery is a fresh schema.
+- **An existing schema is never re-created.** Only absent schemas are
+  created, so no new asynchronous work on a schema overlaps the table creates
+  that follow it.
+- **The HTTP status is read from the response.** `oci raw-request` carries the
+  status in the response body, so the plugin reads it there and raises on any
+  non-2xx.
+- **A job run whose task has not been picked up is resubmitted.** `run`
+  cancels a run whose task is still unstarted after `--cold-start-seconds`
+  (default 120) and resubmits it, up to `--cold-start-restarts` times. A task
+  that has started is never cancelled, however long it runs.
+- **A spent poll budget is reported as STILL RUNNING**, never rounded to a
+  verdict.
 
 ---
 
@@ -321,23 +436,86 @@ not pass.
 | `snowflake-medallion-clone` | 10, and 11 for a requested Standard catalog |
 | `snowflake-clone-notebook` | 12 |
 | `snowflake-compute-proposal` | 5 |
+| `snowflake-provision-environment` | 14 |
 | `snowflake-stage-board` | 13 / `stages`, proactively |
 
 ---
 
-## 7. Where the code diverges from this design
+## 7. Scope
 
-Recorded here so the design is not read as a description of what ships. Full
-detail and ranking in `GAPS.md`.
+**What the plugin covers:**
 
-The 2026-09-16 sweep closed the wiring gaps (deploy's EXTERNAL guard, the
-catalog-type-aware smoke probe, the stage board's `catalog` row and its
-writer claim, the argv credential), and the live campaign that followed
-settled the EXTERNAL registration contract and wired `test-connection` as a
-command. What remains divergent:
+- **Assessment**, read-only: tables and views with row counts, sizes and
+  column types; a census of every other object kind; lineage; table
+  maintenance state; security posture; warehouses.
+- **Plan and DDL**, offline, with `PLANNED_OBJECTS.md` as the approval
+  artifact.
+- **The AIDP environment**: workspace, migration cluster,
+  `backup-snowflake-migration/` folder, and the migration jobs.
+- **Structure**: an EXTERNAL/SNOWFLAKE catalog by default; on request, an
+  INTERNAL target catalog whose schemas, tables and views are created on AIDP
+  compute from the approved plan.
+- **An optional copy**, one job per schema (`snowmig_02_copy_<schema>`), run
+  only on the operator's decision and verified by row counts (plus exact
+  decimal sums with `--verify counts+sums`), then reconciled into
+  `MIGRATION_REPORT.md` by `snowmig_03_reconcile`.
+- **Teardown** of what the record proves the migration created.
 
-| Design element | Divergence |
-|---|---|
-| `notebook --upload` | Still points at the Jupyter contents API and `notebookRuns`. Both are now **known wrong**: files go through `workspace-object`, and execution is a Job with a NOTEBOOK_TASK. The working shapes live in `provision_api.py` / `jobs.py`; this command has not been moved onto them **[GAP 13]** |
-| EXTERNAL catalog browsability | The catalog registers, but its **crawler** cannot reach Snowflake on the validated deployment, so the estate is not browsable there. The data plane does not depend on it (connector mode) **[GAP 13a]** |
-| Cluster libraries | The library-item artifact field is the last inferred shape; nothing in the validated path installs one **[GAP 13b]** |
+**What it deliberately does not do:**
+
+- **Write to Snowflake.** The source is read-only, enforced at the transport.
+- **Span databases.** One Snowflake database is one migration and becomes one
+  AIDP catalog; another database is another migration.
+- **Translate code or policies.** Stored procedures, UDFs, tasks, streams,
+  pipes and dynamic tables are inventoried with effort bands and a language
+  verdict; masking and row-access policies are reported per exposure. Their
+  AIDP equivalents are designed by people, with those reports as the
+  worklist.
+- **Plan views from the in-AIDP manifest.** The discovery manifest carries a
+  view's columns, not its SQL, so `ingest` marks such a view untranslatable.
+  An estate whose views must migrate is planned from a live `assess` (and
+  `deps`, for view ordering). Tables are planned either way.
+- **Guess.** A type with no mapping, or view SQL outside the implemented
+  rewrites (`QUALIFY`, `LATERAL FLATTEN`, …), is refused and named.
+- **Move rows from the control plane.** Rows move only through the in-AIDP
+  copy job, so `SUMMARY.md` reports structure and `MIGRATION_REPORT.md`
+  reports the copy.
+- **Design Silver and Gold, or set maintenance.** Silver and Gold are
+  proposed as job stubs; table maintenance is reported (clustering,
+  retention, churn, capabilities with no AIDP equivalent). The job bodies,
+  cadence and retention are the customer's to set.
+- **Resolve an unmapped region.** The AIDP endpoint's region comes from the
+  short code in the DataLake OCID, for the codes mapped in
+  `target/coords.py`; an unmapped code is refused rather than guessed.
+
+---
+
+## 8. Future scope
+
+Planned capabilities:
+
+- View SQL captured by the in-AIDP discovery, so views can be planned without
+  a live `assess`.
+- View lineage in the in-AIDP path, for dependency ordering without a
+  Snowflake session from the operator's machine.
+- Grouped resolution of flagged conflicts at S8: conflicts grouped into
+  families, each with a count, and decided once per family.
+- Estate statistics at S11: largest, smallest and average table, and totals
+  per schema.
+- A faster bulk copy, with several tables copied in parallel within a
+  schema's job.
+- A per-table maintenance proposal — `OPTIMIZE` cadence from measured churn,
+  `ZORDER`/`CLUSTER BY` keys seeded from the source clustering key, a
+  `VACUUM` retention never shorter than the source's — emitted as a disabled
+  job.
+- A per-table time-travel parity statement: the source recovery window
+  against the proposed Delta retention.
+- A maintenance cost comparison in the compute proposal: Automatic Clustering
+  credits against the AIDP cost of the proposed cadence.
+- Downstream-impact reporting: for each migrating table, the task or stream
+  that populates it on Snowflake.
+- Cluster library installation from `requirements-aidp.txt` as part of the
+  standard provisioning path.
+- `notebook --upload --execute`, on the same workspace upload and job surface
+  `provision` uses.
+- Additional OCI regions and realms.

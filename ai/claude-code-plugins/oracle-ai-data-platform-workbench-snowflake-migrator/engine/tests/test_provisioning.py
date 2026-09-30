@@ -364,13 +364,14 @@ def test_an_all_comments_requirements_file_installs_nothing(scripts, tmp_path):
     assert not any(op == "install_libraries" for op, _ in fake.ops)
 
 
-def test_the_report_carries_the_unverified_warning():
+def test_the_report_carries_no_validation_banner():
     res = provision(call=None, workspace_name="acme", scripts=[],
                     execute=False)
     md = render_provision(res)
     assert "DRY RUN" in md
-    # What has run live is said, and what has not (library items) still is.
-    assert "not live-verified" in md and "library items" in md
+    # The report says what provisioning does, not how the API was validated.
+    assert "live-verified" not in md and "20260430 contract" not in md
+    assert "live API" not in md
 
 
 # --- provision_api ---------------------------------------------------------
@@ -695,7 +696,7 @@ def test_provision_list_commands_carry_the_page_token():
 
 # --- the cluster POST fails: the workspace record must survive -------------
 #
-# GAPS.md records that a cluster POSTed before the workspace reports ACTIVE
+# A cluster POSTed before the workspace reports ACTIVE
 # is a 409 "ongoing operation". That POST was not guarded, so the
 # ProvisionTransportError propagated out of provision(), cmd_provision never
 # wrote provision_result.json or PROVISION.md, and the workspace created two

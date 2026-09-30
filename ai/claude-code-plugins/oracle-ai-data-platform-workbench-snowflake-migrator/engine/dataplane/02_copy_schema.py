@@ -31,9 +31,8 @@ target's types: a target column that is not DECIMAL, or a DECIMAL with fewer
 integer digits or a smaller scale, would be rounded or truncated by the
 INSERT with the row count intact -- `type_drift` too, and NOT copied.
 
-The copy's claim is the verification, not the INSERT returning: exactly the
-discipline the control-plane deploy learned from live AIDP (a 2xx is not the
-claim).
+The copy's claim is the verification, not the INSERT returning: every
+table's row count is read back and compared with the source.
 
 CONSISTENCY: each table is read at its own moment. If the source is still
 being written, per-table counts can be exact and the SCHEMA still be
@@ -401,8 +400,9 @@ def _copy(spark, src: str, tgt: str, *, mode: str, verify: str,
                 "source_count": source_count, "started_at": started,
                 "reason": f"{len(drift)} DECIMAL column(s) are narrower or "
                           f"not DECIMAL on the target; an INSERT would round "
-                          f"or truncate them silently. NOT copied. Recreate "
-                          f"the table from the approved plan."}
+                          f"or truncate them with the row count unchanged. "
+                          f"NOT copied. Recreate the table from the approved "
+                          f"plan."}
 
     target_rows = _count(spark, tgt)
     if mode == "skip-existing" and target_rows > 0:
@@ -511,8 +511,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--source-mode", choices=list(SOURCE_MODES),
                     default="connector",
                     help="how to READ the source (see snowmig_source.py). "
-                         "connector is the live-verified default and needs "
-                         "no successful catalog crawl")
+                         "connector is the default and needs no catalog "
+                         "crawl")
     ap.add_argument("--source-config",
                     help="JSON/YAML connection config (connector mode)")
     ap.add_argument("--source-catalog",

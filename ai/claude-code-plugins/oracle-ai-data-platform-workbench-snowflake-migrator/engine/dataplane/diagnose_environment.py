@@ -1,16 +1,17 @@
 """# Snowflake → AIDP migration: environment diagnosis
 
-Run this INSIDE AIDP (any cluster) before the migration jobs. It answers the
-four questions that cost a day to answer the hard way, in order, and each
-check prints a verdict rather than a traceback:
+Run this INSIDE AIDP (any cluster) before the migration jobs. It answers
+four questions, in order, and each check prints a verdict rather than a
+traceback:
 
-1. **Where do workspace files land on this cluster?** (`/Workspace` on the
-   validated build.)
+1. **Where do workspace files land on this cluster?** (The migration jobs'
+   default paths are under `/Workspace`.)
 2. **Can this cluster reach Snowflake at all?** (TCP 443 to the account host.)
 3. **Do the credentials work through the AIDP Snowflake connector?**
    (`current_user()` via pushdown — the path the migration scripts use.)
-4. **Does the registered EXTERNAL catalog actually expose anything?**
-   (Its crawler can fail while the connector works — observed live.)
+4. **Does the registered EXTERNAL catalog expose any schemas?**
+   (The catalog is filled by its crawler, which is checked separately from
+   the connector.)
 
 `CONFIG_PATH` points at the config's `snowflake:` block, which
 `provision --source-config` places on the workspace mount as JSON
@@ -147,10 +148,11 @@ if EXTERNAL_CATALOG:
         schemas = _spark().sql(f"SHOW SCHEMAS IN `{EXTERNAL_CATALOG}`").collect()
         verdict("external catalog populated", bool(schemas),
                 f"{len(schemas)} schema(s)" if schemas else
-                "registered but EMPTY — the crawler has not succeeded. Check "
-                "its refresh status; a crawl can fail (CONNECTOR_0067, "
-                "'Login has timed out') while the connector above works, "
-                "because the crawler runs outside the cluster's network path")
+                "registered but EMPTY — no crawl has populated it yet. Check "
+                "its refresh status; the crawler reaches Snowflake outside "
+                "the cluster's network path, so a crawl error (for example "
+                "CONNECTOR_0067, 'Login has timed out') can occur while the "
+                "connector check above passes")
     except Exception as exc:
         verdict("external catalog populated", False,
                 f"{type(exc).__name__}: {str(exc)[:300]}")
@@ -161,7 +163,7 @@ else:
 # %% [markdown] Reading the result
 # | Pattern | What it means | What to do |
 # |---|---|---|
-# | connector PASS, catalog EMPTY | the credentials are fine; the crawler cannot reach Snowflake | run the migration with `--source-mode connector` (the default) |
+# | connector PASS, catalog EMPTY | the credentials work; no crawl has populated the catalog yet | run the migration with `--source-mode connector` (the default) |
 # | egress FAIL | the cluster has no route to Snowflake | fix the cluster's network/NAT before anything else |
 # | connector FAIL, egress PASS | credentials, role, warehouse or key | re-confirm the config fields with the user, then retry |
 # | config FAIL | the file is not on the mount, or not readable | re-run `provision --source-config`; a YAML value with `:`, `{`, `[`, `*` or a leading quote must be single-quoted |

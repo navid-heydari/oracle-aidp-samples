@@ -6,7 +6,7 @@ extractor previously picked these settings up only incidentally.
 REPORTS, NEVER PROPOSES. No OPTIMIZE, VACUUM, ZORDER or RETAIN appears here --
 choosing a cadence needs the customer's recovery requirements and query
 patterns, which this plugin does not know. See references/maintenance-and-
-layout.md and ACTION-ITEMS.md (M3).
+layout.md.
 
 Two rules shape the implementation:
 
@@ -36,14 +36,15 @@ NO_AIDP_EQUIVALENT = (
      "snowflake": "7 days of Snowflake-operated recovery after Time Travel "
                   "expires. Not user-controllable, and not something the "
                   "customer ever had to run.",
-     "impact": "There is NO AIDP equivalent and no Delta setting restores it. "
-               "Delta retention plus VACUUM is the whole recovery story, and "
-               "it is operated by the customer."},
+     "impact": "AIDP has no Fail-safe equivalent. Recovery on Delta is "
+               "bounded by the table's retention settings and VACUUM "
+               "schedule, which the customer operates."},
     {"capability": "Search Optimization Service",
      "snowflake": "Point lookups on high-cardinality, non-clustered columns.",
-     "impact": "No AIDP equivalent. Delta data skipping plus ZORDER covers "
-               "range and prefix predicates; arbitrary high-cardinality point "
-               "lookups regress."},
+     "impact": "No direct AIDP equivalent. Delta data skipping plus ZORDER "
+               "covers range and prefix predicates; measure point lookups on "
+               "high-cardinality columns before cutover, as they may run "
+               "slower."},
     {"capability": "MAX_DATA_EXTENSION_TIME_IN_DAYS",
      "snowflake": "Bounds how long Snowflake may extend retention to keep a "
                   "stream from going stale.",
@@ -178,16 +179,17 @@ def _signals(rec: dict) -> list[dict]:
                       f'automatic_clustering='
                       f'{"ON" if rec["automatic_clustering"] else "OFF"}',
             "aidp_equivalent": "liquid clustering (CLUSTER BY) or ZORDER",
-            "aidp_requires": "a scheduled job -- AIDP reclusters nothing on "
-                             "its own, where Snowflake does it in the "
-                             "background"})
+            "aidp_requires": "a scheduled job -- on AIDP, clustering runs as "
+                             "a scheduled OPTIMIZE, where Snowflake "
+                             "reclusters in the background"})
     if rec["search_optimization"]:
         out.append({
             "signal": "Search Optimization Service enabled",
             "detail": f'search_optimization_bytes={rec.get("search_optimization_bytes")}',
             "aidp_equivalent": None,
-            "aidp_requires": "no equivalent; point-lookup performance on "
-                             "high-cardinality columns will regress"})
+            "aidp_requires": "no direct equivalent; measure point-lookup "
+                             "performance on high-cardinality columns before "
+                             "cutover"})
     if rec["change_tracking"]:
         out.append({
             "signal": "change tracking enabled",

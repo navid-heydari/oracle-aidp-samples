@@ -46,11 +46,10 @@ PROPERTIES_THIS_BODY_CANNOT_CARRY = {
         "the catalog API table body has no nullability field (a field is "
         "fieldName/fieldType/fieldPrecision/fieldScale/fieldDescription), so "
         "columns the plan declares NOT NULL are created NULLABLE on this "
-        "transport. Nothing was guessed: an invented key would be accepted "
-        "with 202 and then fail silently. Create the table with the in-AIDP "
-        "structure notebook (`snowmig provision` + 01_create_structure), "
-        "which emits the reviewed CREATE TABLE verbatim, if the constraint "
-        "has to hold."),
+        "transport. The plugin sends only the fields the API defines. Create "
+        "the table with the in-AIDP structure notebook (`snowmig provision` "
+        "+ 01_create_structure), which emits the reviewed CREATE TABLE "
+        "verbatim, if the constraint has to hold."),
 }
 
 # What AIDP calls its two catalog shapes, LIVE-VERIFIED 2026-09-18 by reading
@@ -107,9 +106,8 @@ _DECIMAL = re.compile(r"^DECIMAL\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)$", re.I)
 # table never appears and no error is reported anywhere.
 _SILENTLY_REJECTED = {
     "TIMESTAMP_NTZ": (
-        "the catalog API accepts `timestamp` but not `timestamp_ntz`. A POST "
-        "carrying it returns 202 Accepted and the create then fails SILENTLY "
-        "-- the table never appears and nothing says why. Snowflake "
+        "the catalog API accepts `timestamp` but not `timestamp_ntz` as a "
+        "field type, so this column cannot be sent as planned. Snowflake "
         "TIMESTAMP_NTZ is mapped to Spark TIMESTAMP_NTZ on purpose, because "
         "bare TIMESTAMP is session-timezone-dependent and the wrong choice "
         "shifts every timestamp. Downgrading is therefore a DECISION: pass "
@@ -168,8 +166,8 @@ def field_from_spark_type(name: str, spark_type: str | None,
 
     raise UnmappableFieldType(
         f"{name}: Spark type {spark_type!r} has no catalog field equivalent. "
-        f"Refusing to guess one -- a wrong field type creates a table that "
-        f"silently differs from the plan.")
+        f"Refusing to guess one -- a wrong field type would create a table "
+        f"that differs from the plan.")
 
 
 def _fields(columns: list[dict], *,

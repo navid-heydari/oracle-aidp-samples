@@ -29,7 +29,7 @@ rather than "it doesn't work".
 |---|---|---|
 | Snowflake | identity: user, role, account, region | connection |
 | Snowflake | list databases | `USAGE` on at least one database |
-| Snowflake | read `INFORMATION_SCHEMA` | read on a real database — the probe is **qualified**, because a fresh session has no current database and an unqualified reference fails with `090105` even for `ACCOUNTADMIN` |
+| Snowflake | read `INFORMATION_SCHEMA` | read on a real database — the probe is **qualified**, because a fresh session has no current database, so an unqualified reference fails with `090105` for any role |
 | AIDP | read the target catalog (`SHOW SCHEMAS`) | the four coordinates |
 | AIDP | **write** — creates a probe schema | `--write-probe --execute` |
 
@@ -37,7 +37,7 @@ rather than "it doesn't work".
 
 Proving write means actually writing. `--write-probe --execute` creates ONE
 schema named `snowmig_permission_probe_<8 hex chars>` (a fresh suffix per run,
-because a failed create permanently poisons that name) in the target catalog,
+so no earlier probe's name is ever reused) in the target catalog,
 confirms it is visible, then **drops that one schema**. Never `CASCADE`; it
 only ever removes the schema it just created.
 

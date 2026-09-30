@@ -35,21 +35,21 @@ MAINTENANCE_TRAPS: tuple[dict, ...] = (
      "trap": "On Delta, VACUUM is what bounds time travel.",
      "consequence": "On Snowflake, retention and storage reclamation are "
                     "independent and automatic. On Delta they are the same "
-                    "knob, so a customer used to reclaiming storage freely "
-                    "will delete their own recovery window. Snowflake's 7-day "
-                    "Fail-safe has no equivalent to fall back on."},
+                    "setting, so reclaiming storage aggressively also "
+                    "shortens the recovery window. Snowflake's 7-day "
+                    "Fail-safe has no Delta equivalent, so set retention "
+                    "deliberately."},
     {"id": "T_OPTIMIZE_GROWS_STORAGE",
      "trap": "OPTIMIZE increases storage until VACUUM runs.",
      "consequence": "It writes compacted files and leaves the originals as "
-                    "tombstones until retention expires. Scheduling "
-                    "compaction without reclamation is a cost regression, not "
-                    "a win."},
+                    "tombstones until retention expires, so schedule "
+                    "reclamation (VACUUM) alongside compaction."},
     {"id": "T_NOTHING_RUNS_ITSELF",
-     "trap": "Nothing runs itself; every OPTIMIZE and VACUUM is a scheduled job.",
-     "consequence": "AIDP has no managed predictive-optimization service. "
-                    "Maintenance becomes a pipeline the customer owns, "
-                    "monitors and pays for -- operational surface that simply "
-                    "did not exist for them on Snowflake."},
+     "trap": "Every OPTIMIZE and VACUUM is a scheduled job.",
+     "consequence": "On AIDP, table maintenance runs as scheduled jobs the "
+                    "customer owns, monitors and pays for, where Snowflake "
+                    "ran it in the background. Plan these jobs as part of "
+                    "the migration."},
 )
 
 _ALL_TRAPS = [t["id"] for t in MAINTENANCE_TRAPS]
@@ -94,14 +94,14 @@ OPTIONS: tuple[dict, ...] = (
             "which region the source account is actually in -- this decides "
             "whether same-region unload and Interconnect apply at all",
             "whether NUMBER(p,s) survives unload -> Parquet -> Delta with exact "
-            "precision (never yet measured)",
+            "precision (to be measured)",
             "transfer throughput actually achievable into OCI Object Storage",
         ],
         "handles": ["historic_bulk", "cutover"],
         "implementation_notes": [
             "An unload driver: per-table COPY INTO @stage as Parquet, chunked by partition or by a key range, resumable per chunk.",
             "A transfer step into OCI Object Storage -- rclone, OCI CLI bulk-upload, or storage replication -- with throughput measured, not assumed.",
-            "A landing step: Spark reads the Parquet and writes managed Delta, then registers the table durably rather than relying on CTAS auto-registration.",
+            "A landing step: Spark reads the Parquet and writes managed Delta, then registers the table explicitly in the catalog.",
             "A reconciliation harness: exact row counts and exact-decimal column sums compared against the source. Float tolerance is wrong for money.",
             "Cross-process throttling and 429 handling on the OCI side.",
         ],
@@ -110,7 +110,7 @@ OPTIONS: tuple[dict, ...] = (
         "id": "A2_FEDERATE_EXTERNAL_CATALOG",
         "maintenance_ownership": {
             "owner": 'snowflake', "traps_apply": [],
-            "note": 'The data never becomes a Delta table, so no Delta maintenance applies and none of the traps bite. Snowflake keeps maintaining layout -- and keeps billing for it. The trade is that Delta features (time travel on the target, ZORDER, CDF) are equally unavailable.'},
+            "note": 'The data never becomes a Delta table, so none of the Delta maintenance items apply. Snowflake continues to maintain the layout, and that maintenance stays on the Snowflake bill. The trade is that Delta features (time travel on the target, ZORDER, CDF) are equally unavailable.'},
         "name": "Federate: read Snowflake in place through an EXTERNAL catalog",
         "catalog_type": "EXTERNAL",
         "phase": ("historic", "ongoing"),
@@ -130,8 +130,9 @@ OPTIONS: tuple[dict, ...] = (
             "so this is not a destination",
             "Snowflake keeps running and keeps costing credits -- it defers spend "
             "rather than removing it",
-            "predicate and aggregation pushdown is limited, so large scans pull "
-            "rows across the wire repeatedly",
+            "predicates and aggregations that do not push down to Snowflake "
+            "pull their rows across the network on every scan, so large scans "
+            "need measuring first",
             "the native connector is read-only in AIDP 4.0, which rules out "
             "dual-write and write-back reconciliation",
         ],
@@ -167,7 +168,7 @@ OPTIONS: tuple[dict, ...] = (
             "reuses the existing ingestion tooling rather than replacing it",
         ],
         "cons": [
-            "Fivetran has NO AIDP destination and no generic protocol destination; "
+            "Fivetran has no AIDP destination and no generic protocol destination; "
             "its object-storage destination is AWS-only",
             "the Oracle destination is Beta, so volume and object-type coverage "
             "need confirming",
@@ -191,7 +192,7 @@ OPTIONS: tuple[dict, ...] = (
         "id": "A4_ICEBERG_INTEROP",
         "maintenance_ownership": {
             "owner": 'shared', "traps_apply": _ALL_TRAPS,
-            "note": 'Whoever WRITES the Iceberg tables owns their maintenance. If Snowflake writes them it compacts them; if AIDP writes them the obligation is yours. Iceberg has its own vocabulary for this -- compaction and expire-snapshots rather than OPTIMIZE and VACUUM -- so the traps apply with different command names, and snapshot expiry is what bounds time travel.'},
+            "note": 'Whoever WRITES the Iceberg tables owns their maintenance. If Snowflake writes them it compacts them; if AIDP writes them the obligation is yours. Iceberg has its own vocabulary for this -- compaction and expire-snapshots rather than OPTIMIZE and VACUUM -- so the same maintenance items apply with different command names, and snapshot expiry is what bounds time travel.'},
         "name": "Iceberg interop: share storage instead of copying",
         "catalog_type": "EXTERNAL",
         "phase": ("historic", "ongoing"),
@@ -271,7 +272,7 @@ OPTIONS: tuple[dict, ...] = (
         "maintenance_ownership": {
             "owner": None, "traps_apply": None,
             "note": "Unknown until the design is described. Whether the Delta "
-                    "maintenance traps apply depends on whether the design "
+                    "maintenance items apply depends on whether the design "
                     "lands Delta tables at all, and this plugin has not "
                     "assessed it."},
         "name": "Customer-defined — something not listed here, or not decided yet",

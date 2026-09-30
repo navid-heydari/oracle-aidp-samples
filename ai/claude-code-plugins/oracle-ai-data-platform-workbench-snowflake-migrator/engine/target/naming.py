@@ -79,7 +79,7 @@ def translate_name(original: str, *, kind: str = "resource",
 
     lowered = working.lower()
     if lowered != working:
-        notes.append("lower-cased (AIDP folds identifier case anyway)")
+        notes.append("lower-cased (AIDP stores identifiers in lower case)")
     working = lowered
 
     replaced = re.sub(r"[^a-z0-9]+", "_", working)

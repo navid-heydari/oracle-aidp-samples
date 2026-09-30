@@ -8,21 +8,28 @@ getting its scale wrong does not raise — it silently changes values.
 |---|---|---|
 | `NUMBER(p,s)`, `DECIMAL`, `NUMERIC` | `DECIMAL(p,s)` | Highest-consequence mapping. `NUMBER(38,0)` stays `DECIMAL(38,0)` — 38 digits do not fit in a `BIGINT` |
 | `NUMBER` with no precision | **blocked** | Refuses to guess |
-| `TIMESTAMP_NTZ` | `TIMESTAMP_NTZ` | **Not `TIMESTAMP`.** Spark's bare `TIMESTAMP` is session-timezone-dependent |
+| `TIMESTAMP_NTZ` | `TIMESTAMP` by default; `TIMESTAMP_NTZ` with `--timestamp-ntz preserve` | The target refuses `TIMESTAMP_NTZ` at CREATE TABLE, so the default carries it as `TIMESTAMP` and records the timezone caveat on every affected column: Spark's `TIMESTAMP` is read through the session timezone, so keep sessions on UTC. With `preserve`, `ddl` halts (exit 3) |
 | `TIMESTAMP_LTZ`, `TIMESTAMP_TZ`, `TIMESTAMP` | `TIMESTAMP` | Timezone semantics differ; recorded as a warning |
 | `TEXT`, `VARCHAR(n)`, `CHAR` | `STRING` | Declared length is not enforced by Delta; recorded |
 | `BOOLEAN`, `DATE`, `BINARY` | `BOOLEAN`, `DATE`, `BINARY` | Direct |
 | `FLOAT`, `DOUBLE`, `REAL` | `DOUBLE` | |
 | `TIME` | `STRING` | No Spark TIME type. **Warned**, not silent: ordering, comparison and time arithmetic become string operations |
-| `VARIANT`, `OBJECT`, `ARRAY` | **blocked** by default; `STRING` with `--semi-structured string` | Semi-structured; needs an explicit struct/map/array design |
+| `VARIANT`, `OBJECT`, `ARRAY` | `STRING` (JSON text) by default; **blocked** with `--semi-structured block` | Semi-structured; warned on every affected column. A typed struct/map/array design is a separate decision |
 | `GEOGRAPHY`, `GEOMETRY` | **blocked** by default; `STRING` with `--geospatial string` | No spatial target type |
 | anything else | **blocked** | Unmapped types are never approximated |
 
-## Properties dropped
+## Table properties
 
-Recorded in `omitted_properties`, never emitted: `CLUSTER BY` ·
-`DATA_RETENTION_TIME_IN_DAYS` · `CHANGE_TRACKING` ·
-`MAX_DATA_EXTENSION_TIME_IN_DAYS` · tags · masking policies · row-access policies.
+No table property is emitted as DDL:
+
+- Settings with an AIDP equivalent — `CLUSTER BY`,
+  `DATA_RETENTION_TIME_IN_DAYS`, `CHANGE_TRACKING` — are listed per object in
+  the DDL plan under *"Maintenance and layout — decisions, NOT applied"*, with
+  the equivalent named ([maintenance-and-layout.md](maintenance-and-layout.md)).
+- `MAX_DATA_EXTENSION_TIME_IN_DAYS`, which has no equivalent, is recorded in
+  `omitted_properties`.
+- Tags, masking policies and row-access policies are not carried;
+  `snowmig security` reports them in `SECURITY.md`.
 
 ## Constraints
 
@@ -37,8 +44,8 @@ the inventory and reported, not emitted as DDL.
 A view migrates only if every Snowflake-only construct in its body has an exact
 rewrite. A construct with one is **translated** and the rule id is recorded; a
 construct without one **blocks** the view with the construct named — it is never
-rewritten on a guess, because a view that ships a subtly wrong translation
-returns numbers. The authoritative list is `translate.RULES`, documented in
+rewritten on a guess, because a subtly wrong translation still returns numbers,
+just not the right ones. The authoritative list is `translate.RULES`, documented in
 [dialect-translation.md](dialect-translation.md); the table below summarises it.
 
 Object references inside a view body are identity in the default Bronze mirror
@@ -99,7 +106,7 @@ equivalent) and **materialized views** (rebuild as a table plus a refresh job).
 
 | Snowflake | AIDP |
 |---|---|
-| Database | EXTERNAL catalog (source type SNOWFLAKE) by default; Standard catalog on explicit request |
+| Database | In the S1–S12 runbook: an INTERNAL target catalog for the migrated tables, plus an EXTERNAL catalog (source type SNOWFLAKE) registered over the live source. The stand-alone catalog commands register the EXTERNAL catalog by default and create a Standard catalog on explicit request |
 | Schema | Schema |
 | Table | Table (managed Delta) |
 | View | View |
@@ -119,23 +126,24 @@ informational **note**, not a warning, precisely so it does not inflate every
 table's risk level — a warning on every integer column would drown the warnings
 that matter.
 
-## The two escape hatches
+## Semi-structured, geospatial and timestamp modes
 
-Default-deny is right for a type whose target shape is a design decision. But
-default-deny with *no alternative* is not a usable tool: one `VARIANT` column
-blocks its entire table, and a real Snowflake estate — order payloads, event
-bodies, API responses — is full of them.
+| Flag | Config key | Default | The other mode |
+|---|---|---|---|
+| `--semi-structured` | `mapping.semi_structured` | `string`: carry the JSON as text, with a warning on every affected column | `block`: the table is blocked until a typed design exists |
+| `--geospatial` | — | `block`: the table is blocked | `string`: carry the value as text, with no spatial type, index or predicate support |
+| `--timestamp-ntz` | `mapping.timestamp_ntz` | `timestamp`: carry `TIMESTAMP_NTZ` as `TIMESTAMP`, with the timezone caveat recorded | `preserve`: keep `TIMESTAMP_NTZ`; `ddl` halts on it (exit 3) |
 
-| Flag | Default | What the non-default does |
-|---|---|---|
-| `--semi-structured` | `block` | `string`: carry the JSON as text, with a warning on every affected column |
-| `--geospatial` | `block` | `string`: carry the value as text, with no spatial type, index or predicate support |
+`--mapping-defaults off` (or `mapping.enabled: false` in the config) restores
+the strict modes for a run — `VARIANT` blocks and `TIMESTAMP_NTZ` is preserved
+— and an explicit flag always wins.
 
-They are **separate flags on purpose**. Deciding to carry JSON as text is not
-the same decision as carrying a geography as text, and one switch for both would
-force a customer to accept a call they were not asked about.
+`--semi-structured` and `--geospatial` are **separate flags on purpose**.
+Carrying JSON as text is not the same decision as carrying a geography as
+text, and one switch for both would make a customer accept a call they were
+not asked about.
 
-Neither hatch solves anything — both defer. With `--semi-structured string`
-nothing on the target can address a field inside the value, and any query using
-Snowflake path syntax stops working until a struct/map design is agreed. Say
-that when you use it.
+Text defers the design rather than completing it. With JSON carried as text,
+nothing on the target can address a field inside the value (`from_json` /
+`get_json_object` read it), and a view using Snowflake path syntax is blocked
+until a struct/map design is agreed. Tell the consumers of those tables.

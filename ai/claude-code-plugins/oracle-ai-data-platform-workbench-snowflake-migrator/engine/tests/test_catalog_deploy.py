@@ -667,7 +667,7 @@ def test_a_poisoned_name_is_named_as_such():
     out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=call,
                          retry_delays=(), verify_delays=())
     reason = out["failed"][0]["reason"]
-    assert "poison" in reason.lower() or "burned" in reason.lower()
+    assert "cannot be reused" in reason.lower()
     assert "fresh schema" in reason.lower() or "new schema" in reason.lower()
     assert out["poisoned_names"] == ["lake.DB.T0"]
 
@@ -1092,7 +1092,7 @@ def test_a_refused_create_is_not_called_a_burned_name():
                          call=Refusing(refuse=("T0",)), retry_delays=(),
                          verify_delays=())
     reason = out["failed"][0]["reason"].lower()
-    assert "burned" not in reason or "not burned" in reason
+    assert "cannot be reused" not in reason
     assert "fresh schema" not in reason or "would not help" in reason
     assert out["poisoned_names"] == []
 
@@ -1133,8 +1133,8 @@ def test_an_accepted_create_that_vanishes_is_still_a_burned_name():
     out = deploy_catalog(_plan(1), target=TARGET, execute=True,
                          call=Vanishing(), retry_delays=(), verify_delays=())
     reason = out["failed"][0]["reason"]
-    assert "202 Accepted" in reason
-    assert "BURNED" in reason
+    assert "was accepted" in reason
+    assert "CANNOT BE REUSED" in reason
     assert out["poisoned_names"] == ["lake.DB.T0"]
 
 
@@ -1183,7 +1183,7 @@ def test_a_catalog_that_cannot_make_views_is_not_a_burned_name():
     out = deploy_catalog(_one_view_plan(), target=TARGET, execute=True,
                          call=ViewsVanish(), retry_delays=(), verify_delays=())
     reason = out["failed"][0]["reason"]
-    assert "BURNED" not in reason, reason
+    assert "CANNOT BE REUSED" not in reason, reason
     assert "novel view name" in reason.lower()
     assert out["poisoned_names"] == []
 
@@ -1205,7 +1205,7 @@ def test_a_failed_table_is_still_probed_with_a_table():
     out = deploy_catalog(_plan(1), target=TARGET, execute=True, call=rec,
                          retry_delays=(), verify_delays=())
     assert out["diagnosis_probes"][0]["kind"] == "TABLE"
-    assert "BURNED" in out["failed"][0]["reason"]
+    assert "CANNOT BE REUSED" in out["failed"][0]["reason"]
     assert out["poisoned_names"] == ["lake.DB.T0"]
 
 
@@ -1245,7 +1245,7 @@ def test_a_server_error_with_a_working_probe_points_at_this_object():
                          retry_delays=(), verify_delays=())
     reason = out["failed"][0]["reason"]
     assert "about THIS object" in reason
-    assert "not burned" in reason
+    assert "can still be used" in reason
 
 
 def test_a_catalog_that_refuses_every_view_says_so_and_names_the_way_round():

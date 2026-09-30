@@ -232,11 +232,13 @@ def test_a_board_colours_the_diagram_by_status(tmp_path):
 
 
 def test_the_committed_diagram_matches_the_code():
-    """The .mmd at the plugin root is generated. If STAGES changes and the
-    file is not regenerated (`snowmig stages --diagram`), this fails."""
-    committed = (ENGINE.parent / "phase-diagram_v1.mmd").read_text()
-    assert committed == phase_diagram(), (
-        "phase-diagram_v1.mmd is stale; regenerate it with "
+    """ARCHITECTURE.md embeds the generated diagram. If STAGES changes and
+    the block is not refreshed (`snowmig stages --write-diagram`), this
+    fails."""
+    from report.diagram import embed_in_architecture
+    text = (ENGINE.parent / "ARCHITECTURE.md").read_text(encoding="utf-8")
+    assert embed_in_architecture(text) == text, (
+        "the phase diagram in ARCHITECTURE.md is stale; refresh it with "
         "`bin/snowmig stages --write-diagram`")
 
 

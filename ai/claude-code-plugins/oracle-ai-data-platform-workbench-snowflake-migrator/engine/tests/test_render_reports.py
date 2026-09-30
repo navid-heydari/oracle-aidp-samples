@@ -692,13 +692,13 @@ def test_soft_clone_summary_names_a_dropped_description():
             "source_identifier": "D.PUBLIC.ORDERS", "target_fqn": "d.public.orders",
             "reason": "created with the planned columns, but table COMMENT: "
                       "planned 'orders' found ''."}]})
-    assert "## Descriptions the target dropped" in md
+    assert "## Descriptions not found on the target" in md
     assert "`d.public.orders`" in md and "table COMMENT" in md
 
 
 def test_soft_clone_summary_is_silent_when_nothing_was_dropped():
     md = render_soft_clone_summary(PLAN, dict(_DEPLOYED))
-    assert "cannot carry" not in md and "Descriptions the target dropped" not in md
+    assert "cannot carry" not in md and "Descriptions not found" not in md
 
 
 # ----------------------------- the inventory headline agrees with the run

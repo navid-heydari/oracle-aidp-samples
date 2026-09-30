@@ -16,7 +16,8 @@ can be re-run alone. The main ones:
   compute -> compute.json        + COMPUTE_PROPOSAL.md      (needs Snowflake)
   smoke   -> smoke.json          + SMOKE_TEST.md            (source; dest if given)
   notebook-> <nb>.ipynb          + NOTEBOOK.md              (offline; --upload is
-                                                             refused, see GAPS 13)
+                                                             a dry run, refused
+                                                             with --execute)
   summary -> SUMMARY.md                                     (offline)
   data-options -> data_options.json + DATA_MOVEMENT_OPTIONS.md  (offline; the
                   options are PROPOSALS. This CLI copies no rows itself; the
@@ -557,13 +558,15 @@ def cmd_stages(args) -> int:
     phases = phase_report(out)
     _write(out, "phase_report.json", phases)
     _write(out, "PHASES.md", render_phase_report(phases))
-    # Coloured by this run; the uncoloured copy at the plugin root is the
-    # committed one, and a test holds it equal to the code.
+    # Coloured by this run; the uncoloured copy embedded in ARCHITECTURE.md
+    # is the committed one, and a test holds it equal to the code.
     _write(out, "PHASES.mmd", phase_diagram(board))
     if getattr(args, "write_diagram", False):
-        path = plugin_root() / "phase-diagram_v1.mmd"
-        path.write_text(phase_diagram())
-        print(f"  -> {path}")
+        from report.diagram import embed_in_architecture
+        path = plugin_root() / "ARCHITECTURE.md"
+        path.write_text(embed_in_architecture(
+            path.read_text(encoding="utf-8")), encoding="utf-8")
+        print(f"  -> {path} (phase diagram)")
     for line in render_stages(board).splitlines():
         print(f"  {line}" if line else "")
     return 0
@@ -1177,11 +1180,10 @@ def cmd_run(args) -> int:
         from target.provisioning import COPY_JOB_PREFIX
         from target.stage_notebooks import STAGES, declared_stage_params
         head = (
-            "--param is refused: a run-level job parameter is not known to "
-            "reach a notebook stage (probed live: neither argv nor "
-            "environment; oidlUtils.parameters.getParameter is "
-            "live-verified for a job TASK's parameters only). This run "
-            "would ignore " + ", ".join(sorted(parameters)) + " and execute "
+            "--param is refused: a run-level job parameter does not reach "
+            "a notebook stage. The stage notebooks read the job TASK's "
+            "parameters (oidlUtils.parameters.getParameter) and their "
+            "PARAMS cell. This run would ignore " + ", ".join(sorted(parameters)) + " and execute "
             "what the job already carries: its task parameters, which win "
             "over the notebook's PARAMS cell, then the PARAMS literals.\n")
         stage = next((s for s in STAGES if s.job == args.job), None)
@@ -1685,8 +1687,8 @@ def _render_run(result: dict) -> str:
             "reached a terminal state was resubmitted, and **the output "
             "below then belongs to the last run key, not the first.** A "
             "run whose cancel did NOT (it raised, or never left CANCELING) "
-            "was kept: resubmitting into a slot that is still held gets "
-            "the new run accepted and discarded.",
+            "was kept, and no new run was submitted while it may still "
+            "hold the job's slot.",
             "",
             "| Run | Cancelled to | Waited | Outcome |",
             "|---|---|---|---|",
@@ -1749,9 +1751,8 @@ def cmd_catalog(args) -> int:
             if requested_type != catalog_type else ""
         print(f"  note: creating the {requested_type} catalog CONTAINER "
               f"only{alias}. Its schemas and tables are created on AIDP "
-              f"compute by the structure workflow (runbook S10) -- a "
-              f"control-plane table create can return 202 Accepted and "
-              f"create nothing.")
+              f"compute by the structure workflow (runbook S10), where each "
+              f"create is read back.")
 
     # The connection comes from the ONE config file, discovered the same way
     # every other stage discovers it -- requiring an explicit --config here
@@ -2046,38 +2047,30 @@ def cmd_notebook(args) -> int:
             "--workspace, --cluster-id, --catalog. Ask the user for them.")
 
     # An upload is a write, so it is a dry run without --execute like every
-    # other write. And WITH --execute it is refused: the only transport this
-    # command has is the Jupyter contents API, which the validated build
-    # answers with a 200 and then cannot read the file back (GAPS.md 13).
-    # Reporting "uploaded" on that 200 was a false success; the verified
-    # upload surface is the one `provision` drives for the stage notebooks.
+    # other write. And WITH --execute it is refused: stage notebooks reach
+    # the workspace through the upload surface `provision` drives, each
+    # read back; this command keeps no second upload route.
     remedy = (f"The notebook is at {local}. Upload it from the workspace UI, "
-              f"or create the structure through the verified path: `snowmig "
+              f"or create the structure through the workflow path: `snowmig "
               f"provision --execute` places the stage notebooks in the "
               f"workspace and `snowmig run --job snowmig_01_structure` "
-              f"executes the structure stage from ddl_plan.json.")
+              f"executes the structure stage from ddl_plan.json (S10).")
     if not args.execute:
         print(f"  dry run: --upload would place {local.name} at {ws_path} in "
               f"workspace {target.workspace} on {target.datalake_ocid}; "
-              f"nothing was sent. Add --execute to attempt it -- which is "
-              f"currently refused: the upload transport is known-bad "
-              f"(GAPS.md 13). {remedy}")
+              f"nothing was sent. With --execute the upload is refused. "
+              f"{remedy}")
         lines += [f"Upload was a **dry run**: nothing was sent to `{ws_path}`. "
-                  f"With `--execute` the upload is refused because its "
-                  f"transport is known-bad (GAPS.md 13). {remedy}", ""]
+                  f"With `--execute` the upload is refused. {remedy}", ""]
         _write(out, "NOTEBOOK.md", "\n".join(lines))
         return 0
 
-    lines += [f"**Upload refused.** Nothing was sent to `{ws_path}`: the "
-              f"transport this command has (the Jupyter contents API) returns "
-              f"200 and the file cannot be read back on the validated build "
-              f"(GAPS.md 13), so a success here would be a false one. "
-              f"{remedy}", ""]
+    lines += [f"**Upload refused.** Nothing was sent to `{ws_path}`: this "
+              f"command does not upload notebooks; the stage notebooks are "
+              f"placed on the workspace by `provision`. {remedy}", ""]
     _write(out, "NOTEBOOK.md", "\n".join(lines))
-    print(f"error: notebook --upload is refused: its transport is known-bad "
-          f"(GAPS.md 13 -- the PUT returns 200 and the file cannot be read "
-          f"back), so an upload could not be reported honestly. {remedy}",
-          file=sys.stderr)
+    print(f"error: notebook --upload --execute is refused; nothing was sent. "
+          f"{remedy}", file=sys.stderr)
     return 1
 
 
@@ -2203,6 +2196,13 @@ def cmd_teardown(args) -> int:
         raise MissingTarget("teardown --execute needs --datalake-ocid (or "
                             "aidp.datalake_ocid in the config)")
     call = make_provision_call(ocid) if args.execute else None
+    scope = getattr(args, "scope", None) or "compute"
+    if scope != "compute":
+        return _teardown_scoped(args, out, prov, call, ocid, scope)
+    if getattr(args, "include_data", False):
+        raise MissingTarget("--include-data belongs to --scope all (it lets "
+                            "that scope delete the INTERNAL catalog and its "
+                            "tables); the compute scope deletes no data")
     res = teardown(call, prov, action=action, execute=args.execute,
                    datalake_ocid=ocid)
     _write(out, "teardown_result.json", res)
@@ -2228,6 +2228,47 @@ def cmd_teardown(args) -> int:
     # identify is not "nothing to do".
     print(f'  teardown: {res["verified"]}/{len(res["steps"])} cluster(s) '
           f'{action} verified')
+    return 0 if res["verified"] == len(res["steps"]) else 1
+
+
+def _teardown_scoped(args, out, prov, call, ocid, scope: str) -> int:
+    """teardown --scope credential | all: remove the credential, or undo
+    the migration. Opt-in; the default scope keeps the migration's output."""
+    from report.resources import LEDGER
+    from target.teardown import render_teardown, teardown_everything
+    if scope == "all" and args.action == "stop":
+        raise MissingTarget("--scope all deletes; --action stop contradicts "
+                            "it. Use the default scope to stop the clusters "
+                            "and keep everything else.")
+    if args.include_data and scope != "all":
+        raise MissingTarget("--include-data belongs to --scope all")
+    ledger = []
+    path = out / LEDGER
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                ledger.append(json.loads(line))
+            except ValueError:
+                continue
+    res = teardown_everything(call, prov or {}, scope=scope,
+                              execute=args.execute, ledger=ledger,
+                              include_data=args.include_data,
+                              datalake_ocid=ocid)
+    _write(out, "teardown_result.json", res)
+    _write(out, "TEARDOWN.md", render_teardown(res))
+    if res.get("unknown"):
+        print(f'  teardown: {res["note"]}', file=sys.stderr)
+        return 1
+    if res["dry_run"]:
+        todo = [s for s in res["steps"] if s.get("action") == "would delete"]
+        print(f"  teardown --scope {scope}: dry run — would delete "
+              f"{len(todo)} object(s): "
+              + ", ".join(f'{s["kind"]} {s.get("name") or s.get("catalog")}'
+                          for s in todo)
+              + ("; kept: " + str(len(res["kept"])) if res["kept"] else ""))
+        return 0
+    print(f'  teardown --scope {scope}: {res["verified"]}/'
+          f'{len(res["steps"])} deletion(s) verified')
     return 0 if res["verified"] == len(res["steps"]) else 1
 
 
@@ -2766,8 +2807,8 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("stages", parents=[common],
                        help="what runs, what has run, what it found (offline)")
     st.add_argument("--write-diagram", action="store_true",
-                    help="regenerate phase-diagram_v1.mmd at the plugin root "
-                         "from STAGES")
+                    help="refresh the phase diagram embedded in ARCHITECTURE.md "
+                         "from the stage list")
     st.set_defaults(func=cmd_stages)
 
     dm = sub.add_parser(
@@ -2931,17 +2972,17 @@ def build_parser() -> argparse.ArgumentParser:
     dep = sub.add_parser("deploy", parents=[common], help="dry-run by default")
     dep.add_argument("--execute", action="store_true")
     dep.add_argument("--no-diagnose", action="store_true",
-                     help="skip the one-per-schema probe that distinguishes a "
-                          "permanently burned object name from a bad request. "
-                          "The probe writes (and cleans up), so it can be "
-                          "turned off")
+                     help="skip the one-per-schema probe that tells whether "
+                          "a failed create is specific to its object name or "
+                          "to the request. The probe writes (and cleans up), "
+                          "so it can be turned off")
     dep.add_argument("--transport", choices=["catalog_api", "sql"],
                      default="catalog_api",
                      help="catalog_api (default): create schemas/tables/views "
                           "through the catalog CRUD API. Needs no Spark "
-                          "cluster. sql: the SQL path -- POST .../sql/execute "
-                          "returns 404 on a live DataLake, so it is kept only "
-                          "for a backend where SQL does work")
+                          "cluster. sql: the SQL-statement path (POST "
+                          ".../sql/execute), for a deployment that exposes "
+                          "that endpoint")
     _add_target_args(dep)
     dep.add_argument("--chunk-size", type=int, default=25)
     dep.set_defaults(func=cmd_deploy)
@@ -3017,8 +3058,8 @@ def build_parser() -> argparse.ArgumentParser:
                     default=None,
                     help="how the in-AIDP scripts READ Snowflake. connector "
                          "(default) reads it directly from the cluster and "
-                         "needs no catalog crawl — the path proven live; "
-                         "external-catalog uses three-part names and needs a "
+                         "needs no catalog crawl; external-catalog uses "
+                         "three-part names and needs a "
                          "successful crawl. A --reuse-existing re-push keeps "
                          "the mode the earlier push recorded")
     pv.add_argument("--source-config",
@@ -3104,12 +3145,12 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--job-key", help="job key; use when the name is ambiguous")
     rn.add_argument("--param", action="append", metavar="NAME=VALUE",
                     help="refused, with the route that does set the value: "
-                         "a run-level parameter is not known to reach a "
-                         "notebook (only a job TASK's parameters are "
-                         "live-verified to), so it would be ignored. Set "
-                         "stage values with `provision --stage-param` or on "
-                         "the job's task. Scope and mode are INPUTS -- "
-                         "never edit a script to change them")
+                         "a run-level parameter does not reach a notebook "
+                         "(the stage notebooks read the job TASK's "
+                         "parameters), so it would be ignored. Set stage "
+                         "values with `provision --stage-param` or on the "
+                         "job's task. Scope and mode are INPUTS -- never "
+                         "edit a script to change them")
     rn.add_argument("--refresh", action="store_true",
                     help="re-read the run already recorded in "
                          "run_<job>.json from AIDP -- status, then output "
@@ -3129,20 +3170,18 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--cold-start-seconds", type=float,
                     default=COLD_START_SECONDS,
                     help="how long to wait for the CLUSTER TO PICK UP the "
-                         "task before giving up on the run and resubmitting "
-                         f"(default: {COLD_START_SECONDS:.0f}). A cluster "
-                         "sometimes never takes the first run on a new "
-                         "workspace: it sits at RUNNING with the task "
-                         "unstarted and never fails")
+                         "task before cancelling the run and resubmitting "
+                         f"(default: {COLD_START_SECONDS:.0f}). A run whose "
+                         "task has not started within this window (RUNNING, "
+                         "task unstarted) is cancelled and resubmitted")
     rn.add_argument("--cold-start-restarts", type=int,
                     default=COLD_START_RESTARTS,
-                    help="how many times a never-picked-up run may be "
-                         "cancelled and resubmitted (default: "
-                         f"{COLD_START_RESTARTS}; 0 disables). A fresh "
-                         "cluster has ignored two runs in a row, so one is "
-                         "not enough. Every restart is named in the run "
-                         "report; when all are spent the last run is "
-                         "cancelled and the stage exits 1 as COLD START")
+                    help="how many times a run whose task was not picked "
+                         "up may be cancelled and resubmitted (default: "
+                         f"{COLD_START_RESTARTS}; 0 disables). Every restart "
+                         "is named in the run report; when all are spent the "
+                         "last run is cancelled and the stage exits 1 as "
+                         "COLD START")
     rn.set_defaults(func=cmd_run)
 
     cat = sub.add_parser("catalog", parents=[common],
@@ -3202,17 +3241,17 @@ def build_parser() -> argparse.ArgumentParser:
     nb = sub.add_parser("notebook", parents=[common],
                         help="generate the shallow-clone notebook (offline). "
                              "--upload is a dry run without --execute, and "
-                             "refused with it: its transport is known-bad "
-                             "(GAPS.md 13); the structure workflow is "
-                             "`provision` + `run`")
+                             "refused with it; the structure is created by "
+                             "`provision` + `run --job snowmig_01_structure` "
+                             "(S10)")
     _add_target_args(nb)
     nb.add_argument("--upload", action="store_true",
                     help="say where the notebook would be placed in the AIDP "
                          "workspace (dry run). With --execute the upload is "
-                         "refused -- see GAPS.md 13")
+                         "refused")
     nb.add_argument("--execute", action="store_true",
-                    help="with --upload, attempt the upload instead of the "
-                         "dry run; currently refused (GAPS.md 13)")
+                    help="with --upload: refused; the structure is created "
+                         "by `run --job snowmig_01_structure` (S10)")
     nb.add_argument("--dry-run", action="store_true",
                     help="accepted for compatibility: the upload is a dry run "
                          "unless --execute is given")
@@ -3252,8 +3291,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     td = sub.add_parser("teardown", parents=[common],
                         help="terminate the clusters this migration "
-                             "allocated (stop by default); dry run unless "
-                             "--execute")
+                             "allocated (stop by default); with --scope, "
+                             "remove its credential or everything it "
+                             "created. Dry run unless --execute")
     _add_target_args(td)
     td.add_argument("--config", "--connection-config", dest="config",
                     help="the migration config; `teardown.action` and "
@@ -3261,6 +3301,20 @@ def build_parser() -> argparse.ArgumentParser:
     td.add_argument("--action", choices=("stop", "delete"), default=None,
                     help="overrides teardown.action in the config "
                          "(default stop)")
+    td.add_argument("--scope", choices=("compute", "credential", "all"),
+                    default="compute",
+                    help="compute (default): the clusters only, the "
+                         "migration's output kept. credential: only the "
+                         "Snowflake credential provision --source-config "
+                         "placed on the workspace (the copy jobs can no "
+                         "longer read Snowflake). all: UNDO the migration -- "
+                         "credential, jobs, clusters, the catalogs it "
+                         "created and the workspace, each only where the "
+                         "record proves this migration created it")
+    td.add_argument("--include-data", action="store_true",
+                    help="with --scope all, also delete the INTERNAL target "
+                         "catalog this migration created, with its tables "
+                         "and rows. Without it that catalog is kept")
     td.add_argument("--execute", action="store_true")
     td.set_defaults(func=cmd_teardown)
 

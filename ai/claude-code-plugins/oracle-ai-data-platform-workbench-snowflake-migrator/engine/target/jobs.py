@@ -296,9 +296,9 @@ def watch_job(call: Callable[..., dict], *, workspace: str, job_key: str,
         raise JobRunCollision(
             f"job {job_key} already has {len(active)} run(s) in flight: "
             + ", ".join(active)
-            + ". A job with maxConcurrentRuns=1 accepts a second run and then "
-              "discards it, so starting one now would look like a run that "
-              "did nothing. Wait for it, or cancel it "
+            + ". A job with maxConcurrentRuns=1 executes one run at a time, "
+              "so a second run started now would not execute. Wait for it, "
+              "or cancel it "
               "(`aidp workflow cancel-job-run <workspace> <run-key>`) -- and "
               "note that a notebook re-uploaded mid-run does NOT affect the "
               "run already going.")

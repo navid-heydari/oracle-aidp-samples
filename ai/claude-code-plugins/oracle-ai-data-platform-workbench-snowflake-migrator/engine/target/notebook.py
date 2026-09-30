@@ -192,8 +192,8 @@ def build_notebook(ddl_plan: dict, plan: dict, *, catalog: str,
     cells.append(_md("## 1. Schemas",
                      "",
                      "Created before any object. `IF NOT EXISTS`, so re-running is "
-                     "safe. No `COMMENT` is emitted: AIDP silently fails to persist "
-                     "it on a schema create."))
+                     "safe. No `COMMENT` is emitted on a schema create; table and "
+                     "column comments are carried in the statements below."))
     schema_lines = ["_schema_sql = ["]
     schema_lines += [f"    ('{c}.{sc}', 'CREATE SCHEMA IF NOT EXISTS `{c}`.`{sc}`'),"
                      for c, sc in schemas]
@@ -234,9 +234,9 @@ def build_notebook(ddl_plan: dict, plan: dict, *, catalog: str,
 
     cells.append(_md("## 4. Verify",
                      "",
-                     "Each object is probed individually. A batch can report "
-                     "success while statements inside it failed, so `verified` is "
-                     "the only honest count."))
+                     "Each object is probed individually and its columns are "
+                     "compared with the plan, so `verified` counts only objects "
+                     "read back with the planned structure."))
     verify = ["_expected = ["]
     for s in statements:
         kind = "VIEW" if s.get("object_type") == "VIEW" else "TABLE"

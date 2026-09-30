@@ -31,14 +31,12 @@ class RefusedToExecute(RuntimeError):
 
 _STANDARD_CONTAINER_ONLY = (
     "the STANDARD catalog CONTAINER was created, and nothing inside it. Its "
-    "schemas and tables belong on AIDP compute (a Spark cluster), not the "
-    "control-plane catalog CRUD API -- that POST returns 202 Accepted and can "
-    "create nothing, so a table created that way cannot be verified. Create "
-    "the structure at runbook S10 with `snowmig.py run --job "
-    "snowmig_01_structure` (one workflow per schema, from the approved "
-    "ddl_plan.json placed on the workspace by `snowmig.py provision "
-    "--execute`). Do not use `notebook --upload`: its transport is known-bad "
-    "(GAPS 13) and the upload is refused.")
+    "schemas and tables are created on AIDP compute (a Spark cluster) by the "
+    "structure workflow, where each create is read back. Create the structure "
+    "at runbook S10 with `snowmig.py run --job snowmig_01_structure` (one "
+    "workflow per schema, from the approved ddl_plan.json placed on the "
+    "workspace by `snowmig.py provision --execute`). `notebook --upload` is "
+    "not the path for this: with `--execute` it is refused.")
 
 
 def _find_catalog(call, display_name: str) -> dict | None:

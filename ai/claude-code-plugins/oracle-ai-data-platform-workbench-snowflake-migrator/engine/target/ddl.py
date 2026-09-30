@@ -58,7 +58,7 @@ __all__ = ["RuleApplication", "RewriteResult", "UnsupportedDDL",
 TARGET_REJECTED_COLUMN_TYPES: dict[str, str] = {
     "TIMESTAMP_NTZ":
         "the AIDP Hive metastore refuses it with `InvalidObjectException: "
-        "Invalid column type: timestamp_ntz` (live-verified 2026-09-19). "
+        "Invalid column type: timestamp_ntz`. "
         "Re-run `ddl --timestamp-ntz timestamp` (offline, re-mapped from "
         "inventory.json, no Snowflake re-read), or `assess`/`ingest` with "
         "`--timestamp-ntz timestamp` if INVENTORY.md should show the "
@@ -388,8 +388,9 @@ def build_create_table(record: dict, target_fqn: str) -> RewriteResult:
             f"{len(not_null)} column(s) are NOT NULL in the source and in "
             f"this SQL ({', '.join(not_null)}). The in-AIDP structure "
             f"notebook applies them. The catalog-API transport (`snowmig "
-            f"deploy --execute`) CANNOT: its table body has no nullability "
-            f"field, so on that path those columns arrive NULLABLE. Create "
+            f"deploy --execute`) does not carry them: its table body has no "
+            f"nullability field, so on that path those columns are created "
+            f"NULLABLE. Create "
             f"this table with the structure notebook if the constraint "
             f"matters, or re-apply it afterwards."))
 
@@ -873,9 +874,9 @@ def build_create_view(record: dict, target_fqn: str,
             + ", ".join(sorted(leftover))
             + ". They are not part of this migration, so there is no target "
               "name to qualify them with. A view whose body the target cannot "
-              "resolve is rejected -- the catalog API answers 500 with no "
-              "detail -- so create this view only once those objects exist "
-              "and are named in full.")
+              "resolve is rejected (on the catalog-API path, as an HTTP 500), "
+              "so create this view only once those objects exist and are "
+              "named in full.")
         res.rules_applied.append(RuleApplication(
             "R42_VIEW_REFS_UNRESOLVED",
             "left unqualified, no target name known: "

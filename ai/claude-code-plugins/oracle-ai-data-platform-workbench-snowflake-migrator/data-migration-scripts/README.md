@@ -1,117 +1,121 @@
 # Data-plane notebooks — run INSIDE AIDP, schema by schema
 
-These four **notebooks** are the **data plane** of the migrator. The Claude
-Code plugin (assessment, plan, DDL, catalog registration) is the control
-plane; it uploads these to the workspace folder
-`backup-snowflake-migration/scripts/` and wires each into a parametrised AIDP
-Job. They are equally runnable by hand: open one in the console, edit the
-`PARAMS` cell at the top, and run it.
+These **notebooks** are the **data plane** of the migrator. The Claude Code
+plugin (assessment, plan, DDL, catalog registration) is the control plane;
+its `provision` stage uploads these notebooks to the workspace folder
+`backup-snowflake-migration/scripts/` and wires each stage into an AIDP job.
+They can also be run by hand: open one in the console, edit the `PARAMS` cell
+at the top, and run it.
 
-## Everything here is `.ipynb`, and that is not a style choice
+| # | Notebook | Reads | Writes | Purpose |
+|---|---|---|---|---|
+| — | `diagnose_environment.ipynb` | everything | nothing | **run this first**: workspace mount, network reach to Snowflake, credentials through the connector, EXTERNAL catalog contents |
+| 0 | `00_discover_snowflake.ipynb` | Snowflake | reports dir | inventory every schema, table and column into `discovery_manifest.json`, with a dated backup |
+| 1 | `01_create_structure.ipynb` | `ddl_plan.json` (or source) | target catalog | create the target schemas and empty Delta tables, read each back against the plan, then create the plan's views |
+| 2 | `02_copy_schema.ipynb` | Snowflake | target catalog + reports | copy ONE schema's tables and verify them: row counts, and exact decimal sums on request |
+| 3 | `03_reconcile.ipynb` | reports + target catalog | reports dir | plan-versus-reality report: what landed, what did not, and why |
 
-AIDP types a workspace object by its **extension**: a `.py` is stored as a
-`FILE` even when uploaded with `--type NOTEBOOK`, and only an `.ipynb`
-becomes a `NOTEBOOK`. A job task is a `NOTEBOOK_TASK` pointing at a NOTEBOOK.
-So a `.py` on the workspace could never be run as a job at all. Verified live
-2026-09-19 by uploading both shapes and reading the listing back.
+## Notebooks, not scripts
 
-Each notebook is **self-contained** — parameters, shared source helpers and
-stage logic in one object. There is no driver wrapper and nothing is imported
-off the `/Workspace` mount, so the code you open is exactly the code that
-runs.
+AIDP types a workspace object by its **extension**: an `.ipynb` becomes a
+`NOTEBOOK`, which a job's `NOTEBOOK_TASK` runs, while a `.py` is stored as a
+`FILE`. So everything that runs on AIDP ships as `.ipynb`.
 
-## They are GENERATED — edit the source, not the notebook
+Each notebook is **self-contained** — parameters, the shared source helper
+and the stage logic in one object. There is no driver wrapper and nothing is
+imported from the `/Workspace` mount, so the code you open is exactly the code
+that runs.
 
-The canonical Python lives once in `engine/dataplane/`. These notebooks are
+## They are generated — edit the source, not the notebook
+
+The canonical Python lives in `engine/dataplane/`. The notebooks are
 assembled from it:
 
 ```bash
 bin/snowmig build-notebooks
 ```
 
-Generated so five copies of the shared helpers cannot drift; committed so
-what ships is reviewable. **A hand edit here is overwritten on the next
-build.**
+They are generated so the shared helper cannot drift between copies, and
+committed so what ships is reviewable. **A hand edit here is overwritten on
+the next build.**
 
-**Precondition:** a Snowflake connection config on the workspace mount (the
-plugin's `provision --source-config` puts it there), and an INTERNAL target
-catalog. Registering the account as an EXTERNAL catalog is optional — useful,
-but only required for `--source-mode external-catalog`.
+## Preconditions and safety
 
-**Nothing here can write to Snowflake.** The connector is read-only in AIDP
-4.0 by Oracle's statement, an external catalog refuses DDL by contract, and
-every statement these notebooks issue against the source is a SELECT.
+**Preconditions:** a Snowflake connection config on the workspace mount (the
+plugin's `provision --source-config` puts it there) and an INTERNAL target
+catalog. Registering the account as an EXTERNAL catalog is optional for these
+notebooks, and required only for `--source-mode external-catalog`.
 
-| # | Notebook | Reads | Writes | Purpose |
-|---|---|---|---|---|
-| — | `diagnose_environment.ipynb` | everything | nothing | **run this first**: mount, egress, credentials, catalog |
-| 0 | `00_discover_snowflake.ipynb` | Snowflake | reports dir | inventory every schema/table/column into `discovery_manifest.json` |
-| 1 | `01_create_structure.ipynb` | `ddl_plan.json` (or source) | target catalog | create target schemas + empty Delta tables, read back against the plan (views listed, not created) |
-| 2 | `02_copy_schema.ipynb` | Snowflake | target catalog + reports | copy ONE schema's tables, verify counts (and exact decimal sums) |
-| 3 | `03_reconcile.ipynb` | reports + target catalog | reports dir | plan-vs-reality report: what landed, what did not, and why |
+**Nothing here can write to Snowflake.** The AIDP Snowflake connector is
+read-only (AIDP 4.0), an EXTERNAL catalog refuses DDL, and every statement
+these notebooks issue against the source is a `SELECT`. The service user's
+read-only grant is a second guarantee.
 
-The shared helper (`how the source is read, in either mode`) is inlined into
-every notebook that needs it; it is no longer a separate upload.
+- **Nothing is dropped.** `--mode overwrite` rewrites a table's **rows**
+  (`INSERT OVERWRITE`); it never drops the table. The default mode
+  (`skip-existing`) touches nothing that already has rows — it compares their
+  count with the source's and records `count_mismatch` when they differ.
+- **A per-table failure is recorded and the run continues**; the report, not
+  the exit code alone, is the deliverable.
+- **Verification is explicit.** Row counts by default; `counts+sums` adds an
+  exact `SUM` over every decimal column **of the source** (cast to
+  `DECIMAL(38,s)` with the source's scale on both sides). Floats are never
+  summed for equality, because float tolerance is wrong for money. A target
+  column that cannot hold a source decimal without loss stops the copy as
+  `type_drift` before any row moves, in both verify modes.
 
-All three of 01, 02 and 03 address the **target schema the approved plan
-names** (`target_fqn` in `ddl_plan.json`, e.g. `db_core` under a bronze
-prefix), not `--schema` itself; the source schema's own name stands in only
-where the plan names none. `--target-schema` may restate the plan's schema
-in any case, never contradict it. Schema names compare case-insensitively,
-as Spark resolves them, and the copy refuses to run when the structure
-report on disk targets a different schema rather than widening its scope to
-the whole manifest.
+## Source modes — use `connector`
 
-## Two source modes — use `connector`
-
-**Discover schemas and tables by running the workflow in `connector` mode.
-Do not enumerate them with three-part names against the EXTERNAL catalog.**
-Both can be made to return an answer; only one of them finishes on a real
-estate.
-
-| Mode | How it reads Snowflake | Use it? |
+| Mode | How it reads Snowflake | When |
 |---|---|---|
-| `connector` *(default)* | the AIDP Snowflake connector, from the cluster: `spark.read.format("aidataplatform").option("type","SNOWFLAKE")` | **yes** — live-verified, needs no extra cluster library and no catalog crawl |
-| `external-catalog` | three-part names against a registered EXTERNAL catalog | only on explicit request — needs a completed crawl, and costs a `DESCRIBE` per object |
+| `connector` *(default)* | the AIDP Snowflake connector, from the cluster: `spark.read.format("aidataplatform").option("type","SNOWFLAKE")` | **always, unless asked otherwise** — needs no extra cluster library and no catalog crawl |
+| `external-catalog` | three-part names against a registered EXTERNAL catalog | only on explicit request — needs the catalog's metadata to be populated, and costs a `DESCRIBE` per object |
 
-Why it is not a close call:
+Why `connector`:
 
 - **Cost.** Connector discovery is **two `INFORMATION_SCHEMA` queries for the
-  whole database** — live: 1065 relations and 9935 columns in a single run.
-  The three-part-name route is `SHOW` plus a `DESCRIBE` per object, so its
-  cost scales with the object count and does not finish at estate scale.
-- **Fewer preconditions.** The connector needs the credentials that smoke
-  already proved. The external-catalog route additionally needs the catalog
-  crawl to have completed, which is one more thing that has to be true
-  before discovery can even start.
-- **Evidence.** A workflow leaves a job run, its task output and a manifest
-  on the platform. That is the record of the migration; a read that happens
-  somewhere else leaves nothing behind.
+  whole database**. The three-part-name route is `SHOW` plus a `DESCRIBE`
+  per object, so its cost grows with the object count.
+- **Fewer preconditions.** The connector needs only the credentials `smoke`
+  already checked; the external-catalog route also needs the catalog's
+  metadata to be in place before discovery can start.
+- **Evidence.** A job leaves a run, its task output and a manifest on the
+  platform — the record of the migration.
 
-The practical point is **time**: an agent that starts down the three-part
-route spends a long while discovering that it does not scale. Start with
-`connector` and stay there unless a user asks otherwise.
+## Target schema
+
+01, 02 and 03 all address the **target schema the approved plan names**
+(`target_fqn` in `ddl_plan.json`, e.g. `db_core` under a bronze prefix), not
+`--schema` itself; the source schema's own name stands in only where the plan
+names none. `--target-schema` may restate the plan's schema in any case,
+never contradict it. Schema names compare case-insensitively, as Spark
+resolves them. The copy refuses to run when the structure report on disk
+targets a different schema, rather than widening its scope to the whole
+manifest.
 
 ## Structure modes
 
 `01_create_structure` `--mode`:
 
-| Mode | Types come from | Cost |
+| Mode | Types come from | Notes |
 |---|---|---|
-| `ddl-plan` *(default)* | `plan/ddl_plan.json` — the migrator's own mapper, which refuses what it cannot map exactly, reviewed and signed off before the run | no source read; a table absent from the plan is reported `not_in_plan` and NOT created, and a run in which **every** table is `not_in_plan` exits 1 — the plan and the requested schema do not overlap |
-| `ctas` | Spark, derived through the connector | one Snowflake round trip per table — measured slow, and the mapping is the connector's, not an audited one |
-| `manifest` | `discovery_manifest.json` verbatim | only valid for an external-catalog manifest (Spark types); a connector manifest carries Snowflake types and is refused rather than mistranslated |
+| `ddl-plan` *(default)* | `plan/ddl_plan.json` — the migrator's own mapper, which refuses what it cannot map exactly, reviewed and signed off before the run | no source read. A table absent from the plan is reported `not_in_plan` and NOT created; a run in which **every** table is `not_in_plan` exits 1, because the plan and the requested schema do not overlap. Creates the plan's views after every table |
+| `ctas` | Spark, derived through the connector | one Snowflake round trip per table, and the types are the connector's mapping rather than the reviewed plan's. Tables only |
+| `manifest` | `discovery_manifest.json` verbatim | valid only for an external-catalog manifest (Spark types); a connector manifest carries Snowflake types and is refused rather than mistranslated. Tables only |
 
-In every mode the CREATE returning is not the claim: the table is `DESCRIBE`d
-afterwards and compared with the plan, column by column and in order.
-`CREATE TABLE IF NOT EXISTS` is a silent no-op on a table that is already
-there, so without the read-back a stale layout would be certified as created
-from the plan — and the copy fills the target's columns in the target's
-order.
+In every mode each table is `DESCRIBE`d after the CREATE and compared with
+the plan, column by column and in order. `CREATE TABLE IF NOT EXISTS` does
+nothing on a table that is already there, so without the read-back a stale
+layout could be certified as created from the plan — and the copy fills the
+target's columns in the target's order.
+
+`--parallel` (default 4) sets how many tables are created at a time within a
+schema, each still read back on its own; `ctas` and dry runs create one at a
+time, and `parallel=1` creates them one by one.
 
 ## Statuses and verdicts
 
-What each report records per table. Anything under **problem** exits 1 in
+What each report records per table. Anything marked **problem** exits 1 in
 the stage that records it and is a problem verdict in `MIGRATION_REPORT.md`.
 
 **`structure_report_<schema>.json`** (`objects`, one per table)
@@ -125,17 +129,17 @@ the stage that records it and is a problem verdict in `MIGRATION_REPORT.md`.
 | `failed` | the CREATE raised; the error is the reason | **yes** |
 | `dry_run` | `--dry-run`; nothing was issued | no |
 
-Views sit under a separate `views` key, never in `objects` (the table map
-the copy takes its default scope from). In `ddl-plan` mode each planned view
-is created from the plan's own CREATE VIEW SQL after every table exists, and
+Views sit under a separate `views` key, never in `objects` (the table map the
+copy takes its default scope from). In `ddl-plan` mode each planned view is
+created from the plan's own CREATE VIEW SQL after every table exists, and
 recorded `created`, `failed` (**a problem**: exit 1, the error is the reason)
 or `dry_run`; a manifest view the plan does not carry is `not_in_plan`
 (`in_plan: false`) and NOT created. `ctas` and `manifest` mode create tables
 only and record every view `not_created_by_this_path`; create those with
-`snowmig deploy --execute` and verify them against the source. Every
-manifest view is listed, so none is ever absent from every report with
-exit 0. The copy never writes into a view: its default scope is the
-`objects` the manifest lists as tables.
+`snowmig deploy --execute` and verify them against the source. Every manifest
+view is listed, so none is ever absent from every report with exit 0. The
+copy never writes into a view: its default scope is the `objects` the
+manifest lists as tables.
 
 **`copy_report_<schema>.json`** (`tables`, one per table)
 
@@ -147,12 +151,14 @@ exit 0. The copy never writes into a view: its default scope is the
 | `sum_mismatch` | counts equal, a decimal column does not sum equal | **yes** |
 | `type_drift` | the live source's column names are not the target's (renamed, dropped or added since the plan; `layout_drift` lists them), or a source DECIMAL column is not DECIMAL, or narrower, on the target; NOT copied — the rows would land in the wrong columns, or be rounded or truncated, with the count intact. A source whose columns are only **reordered** is copied: every column is selected by name, in the target's order | **yes** |
 | `failed` | the copy raised — including a `DESCRIBE` of the target that failed for any reason but not-found (a metastore timeout, a permission denied: "could not look" is never recorded as absent); `insert_completed: true` means the rows landed before verification failed, so re-copy with `--mode overwrite`, never `append` | **yes** |
-| `target_missing` | Spark says there is no table to copy into (usually `not_in_plan` upstream) | no — **yes** when the structure report records the table `created` or `already_existed`, or the approved plan places the table at this target (also with `--tables`, or before `01_create_structure` has run) |
+| `target_missing` | Spark says there is no table to copy into (usually `not_in_plan` upstream); the table is skipped and the run continues | no — **yes** when the structure report records the table `created` or `already_existed`, or the approved plan places the table at this target (also with `--tables`, or before `01_create_structure` has run) |
 
-A re-run never softens a recorded failure: `count_mismatch`, `sum_mismatch`,
-`type_drift` and `failed` stand until a real re-copy verifies the table.
-`--force` re-copies verified tables and needs `--mode overwrite` or
-`append` — `skip-existing` cannot re-copy a table that holds rows.
+The copy's default scope is **what the structure step created for this
+target**, not the whole manifest. A re-run never softens a recorded failure:
+`count_mismatch`, `sum_mismatch`, `type_drift` and `failed` stand until a real
+re-copy verifies the table. `--force` re-copies verified tables and needs
+`--mode overwrite` or `append` — `skip-existing` cannot re-copy a table that
+holds rows.
 
 **`MIGRATION_REPORT.md` verdicts** (per table, from the two reports plus the
 live catalog)
@@ -162,7 +168,7 @@ live catalog)
 | `MIGRATED_VERIFIED` | copy verified, table present (and, with `--counts`, still at the verified row count) | no |
 | `PRESENT_NOT_REVERIFIED` | rows were already there at the source's count; sums not re-checked | no |
 | `STRUCTURE_ONLY` | table present, no copy yet | no |
-| `NOT_MIGRATED` | never attempted yet (expected while the migration runs schema by schema) | no |
+| `NOT_MIGRATED` | not attempted yet (expected while the migration runs schema by schema) | no |
 | `NOT_IN_PLAN` | the approved plan leaves it out (an S9 scope reduction, or a table the engine blocked); the structure report records it `not_in_plan`. Not pending | no |
 | `VIEW_CREATED` | a view the structure job created from the approved plan | no |
 | `VIEW_NOT_IN_PLAN` | a manifest view the approved plan does not carry; NOT created | no |
@@ -181,16 +187,15 @@ A report written for a **different target** — another catalog, or another
 schema than the one the plan names — is ignored by reconcile (and named in
 the report), never applied to this one.
 
-## The intended run, per schema
+## Parameters and the intended run
 
-The plugin's `provision` stage uploads these notebooks and wires one AIDP job
-per notebook, pointing each job straight at it — no driver wrapper. This
-run's coordinates are written into the notebook's own `PARAMS` cell at upload
-time, as defaults. A job TASK's `parameters` override them by the same names
-at run time -- the notebook reads them with
-`oidlUtils.parameters.getParameter` (live-verified) -- which is how each
-per-schema copy job passes its `schema` to the one `02_copy_schema`
-notebook.
+`provision` uploads these notebooks and wires one AIDP job per stage, each
+pointing straight at its notebook, plus one copy job per schema of the
+approved plan, all running the same `02_copy_schema` notebook. This run's
+coordinates are written into each notebook's `PARAMS` cell at upload time, as
+defaults. A job task's `parameters` override them by the same names at run
+time — the notebook reads them with `oidlUtils.parameters.getParameter` —
+which is how each per-schema copy job passes its `schema`.
 
 To run one by hand, open it in the console and edit the `PARAMS` cell:
 
@@ -207,94 +212,44 @@ PARAMS = {
 ```
 
 `None` omits a flag entirely; `True` passes a bare switch. The notebook turns
-`PARAMS` into the same argument list the stage has always taken, so behaviour
-is unchanged — only the way you supply it is.
+`PARAMS` into the stage's argument list.
 
 Run order: `00_discover_snowflake` once, then `01_create_structure` and
-`02_copy_schema` per schema in the order the plan's waves say, then
-`03_reconcile` at the end (or any time — it only reads).
+`02_copy_schema` per schema in the order the plan's waves give, then
+`03_reconcile` at the end (or at any time — it only reads). For a first run on
+a new estate, run `diagnose_environment.ipynb`, then one small schema end to
+end, then read `MIGRATION_REPORT.md` before running the rest.
 
-**Scope and mode are INPUTS.** To migrate less, change a `PARAMS` value —
-never edit the stage logic to make it cover less.
+**Scope and mode are inputs.** To migrate less, change a `PARAMS` value or a
+job's task parameter — never edit the stage logic to make it cover less.
 
-**A schema is the operating unit, never a table.** Two measured costs drive
-that:
+**A schema is the operating unit, never a table.** Two costs drive that:
 
-- a job run costs ~5–6 minutes of startup before it does anything, so
-  per-table runs are the wrong shape;
+- each job run has a start-up cost before it does any work, so per-table runs
+  are the wrong shape;
 - in connector mode every source read opens its own Snowflake session, so the
-  copy batches all of a schema's source counts into **one** round trip per 50
-  tables instead of two per table. `--verify counts+sums` still costs a read
-  per table for the sums, which is why it is opt-in.
+  copy batches a schema's source counts into **one** round trip per 50 tables
+  instead of two per table. `--verify counts+sums` still costs a read per
+  table for the sums, which is why it is opt-in.
 
-Every script is **resumable**: re-running skips work its report already
+Every notebook is **resumable**: re-running skips work its report already
 records as done (`--force` overrides; for the copy it needs `--mode overwrite`
-or `append`), because a 200k-table estate will not finish in one sitting and
-must never restart from zero. A re-run never softens a recorded failure.
+or `append`), because a large estate may take several sittings and a run
+should never restart from zero. A re-run never softens a recorded failure.
 
-## Safety properties (hold for all four)
-
-- The source is read-only twice over: by the connector's own contract (or the
-  external catalog's), and by the read-only grant on the service user.
-- Nothing is dropped, ever. `--mode overwrite` rewrites a table's **rows**
-  (`INSERT OVERWRITE`); it never drops the table, and the default mode
-  (`skip-existing`) touches nothing that already has rows — it compares
-  their count with the source's and records `count_mismatch` when they differ.
-- A per-table failure is recorded and the run continues; the report — not the
-  exit code alone — is the deliverable.
-- Verification is explicit: row counts by default, `counts+sums` adds an
-  exact `SUM` over every decimal column **of the source** (cast to
-  `DECIMAL(38,s)` with the source's scale on both sides); float tolerance is
-  wrong for money, so floats are never summed for equality. A target column
-  that cannot hold a source decimal without loss stops the copy as
-  `type_drift` before any row moves, in both verify modes.
-
-## Consistency warning — read before a production cutover
+## Consistency — read before a production cutover
 
 Each table is copied at a different moment. If the source keeps changing
-during the copy, the target is internally consistent per table but NOT across
-tables. For a real cutover: freeze writers, or copy from a Snowflake
-zero-copy `CLONE` taken at a single point in time, or plan an incremental
-re-sync. The reconcile report tells you what drifted since the copy.
+during the copy, the target is consistent per table but NOT across tables.
+For a real cutover: freeze writers, or copy from a Snowflake zero-copy
+`CLONE` taken at a single point in time, or plan an incremental re-sync. The
+reconcile report (`--counts`) shows what changed since the copy.
 
 ## Cluster libraries (`requirements-aidp.txt`)
 
 **Nothing needs installing.** Both source modes use surfaces already on the
 cluster — the `aidataplatform` format is built in. `requirements-aidp.txt`
-exists for fallbacks only and ships empty of active entries; the plugin's
-provisioning step installs whatever it does contain via the documented
-cluster-libraries API (`PATCH .../clusters/{key}/libraries`, types `PYPI` /
-`WORKSPACE_FILE` / `MAVEN`), and a cluster restart follows.
-
-## What is proven, and what is not
-
-Canonical per-stage status: `../GAPS.md` → "What is actually proven". Its
-sentence, repeated here so this file cannot drift from it:
-
-**What has run live:** the discovery job (`snowmig_00_discover`) ran to
-SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in
-two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
-ran on a cluster from the approved plan, a healthy 23-minute run left alone
-by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_<schema>`)
-and reconcile (`snowmig_03_reconcile`) jobs ran live on 2026-09-29, on a
-4-table canary across two schemas: 4/4 copied and verified by row count,
-reconcile 4 `MIGRATED_VERIFIED` -- at ~340 s per 10-row table, one table at a
-time, which does not scale as it stands (GAPS P0 item 8).
-
-Also live-verified (2026-09-16, a real DataLake and a real Snowflake
-account): the connector read and pushdown; the structure step's refusal of
-tables absent from the approved plan; the upload/job/run/output loop; and the
-`/Workspace` mount these paths assume.
-
-An earlier version of this file described a five-table copy verified
-row-for-row with exact decimal sums; the 0.25.0 changelog, three days later,
-said the copy had not executed. Until the person who ran the cluster jobs
-confirms which is right, the copy is unproven here. Two rules did come out
-of an early copy attempt — a table with no target is recorded as
-`target_missing` and skipped rather than ending the run, and the copy's
-default scope is **what the structure step created for this target**, not the
-whole manifest — and they are pinned by tests regardless.
-
-**Not yet proven at scale**: the largest run was one schema. Before a real
-estate, run `diagnose_environment.ipynb`, then one small schema end to end,
-then read `MIGRATION_REPORT.md` against the console.
+is for optional additions and ships with no active entries; the plugin's
+provisioning step installs whatever it contains through the cluster-libraries
+API (`PATCH .../clusters/{key}/libraries`, types `PYPI` / `WORKSPACE_FILE` /
+`MAVEN`), followed by a cluster restart.

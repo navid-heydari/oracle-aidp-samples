@@ -18,8 +18,8 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig provision \
 
 Dry run first, always. Show `PROVISION.md` — it lists every step that would
 run, the **translated** workspace/cluster names with the reasons, and the
-⚠️ unverified-contract warning — and only then, on the user's go-ahead,
-re-run with `--execute`.
+API-contract note — and only then, on the user's go-ahead, re-run with
+`--execute`.
 
 ## What it does, in order
 
@@ -33,7 +33,8 @@ re-run with `--execute`.
    touches can be identified, audited and torn down as a unit; inheriting a
    stranger's workspace makes the blast radius unknowable. Report the
    collision and ask the user for another name. `--reuse-existing` opts back
-   in, and it is never what you offer first.
+   in, and it is never what you offer first (its legitimate use is re-pushing
+   into this migration's own workspace — see Rules).
 2. **Cluster `migration_assets`** — CREATED, default small config; sizing is
    a later, explicit decision (`/snowflake-compute` proposes it). A taken
    name stops the run, exactly as for the workspace.
@@ -50,12 +51,12 @@ re-run with `--execute`.
    only before a plan is pushed). Each runs one **self-contained stage
    notebook** whose own `PARAMS` cell carries the default arguments. A job
    TASK's `parameters` win over those defaults by the same name: every
-   stage notebook reads them with `oidlUtils.parameters.getParameter`
-   (live-verified), and that is how each per-schema copy job passes its
-   `schema` to the ONE shared `02_copy_schema` notebook. A run-level
-   `run --param` is still refused: that run parameters reach a task is not
-   verified. No schedule: running one is always the user's call, and the
-   PARAMS cell is editable in the console.
+   stage notebook reads them with `oidlUtils.parameters.getParameter`, and
+   that is how each per-schema copy job passes its `schema` to the ONE
+   shared `02_copy_schema` notebook. `run --param` is refused; set stage
+   values as task parameters or with `--stage-param`. No schedule: running
+   one is always the user's call, and the PARAMS cell is editable in the
+   console.
 
    `--stage-param NAME=VALUE` (repeatable) writes a value into the PARAMS
    cell of every stage that declares NAME — the stage flag without `--`,
@@ -81,21 +82,18 @@ re-run with `--execute`.
 ## Source mode — say which one is in play
 
 `--source-mode connector` (the default) has the in-AIDP scripts read
-Snowflake through the AIDP connector on the cluster. It is the path proven
-live, it needs no extra cluster library, and it does not wait on the external
-catalog's crawler — which on at least one deployment fails
-(`CONNECTOR_0067, Login has timed out`) with credentials the connector
-accepts. It needs `--source-config` so the credential reaches the workspace
-mount: its `snowflake:` block is uploaded as JSON to
+Snowflake through the AIDP connector on the cluster. It needs no extra cluster
+library and does not depend on the external catalog's metadata crawl. It
+needs `--source-config` so the credential reaches the workspace mount: its `snowflake:` block is uploaded as JSON to
 `plan/<config stem>.json` (the `aidp:` block is not copied), and because that
 block carries a secret it is uploaded only when passed explicitly. A `*_path`
 secret is refused before anything is uploaded — the path is not on the
 cluster.
 
 `--source-mode external-catalog` uses three-part names instead, and needs a
-catalog whose crawl has actually succeeded. Check that first — an empty
-`SHOW SCHEMAS IN <catalog>` means the crawler never populated it, which is
-not the same as an empty database.
+catalog whose metadata crawl has completed. Check that first — an empty
+`SHOW SCHEMAS IN <catalog>` means the catalog has not been populated yet, not
+that the database is empty. Use it only when the user explicitly asks for it.
 
 ## Rules
 
@@ -106,20 +104,31 @@ not the same as an empty database.
   API accepted and the object never became visible in the poll budget — say
   it is pending and point at the console. `name_taken` is neither: it means
   something of that name was already there and this run did **not** adopt it.
-- **Hand-off.** After `--execute`, read `workspace.key` and `cluster.key`
-  from `provision_result.json` and have the user put them under `aidp:` in
-  `snowmig-config.yaml` (`aidp.workspace`, `aidp.cluster_id`) before
-  `/snowflake-catalog`. `PROVISION.md` shows the display names, which are
-  not the keys; the catalog step needs the keys, and `provision` does not
-  write them back.
+- **Hand-off.** After `--execute`, the CLI (`hand-off: --workspace …
+  --cluster-id …`) and a hand-off block in `PROVISION.md` print the keys,
+  recorded as `workspace.key` and `cluster.key` in `provision_result.json`.
+  The display names are not the keys. Pass them as `--workspace` /
+  `--cluster-id` on every later command, or have the user put them under
+  `aidp:` in `snowmig-config.yaml` (`aidp.workspace`, `aidp.cluster_id`) —
+  one or the other. `provision` does not write them back, and no command
+  reads them from the record implicitly.
+- **Re-push (the plan push, S9/S10).** `provision --execute --reuse-existing
+  --workspace-name <the S1 name> --plan-label FULL|REDUCED` re-adopts this
+  migration's own workspace, uploads the approved plans to `plan/`, backs them
+  up dated into `backup/` and registers the per-schema copy jobs. It keeps the
+  cluster name the first push recorded when no `--cluster-name` is given. A
+  copy job for a schema no longer in the plan is reported `stale` (exit 1)
+  until it is deleted in the console or by re-pushing with
+  `--delete-stale-copy-jobs`.
 - **Never reuse, never "ensure".** Do not list existing workspaces or
   clusters and offer the user a choice among them. The only question is *may
   I create this*.
-- Every REST shape here follows the documented 20260430 contract and is not
-  yet live-verified; two field families are inferred (library items,
-  per-task job fields). On the first live run, validate against a UI-created
-  job/library before scaling out — and say so to the user.
-- After provisioning, the run order is: `snowmig_00_discover`, then
-  `01_structure`, then `02_copy_schema` once per schema, then
+- The workspace, cluster, folder, upload, job and delete calls follow the
+  documented 20260430 API contract. The cluster-library item format is
+  inferred from that contract: validate one against a library created in the
+  console before relying on it, and say so to the user.
+- After provisioning, the run order is: the catalogs (S3, S4), then
+  `snowmig_00_discover`, then `01_structure`, then each
+  `snowmig_02_copy_<schema>` job (on the customer's decision), then
   `03_reconcile`. `MIGRATION_REPORT.md` in the reports folder is the
   plan-vs-reality deliverable.

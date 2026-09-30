@@ -122,10 +122,10 @@ def run_demo(out_dir) -> dict:
           f'census found {inv["census"]["total"]} object(s) that cannot migrate '
           f'({kinds or "none"})')
     lessons.append(
-        "TIMESTAMP_NTZ was downgraded to TIMESTAMP on purpose "
-        "(`--timestamp-ntz timestamp`): the AIDP catalog API silently rejects "
-        "timestamp_ntz, and the downgrade changes timezone semantics — a "
-        "decision the operator makes, never a default.")
+        "TIMESTAMP_NTZ was mapped to TIMESTAMP on purpose "
+        "(`--timestamp-ntz timestamp`): the AIDP catalog API takes "
+        "`timestamp`, not `timestamp_ntz`, and the mapping changes timezone "
+        "semantics — a decision the operator makes, never a default.")
     lessons.append(
         "SALES.EVENTS_RAW is BLOCKED: VARIANT has no typed Delta mapping, and "
         "the engine refuses rather than guesses. `--semi-structured string` "
@@ -145,10 +145,11 @@ def run_demo(out_dir) -> dict:
     stage(f'maintenance: {maint["objects_with_signals"]} of '
           f'{len(maint["tables"])} table(s) need a maintenance decision')
     lessons.append(
-        "SALES.ORDERS fires every maintenance signal: a clustering key (AIDP "
-        "reclusters nothing on its own), change tracking (Delta CDF must be "
-        "enabled explicitly), a table-level retention override, and >1M "
-        "rewritten rows in 30 days (needs an OPTIMIZE cadence).")
+        "SALES.ORDERS fires every maintenance signal: a clustering key (the "
+        "AIDP equivalent, liquid clustering or ZORDER, runs on a schedule "
+        "the operator sets), change tracking (Delta CDF must be enabled "
+        "explicitly), a table-level retention override, and >1M rewritten "
+        "rows in 30 days (needs an OPTIMIZE cadence).")
 
     sec = build_security(demo_run_sql, inv)
     _write(out, "security.json", sec)
@@ -156,10 +157,10 @@ def run_demo(out_dir) -> dict:
     stage(f'security: {sec["exposure_count"]} policy exposure(s), '
           f'{len(sec["secure_views"])} secure view(s)')
     lessons.append(
-        "CUSTOMERS.EMAIL is masked in Snowflake and arrives UNMASKED: AIDP "
-        "has no masking API, so the equivalent is a restricted view plus "
-        "sensitivity classification — a design decision the report forces "
-        "into the open.")
+        "CUSTOMERS.EMAIL is masked in Snowflake and arrives UNMASKED: the "
+        "masking policy is not carried over, and the AIDP equivalent is a "
+        "restricted view plus sensitivity classification — a design "
+        "decision the report makes visible.")
 
     warehouses = extract_warehouses(demo_run_sql)
     _write(out, "warehouses.json", warehouses)
@@ -298,20 +299,22 @@ def run_demo(out_dir) -> dict:
     _write(out, "SOFT_CLONE_SUMMARY.md", render_soft_clone_summary(built, deployed))
     stage(f'deploy (STANDARD): verified {deployed["verified"]}/'
           f'{deployed["statement_count"]} by reading each object back; '
-          f'{len(deployed["poisoned_names"])} name(s) diagnosed as burned, '
+          f'{len(deployed["poisoned_names"])} name(s) diagnosed as not '
+          f'reusable in their schema, '
           f'{len(deployed["derived_type_drift_targets"])} view(s) with '
           f'derived-type drift')
     lessons.append(
-        "LEGACY_AUDIT returned 202 Accepted and never appeared — the "
-        "asynchronous create failed reporting NOTHING. The diagnosis then "
-        "created a novel name in the same schema, which landed, proving the "
-        "planned name is permanently burned (a live-verified AIDP behaviour): "
-        "the only recovery is a fresh schema.")
+        "LEGACY_AUDIT was accepted but did not appear when the plugin read it "
+        "back, so it is reported as failed, not created. The diagnosis then "
+        "created a novel name in the same schema, which landed, so the "
+        "planned name is reported as not reusable in that schema and the "
+        "next step is a fresh schema.")
     lessons.append(
-        "ORDER_SUMMARY_VW was created, but the engine re-derived "
+        "ORDER_SUMMARY_VW was created, but the target re-derived "
         "TOTAL_AMOUNT as decimal(28,2) against a declared decimal(30,2) — a "
         "NARROWING that can overflow. Reported as drift, distinct from a "
-        "mismatch, because the view is ours; its types are not.")
+        "mismatch: the view's SQL comes from the plan, while its column "
+        "types are derived by the target.")
 
     # 11-13 · notebook, summary, board ---------------------------------------
     notebook = build_notebook(ddl, built, catalog=DEMO_STANDARD_CATALOG,
@@ -327,12 +330,12 @@ def run_demo(out_dir) -> dict:
         "",
         "Not uploaded: this is the demo. In production the structure is "
         "created by `provision --execute` and then `run --job "
-        "snowmig_01_structure`; `notebook --upload` is a dry run, and is "
-        "refused with `--execute` (GAPS.md 13).",
+        "snowmig_01_structure` (S10); `notebook --upload` is a dry run, "
+        "and is refused with `--execute`.",
         ""]))
     stage("notebook: the Standard-catalog path generated as a script that "
-          "runs on AIDP compute, where Spark reports real errors — the "
-          "control-plane API can return 202 and create nothing")
+          "runs on AIDP compute, where a final cell verifies each object "
+          "individually")
 
     _write(out, "SUMMARY.md",
            render_summary(built, inv, deployed, dataclasses.asdict(std_target)))
@@ -387,9 +390,9 @@ def _render_demo(narrative: list[str], lessons: list[str]) -> str:
         "assumed.",
         "- `catalog` and `deploy` are dry runs unless `--execute` is passed, "
         "and nothing is reported as done until it is read back and compared.",
-        "- The asynchronous-create, name-poisoning and type-drift behaviours "
-        "demonstrated here are not inventions: each one was observed against "
-        "a live DataLake first and is regression-tested.",
+        "- The read-back, name-reuse and type-drift checks demonstrated "
+        "here are the same checks a production run applies, and each one "
+        "is regression-tested.",
         "",
     ]
     return "\n".join(lines)

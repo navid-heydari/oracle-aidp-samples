@@ -129,7 +129,8 @@ def test_timestamp_ntz_is_refused_by_default_on_this_transport():
     with pytest.raises(UnmappableFieldType) as exc:
         field_from_spark_type("TS", "TIMESTAMP_NTZ")
     assert "timestamp_ntz" in str(exc.value).lower()
-    assert "silently" in str(exc.value).lower() or "202" in str(exc.value)
+    assert "cannot be sent as planned" in str(exc.value)
+    assert "--timestamp-ntz timestamp" in str(exc.value), "names the decision"
 
 
 def test_timestamp_ntz_can_be_downgraded_explicitly():

@@ -209,14 +209,16 @@ def test_the_schema_note_is_printed_for_the_external_catalog_only(
     assert "is not used here" not in capsys.readouterr().out
 
 
-def test_an_empty_reason_failure_points_at_the_known_issue_not_the_credential():
+def test_an_empty_reason_failure_points_at_discovery_not_the_credential():
     md = render_catalog({"dry_run": False, "catalog": "src",
                          "catalog_type": "EXTERNAL", "action": "created",
                          "verified": True, "key": "src",
                          "test_connection": {"status": "FAILED",
                                              "error": "Test connection "
                                                       "failed: "}})
-    assert "known platform issue" in md
+    assert "returned no reason" in md and "Keep the registration" in md
+    assert "discovery (S6)" in md
+    assert "known platform issue" not in md
     assert "fix the credential" not in md
 
 

@@ -259,10 +259,10 @@ def make_call(target, *, backend: str, run_process=None):
             # make every object past it "absent"; say so instead.
             raise CatalogTransportError(
                 f"{operation}: the aidp CLI answered with a next-page token "
-                f"({str(next_page)[:40]!r}), so this listing is only its "
-                f"first page and the rest cannot be requested through that "
-                f"CLI. Use the oci CLI (backend oci_raw), which follows "
-                f"opc-next-page.")
+                f"({str(next_page)[:40]!r}), so this listing holds only its "
+                f"first page, and this plugin requests further pages only "
+                f"through the oci CLI. Use the oci CLI (backend oci_raw), "
+                f"which follows opc-next-page.")
         return rows, next_page
 
     def call(operation: str, **kwargs) -> dict:

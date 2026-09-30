@@ -280,7 +280,7 @@ def _listagg(sql: str) -> tuple[str, str | None]:
     if lexer.find_code(r"\bWITHIN\s+GROUP\b", sql):
         return sql, ("LISTAGG ... WITHIN GROUP (ORDER BY ...) -- Spark's "
                      "collect_list does not guarantee ordering, so the ordering "
-                     "semantics would be lost silently")
+                     "semantics would not be preserved")
     # LISTAGG(...) OVER (...) is the window form. The match ends at LISTAGG's
     # own closing paren, so it became concat_ws(...) OVER (...) -- a scalar
     # function with a window clause, which Spark rejects at create -- and was

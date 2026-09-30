@@ -155,9 +155,9 @@ STAGES: tuple[StageSpec, ...] = (
             "Creates the schemas and the empty Delta tables in the INTERNAL "
             "target catalog, one schema per run. **Structure only — no rows "
             "move.** Every table arrives empty.\n\n"
-            "Runs on compute rather than through the catalog CRUD API "
-            "because that API returns `202 Accepted` and can create nothing, "
-            "so a table 'created' that way cannot be verified."),
+            "Runs on AIDP compute, where each table is read back after its "
+            "CREATE and, in the default `ddl-plan` mode, compared with the "
+            "approved plan column by column."),
         # `mode` is `ddl-plan`, matching the stage's own argparse default and
         # runbook S10 ("reading the approved plan"). It used to ship
         # `manifest`, which CANNOT work alongside the `connector` source-mode
@@ -184,9 +184,9 @@ STAGES: tuple[StageSpec, ...] = (
             "migration registers this notebook and never runs it. Moving "
             "data is a later decision the customer makes, with the notebook "
             "already sitting here.\n\n"
-            "One notebook per SCHEMA, never per table: a job run costs five "
-            "to six minutes of startup, so per-table runs are the wrong "
-            "shape."),
+            "One notebook per SCHEMA, never per table: each job run has its "
+            "own startup time, so one run per schema pays it once for every "
+            "table in that schema."),
         params={"source-mode": "connector", "source-config": None,
                 "source-catalog": None, "target-catalog": None,
                 "schema": None, "target-schema": None, "ddl-plan": None,
@@ -512,10 +512,9 @@ def _params_cell(stage: StageSpec,
         "# A job task's `parameters` ({name, value}) override the literals",
         "# above, by the same names (`schema`, `mode`, `dry-run`, ...). Read",
         "# with oidlUtils.parameters.getParameter -- resolved by the AIDP",
-        "# runtime, never imported; live-verified 2026-09-29 for a task's",
-        "# parameters. The environment is only a fallback (none was observed",
-        "# there live). This is how ONE notebook serves one workflow per",
-        "# schema: each task passes its own `schema`.",
+        "# runtime, never imported. The environment is only a fallback. This",
+        "# is how ONE notebook serves one workflow per schema: each task",
+        "# passes its own `schema`.",
         "import os as _os",
         "_MISS = '\\x00__no_parameter__'",
         f"_SWITCHES = {switches!r}",
@@ -548,9 +547,8 @@ def _params_cell(stage: StageSpec,
         "            v = _MISS",
         "        if v != _MISS and v is not None and str(v).strip() != '':",
         "            return str(v).strip()",
-        "    # The environment is a fallback only, by the plain spellings: none",
-        "    # was observed there live, and a generic name (SCHEMA, DRYRUN) could",
-        "    # be any stray cluster variable.",
+        "    # The environment is a fallback only, by the plain spellings: a",
+        "    # generic name (SCHEMA, DRYRUN) could be any stray cluster variable.",
         "    for n in dict.fromkeys((name, name.replace('-', '_'),",
         "                            name.replace('-', '_').upper())):",
         "        v = _os.environ.get(n)",

@@ -17,24 +17,19 @@ before anything is created; another database is another migration.
 
 **S4 — the INTERNAL target catalog** is the managed target the migrated
 schemas and tables land in. Creating it is part of the sequence, not an
-exception to argue for. It is a **container**: one control-plane object. Its
-schemas and tables are a separate matter and are created on compute at S10,
-because a control-plane table create can return `202 Accepted` and silently
-create nothing.
+exception to argue for. It is a **container**: one control-plane object.
+Tables are created on AIDP compute by the structure workflow (S10), where each
+create is read back; the control-plane catalog API is used for the catalog
+container only.
 
-**`INTERNAL` is the type on the wire.** "Standard" is the runbook's and the
-CLI's word, kept as an accepted alias and translated once by
-`normalize_catalog_type()`. AIDP rejects `catalogType=STANDARD` outright with
-`400 InvalidParameter: Invalid CatalogType: STANDARD`; its two real types are
-`INTERNAL` and `EXTERNAL`.
+**`INTERNAL` is the API type.** "Standard" is the runbook's and the CLI's
+word, an accepted alias that `normalize_catalog_type()` translates to
+`INTERNAL` before any call. AIDP's two catalog types are `INTERNAL` and
+`EXTERNAL`.
 
 **Both catalogs come after the workspace and the cluster.** Any AIDP write
 resolves four coordinates — DataLake, workspace, cluster, catalog — so neither
 catalog can be registered before S1 and S2 have made the first three.
-
-Do not confuse the two refusals. The engine no longer refuses to create the
-managed container; it refuses to create its **tables** through the catalog
-CRUD API, and that refusal still stands.
 
 ## Phase A — register the EXTERNAL catalog (the default path)
 
@@ -76,8 +71,12 @@ connection fields were built, and creates nothing. Show `CATALOG.md`.
 Then validate the connection with `--test-connection` on the same command
 (`${CLAUDE_PLUGIN_ROOT}/bin/snowmig catalog ... --execute --test-connection`;
 it only runs with `--execute`, because the API resolves RBAC on an existing
-catalog) before claiming the catalog is usable — a registered catalog that
-cannot reach Snowflake reads as created and returns nothing.
+catalog) before claiming the catalog is usable. Report the result as it is:
+`PENDING` is pending, never a pass.
+
+If the connection test returns `FAILED` without a reason, keep the
+registration and continue; discovery (S6) validates the connection through
+the connector. Never delete and re-register to make the test pass.
 
 ## Phase B — generate the DDL (offline, safe; needed only for Phase C)
 
@@ -92,16 +91,20 @@ always follows the tables it reads. Nothing has touched AIDP.
 **Exit code 3 is a halt, not a failure:** a column uses a type the target
 refuses at CREATE TABLE, usually `TIMESTAMP_NTZ` on a default-assessed estate.
 stderr and `DDL_PLAN.md` name the columns. The remedy is a decision for the
-user -- `ddl --timestamp-ntz timestamp` (offline) maps them to `TIMESTAMP`,
-which changes timezone semantics -- and until it is made, do not hand this
+user — `ddl --timestamp-ntz timestamp` (offline) maps them to `TIMESTAMP`,
+which changes timezone semantics — and until it is made, do not hand this
 plan to Phase C.
 
-## Phase C — Standard catalog only, and only when explicitly requested
+## Phase C — Standard catalog, only when requested
+
+Within the migration runbook this is not a separate request: S4 creates the
+INTERNAL target catalog and S10's structure workflow creates its tables. This
+phase covers a Standard catalog asked for outside the runbook.
 
 An EXTERNAL catalog needs no tables. A Standard catalog does, and **those tables
 are created on AIDP compute, not through the control-plane API**: a Spark run on
-the cluster prints per-object progress and a real Spark error, where a series of
-catalog-CRUD HTTP calls returns 202 Accepted and then fails silently.
+the cluster prints per-object progress and the Spark error for any failure, and
+reads each object back.
 
 So for a Standard catalog's TABLES, hand over the script and let it run on
 compute. In the runbook that is S10: `snowmig.py run --job
@@ -112,8 +115,9 @@ The catalog container itself comes from
 `INTERNAL` and reports `container_only: true` — pass that on, so nobody reads
 a created container as created structure.
 
-`snowmig.py deploy` is the older control-plane path. Prefer Phase C; reach for
-`deploy` only when the user asks for it specifically.
+`snowmig.py deploy` creates the structure through the control-plane catalog
+API instead. Prefer Phase C; use `deploy` only when the user asks for it
+specifically.
 
 ## Rules
 
@@ -129,6 +133,7 @@ a created container as created structure.
 3. **Never `--execute` on an earlier approval.** Ask in the turn you run it.
 4. **ADB/ADW/ALH EXTERNAL catalogs cannot hold managed Delta.** If a Standard
    clone is aimed at one, explain rather than trying.
+
 Rules 5–7 govern the Phase C clone; there is nothing to verify per object when
 a catalog is merely registered.
 
@@ -143,8 +148,8 @@ a catalog is merely registered.
    and has **not** been cloned. Resolve the collision before re-running — do
    not describe it as migrated. *Structure not verified* means it exists but
    its columns could not be compared, so no clone claim has been earned.
-5c. **Creation is asynchronous — a 202 is not a create.** Schema and table
-   creates can appear seconds later or never. If `verified/total` is less than
+5c. **Creation is asynchronous — a `202 Accepted` is not a create.** An
+   object exists once it has been read back. If `verified/total` is less than
    the statement count when the command returns, that batch is still settling,
    not failed and not done — say "pending, N of M verified so far" and check
    again rather than reporting the run as complete either way. Never say
@@ -167,4 +172,4 @@ a catalog is merely registered.
 The engine uses the `aidp` CLI when installed and falls back to `oci
 raw-request`. It prints which one it chose. If neither CLI is present it fails
 loudly rather than guessing a transport. `oci ai-data-platform` covers only the
-control plane, which is why the data plane goes through `raw-request`.
+control plane, so the data plane goes through `raw-request`.

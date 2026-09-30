@@ -33,7 +33,7 @@ Then say three things out loud:
    deletes them when asked. Both are dry runs unless `--execute`. Everything
    else is read-only, apart from one narrow opt-in that is itself gated by
    `--execute` (`smoke --write-probe --execute`); `notebook --upload` writes
-   nothing (dry run, refused with `--execute`, GAPS.md 13). If someone is
+   nothing (a dry run, refused with `--execute`). If someone is
    nervous about running the pipeline, this is the sentence that answers them.
 2. **Read out every ⚠️ row.** A flagged stage either found something or could
    not look, and those are not the same. `0 policy exposures` means the check

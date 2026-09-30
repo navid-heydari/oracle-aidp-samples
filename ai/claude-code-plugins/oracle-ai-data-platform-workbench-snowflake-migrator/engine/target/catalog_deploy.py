@@ -390,7 +390,8 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         # A view we DID create, whose column types the engine re-derived.
         # Distinct from a mismatch: the object is ours, the types are not.
         "derived_type_drift_targets": [], "derived_type_drift": [],
-        # Names the target has permanently burned. See P1 in ACTION-ITEMS.md.
+        # Names a create was accepted for and never appeared: not reusable
+        # in this schema, reported so the retry goes to a fresh schema.
         "poisoned_names": [],
         # Objects the diagnosis created. Deletes are async, so cleanup is
         # best-effort and the name is reported either way rather than left
@@ -443,11 +444,11 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         raise RefusedToExecute(
             f"catalog {target.catalog!r} is EXTERNAL -- a registered, "
             f"read-only pointer at the live Snowflake source. It cannot hold "
-            f"managed Delta: the creates would return 202 Accepted and "
-            f"silently produce nothing. A structure clone needs a STANDARD "
-            f"catalog, whose tables are created on AIDP compute via "
-            f"`snowmig.py notebook`, and only when the user has explicitly "
-            f"asked for one.")
+            f"managed Delta, so this deploy writes nothing into it. A "
+            f"structure clone needs a STANDARD catalog, whose tables are "
+            f"created on AIDP compute by the structure workflow (`snowmig.py "
+            f"run --job snowmig_01_structure`, runbook S10), and only when the "
+            f"user has explicitly asked for one.")
     out["catalog_type"] = catalog_type
     if catalog_type == "UNKNOWN":
         out["errors"].append(
@@ -468,9 +469,9 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         raise RefusedToExecute(
             f"could not list the schemas of catalog {target.catalog!r} before "
             f"writing ({str(exc)[:200]}). A schema that cannot be listed is "
-            f"not known to be absent, and re-POSTing one that exists gets "
-            f"the table creates that follow it accepted and then silently "
-            f"dropped, so it refuses rather than guesses.") from exc
+            f"not known to be absent, and this deploy creates a schema only "
+            f"once it is confirmed absent, so it refuses rather than guesses. "
+            f"Check the listing permission and re-run.") from exc
 
     def _look(catalog: str, schema: str) -> dict | None:
         # Mid-poll, the schema has already been POSTed; refusing would help
@@ -520,9 +521,9 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
         elif not is_active(found):
             state = str(found.get("lifecycleState"))
             out["errors"].append(
-                f"schema {requested} is {state}, not ACTIVE. Creating tables "
-                f"against a settling schema is what gets them accepted and "
-                f"then silently dropped, so nothing was posted into it.")
+                f"schema {requested} is {state}, not ACTIVE. Tables are "
+                f"created only in an ACTIVE schema, so nothing was posted "
+                f"into it. Re-run once the schema reports ACTIVE.")
             # Gated, not just recorded. This used to fall through to the
             # create loop: every object was POSTed into the settling schema,
             # never appeared, and the burned-name probe -- run once the
@@ -557,10 +558,9 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 "source_identifier": ident, "target_fqn": stmt["target_fqn"],
                 "reason": (
                     f"schema {catalog}.{schema} was still {settling} after "
-                    f"the schema wait, so nothing was posted into it: a "
-                    f"create against a settling schema is accepted and then "
-                    f"silently dropped. The name is not burned. Re-run once "
-                    f"the schema reports ACTIVE.")})
+                    f"the schema wait, so nothing was posted into it: tables "
+                    f"are created only in an ACTIVE schema. The name can "
+                    f"still be used. Re-run once the schema reports ACTIVE.")})
             continue
 
         # The key the SERVER uses, which is lower-cased.
@@ -660,7 +660,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 "source_identifier": ident, "target_fqn": stmt["target_fqn"],
                 "reason": (
                     f"the create "
-                    f"{'returned 202 Accepted' if accepted else 'was REFUSED'}"
+                    f"{'was accepted' if accepted else 'was REFUSED'}"
                     f" and "
                     f"the object could not be read back: listing {relation} "
                     f"in {schema_key} failed ({str(list_error)[:200]}). Its "
@@ -679,7 +679,7 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
             if _is_client_error(create_error):
                 reason += (
                     "The target named what was wrong with this request, so "
-                    "the name is not burned and a fresh schema would not "
+                    "the name can still be used and a fresh schema would not "
                     "help -- fix what the message says, or exclude the "
                     "object, and re-run.")
             else:
@@ -698,16 +698,17 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                         f"{schema_key} straight afterwards, so this catalog "
                         f"CAN create a {kind} and the server error is about "
                         f"THIS object -- its SQL or one of its column types. "
-                        f"The name is not burned.")
+                        f"The name can still be used.")
                 elif verdict is False:
                     reason += (
                         f"A trivial {kind} with a novel name failed in "
                         f"{schema_key} too, so this is not about your object: "
                         f"**this catalog cannot create a {kind} through the "
-                        f"catalog API at all.** Nothing here will succeed on "
-                        f"a retry or in a fresh schema. Create the structure "
-                        f"on AIDP compute instead -- `provision` + `run` -- "
-                        f"or raise the server error with the platform.")
+                        f"catalog API at all.** A retry or a fresh schema "
+                        f"will not change that. Create the structure on AIDP "
+                        f"compute instead -- `provision` + `run --job "
+                        f"snowmig_01_structure` (runbook S10) -- or raise the "
+                        f"server error with your AIDP administrator.")
                 else:
                     reason += (
                         f"The server gave no detail and the {kind} probe "
@@ -719,9 +720,9 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 "reason": reason})
             continue
         if listed is None:
-            base = (f"the create returned 202 Accepted but no object matching "
-                    f"{schema_key}.{name} ever appeared, and the asynchronous "
-                    f"create reported nothing. ")
+            base = (f"the create was accepted but no object matching "
+                    f"{schema_key}.{name} appeared within the read-back "
+                    f"window. ")
             # Ask the schema whether it is refusing OUR name or everything.
             # Once per schema: the answer is a property of the schema.
             # Keyed by kind as well as schema: "a table lands here" and
@@ -740,29 +741,29 @@ def deploy_catalog(ddl_plan: dict, *, target=None, execute: bool = False,
                 reason = base + (
                     f"A NOVEL {kind} name in {schema_key} was created "
                     f"successfully, "
-                    f"so the schema and your request are both fine and this "
-                    f"NAME IS BURNED: a create that failed here once is "
-                    f"refused for ever after, and DELETE does not recover it. "
-                    f"Retry into a FRESH SCHEMA -- re-running into this one "
-                    f"will keep returning 202 and keep creating nothing.")
+                    f"so the schema and your request are both fine and THIS "
+                    f"NAME CANNOT BE REUSED in this schema: after a failed "
+                    f"create the name stays unavailable there, and a DELETE "
+                    f"does not release it. Retry into a FRESH SCHEMA -- "
+                    f"re-running into this one will not create the object.")
             elif verdict is False:
                 reason = base + (
                     f'A novel {"view" if is_view else "table"} name in the '
-                    "same schema failed too, so this is "
-                    "not a burned name: suspect the request itself (an "
-                    "unsupported field type is the usual cause) or the "
-                    "permissions on this catalog.")
+                    "same schema failed too, so the name is not the cause: "
+                    "check the request itself (an unsupported field type is "
+                    "the usual cause) or the permissions on this catalog.")
             elif diagnose:
                 reason = base + (
                     "Most often an unsupported field type. The diagnosis "
-                    "probe could not be read back either, so a burned name "
-                    "and a bad request cannot be told apart here -- see "
-                    "diagnosis_probes for the listing error.")
+                    "probe could not be read back either, so a name that "
+                    "cannot be reused and a request the target rejects "
+                    "cannot be told apart here -- see diagnosis_probes for "
+                    "the listing error.")
             else:
                 reason = base + (
                     "Most often an unsupported field type. Re-run with "
-                    "diagnosis enabled to tell a burned name from a bad "
-                    "request.")
+                    "diagnosis enabled to tell a name that cannot be reused "
+                    "from a request the target rejects.")
 
             out["failed_targets"].append(ident)
             out["failed"].append({

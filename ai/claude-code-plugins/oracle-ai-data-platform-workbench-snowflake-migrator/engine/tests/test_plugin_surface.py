@@ -150,15 +150,12 @@ def test_smoke_skill_documents_the_write_probe_lifecycle():
     assert "external" in low, \
         "must say the probe is skipped for a read-only EXTERNAL catalog"
     # plan/smoke.py `_probe_schema_name()` suffixes PROBE_SCHEMA with 8 hex
-    # chars per run (a failed create poisons the name for good) and drops
+    # chars per run and drops
     # only what this run created -- there is no pre-existence check. The
-    # skill and ASSUMPTIONS.md D8 described a constant name and a skipped
-    # drop long after that changed.
+    # skill once described a constant name and a skipped drop.
     from plan.smoke import PROBE_SCHEMA
     flat = " ".join(low.split())
-    assumptions = " ".join((ROOT / "ASSUMPTIONS.md")
-                           .read_text(encoding="utf-8").lower().split())
-    for name, doc in (("smoke skill", flat), ("ASSUMPTIONS.md", assumptions)):
+    for name, doc in (("smoke skill", flat),):
         assert (PROBE_SCHEMA + "_") in doc, \
             f"{name}: must name the per-run suffixed probe schema"
         for stale in ("creates a schema named `snowmig_permission_probe`",
@@ -200,26 +197,6 @@ def test_overview_states_the_source_read_only_guarantee_as_enforced():
     assert "enforced" in low
     assert "ever written to or dropped from the source" in low
     assert "assume none" in low, "no destination means no assumption"
-
-
-def test_assumptions_register_states_the_live_verified_split():
-    """The header table must say what WAS contacted and what was not.
-
-    An earlier version asserted the literal "AIDP: Never contacted", which
-    became false the day the catalog transport was live-verified -- the test
-    then ENFORCED the stale claim, and correcting the document broke the
-    suite. What is invariant is the split itself: the register must name the
-    live-verified surfaces and the never-executed ones, in both directions."""
-    text = (ROOT / "ASSUMPTIONS.md").read_text(encoding="utf-8")
-    assert "Never contacted" not in text, \
-        "AIDP has been contacted; the register must say so"
-    low = text.lower()
-    assert "live-verified" in low, "must name what a real AIDP run proved"
-    assert "still unproven" in low or "never executed" in low, \
-        "must name the surfaces still unproven"
-    assert "AWS_US_EAST_2" in text, "must name the Snowflake env that WAS used"
-    for section in ("## A.", "## B.", "## C.", "## D.", "## E."):
-        assert section in text
 
 
 def test_data_movement_reference_offers_at_least_three_options():
@@ -576,7 +553,7 @@ def test_privacy_doc_describes_the_current_credential_and_data_flows():
 
 def test_no_operator_surface_mentions_the_nonexistent_notebook_run_command():
     """`aidp notebook run` is not a command the aidp CLI has, and the
-    notebookRuns API does not exist (GAPS.md 13). Neither may be offered to
+    notebookRuns API does not exist. Neither may be offered to
     an operator as the way to run a notebook."""
     paths = list((ROOT / "skills").rglob("SKILL.md")) \
         + list((ROOT / "commands").glob("*.md")) \
@@ -598,8 +575,7 @@ _NO_DATA_CLAIM = re.compile(
     r"none implemented|nothing below is implemented|"
     r"no code path can report that data moved", re.I)
 _DATA_SURFACES = (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json",
-                  "NOTICE", "GAPS.md", "ASSUMPTIONS.md", "README.md",
-                  "references/data-movement-options.md")
+                  "NOTICE", "README.md", "references/data-movement-options.md")
 
 
 def test_no_surface_claims_the_plugin_copies_no_data_unscoped():
@@ -622,9 +598,10 @@ def test_manifest_and_marketplace_agree_on_the_data_claim():
     market = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
     entry = market["plugins"][0]
     assert entry["version"] == plugin["version"]
+    # Rows move only through the per-schema copy job: both descriptions say
+    # so, and neither claims data moves any other way.
     for desc in (plugin["description"], entry["description"]):
-        assert "snowmig_02_copy_schema" in desc, desc
-        assert "control plane" in desc.lower(), desc
+        assert "copy job per schema" in desc.lower(), desc
 
 
 # --------------------------------------------------------------------------
@@ -723,45 +700,9 @@ def test_the_three_runbooks_agree_on_the_step_order():
 # from this, so it must not drift.
 # --------------------------------------------------------------------------
 
-_LIVE_STATUS_DOCS = ("README.md", "ASSUMPTIONS.md", "MIGRATION-ARCHITECTURE.md",
-                     "data-migration-scripts/README.md",
-                     "skills/snowflake-migrator-overview/SKILL.md")
-_STALE_LIVE_CLAIM = re.compile(
-    r"never run against a live AIDP|(still|remains?) unexecuted|"
-    r"none implemented", re.I)
-
-
 def _flat(text: str) -> str:
     return " ".join(text.split())
 
-
-def test_live_status_register_has_one_home_and_one_wording():
-    gaps = (ROOT / "GAPS.md").read_text(encoding="utf-8")
-    assert "## What is actually proven" in gaps
-    register = gaps.split("## What is actually proven", 1)[1].split("\n## ", 1)[0]
-    for stage in ("00_discover", "01_create_structure", "02_copy", "03_reconcile"):
-        assert stage in register, stage
-    # The sentence ends where the live copy's verdict does (2026-09-29).
-    statement = re.search(r"\*\*What has run live:\*\*.*?does not scale as "
-                          r"it stands \(GAPS P0 item 8\)\.", _flat(register))
-    assert statement, "GAPS.md must carry the canonical live-status sentence"
-    canonical = statement.group(0)
-    for rel in _LIVE_STATUS_DOCS:
-        text = (ROOT / rel).read_text(encoding="utf-8")
-        stale = _STALE_LIVE_CLAIM.search(text)
-        assert not stale, f"{rel} carries a stale live-status claim: {stale.group(0)!r}"
-        flat = _flat(text)
-        assert "What is actually proven" in flat, f"{rel} must point at the GAPS register"
-        assert canonical in flat, f"{rel} must carry the GAPS sentence verbatim"
-
-
-# --------------------------------------------------------------------------
-# The slash commands are the agent's entry points at S4/S10. They must route
-# Standard-catalog structure the way the runbook and the CLI do: the
-# container from `catalog --catalog-type standard --execute`, the tables from
-# `run --job snowmig_01_structure` -- never through `notebook --upload`,
-# whose transport GAPS 13 records as known-bad.
-# --------------------------------------------------------------------------
 
 def test_catalog_command_does_not_call_the_standard_catalog_refused():
     text = (ROOT / "commands/snowflake-catalog.md").read_text(encoding="utf-8")
@@ -827,7 +768,7 @@ def test_the_docs_say_how_the_aidp_clis_authenticate():
 def test_the_write_carve_outs_name_the_execute_gate():
     """cmd_smoke: `write_probe = bool(args.write_probe and args.execute)`;
     cmd_notebook: `--upload` is a dry run without --execute and refused with
-    it (GAPS.md 13). ARCHITECTURE.md and the stage board listed both as bare
+    it. ARCHITECTURE.md and the stage board listed both as bare
     opt-in writers, which is what the code did before the cli fix."""
     for rel in ("ARCHITECTURE.md", "MIGRATION-ARCHITECTURE.md",
                 "skills/snowflake-stage-board/SKILL.md"):
@@ -910,10 +851,7 @@ def test_view_docs_carry_the_rule_counts_from_translate_rules():
     assert f"{c['implemented']} dialect rewrites" in arch
     assert f"{c['implemented']} SQL rewrites" in arch
     assert f"{c['declared']} constructs" in arch
-    assumptions = (ROOT / "ASSUMPTIONS.md").read_text(encoding="utf-8")
-    assert f"of the {c['implemented']} implemented dialect rules" in assumptions
-    for rel, doc in (("README.md", readme), ("MIGRATION-ARCHITECTURE.md", arch),
-                     ("ASSUMPTIONS.md", assumptions)):
+    for rel, doc in (("README.md", readme), ("MIGRATION-ARCHITECTURE.md", arch)):
         for stale in ("6 exact", "6 implemented", "15 Snowflake-only"):
             assert stale not in doc, f"{rel}: {stale!r}"
 
@@ -935,9 +873,8 @@ def test_no_doc_says_the_standard_catalog_is_never_created_or_routes_to_the_note
     """`catalog --catalog-type standard --execute` creates the INTERNAL
     container (S4, live-verified) and the structure is `run --job
     snowmig_01_structure` (S10); `notebook --upload --execute` is refused.
-    ASSUMPTIONS.md B2 kept the older story after every sibling doc moved."""
-    paths = [ROOT / p for p in ("ASSUMPTIONS.md", "GAPS.md", "README.md",
-                                "ARCHITECTURE.md")]
+    No doc may keep the older story."""
+    paths = [ROOT / p for p in ("README.md", "ARCHITECTURE.md")]
     paths += sorted((ROOT / "commands").glob("*.md"))
     paths += sorted((ROOT / "skills").glob("*/SKILL.md"))
     for path in paths:
@@ -954,8 +891,7 @@ def test_no_doc_says_the_standard_catalog_is_never_created_or_routes_to_the_note
 
 def test_notebook_command_and_skill_do_not_promise_upload_or_execution():
     """cmd_notebook never places anything on the workspace: `--upload` is a
-    dry run and `--upload --execute` exits 1 with "Upload refused" (GAPS.md
-    13). The command promised "place it in the AIDP workspace, ready for you
+    dry run and `--upload --execute` exits 1 with "Upload refused". The command promised "place it in the AIDP workspace, ready for you
     to execute" and the skill "generate, upload, run"."""
     text = (ROOT / "commands/snowflake-notebook.md").read_text(encoding="utf-8")
     low = text.lower()

@@ -19,7 +19,7 @@ Two rules it holds to, both learned the hard way elsewhere in this plugin:
     further write is `smoke --write-probe --execute`:
     one probe schema, created and removed; `--write-probe` alone is a dry
     run. `notebook --upload` sends nothing -- a dry run without `--execute`,
-    refused with it (GAPS.md 13).
+    refused with it.
 """
 from __future__ import annotations
 
@@ -198,7 +198,9 @@ STAGES: tuple[dict, ...] = (
      "writes": True, "optional": True, "artifact": "teardown_result.json",
      "purpose": "terminate the clusters this migration allocated (stop by "
                 "default, delete when asked); the workspace, catalogs and "
-                "jobs are kept. Dry-run unless --execute"},
+                "jobs are kept -- unless --scope credential (the Snowflake "
+                "credential only) or --scope all (everything the migration "
+                "created) is asked for. Dry-run unless --execute"},
 )
 
 # CLI commands that are tools, not steps of a migration. Every other command

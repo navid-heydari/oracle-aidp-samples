@@ -33,7 +33,7 @@ flattened. `--bronze-catalog-prefix` is the only variation: it puts everything i
 one catalog and folds the database into the schema name. Under the runbook that
 catalog is the S4 INTERNAL catalog, and the prefix is required: S10 refuses a
 plan whose catalog is not its `--target-catalog`, and without the prefix the
-plan's catalog is the source database name -- the EXTERNAL pointer registered
+plan's catalog is the source database name — the EXTERNAL catalog registered
 at S3.
 
 ## Can and cannot, with reasons
@@ -103,9 +103,9 @@ Exit 3 means a target-name collision — show it and stop.
 
 ## The architecture options are not optional reading
 
-`PLANNED_OBJECTS.md` ends with all five. Do not skip past them because this MVP
-moves no data: the user needs to know which architecture they are heading toward
-*before* structure lands, because it decides whether the destination is an
+`PLANNED_OBJECTS.md` ends with every option. Do not skip past them because the
+runbook itself moves no data: the user needs to know which architecture they are
+heading toward *before* structure lands, because it decides whether the destination is an
 INTERNAL catalog they will fill, an EXTERNAL catalog they will read through, or
 both.
 
@@ -180,7 +180,7 @@ section, read it out. Say three things:
 
 Do not propose a cadence or a retention. Both need the customer's recovery
 requirements and query patterns. `references/maintenance-and-layout.md` has the
-full mapping; `ACTION-ITEMS.md` has the planned work.
+full mapping.
 
 ## Finish with `summary` — it is not optional
 

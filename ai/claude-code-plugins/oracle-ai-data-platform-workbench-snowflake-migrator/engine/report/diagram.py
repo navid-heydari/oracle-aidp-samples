@@ -5,14 +5,16 @@ subgraph per phase group, nodes in pipeline order, thick arrows into a stage
 that writes to AIDP, a dotted link between two stages that are alternatives.
 Given a stage board, nodes are coloured by what has actually run.
 
-The copy committed at the plugin root (phase-diagram_v1.mmd) is this output
-verbatim; a test fails if the two differ.
+ARCHITECTURE.md carries this output (without its %% comment lines) in a
+```mermaid block between the phase-diagram markers; `stages
+--write-diagram` refreshes it and a test fails if the two differ.
 """
 from __future__ import annotations
 
 from .stages import STAGES
 
-__all__ = ["phase_diagram", "GROUP_TITLES"]
+__all__ = ["phase_diagram", "GROUP_TITLES", "DIAGRAM_BEGIN", "DIAGRAM_END",
+           "architecture_block", "embed_in_architecture"]
 
 GROUP_TITLES = {
     "setup": "Setup &nbsp;&#40;environment and catalogs&#41;",
@@ -38,7 +40,7 @@ def _label(spec: dict) -> str:
 
 
 def phase_diagram(board: dict | None = None) -> str:
-    out = ["%% Snowflake -> Oracle AIDP migrator: phase diagram (v1)",
+    out = ["%% Snowflake -> Oracle AIDP migrator: phase diagram",
            "%% GENERATED from engine/report/stages.py STAGES -- do not edit by "
            "hand;",
            "%% regenerate with `bin/snowmig stages --write-diagram`.",
@@ -98,3 +100,24 @@ def phase_diagram(board: dict | None = None) -> str:
         if flagged:
             out.append(f'  class {",".join(flagged)} attention')
     return "\n".join(out) + "\n"
+
+
+DIAGRAM_BEGIN = "<!-- phase-diagram:begin -->"
+DIAGRAM_END = "<!-- phase-diagram:end -->"
+
+
+def architecture_block() -> str:
+    """The diagram as ARCHITECTURE.md embeds it: a ```mermaid block, the
+    %% comment lines left out (the surrounding prose explains the arrows)."""
+    body = "\n".join(line for line in phase_diagram().splitlines()
+                     if not line.startswith("%%")).strip("\n")
+    return f"{DIAGRAM_BEGIN}\n```mermaid\n{body}\n```\n{DIAGRAM_END}"
+
+
+def embed_in_architecture(text: str) -> str:
+    """ARCHITECTURE.md's text with the block between the markers replaced.
+    Raises ValueError when the markers are missing."""
+    start, end = text.find(DIAGRAM_BEGIN), text.find(DIAGRAM_END)
+    if start < 0 or end < start:
+        raise ValueError("ARCHITECTURE.md has no phase-diagram markers")
+    return text[:start] + architecture_block() + text[end + len(DIAGRAM_END):]

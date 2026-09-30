@@ -8,9 +8,8 @@ Runs on AIDP compute. Three structure sources, chosen with --mode:
                       it cannot map exactly instead of guessing, and the plan
                       was reviewed and signed off before this ran. Costs NO
                       source read per table, which is what makes a large
-                      estate feasible: creating 100 tables by CTAS took
-                      minutes on a live run, because each CTAS is its own
-                      Snowflake round trip.
+                      estate feasible: each CTAS is its own Snowflake round
+                      trip.
   ctas                CREATE TABLE ... USING DELTA AS SELECT * ... WHERE 1=0.
                       Spark derives the types through the connector, so the
                       copy cannot hit a type the table cannot hold -- but the
@@ -36,9 +35,8 @@ compared with the plan, column by column and in order.
 
 In --mode ddl-plan the plan's `NOT NULL`, column COMMENTs and table COMMENT
 are applied, not just its names and types: they are in the CREATE TABLE the
-reviewer approved, and this stage used to render `name type` and then compare
-against the same reduced shape, so a table that differed from the approved
-SQL still read back as matching. Nullability is read from the table's schema
+reviewer approved, and each table is read back against that full shape.
+Nullability is read from the table's schema
 (DESCRIBE does not report it); when that read fails the table's record says
 the property is UNCHECKED rather than counting it as applied.
 

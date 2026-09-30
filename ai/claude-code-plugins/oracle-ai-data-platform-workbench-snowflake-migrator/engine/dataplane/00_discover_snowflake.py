@@ -559,8 +559,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if not manifest["schemas"]:
         log("ZERO schemas discovered. In external-catalog mode that usually "
-            "means the catalog never crawled successfully (check its refresh "
-            "status and the crawler's network path to Snowflake); in "
+            "means the catalog has not completed a crawl yet (check its "
+            "refresh status and the crawler's network path to Snowflake); in "
             "connector mode it means these credentials see nothing, or "
             "DISCOVERY FAILED above (read that traceback first). Either "
             "way it is a FINDING, not a success.")

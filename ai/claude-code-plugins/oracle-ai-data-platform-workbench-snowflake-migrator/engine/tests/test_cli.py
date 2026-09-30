@@ -687,7 +687,7 @@ def test_notebook_upload_without_execute_is_a_dry_run(
 def test_notebook_upload_with_execute_is_refused_and_points_at_provision(
         tmp_path, monkeypatch, capsys):
     # The Jupyter-contents transport 200s and cannot read the file back
-    # (GAPS.md 13). Refusing is honest; "uploaded" was not.
+    #. Refusing is honest; "uploaded" was not.
     _no_subprocess(monkeypatch)
     write(tmp_path, "inventory.json", INV)
     write(tmp_path, "dependencies.json", DEPS)

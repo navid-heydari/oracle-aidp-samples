@@ -40,6 +40,7 @@ whose flags were established against the installed 4.2.1 client.
 from __future__ import annotations
 
 import json
+from urllib.parse import quote
 
 from .coords import region_from_ocid
 from .executor import paged_uri
@@ -214,9 +215,7 @@ def build_driver_notebook(script_workspace_path: str,
         "sys.argv = [SCRIPT] + ARGS\n"
         "print('running', SCRIPT, ARGS, flush=True)\n"
         "# A script's sys.exit(0) raises SystemExit, which a notebook cell\n"
-        "# reports as an error -- live, a fully successful discovery (11\n"
-        "# schemas, 1000 tables, manifest written) came back as a FAILED job\n"
-        "# for exactly that reason. So the exit CODE decides, and a non-zero\n"
+        "# reports as an error. So the exit CODE decides, and a non-zero\n"
         "# one is re-raised so the job still fails when the work did.\n"
         "try:\n"
         "    runpy.run_path(SCRIPT, run_name='__main__')\n"
@@ -260,10 +259,8 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
     """The argv for one provisioning operation. Pure — runs nothing."""
     if backend != "oci_raw":
         raise ProvisionBackendUnsupported(
-            f"backend {backend!r}: provisioning is wired for oci_raw only. "
-            f"The `aidp` CLI has the right command groups, but its flags are "
-            f"not documented and will be mapped during live validation "
-            f"rather than guessed.")
+            f"backend {backend!r}: provisioning runs on the oci_raw backend "
+            f"(`oci raw-request`) only.")
     base = _base(platform_ocid)
 
     def raw(method: str, uri: str, body: dict | None = None,
@@ -391,5 +388,33 @@ def build_provision_command(backend: str, operation: str, platform_ocid: str,
         # and passes `body_file`, which `raw()` prefers over the inline body.
         return raw("POST", f"{base}/actions/testConnection",
                    kwargs.get("body"), body_file=kwargs.get("body_file"))
+
+    # --- teardown --scope credential|all. Each shape below ran live on the
+    # validated DataLake on 2026-09-29 before it was wired here.
+    if operation == "delete_ws_object":
+        # `aidp workspace-object delete` drops the path into the URI
+        # unencoded and answers 404. The path percent-encoded as ONE segment
+        # (`a%2Fb%2Fc.json`) answers 204, and the object leaves the listing.
+        return raw("DELETE", f"{base}/workspaces/{ws}/objects/"
+                             f'{quote(kwargs["path"].lstrip("/"), safe="")}')
+    if operation == "delete_workspace":
+        # 204 with an async operation key in a header; the operation reads
+        # SUCCEEDED about a minute later, and the workspace takes its files
+        # with it.
+        return raw("DELETE", f"{base}/workspaces/{ws}")
+    if operation == "delete_catalog":
+        # 202 with an async operation key. `is-forced` is a request HEADER
+        # (the aidp client sends it as one): as a query parameter
+        # (`?force=true`, `?isCascade=true`) it is ignored, and an INTERNAL
+        # catalog holding schemas stayed ACTIVE. `--is-forced` deleted one
+        # with its tables (SUCCEEDED in ~130 s); an EXTERNAL catalog needs
+        # no force.
+        return aidp_cli("catalog", "delete", kwargs["catalog"],
+                        *(["--is-forced"] if kwargs.get("forced") else []))
+    if operation == "list_catalogs":
+        # The listing `snowmig catalogs` reads (the dataLakes family).
+        return raw("GET", f"https://aidp.{region}.oci.oraclecloud.com/"
+                          f"20240831/dataLakes/{platform_ocid}/catalogs",
+                   page=page)
 
     raise ValueError(f"unknown provisioning operation {operation!r}")

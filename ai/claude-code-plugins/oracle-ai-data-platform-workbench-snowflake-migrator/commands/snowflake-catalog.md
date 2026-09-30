@@ -20,12 +20,18 @@ Thin wrapper over the registration phase of
 4. Report `action` and `verified` from `catalog_result.json` — never
    `executed`. `create_requested` means the create was accepted but the
    catalog never became visible: say it is pending, not done.
-5. A **Standard** catalog is created here too, but only when the user
-   explicitly asked for one, and only as the CONTAINER (runbook S4):
+5. Validate the EXTERNAL catalog with `--test-connection` (with `--execute`)
+   and report the result as it is; `PENDING` is not a pass. If it returns
+   `FAILED` without a reason, keep the registration and continue: discovery
+   (S6) validates the connection through the connector. Never delete and
+   re-register to make the test pass.
+6. A **Standard** (INTERNAL) catalog is created here too, as the CONTAINER
+   only: at runbook S4 in every migration, or when the user asks for one
+   outside the runbook:
    `snowmig.py catalog --catalog <name> --catalog-type standard --execute`.
    `catalog_result.json` then carries `container_only: true` — pass that on,
    so nobody reads a created container as created structure. Its schemas and
    tables come later, at S10, from
    `snowmig.py run --job snowmig_01_structure` (one workflow per schema on
-   AIDP compute), never through this command and never through the
-   control-plane API, which can return `202 Accepted` and create nothing.
+   AIDP compute, each create read back), never through this command: the
+   control-plane catalog API is used for the catalog container only.

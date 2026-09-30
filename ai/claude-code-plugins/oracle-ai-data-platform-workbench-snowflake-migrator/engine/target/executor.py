@@ -96,9 +96,8 @@ def detect_backend(*, which: Callable[[str], str | None] = shutil.which) -> str:
     if which("aidp"):
         return "aidp_cli"
     raise NoBackendAvailable(
-        "no AIDP execution backend found: install the `oci` CLI (preferred -- "
-        "its REST surface is the verified one) or the `aidp` CLI. The "
-        "migrator will not guess at a transport.")
+        "no AIDP execution backend found: install the `oci` CLI (preferred) "
+        "or the `aidp` CLI. The migrator will not guess at a transport.")
 
 
 def _endpoint(target) -> str:

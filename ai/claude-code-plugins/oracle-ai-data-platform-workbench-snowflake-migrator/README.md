@@ -1,72 +1,75 @@
 # Oracle AI Data Platform — Snowflake Migrator (Claude Code plugin)
 
-Investigate a Snowflake estate and migrate it onto Oracle AI Data Platform
-(AIDP): inventory → what can and cannot move → medallion layout → the target
-catalog, registered EXTERNAL against the live Snowflake source → the AIDP
-migration environment (workspace, `migration_assets` cluster, jobs) → **data,
-schema by schema**, via the parametrised PySpark **notebooks** in
-[data-migration-scripts/](data-migration-scripts/) that run INSIDE AIDP and
-verify every copy (row counts, exact decimal sums).
+Migrate a Snowflake database onto Oracle AI Data Platform (AIDP): structure
+first, then data, schema by schema. The plugin:
+
+- inventories the Snowflake estate and states, per object, what can migrate
+  and what cannot, with the reason;
+- registers the source as an EXTERNAL catalog (a read-only pointer at the
+  live Snowflake database) and creates the INTERNAL target catalog;
+- provisions the AIDP migration environment: a workspace, the
+  `migration_assets` cluster, the migration notebooks and their jobs;
+- runs discovery and structure creation **inside AIDP**, as jobs, from a plan
+  you approve;
+- leaves one copy job per schema that copies the rows and verifies them (row
+  counts, and exact decimal sums on request), for you to run when you decide.
 
 **The control plane copies no data itself.** Rows move only when the operator
 runs one of the in-AIDP copy jobs: `snowmig_02_copy_<schema>`, one per schema
 of the approved plan, each running the `02_copy_schema` notebook (before a
-plan is pushed, the single `snowmig_02_copy_schema` job). The data
-plane is the scripts on AIDP compute, and the jobs that run them carry **no
-schedule** — running one is always the operator's call. Stored procedures,
-tasks, streams and pipes are inventoried with effort bands, never
-auto-translated.
+plan is pushed, the single `snowmig_02_copy_schema` job). The jobs carry **no
+schedule**, and row data flows from Snowflake to your AIDP cluster and catalog
+storage without passing through your machine. Stored procedures, tasks,
+streams and pipes are inventoried with effort bands, not translated.
 
-Two modes: **dev** (`snowmig.py demo` — the whole pipeline against a built-in
-emulation, zero credentials, every artifact narrated in `DEMO.md`) and
-**prod** (the pipeline below, with `--execute` gates).
+Two modes: **dev** (`bin/snowmig demo --out-dir ./snowmig_demo` — the whole
+pipeline against a built-in emulation, no credentials, every artifact
+narrated in `DEMO.md`) and **prod** (the run below, with `--execute` gates).
 
-**→ Start here: [How to run a migration](#how-to-run-a-migration-from-zero).**
-The design record behind it — the full Snowflake→AIDP mapping and what is
-deterministic versus AI — is
+**Start here: [How to run a migration, from zero](#how-to-run-a-migration-from-zero).**
+The design record — the full Snowflake-to-AIDP mapping and what is
+deterministic versus AI-assisted — is
 [MIGRATION-ARCHITECTURE.md](MIGRATION-ARCHITECTURE.md).
 
 ---
 
 ## How to run a migration, from zero
 
-The migration is the overview skill's **twelve steps, S1–S12, in that
-order** (`skills/snowflake-migrator-overview/SKILL.md` is the authority on
-the sequence); the sections below are its runnable form and name the step
-each command serves. Everything reads from one config file, and nothing
-writes to AIDP without `--execute` -- except `run`, which has no dry run:
-invoking it starts a job `provision` already created.
+A migration is twelve steps, **S1–S12, in a fixed order**.
+`skills/snowflake-migrator-overview/SKILL.md` is the authority on the
+sequence; the sections below are its runnable form and name the steps each
+one covers. Every command reads one config file, and nothing writes to AIDP
+without `--execute` — except `run`, which has no dry run: it starts a job
+that `provision` already created.
 
-> **On the paths below.** They are written `engine/snowmig.py`, which is what
-> you type from a checkout of this repo. If the plugin is **installed** rather
-> than cloned, the same file is at `${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py` —
-> use that, from whatever directory you are in. You never need to `cd` into the
-> plugin, and `--out-dir` and the config live wherever *you* are working.
+> **Paths.** Commands are written `bin/snowmig <stage>`, as typed from a
+> checkout of this repository. With the plugin installed, use
+> `${CLAUDE_PLUGIN_ROOT}/bin/snowmig` (or
+> `${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py`) from any directory; the in-AIDP
+> notebooks are in `${CLAUDE_PLUGIN_ROOT}/data-migration-scripts/`. The
+> config file and `--out-dir` belong in **your** working directory — an
+> installed plugin's directory may be read-only.
 
 ### 0. Prerequisites
 
 | | |
 |---|---|
-| Snowflake | a **read-only** role and a service user. Password or key-pair — **both go in the one config file**, the PEM pasted inline under `private_key: |`. Nothing else to create |
-| AIDP | the `oci` CLI configured, plus the `aidp` CLI (`pip install aidp-python-client aidp-cli`) for workspace files. You need the **aiDataPlatform OCID** |
-| Local | `pip install -r engine/requirements.txt` |
+| Snowflake | a **read-only** role and a service user, authenticated by password or key pair. Both go in the one config file (a PEM can be pasted inline under `private_key:`). No write grant is needed: the transport refuses any statement that is not a read, whatever the credential permits |
+| AIDP | the `oci` CLI configured, the `aidp` CLI (`pip install aidp-python-client aidp-cli`) for workspace files, and the **aiDataPlatform OCID** |
+| Local | Python 3.10+ and `pip install -r engine/requirements.txt` (`bin/snowmig` does this for you when needed) |
 
-Never needed: any write grant on Snowflake. The transport refuses non-read
-verbs regardless of what the credential permits.
-
-### 1. One config file — and where it lives
+### 1. One config file
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig init-config
+bin/snowmig init-config
 ```
 
-That writes `./snowmig-config.yaml` from `snowmig-config.example.yaml` with
-mode `0600` (on POSIX; Windows has no mode bits, so the file inherits your
-profile's ACL), and refuses to overwrite one that already exists (it would be
-holding credentials). Copying the template by hand works just as well —
-`chmod 600` it yourself if you do. Fill it in:
-**the Snowflake connection and the AIDP destination both live in that one
-file**, so nothing has to be repeated on the command line.
+This writes `./snowmig-config.yaml` from `snowmig-config.example.yaml`,
+readable by you alone (`0600` on POSIX; on Windows the file inherits your
+profile's ACL), and refuses to overwrite an existing one. Copying the
+template by hand works too — `chmod 600` it. **The Snowflake connection and
+the AIDP destination both live in this file**, so nothing is repeated on the
+command line:
 
 ```yaml
 snowflake:
@@ -82,265 +85,164 @@ snowflake:
 
 aidp:
   datalake_ocid: ocid1.aidataplatform.oc1.<region>.<unique-id>
-  # catalog: my_target_catalog        # the INTERNAL target (create it yourself)
+  # catalog: my_target_catalog        # the INTERNAL target catalog (S4)
   # external_catalog: my_snowflake_source
 ```
 
-**Where the CLI looks for it**, in order — every stage prints which file it
+The CLI looks for it in this order, and every stage prints which file it
 used:
 
 1. `--config <path>`, when given;
 2. `./snowmig-config.yaml` in the working directory;
 3. the same name beside the plugin.
 
-Any field can still be overridden per run with a flag (`--role`,
-`--warehouse`, `--catalog`, `--datalake-ocid`), without editing the file.
+Any field can be overridden per run with a flag (`--role`, `--warehouse`,
+`--catalog`, `--datalake-ocid`).
 
-#### What is *not* in that file
+**AIDP authentication is not in this file.** The plugin drives the `oci` and
+`aidp` CLIs with your OCI setup (`~/.oci/config`, from `oci setup config`):
 
-**AIDP authentication.** The plugin drives the `oci` and `aidp` CLIs with
-your normal OCI setup (`~/.oci/config`, from `oci setup config`), and this
-is exactly how: `oci raw-request` runs with that file's `DEFAULT` profile
-(or whatever `OCI_CLI_PROFILE` selects in your shell) unless the config
-names one — `aidp.oci_profile`, when set, is announced on stdout and passed
-as `--profile <name>` to every `oci` call, which wins over
-`OCI_CLI_PROFILE`; the `aidp` CLI is not given a profile flag, because its
-flag set is unverified. For those `oci` calls a session-token profile
-additionally needs `OCI_CLI_AUTH=security_token` in your shell, which the
-plugin does not add. Every `aidp` invocation is given `--auth api_key` plus
-`--region` derived from the DataLake OCID, because the `aidp` CLI's own
-default is a session token. So the API key the plugin uses is the one in
-that profile. The config only names *which* AIDP resources to use — never a
-credential for them.
+- `oci raw-request` runs with that file's `DEFAULT` profile, or the one
+  `OCI_CLI_PROFILE` selects. When the config sets `aidp.oci_profile`, it is
+  announced and passed as `--profile <name>` to every `oci` call, overriding
+  `OCI_CLI_PROFILE`. A session-token profile also needs
+  `OCI_CLI_AUTH=security_token` in your shell.
+- Every `aidp` call is given `--auth api_key` and the `--region` of the
+  DataLake OCID; it is not given a profile flag.
 
-#### The rules that go with an inline secret
+The config names which AIDP resources to use, never a credential for them.
 
-The file holds live credentials in plain text, which is the trade made for
-having one file. So:
+**Rules for the inline secret.** The file holds live credentials in plain
+text:
 
-- it is **gitignored only inside this plugin's own folder** (the rule lives
-  in the plugin's `.gitignore`), and the file belongs in *your* working
-  directory — so add `snowmig-config.yaml` (and `.yml`, `.json`) to your own
-  `.gitignore` before filling it in; `git add .` from another repo stages
-  it otherwise. It must stay out of commits, tickets and chat;
-- **secrets are never echoed** — `preflight` and every report render the
-  config through a redactor, so a password cannot reach a log or a summary;
-- **an agent asks before reading it**, and never asks you to paste a secret
-  into the conversation. If one ends up there, rotate it;
-- a destination that came from the file is **announced** before anything acts
-  on it, and writing still needs `--execute`. The resolver itself does no I/O
-  at all, so a stale config cannot silently redirect a write.
+- It is **gitignored only inside this plugin's own folder**, and the file
+  belongs in your working directory — so add `snowmig-config.yaml` (and
+  `.yml`, `.json`) to your own `.gitignore` before filling it in. Keep it out
+  of commits, tickets and chat.
+- **Secrets are never echoed**: `preflight` and every report render the
+  config through a redactor.
+- **An agent asks before reading it**, and never asks you to paste a secret
+  into the conversation. If one ends up there, rotate it.
+- A destination read from the file is **announced** before anything acts on
+  it, and writing still needs `--execute`.
 
-#### You do not need to be inside this repo
-
-The plugin can be installed rather than cloned, and the working directory can
-be anywhere. The engine is always at
-`${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py` — or run it through
-`${CLAUDE_PLUGIN_ROOT}/bin/snowmig`, which creates the environment on first
-use — and the in-AIDP notebooks at
-`${CLAUDE_PLUGIN_ROOT}/data-migration-scripts/`. The config, by contrast,
-belongs in **your** working directory: an installed plugin's own directory may
-be read-only.
-
-### 2. Confirm the config out loud, and test both ends
+### 2. Confirm the config and test the source
 
 ```bash
 bin/snowmig preflight --test-source
 ```
 
-No `--config` needed — the CLI finds the file and prints which one. Add
-`--config <path>` only to point at a different one.
+`PREFLIGHT_CONFIG.md` lists every field with what it is for, secrets masked
+(an inline secret reads as *inline*, a `*_path` shows the path), then the
+checks. Review it with the account owner before going further: a wrong host
+or role is cheapest to fix here.
 
-`PREFLIGHT_CONFIG.md` echoes every field with what it is *for*, with every
-secret masked — an inline one reads as *inline*, a `*_path` shows the path,
-neither shows a value — then reports the checks. Read it with whoever owns the account before going further — a wrong
-host or role here surfaces hours later as something that looks like a tool
-failure.
+- `--test-source` connects to Snowflake; it is opt-in because it resumes the
+  warehouse.
+- The AIDP end is checked when the config carries both `datalake_ocid` and
+  `catalog`: the report says whether that catalog exists and whether it is
+  `INTERNAL` or `EXTERNAL`.
+- **A skipped check is not a pass.** The report says which end was not
+  configured.
 
-- `--test-source` opts into the Snowflake connection; it is opt-in because it
-  resumes the warehouse.
-- The AIDP end is checked automatically when the config carries both
-  `datalake_ocid` and `catalog`: it reports whether that catalog exists and
-  whether it is `INTERNAL` or `EXTERNAL`.
-- **A *skipped* check is not a pass.** If one end was never configured, the
-  report says so rather than implying it passed.
+### 3. Assess the estate (optional preview, read-only, from your machine)
 
-### 3. Assess the estate (read-only, from the laptop — optional preview)
-
-This is the pre-sales and estimation pass, and it is **optional for a
-migration**: it reads Snowflake from your machine and leaves no workflow, no
-log and no evidence inside AIDP, so the migration's own discovery is the
-`snowmig_00_discover` job at step 9 (runbook S6). Run it to answer *"what is
-in this account?"* before anyone commits to anything.
-
-Every stage that reads Snowflake takes the same config file, so the
-coordinates are written once:
+This pass answers *"what is in this account?"* before anyone commits to a
+migration. It is **optional**: it reads Snowflake from your machine and
+leaves no job run or evidence inside AIDP. The migration's own discovery is
+the `snowmig_00_discover` job (step 6, S6).
 
 ```bash
-bin/snowmig assess     
-bin/snowmig deps       
+bin/snowmig assess
+bin/snowmig deps
 bin/snowmig maintenance
-bin/snowmig security   
-bin/snowmig compute     --credit-price <USD>
+bin/snowmig security
+bin/snowmig compute --credit-price <USD>
 ```
 
-No coordinates on the command line: they come from the config the CLI just
-announced. Any one of them can still be overridden per run (`--role`,
-`--warehouse`, `--database`).
+Coordinates come from the config; override them per run with `--role`,
+`--warehouse` or `--database`. Read `INVENTORY.md`, `CENSUS.md` (everything
+that is not a table or view), `SECURITY.md` (protections that do not carry
+over) and `MAINTENANCE.md`. `compute` writes `COMPUTE_PROPOSAL.md` and the
+`warehouses.json` that `provision --warehouse-clusters` reads. A live
+`assess` is also how views are planned (step 7).
 
-Read `INVENTORY.md`, `CENSUS.md` (everything that is **not** a table or view,
-and cannot migrate), `SECURITY.md` (what arrives unprotected) and
-`MAINTENANCE.md`. If `assess` blocks tables on `VARIANT`/`GEOGRAPHY`, that is
-the type mapper refusing to guess: re-run with `--semi-structured string` (or
-`--geospatial string`) only as a **deliberate** decision, and say so.
+A table with a `GEOGRAPHY`/`GEOMETRY` column is blocked until someone
+decides; `--geospatial string` carries it as text, as a deliberate decision
+(see [the type modes](#semi-structured-geospatial-and-timestamp-types)).
 
-### 4. Plan, generate DDL, get sign-off
+### 4. Provision the migration environment inside AIDP (S1, S2, S5)
 
-```bash
-bin/snowmig plan --bronze-catalog-prefix <internal catalog> [--restrictions ./restrictions.json]
-bin/snowmig ddl 
-bin/snowmig summary
-```
-
-**`PLANNED_OBJECTS.md` is the approval artifact — stop here for sign-off.**
-`ddl_plan.json` is the authority from this point on: the in-AIDP scripts create
-only what it contains, and report anything else as `not_in_plan`. The structure
-job creates each approved target name as it stands and refuses a
-`--target-catalog` that is not the plan's catalog, so `<internal catalog>` here
-is the same INTERNAL catalog you create at S4 and pass to `provision
---target-catalog`. Without the prefix the plan's catalog is the source database
-name, which under this runbook is the EXTERNAL pointer, and S10 refuses it. Use
-`--restrictions` to scope a first wave (a canary of a few tables is a good
-first live write).
-
-Once the environment exists (step 6), push the approved plan to the workspace
-with `provision` itself, never by hand: it uploads `plan.json`,
-`ddl_plan.json` and their reports to `plan/`, backs the two plans up dated
-into `backup/`, and registers one copy workflow per schema of the plan.
-
-```bash
-bin/snowmig provision --execute --reuse-existing --workspace-name <the S1 name> \
-  --plan-label FULL        # REDUCED after an S9 scope reduction
-```
-
-Where no flag gives them, the push keeps the catalogs, the `--source-mode`
-and the credential path the step-6 push recorded (same aiDataPlatform and
-workspace key only), so a `--refresh-notebooks` re-push does not flip an
-external-catalog migration to connector mode.
-
-A push never drops what an earlier push allocated: the clusters step 6
-created stay in `provision_result.json` (under `earlier_allocations` when
-this push does not record them itself, as the plan push does not), so
-`teardown` still reaches them. A record written before provenance was
-recorded (no `created` field) proves a cluster only by its `created` step;
-any other keyed cluster in it is `provenance_unknown`, which teardown never
-touches and reports as a failed step (exit 1) to confirm in the console. A
-push that halts before recording a
-workspace -- a name collision without `--reuse-existing` -- is written to
-`provision_result.halted.json` / `PROVISION_HALTED.md`, and the earlier
-record is kept.
-
-### 5. Prove both ends reach each other
-
-```bash
-bin/snowmig smoke \
-  [--datalake-ocid <ocid> --workspace <ws> --cluster-id <cl> --catalog <cat>]
-```
-
-Anything already in the config's `aidp:` block can be left off; the CLI prints
-the destination it resolved. The values themselves come from the console, or
-from `oci`/`aidp` list calls. **Read that printed line before you approve an
-`--execute` later** — it is the last chance to notice a config written for a
-different environment.
-
-Without all four coordinates the run exits 1 with `verdict: PARTIAL`: only
-Snowflake was proven, which is not a pass and not a connectivity failure.
-Exit 0 needs both ends.
-
-### 6. Provision the migration environment inside AIDP (S1, S2, S5)
-
-**The environment comes first**, because every later AIDP write — including
-registering a catalog — is addressed by four coordinates (DataLake OCID,
-workspace, cluster, catalog) and `resolve_target()` requires all four. A run
-that registers the source catalog before it has a workspace and a cluster
-stops on `AIDP target coordinates not supplied`.
+**The environment comes first**, because every AIDP write — including a
+catalog registration — is addressed by four coordinates (DataLake OCID,
+workspace, cluster, catalog), and a write without all four stops on
+`AIDP target coordinates not supplied`.
 
 ```bash
 bin/snowmig provision \
   --workspace-name "<the Snowflake account or project name>" \
-  --warehouse-clusters \
   --source-mode connector --source-config ./snowmig-config.yaml \
   --external-catalog <name> --target-catalog <internal catalog> \
-  --datalake-ocid <ocid>                                             # dry run
+  --datalake-ocid <ocid> [--warehouse-clusters]                      # dry run
 bin/snowmig provision ... --execute
 ```
 
-Creates the workspace (name translated to a charset the API cannot reject),
-the `migration_assets` cluster, **one cluster per Snowflake warehouse with the
-same name** on the AIDP default config (its base name, `COMPUTE_WH` ->
-`compute`; two warehouses whose base names fold alike, or one that would take
-the migration cluster's name, keep their full names instead, so no two share
-a cluster), the workspace folder
-`backup-snowflake-migration/` holding the scripts and the plan, and 3 + N
-**unscheduled** jobs: discover, structure and reconcile, plus one copy job
-per schema of the approved plan. `--external-catalog` and `--target-catalog` are names
-being pre-declared for the job parameters, not catalogs that must already
-exist. Read `PROVISION.md`: pending is pending, never rounded up.
+This creates:
 
-Stage parameters (`tables`, `mode`, `dry-run`, reconcile's `counts`, ...)
-have their defaults in each stage notebook's own PARAMS cell. A job task's
-`parameters` win over those defaults by the same name (read with
-`oidlUtils.parameters.getParameter`, live-verified), and that is how each
-per-schema copy job passes the schema it covers; a run-level `run --param`
-is refused, because that run parameters reach a task is not verified.
-`--stage-param NAME=VALUE`
-(repeatable; NAME is the stage flag without `--`) writes one there: a name
-no stage declares is refused, a switch takes `true`/`false`, a list flag
-takes `A,B`. An unqualified NAME reaches every stage that declares it, so
-its value must suit them all -- `mode` is `ddl-plan`/`ctas`/`manifest` in
-01 but `skip-existing`/`append`/`overwrite` in 02 -- and one that does not
-is refused; `copy_schema.mode=overwrite` (stages: `discover`, `structure`,
-`copy_schema`, `reconcile`) writes that stage only. With `--reuse-existing` add `--refresh-notebooks`, or the
-notebooks already on the workspace are kept and the value is refused rather
-than dropped. Next to per-schema copy jobs, `schema` and
-`copy_schema.schema` are refused (the job's task parameter wins, so the
-value would change nothing the copy does; `structure.schema=` narrows 01
-only), and so is `tables` with two or more copy schemas: the one shared
-`02_copy_schema` notebook would narrow every per-schema copy job.
+- the workspace, its name translated to the charset `[a-z0-9_]` (the rename
+  is reported);
+- the `migration_assets` cluster, plus cluster libraries from
+  `data-migration-scripts/requirements-aidp.txt` (it ships with no active
+  entries);
+- with `--warehouse-clusters` (S12, once the warehouse list is approved),
+  **one cluster per Snowflake warehouse** on the AIDP default config, named
+  from its base name (`COMPUTE_WH` → `compute`; names that would collide keep
+  the full warehouse name). It reads `warehouses.json`, so run `compute`
+  first; sizing stays a decision in `COMPUTE_PROPOSAL.md`;
+- the workspace folder `backup-snowflake-migration/` (`scripts/`, `plan/`,
+  `reports/`, `backup/`) holding the notebooks;
+- 3 + N **unscheduled** jobs: discover, structure and reconcile, plus one copy
+  job per schema of the approved plan (a single generic copy job until a
+  plan is pushed).
+
+`--external-catalog` and `--target-catalog` pre-declare names for the job
+parameters; the catalogs do not have to exist yet. Read `PROVISION.md`: a
+pending step is reported as pending.
 
 **Hand-off.** After `--execute`, `provision_result.json` records the
 **workspace key** under `workspace.key` and the **cluster key** under
-`cluster.key`, and the CLI and `PROVISION.md` print both in a hand-off
-block. Every later AIDP command needs them, and there are two equivalent
-ways to give them -- pick one and keep to it:
+`cluster.key`, and the CLI and `PROVISION.md` print both in a hand-off block.
+Every later AIDP command needs them. There are two equivalent ways to supply
+them — pick one and keep to it:
 
-- pass `--workspace <key> --cluster-id <key>` on each command (what the
-  runbook's commands show; the config file stays untouched), or
-- paste them into `aidp.workspace` and `aidp.cluster_id` of
+- pass `--workspace <key> --cluster-id <key>` on each command (as the
+  commands below do; the config file stays untouched), or
+- paste them into `aidp.workspace` and `aidp.cluster_id` in
   `snowmig-config.yaml` (the commented lines in the template).
 
-`provision` does not write them back into the config, and the coordinates
-are never read from `provision_result.json` behind your back: a stale
-record from another migration must not be able to redirect a write. Every
-command prints the destination it resolved, and says for each value
-whether it came from a flag or from the config file.
+`provision` does not write them back into the config, and later commands
+never read them from `provision_result.json` implicitly, so a record from
+another migration cannot redirect a write. Every command prints the
+destination it resolved and whether each value came from a flag or from the
+config file.
 
-`--source-config` places the config's `snowflake:` block — and only that
-block, re-serialised as JSON — on the workspace mount as
-`backup-snowflake-migration/plan/<config stem>.json`, so the in-AIDP scripts
-can reach Snowflake themselves. **It carries the credential**, which is why
-it is uploaded only when you pass it explicitly; the `aidp:` block is not
-copied, and a config whose secret is a `*_path` is refused before anything
-is uploaded, because that path does not exist on the cluster. The copy is
-JSON, so the scripts need no PyYAML to read it. It is recorded as holding
-the credential only once it is read back on the workspace. A
-`--reuse-existing` re-push inherits its path only into the same
-aiDataPlatform and workspace key, and only after finding the object there;
-a re-push with a different `--source-config` keeps the old object on the
-record, flagged as still holding the previous credential, until you
-remove it.
+**The Snowflake credential on the workspace.** `--source-config` places the
+config's `snowflake:` block — only that block, as JSON — at
+`backup-snowflake-migration/plan/<config stem>.json`, so the in-AIDP
+notebooks can reach Snowflake. It carries the credential, so it is uploaded
+only when you pass the flag. The `aidp:` block is not copied, and a config
+whose secret is a `*_path` is refused before anything is uploaded, because
+that path does not exist on the cluster. The copy is recorded as holding the
+credential once it is read back on the workspace. A re-push with a different
+`--source-config` keeps the earlier object on the record, flagged as holding
+the previous credential, until you remove it. Remove the credential with
+`teardown --scope credential` once the copies are done (step 10).
 
-### 7. Register the source as an EXTERNAL catalog, then create the INTERNAL target (S3, S4)
+### 5. Register the source as an EXTERNAL catalog, then create the INTERNAL target (S3, S4)
+
+One Snowflake database becomes one AIDP catalog. If the account holds
+several, choose the one this migration covers (`bin/snowmig databases` lists
+them); another database is another migration.
 
 ```bash
 bin/snowmig catalog --catalog <name> \
@@ -350,74 +252,251 @@ bin/snowmig catalog ... --execute --test-connection
 ```
 
 `--datalake-ocid`, `--workspace` and `--cluster-id` are **required for
-`--execute`** unless the config's `aidp:` block carries them (step 6's
-hand-off); the dry run tolerates their absence. The EXTERNAL catalog is a
-read-only pointer at the live source; it copies nothing. The Snowflake
-credential it registers is read from the same config file. `--test-connection`
-only runs with `--execute`, because the API resolves RBAC on an existing
-catalog.
+`--execute`** unless the config's `aidp:` block carries them (the step 4
+hand-off); the dry run does not need them. The EXTERNAL catalog is a
+read-only pointer at the live source and copies nothing; the Snowflake
+credential it registers is read from the config file. `--test-connection`
+runs only with `--execute`, because the connection is tested on an existing
+catalog, and a `PENDING` result is reported as pending. **If the test returns
+`FAILED` without a reason, keep the registration and continue** — discovery
+(S6) validates the connection through the connector. Do not delete and
+re-register to make the test pass.
 
-Then the target **INTERNAL** catalog, which IS created by this plugin, as a
-container and nothing more:
+Then the **INTERNAL** target catalog, which this plugin creates as a
+container:
 
 ```bash
 bin/snowmig catalog --catalog <internal catalog> --catalog-type standard --execute
 ```
 
-(runbook S4, live-verified). Each catalog keeps its own record
-(`catalog_result_<name>.json`, `CATALOG_<name>.md`), so dry-running S4
-after S3 has executed is allowed and leaves the S3 record intact. The
-container is not the structure — its
-schemas and tables are created later, on AIDP compute, by the structure
-workflow at S10, because a control-plane table create can return
-`202 Accepted` and create nothing.
+`standard` is the CLI's name for AIDP's `INTERNAL` catalog type. Each catalog
+keeps its own record (`catalog_result_<name>.json`, `CATALOG_<name>.md`), so
+dry-running S4 after S3 has executed leaves the S3 record intact.
+`bin/snowmig catalogs` lists the catalogs the DataLake holds, with their
+types.
 
-### 8. Diagnose from inside AIDP, once
+The container is not the structure. A control-plane table create is
+asynchronous (`202 Accepted`), so schemas and tables are created on AIDP
+compute by the structure job at S10, where each create is read back.
 
-Open `backup-snowflake-migration/scripts/diagnose_environment.ipynb` on the
-cluster and run it. It answers, with a verdict per check: is the workspace
-mounted, can the cluster reach Snowflake, do the credentials work through the
-connector, and did the external catalog's crawler actually populate anything.
+### 6. Check both ends, then discover inside AIDP (S6)
 
-### 9. Run the jobs inside AIDP
+```bash
+bin/snowmig smoke \
+  [--datalake-ocid <ocid> --workspace <ws> --cluster-id <cl> --catalog <cat>]
+```
 
-Run them with `bin/snowmig run --job <name>` (or from the console); the
-DataLake OCID and workspace come from the config's `aidp:` block, or
-`--datalake-ocid`/`--workspace` override it. Two of
-the four are **part of the migration**; the other two are **run later, on
-the customer's decision**.
+Anything already in the config's `aidp:` block can be left off; the CLI
+prints the destination it resolved. **Read that printed line before you
+approve a later `--execute`** — it is the moment to notice a config written
+for a different environment. Without all four coordinates the run exits 1
+with `verdict: PARTIAL`: only Snowflake was checked, which is neither a pass
+nor a connectivity failure. Exit 0 needs both ends.
 
-Part of the migration (S6, S10):
+Then open `backup-snowflake-migration/scripts/diagnose_environment.ipynb` in
+the workspace and run it once. It gives a verdict per check — the workspace
+mount, network reach from the cluster to Snowflake, the credentials through
+the AIDP Snowflake connector, and whether the EXTERNAL catalog lists the
+source's schemas — and writes nothing.
+
+Now discovery:
+
+```bash
+bin/snowmig run --job snowmig_00_discover
+```
+
+The job reads the whole database through the AIDP Snowflake connector in two
+`INFORMATION_SCHEMA` queries, writes `discovery_manifest.json` and
+`DISCOVERY.md` to `reports/`, and backs the manifest up, dated, into
+`backup/`. When it ends in SUCCESS, `run` downloads the manifest into the
+artifacts directory; `bin/snowmig fetch` downloads it on demand (`--path`
+for any other workspace file).
+
+How `run` behaves, for every job:
+
+- The DataLake OCID and workspace come from the config's `aidp:` block, or
+  from `--datalake-ocid` / `--workspace`.
+- It polls the run to a terminal state and writes `RUN_*.md` with the task
+  output. When the poll budget runs out it reports **STILL RUNNING**; bring
+  the record up to date later with `run --job <name> --refresh` (nothing is
+  resubmitted). A status that cannot be read is reported as **STATUS COULD
+  NOT BE READ** (exit 1): check the console before starting another run. A
+  run started from the console is recorded with `--run-key <key>`.
+- If a run's task has not started after `--cold-start-seconds` (default
+  120), `run` cancels it and resubmits, up to `--cold-start-restarts` times
+  (default 5). A task that has started is never cancelled. The output
+  belongs to the last run key; `RUN_*.md` lists every attempt.
+
+Discovery uses `connector` source mode, the default. The `external-catalog`
+mode reads through three-part names and costs a `DESCRIBE` per object; use
+it only on explicit request.
+
+### 7. Plan, review and approve (S7–S9)
+
+Turn the manifest into the inventory the planner reads, then plan and
+generate the DDL — all offline:
+
+```bash
+bin/snowmig ingest --manifest <artifacts dir>/discovery_manifest.json \
+  --database-name <SOURCE_DB>
+bin/snowmig plan --bronze-catalog-prefix <internal catalog> [--restrictions ./restrictions.json]
+bin/snowmig ddl
+bin/snowmig summary
+```
+
+- `--database-name` is required: a manifest does not record which database
+  it describes.
+- `ingest` uses the same type mapper as a live `assess`. **A view's SQL is not
+  part of the in-AIDP discovery manifest, so views are planned from a live
+  `assess`** (step 3), which writes the same `inventory.json`; add `deps`
+  when view ordering matters.
+- `--bronze-catalog-prefix` names the INTERNAL catalog from S4. The
+  structure job creates each approved target name as it stands and refuses a
+  `--target-catalog` that is not the plan's catalog. Without the prefix the
+  plan's catalog is the source database name — under this runbook, the
+  EXTERNAL pointer — and S10 refuses it.
+- `--restrictions` narrows the scope (see [Restrictions](#restrictions)); a
+  canary of a few tables is a good first wave.
+
+The planning stages resolve everything with a direct correspondence and
+**flag** what they cannot map exactly (S7). Resolve the flags with the
+owner, grouped by kind — one decision covers every column it applies to
+(S8) — and record each decision in the plan, which is what S10 executes.
+
+**`PLANNED_OBJECTS.md` is the approval artifact — stop here for sign-off
+(S9).** From this point `ddl_plan.json` is the authority: the in-AIDP
+notebooks create only what it contains and report anything else as
+`not_in_plan`.
+
+### 8. Create the structure (S10–S12)
+
+Push the approved plan to the workspace with `provision` itself, never by
+hand, then run the structure job:
+
+```bash
+bin/snowmig provision --execute --reuse-existing --workspace-name <the S1 name> \
+  --plan-label FULL        # REDUCED after an S9 scope reduction
+bin/snowmig run --job snowmig_01_structure
+```
+
+The push uploads `plan.json`, `ddl_plan.json` and their reports to `plan/`,
+backs the two plans up, dated, into `backup/`, and registers one copy job per
+schema of the plan (S11). To reduce the scope, push the full plan first
+(`FULL`), re-plan with `--restrictions`, and push again with `--plan-label
+REDUCED`: the full plan stays recoverable in `backup/`, and the reduced one
+is what runs. `--reuse-existing` here re-adopts this migration's own
+environment, as `provision_result.json` records it.
+
+- Catalogs, `--source-mode` and the credential path not given as flags are
+  carried over from the earlier push's record (same aiDataPlatform and
+  workspace), so a re-push does not switch the source mode.
+- A push keeps what earlier pushes created: the clusters from step 4 stay in
+  `provision_result.json` (under `earlier_allocations`), so `teardown` still
+  reaches them. A push that halts before recording a workspace — a name
+  collision without `--reuse-existing` — writes
+  `provision_result.halted.json` / `PROVISION_HALTED.md` and keeps the
+  earlier record.
+- A schema reduced out of the plan gets no new copy job. A copy job an
+  earlier push registered for it is reported `stale` (exit 1) until it is
+  deleted — in the console, or by re-pushing with
+  `--delete-stale-copy-jobs`.
+
+`snowmig_01_structure` works schema by schema: it creates the schemas, then
+the empty Delta tables, then the approved plan's views, and reads each table
+back (`DESCRIBE`) to compare it with the plan, column by column. Tables are
+created `parallel` at a time within a schema (default 4); set the job's task
+parameter `parallel=1` to create them one at a time. Each schema's outcome
+is in `structure_report_<schema>.json`.
+
+At S12 the migration is **done**: the structure, the notebooks, the plans
+and their backups exist, and so do the warehouse-equivalent clusters if you
+approved them. **The data migration is not run.** Moving rows is a later
+decision the customer makes, with the copy jobs already in place.
+
+#### Stage parameters
+
+Each stage notebook's `PARAMS` cell holds its defaults (`tables`, `mode`,
+`dry-run`, reconcile's `counts`, ...). A job task's `parameters` override
+them by the same name at run time — every stage notebook reads them with
+`oidlUtils.parameters.getParameter` — and that is how each per-schema copy
+job passes the schema it covers. A run-level `run --param` is refused; set
+values on the jobs with `provision --stage-param NAME=VALUE` (repeatable;
+NAME is the stage flag without `--`):
+
+- a name no stage declares is refused; a switch takes `true`/`false`; a list
+  flag takes `A,B`;
+- an unqualified NAME reaches every stage that declares it, so its value
+  must suit them all — `mode` is `ddl-plan`/`ctas`/`manifest` in 01 but
+  `skip-existing`/`append`/`overwrite` in 02 — and one that does not is
+  refused. Qualify it to reach one stage: `copy_schema.mode=overwrite`
+  (stages: `discover`, `structure`, `copy_schema`, `reconcile`);
+- with `--reuse-existing`, add `--refresh-notebooks`; otherwise the notebooks
+  already on the workspace are kept and the value is refused rather than
+  dropped;
+- next to per-schema copy jobs, `schema` and `copy_schema.schema` are refused
+  (each job's task parameter wins), while `structure.schema=` narrows 01
+  only; `tables` is refused when there are two or more copy schemas, because
+  the one shared `02_copy_schema` notebook would narrow every copy job.
+
+The `PARAMS` literals can also be edited in the console. There is no driver
+wrapper: each job runs the stage notebook itself. Every stage is resumable —
+a re-run skips what its report already records as done.
+
+### 9. Copy the data and reconcile, when the customer decides
 
 | Job | What it does | Report |
 |---|---|---|
-| `snowmig_00_discover` | the whole estate in two `INFORMATION_SCHEMA` queries; back up the manifest (S6) | `discovery_manifest.json`, `DISCOVERY.md` |
-| `snowmig_01_structure` | empty Delta tables from the **approved** `ddl_plan`, one workflow per schema (S10) | `structure_report_<schema>.json` |
+| `snowmig_02_copy_<schema>` (`snowmig_02_copy_schema` before a plan is pushed) | one job per schema of the approved plan, each running the same `02_copy_schema` notebook with `schema` as a task parameter; copies that schema and **verifies** it (row counts; `--verify counts+sums` adds exact decimal sums) | `copy_report_<schema>.json` |
+| `snowmig_03_reconcile` | compares the plan with what the target catalog holds | **`MIGRATION_REPORT.md`** |
 
-At S12 the migration is **done**: the structure, the scripts, the plans and
-the backups exist. **The data migration is not run.** Moving rows is a later
-decision the customer makes, with the scripts already sitting there:
+```bash
+bin/snowmig run --job snowmig_02_copy_<schema>
+bin/snowmig run --job snowmig_03_reconcile
+```
 
-| Job | What it does | Report |
-|---|---|---|
-| `snowmig_02_copy_<schema>` (`snowmig_02_copy_schema` before a plan is pushed) | one job per schema of the approved plan, each a task running the same `02_copy_schema` notebook with `schema` as a task parameter; copies that schema and **verifies** it (row counts; `--verify counts+sums` adds exact decimal sums) | `copy_report_<schema>.json` |
-| `snowmig_03_reconcile` | plan versus what the catalog actually holds | **`MIGRATION_REPORT.md`** |
-
-A job task's `parameters` override the notebook's `PARAMS` cell by the same
-names (`schema`, `mode`, `verify`, ...): every stage notebook reads them at
-run time with `oidlUtils.parameters.getParameter`. The `PARAMS` literals are
-the defaults, and can still be edited in the console. There is
-no driver wrapper — the job runs the stage notebook itself. Every stage is
-resumable: a re-run skips what its report already records as done.
+Before a copy job starts, `run` reads the job's task parameters and refuses
+a name no stage parameter matches, or a value the stage would reject, before
+any job start-up time is spent. Start with one small schema end to end and
+read `MIGRATION_REPORT.md` before running the rest.
 
 **`MIGRATION_REPORT.md` is the deliverable.** A table reads `NOT_MIGRATED`
-when it was never attempted — expected while the migration is still running —
-and `NOT_IN_PLAN` when the approved plan leaves it out (not pending); only `MISSING_DESPITE_REPORT`, `STRUCTURE_FAILED`, `STRUCTURE_TYPE_DRIFT`,
-`STRUCTURE_ONLY_COPY_FAILED`, `COUNT_DRIFT` (with `--counts`),
-`TARGET_UNREADABLE`, `VIEW_FAILED` or `VIEW_MISSING_DESPITE_REPORT` mean something is wrong (the full status
-vocabulary is in `data-migration-scripts/README.md`). Views are listed there
-too: the structure job creates the approved plan's views after every table,
-and the copy never writes into one.
+when it has not been attempted yet — expected while the migration runs
+schema by schema — and `NOT_IN_PLAN` when the approved plan leaves it out
+(not pending). Only `MISSING_DESPITE_REPORT`, `STRUCTURE_FAILED`,
+`STRUCTURE_TYPE_DRIFT`, `STRUCTURE_ONLY_COPY_FAILED`, `COUNT_DRIFT` (with
+`--counts`), `TARGET_UNREADABLE`, `VIEW_FAILED` or
+`VIEW_MISSING_DESPITE_REPORT` mean something is wrong; the full vocabulary
+is in [data-migration-scripts/README.md](data-migration-scripts/README.md).
+Views are listed too: the structure job creates the plan's views after every
+table, and the copy never writes into a view.
+
+### 10. Release the compute, or remove what the migration created
+
+```bash
+bin/snowmig teardown                                  # dry run: stop the migration's clusters
+bin/snowmig teardown --execute
+bin/snowmig teardown --scope credential [--execute]   # only the Snowflake credential on the workspace
+bin/snowmig teardown --scope all [--include-data] [--execute]   # undo the migration
+```
+
+- **Default scope**: stops (or, with `--action delete`, deletes) only the
+  clusters this migration created, and keeps its output — the workspace, the
+  catalogs and the jobs. Stopping is reversible and leaves the copy jobs
+  runnable.
+- **`--scope credential`** removes the credential `--source-config` placed on
+  the workspace. Run it after the copies: the copy jobs need it.
+- **`--scope all`** is for a lab, a rehearsal or an abandoned migration: the
+  credential, the jobs, the clusters, the catalogs it created and the
+  workspace, each only where `provision_result.json` and the catalog ledger
+  prove this migration created it, and each read back gone. The INTERNAL
+  catalog holds the migrated rows; `teardown --scope all` deletes it only
+  with `--include-data`.
+
+Anything adopted with `--reuse-existing`, or reused by the catalog stage, is
+never deleted, and a cluster whose provenance the record cannot establish is
+left alone and reported (exit 1) for you to confirm in the console. Every
+scope is a dry run unless `--execute`, and `TEARDOWN.md` lists what was, or
+would be, removed.
 
 ### Before a production cutover
 
@@ -433,87 +512,77 @@ masking or row-access policy. `CENSUS.md` and `SECURITY.md` list them.
 
 | Snowflake | AIDP |
 |---|---|
-| Database | **EXTERNAL catalog, source type SNOWFLAKE** (default) — a read-only pointer at the live source. A **Standard catalog** only when you explicitly ask for one |
-| Schema | Schema |
-| Table | Table (managed Delta, empty) — Standard catalogs only |
-| View | View — when every Snowflake-only construct in its SQL has an exact rewrite (see *Why a view might not migrate*) — Standard catalogs only |
+| Database | an **INTERNAL catalog** that receives the migrated tables (S4), plus an **EXTERNAL catalog of source type SNOWFLAKE** registered over the live database (S3) — a read-only pointer that copies nothing |
+| Schema | Schema in the INTERNAL catalog |
+| Table | Managed Delta table, created empty at S10; rows arrive when its schema's copy job runs |
+| View | View, created after the tables at S10 — when every Snowflake-only construct in its SQL has an exact rewrite (see [Why a view might not migrate](#why-a-view-might-not-migrate)) |
 | Warehouse | Spark compute cluster (see the compute proposal) |
 
-Bronze mirrors the source 1:1, so target names equal source names. Silver and
-Gold are requirement-driven: the plan emits **disabled job stubs** that the
-migrator never triggers, because their content is a requirement to define with
-the customer rather than logic to invent.
+The stand-alone `/snowflake-catalog` and `/snowflake-soft-clone` commands
+register the EXTERNAL catalog by default, and create a Standard (INTERNAL)
+catalog only when you ask for one.
+
+Bronze mirrors the source 1:1: table and column names are kept. With
+`--bronze-catalog-prefix <internal catalog>`, each source schema lands in
+that catalog as `<database>_<schema>` (the default `--bronze-schema-style
+db_schema`; `db` names it after the database alone). `PLANNED_OBJECTS.md`
+shows every target name. Silver and Gold are requirement-driven: the plan
+emits **disabled job stubs** that the migrator never triggers, because their
+content is a requirement to define with the customer.
 
 ## Safety posture
 
 | | |
 |---|---|
 | Against Snowflake | **Read-only, always.** Only `SHOW`, `SELECT`, `DESCRIBE`, `GET_DDL` |
-| Against AIDP | **Dry-run by default.** Writing needs `--execute` plus all four target coordinates in the same command |
-| Target coordinates | **Never used without being shown.** They come from a flag or from the one migration config; a value read from the file is printed before anything acts on it, and a write still needs `--execute` and a confirmation in that turn. No environment default, no cache, and `target/coords.py` performs no I/O of its own |
-| Unmapped types/features | **Blocked with a reason.** Never approximated, never silently defaulted. Semi-structured and geospatial types have an explicit opt-in escape hatch — see below |
-| "Verified" | **Means the planned columns are there**, checked by `DESCRIBE`. A name that already belonged to a different structure is reported as a mismatch and left untouched — never counted as cloned |
+| Against AIDP | **Dry-run by default.** Writing needs `--execute` plus all four target coordinates |
+| Target coordinates | **Never used without being shown.** They come from a flag or the one config file; a value read from the file is printed before anything acts on it, and a write still needs `--execute` and a confirmation in that turn. No environment default, no cache |
+| Unmapped types and features | **Blocked with a reason.** Never approximated, never silently defaulted. The type decisions have explicit modes — see [Semi-structured, geospatial and timestamp types](#semi-structured-geospatial-and-timestamp-types) |
+| "Verified" | **Means the planned columns are there**, checked by `DESCRIBE`. A name that already belongs to a different structure is reported as a mismatch and left untouched |
 | Assessment cost | **Free by default.** Row counts come from Snowflake's maintained metadata; a `COUNT(*)` per object, which executes every view, is opt-in |
 | Collisions | **Halt (exit 3).** Identifier-case and target-name collisions stop the run rather than picking a winner |
 
-## Pipeline
+## Skills and commands
 
-```
-Snowflake ──▶ inventory.json ──▶ dependencies.json ──▶ plan.json ──▶ ddl_plan.json ──▶ [AIDP]
-              INVENTORY.md                           PLANNED_OBJECTS.md  DDL_PLAN.md   SOFT_CLONE_SUMMARY.md
-
-Snowflake ──▶ warehouses.json ──▶ compute.json ──▶ COMPUTE_PROPOSAL.md
-```
-
-The two reports the plugin exists to produce:
-
-- **`PLANNED_OBJECTS.md`** — what is planned to move, and what cannot with a
-  brief reason per object
-- **`SOFT_CLONE_SUMMARY.md`** — what the shallow clone actually created
-
-Each stage reads the previous artifact and is independently re-runnable.
-
-| Stage | Skill | Command |
+| Command | Skill | What it does |
 |---|---|---|
-| 0 · auth | `snowflake-migrator-bootstrap` | |
-| 1 · investigate | `snowflake-assess-estate` | `/snowflake-assess` |
-| 2 · plan | `snowflake-migration-plan` | `/snowflake-plan` |
-| 3 · medallion + shallow clone | `snowflake-medallion-clone` | `/snowflake-soft-clone` |
-| — · compute | `snowflake-compute-proposal` | `/snowflake-compute` |
+| — | `snowflake-migrator-overview` | the S1–S12 runbook and shared rules; routes to the others |
+| — | `snowflake-migrator-bootstrap` | first-run setup: config, authentication, connection check |
+| `/snowflake-smoke` | `snowflake-smoke-test` | connectivity and permissions on both ends |
+| `/snowflake-assess` | `snowflake-assess-estate` | read-only preview of the estate |
+| `/snowflake-plan` | `snowflake-migration-plan` | the migration plan, for approval |
+| `/snowflake-provision` | `snowflake-provision-environment` | workspace, cluster, notebooks and jobs |
+| `/snowflake-catalog`, `/snowflake-soft-clone` | `snowflake-medallion-clone` | catalog registration and medallion structure |
+| `/snowflake-notebook` | `snowflake-clone-notebook` | an offline table-creation notebook for a Standard catalog |
+| `/snowflake-compute` | `snowflake-compute-proposal` | warehouse-to-cluster sizing and cost |
+| `/snowflake-demo` | `snowflake-migrator-demo` | dev mode against an emulated estate |
+| — | `snowflake-stage-board` | where the run stands, stage by stage |
 
-`snowflake-migrator-overview` routes between them and carries the shared rules.
+Each planning stage reads the previous stage's artifact (`inventory.json` →
+`plan.json` → `ddl_plan.json`) and can be re-run on its own; `summary` writes
+the per-object roll-up, `SUMMARY.md`.
 
-## Quick start
-
-The full sequence is [How to run a migration, from
-zero](#how-to-run-a-migration-from-zero). Two things worth knowing before the
-first `assess`:
-
-**Cost and refusal flags** (all default to the safe option):
+## Assessment flags and exit codes
 
 | Flag | Default | Why you might change it |
 |---|---|---|
 | `--row-counts metadata\|exact\|none` | `metadata` | free, and exact for a settled table. `exact` runs `COUNT(*)` per object and **executes every view** |
-| `--semi-structured block\|string` | `block` | `VARIANT`/`OBJECT`/`ARRAY` block their table until somebody decides; `string` carries the JSON as text, which **defers rather than solves** |
-| `--geospatial block\|string` | `block` | same decision for `GEOGRAPHY`/`GEOMETRY` |
-| `--timestamp-ntz preserve\|timestamp` | `preserve` | the catalog API cannot express `timestamp_ntz`; `timestamp` changes timezone semantics and records the caveat |
+| `--semi-structured string\|block` | `string` | `block` refuses a table with `VARIANT`/`OBJECT`/`ARRAY` until a typed design exists |
+| `--geospatial block\|string` | `block` | `string` carries `GEOGRAPHY`/`GEOMETRY` as text |
+| `--timestamp-ntz timestamp\|preserve` | `timestamp` | `preserve` keeps `TIMESTAMP_NTZ`, and `ddl` then halts on it |
+| `--mapping-defaults on\|off` | the config's `mapping.enabled` (`true`) | `off` restores the strict modes for one run |
 
-**Exit codes:** `0` ok · `1` error · `3` halt — a condition to resolve
-with you, shown and never resolved for you: an identifier-case or
-target-name collision (`assess`, `plan`), or a column type the target
-refuses at CREATE TABLE (`ddl`; on most estates `TIMESTAMP_NTZ`, remedied
-offline with `ddl --timestamp-ntz timestamp`).
-
-Dev mode needs none of this:
-
-```bash
-bin/snowmig demo --out-dir ./snowmig_demo
-```
+**Exit codes:** `0` ok · `1` error · `3` halt — a condition to resolve with
+you, never resolved for you: an identifier-case or target-name collision
+(`assess`, `plan`), or a column type the target refuses at CREATE TABLE
+(`ddl`; `TIMESTAMP_NTZ` under `--timestamp-ntz preserve`, remedied offline
+with `ddl --timestamp-ntz timestamp`).
 
 ## Restrictions
 
-Narrow the estate before planning with `--restrictions restrictions.json`. Every
-exclusion appears in `PLANNED_OBJECTS.md` with the restriction that fired.
+Narrow the estate before planning with `--restrictions restrictions.json`.
+Every exclusion appears in `PLANNED_OBJECTS.md` with the restriction that
+fired.
 
 ```json
 {
@@ -525,57 +594,35 @@ exclusion appears in `PLANNED_OBJECTS.md` with the restriction that fired.
 }
 ```
 
-`include_*` variants act as allowlists. An unrecognised key is an **error**, not
-an ignored line — a typo would otherwise apply nothing while appearing to work.
+`include_*` variants act as allowlists. An unrecognised key is an **error**,
+not an ignored line, so a typo cannot appear to work while applying nothing.
 
 ## Why a view might not migrate
 
-Object references inside a view are left as-is in the default Bronze mirror
-(`R40`) and rewritten to the planned names under `--bronze-catalog-prefix`
-or a schema-style option (`R41`): whole three-part names only, never inside
-a string literal or a comment. Dialect is the other half. The translator
-carries 21 rules (`translate.RULES`). 9 have a provably exact rewrite and
-are translated with the rule id recorded in the DDL plan — `IFF`, `x::TYPE`
-on a bare column or literal, `ARRAY_CONSTRUCT`, `OBJECT_CONSTRUCT`,
-`DATEADD(unit, n, col)` (exact for `DATE` operands only, and the plan says
-so), `LISTAGG(x, sep)`, `"quoted identifiers"` → backticks, `''` → `\'`
-and `//` line comments → `--`
-— but only in those exact forms; a form the rule cannot prove (an expression
-left of `::`, `LISTAGG … WITHIN GROUP` or `… OVER`, a non-literal `DATEADD`
-amount) is refused with the construct named. 12 others — `QUALIFY`, `LATERAL FLATTEN`,
-`DATEDIFF`, `PIVOT`, `DECODE`, `$$…$$`, … — **block** the view with the
-construct named, rather than being rewritten on a guess; a mixed view is
-blocked, never partially translated. Secure and materialized views are
-blocked outright. The authoritative rule table is
+Object references inside a view are left as they are in the default Bronze
+mirror (`R40`) and rewritten to the planned names under
+`--bronze-catalog-prefix` or a schema-style option (`R41`): whole three-part
+names only, never inside a string literal or a comment.
+
+Dialect is the other half. The translator carries 21 rules
+(`translate.RULES`):
+
+- 9 have a provably exact rewrite and are translated, with the rule id
+  recorded in the DDL plan: `IFF`, `x::TYPE` on a bare column or literal,
+  `ARRAY_CONSTRUCT`, `OBJECT_CONSTRUCT`, `DATEADD(unit, n, col)` (exact for
+  `DATE` operands only, and the plan says so), `LISTAGG(x, sep)`,
+  `"quoted identifiers"` → backticks, `''` → `\'` and `//` line comments →
+  `--`. Only those exact forms are rewritten; a form the rule cannot prove (an
+  expression left of `::`, `LISTAGG … WITHIN GROUP` or `… OVER`, a
+  non-literal `DATEADD` amount) is refused with the construct named.
+- 12 others — `QUALIFY`, `LATERAL FLATTEN`, `DATEDIFF`, `PIVOT`, `DECODE`,
+  `$$…$$`, … — **block** the view with the construct named, rather than being
+  rewritten on a guess.
+
+A mixed view is blocked, never partially translated. Secure and materialized
+views are blocked outright. The authoritative rule table is
 [references/dialect-translation.md](references/dialect-translation.md);
 [references/type-mapping.md](references/type-mapping.md) summarises it.
-
-## Tests
-
-Offline, no credentials, no AIDP:
-
-```bash
-cd engine && python3 -m pytest tests -q
-```
-
-Live end-to-end against a real estate (read-only, does not deploy):
-
-```bash
-cd engine && SNOWMIG_LIVE=1 SNOWFLAKE_ACCOUNT=... SNOWFLAKE_USER=... \
-  SNOWFLAKE_PRIVATE_KEY_PATH=... python3 -m pytest tests/test_live_smoke.py -q
-```
-
-The test corpus generator is `engine/snowflake_source/corpus/00_acme_setup.sql`
-with `validate.py` asserting referential integrity, join fan-out and two exact
-business invariants — row-count floors alone cannot catch a migration that runs
-clean and returns the wrong numbers.
-
-## Execution backend
-
-AIDP writes go through the **`aidp` CLI** when installed, otherwise **`oci
-raw-request`**. `oci ai-data-platform` covers only the control plane, which is why
-the data plane uses `raw-request`. The engine prints which backend it chose and
-fails loudly if neither CLI is present.
 
 ## Row counts, and what they cost
 
@@ -585,23 +632,27 @@ fails loudly if neither CLI is present.
 | `exact` | `COUNT(*)` per object | **Executes every view.** Warehouse time per object |
 | `none` | — | Free |
 
-The metadata count agrees with `COUNT(*)` for a settled standard table — the
-live corpus confirms it on all six — but it can lag very recent DML and is not
-maintained for external tables, so the reports label it as metadata and never
-call it verified. Every blank in a Rows column carries its reason: not counted,
-not requested, or a named error.
+The metadata count agrees with `COUNT(*)` for a settled standard table, but
+it can lag very recent DML and is not maintained for external tables, so the
+reports label it as metadata and never call it verified. Every blank in a
+Rows column carries its reason: not counted, not requested, or a named error.
+Rows are verified by the copy job, after the copy.
 
-## Semi-structured and geospatial types
+## Semi-structured, geospatial and timestamp types
 
-`VARIANT`, `OBJECT` and `ARRAY` block their table by default, because the
-target shape is a design decision rather than something to guess. Because that
-would otherwise be a dead end on an estate full of JSON payloads,
-`--semi-structured string` carries the value as text with a warning on every
-affected column. `--geospatial string` does the same for `GEOGRAPHY` and
-`GEOMETRY`. Two flags, not one: they are separate decisions.
+| Snowflake | Default | Alternative |
+|---|---|---|
+| `VARIANT`, `OBJECT`, `ARRAY` | carried as JSON text (`STRING`), with a warning on every affected column (`mapping.semi_structured: string`) | `--semi-structured block`: the table is blocked until a typed struct/map/array design exists |
+| `GEOGRAPHY`, `GEOMETRY` | the table is blocked | `--geospatial string`: carried as text, with no spatial type, index or predicate support |
+| `TIMESTAMP_NTZ` | carried as `TIMESTAMP`, with the timezone caveat recorded on every affected column (`mapping.timestamp_ntz: timestamp`); values are read through the session timezone, so keep sessions on UTC | `--timestamp-ntz preserve`: kept as `TIMESTAMP_NTZ`, which the target refuses at CREATE TABLE, so `ddl` halts (exit 3) |
 
-Neither hatch solves the problem — both defer it. As text, nothing on the target
-can address a field inside the value.
+Carrying JSON as text defers the design rather than completing it: nothing is
+lost, but nothing on the target can address a field inside the value until a
+struct/map design is agreed (`from_json` / `get_json_object` read it), and a
+view using Snowflake path syntax (`col:field`) is blocked. The semi-structured
+and geospatial flags are separate because they are separate decisions.
+`--mapping-defaults off` (or `mapping.enabled: false`) restores the strict
+modes for a run; an explicit flag always wins.
 
 ## What is not a table or a view
 
@@ -610,50 +661,49 @@ streams, alerts, materialized and dynamic tables, stages (internal and
 external, told apart), pipes, sequences, file formats, secrets, network
 rules, Streamlit apps, notebooks and container services per database, and
 the account's shares, roles, network policies, applications and compute
-pools once per run → `CENSUS.md`.
-**None of them migrate**, and no equivalent is generated — a
-plausible-but-wrong procedure translation is worse than an honest gap. The
-scope statement travels into `PLANNED_OBJECTS.md` and `SUMMARY.md`, so the
-migratable count is never mistaken for the size of the estate.
+pools once per run → `CENSUS.md`. **None of them migrate**, and no
+equivalent is generated: rebuilding them on AIDP is outside this plugin's
+scope, and each is listed with an effort band so the work can be planned.
+The scope statement travels into `PLANNED_OBJECTS.md` and `SUMMARY.md`, so
+the migratable count is never mistaken for the size of the estate.
 
 A table that `SHOW TABLES` flags as dynamic, external, Iceberg, event or
 hybrid is not a plain table either: `plan` blocks it with the reason named
-(`unsupported_object`; `_TABLE_KIND_BLOCKS` in `engine/plan/build.py`), under
-"Object kinds with no AIDP equivalent" in `PLANNED_OBJECTS.md`. A view whose
-base table or view is blocked or excluded is blocked too
-(`dependency_not_migrated`), naming what it depends on.
+(`unsupported_object`), under "Object kinds with no AIDP equivalent" in
+`PLANNED_OBJECTS.md`. A view whose base table or view is blocked or excluded
+is blocked too (`dependency_not_migrated`), naming what it depends on.
 
-Procedures and UDFs are read from `INFORMATION_SCHEMA` rather than `SHOW`,
-because `SHOW PROCEDURES` returns Snowflake's built-ins (33 on an empty
-schema) and `INFORMATION_SCHEMA` does not. It also carries the handler
-language, which drives the triage band — JavaScript is HIGH, since AIDP has no
-JavaScript runtime.
+Procedures and UDFs are read from `INFORMATION_SCHEMA`, which lists the
+account's own routines (`SHOW PROCEDURES` also lists system built-ins) and
+carries the handler language that drives the effort band. JavaScript
+handlers are rated HIGH: they are rewritten rather than ported.
 
-The most damaging entry is a **task**: if it populates a table you are
-migrating, that table stops being refreshed after cutover. The clone succeeds
-and then goes stale.
+Pay particular attention to **tasks**: a task that populates a table you are
+migrating does not move with it, so after cutover that table is no longer
+refreshed until an equivalent AIDP job exists.
 
-## Security posture — the one with an exposure consequence
+## Security posture
 
 `snowmig security` reports masking, row-access, aggregation and projection
 policy *attachments*, secure views, and who holds grants today →
 `SECURITY.md`.
 
-A masked column arrives **unmasked**. A row filter is simply absent. A secure
-view loses `SECURE`. The clone does not fail — it **succeeds without the
-protection**. AIDP has no masking API; the equivalent is a restricted view
-plus ontology sensitivity granted per role, which is a design decision rather
-than a translation, so this plugin reports and changes nothing.
+A masked column arrives **unmasked**. A row filter is absent. A secure view
+loses `SECURE`. The copy **succeeds without the protection**. Recreating it on
+AIDP — for example, a restricted view plus ontology sensitivity granted per
+role — is a design decision rather than a translation, so this plugin
+reports and changes nothing.
 
 If `ACCOUNT_USAGE` cannot be read, the exposure count is `null` and the report
 says the question is **unanswered** — never "none found".
 
-## Table maintenance — a difference worth reading before you migrate
+## Table maintenance — read before you migrate
 
 Snowflake exposes **no `OPTIMIZE` and no `VACUUM`**: it maintains layout and
 reclaims storage in the background. AIDP has `OPTIMIZE`, `VACUUM`, `ZORDER BY`
-and liquid clustering, and **runs none of them for you**. The capability
-survives the migration; the *responsibility* moves.
+and liquid clustering as explicit statements, which the table owner schedules.
+The capability carries over; the *responsibility* moves to whoever owns the
+target.
 
 `snowmig maintenance` (after `assess`) measures what the source actually does
 — clustering keys, `automatic_clustering`, Search Optimization,
@@ -664,57 +714,64 @@ opposite decisions. The retention *level* is inferred from effective values
 rather than probed per table, so the stage costs a handful of queries;
 `--probe-table-parameters` opts into the exact path.
 
-Every data-movement option also states **who inherits `OPTIMIZE`/`VACUUM`** and
-which traps apply to it, because that is decided by the architecture rather than
-discovered afterwards.
-
 This plugin reports the gap per object and applies nothing — no maintenance
-DDL is generated, enforced by test. Source settings with a real equivalent
-(`cluster_by`, `retention_time`, `change_tracking`) appear in the DDL plan under
-*"Maintenance and layout — decisions, NOT applied"*, with the equivalent named,
-and raise the object's risk to MEDIUM.
+DDL is generated. Source settings with an AIDP equivalent (`cluster_by`,
+`retention_time`, `change_tracking`) appear in the DDL plan under
+*"Maintenance and layout — decisions, NOT applied"*, with the equivalent
+named, and raise the object's risk to MEDIUM. Every data-movement option also
+states who takes on `OPTIMIZE`/`VACUUM`.
 
-Two traps are worth knowing up front: on Delta **`VACUUM` is what bounds time
-travel** (on Snowflake those are independent and automatic), and **`OPTIMIZE`
-increases storage until `VACUUM` runs**. Full mapping and the planned work:
-`references/maintenance-and-layout.md`, `ACTION-ITEMS.md`.
+Two points to know up front: on Delta, **`VACUUM` is what bounds time
+travel** (on Snowflake the two are independent and automatic), and
+**`OPTIMIZE` increases storage until `VACUUM` runs**. The full mapping is in
+[references/maintenance-and-layout.md](references/maintenance-and-layout.md).
 
-## Where this stands
+## Execution backend
 
-One real migration has run end to end against a live AIDP DataLake: seven
-objects created and read back, six verified exactly and one reporting derived
-type drift. The Snowflake side and the target **catalog CRUD** transport are
-live-verified; the SQL transport is dead (404). The notebook upload-and-run
-path is now live-verified too: the four stage notebooks upload as `NOTEBOOK`
-objects through the `aidp` CLI and the discovery job ran to SUCCESS on a
-migration cluster, reading 1065 relations and 9935 columns from Snowflake in
-two `INFORMATION_SCHEMA` queries.
+AIDP writes go through the **`aidp` CLI** when it is installed, otherwise
+**`oci raw-request`** against the documented AIDP REST API (`oci
+ai-data-platform` covers the control plane). The engine prints which backend
+it chose and stops with an error if neither CLI is present.
 
-Per-stage live status is kept in one place, `GAPS.md` → "What is actually
-proven", and this is its sentence:
+## Tests
 
-**What has run live:** the discovery job (`snowmig_00_discover`) ran to
-SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in
-two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
-ran on a cluster from the approved plan, a healthy 23-minute run left alone
-by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_<schema>`)
-and reconcile (`snowmig_03_reconcile`) jobs ran live on 2026-09-29, on a
-4-table canary across two schemas: 4/4 copied and verified by row count,
-reconcile 4 `MIGRATED_VERIFIED` -- at ~340 s per 10-row table, one table at a
-time, which does not scale as it stands (GAPS P0 item 8).
+Offline, with no credentials and no AIDP:
 
-Not yet proven: anything at full-estate scale (the largest run was one
-schema), the EXTERNAL catalog crawler, the cluster-library item shape.
-**Treat the first run on a new estate as a shake-out**: run
-`diagnose_environment.ipynb`, then one small schema end to end, and read
-`MIGRATION_REPORT.md` against the console before anything larger.
+```bash
+bin/snowmig-test            # or: cd engine && python3 -m pytest tests -q
+```
 
-**`GAPS.md` is the ranked list of what is left**, including the two questions
-that need Oracle rather than code. The Snowflake side is live-verified: 10
-gated end-to-end tests run against a real account.
+An optional end-to-end check against your own Snowflake account (read-only,
+deploys nothing):
+
+```bash
+cd engine && SNOWMIG_LIVE=1 SNOWFLAKE_ACCOUNT=... SNOWFLAKE_USER=... \
+  SNOWFLAKE_PRIVATE_KEY_PATH=... python3 -m pytest tests/test_live_smoke.py -q
+```
+
+
+## Scope
+
+The plugin migrates one Snowflake database per run into AIDP: its schemas,
+its tables as managed Delta, and the views whose SQL translates exactly, with
+per-schema jobs that copy and verify the rows. The rest of the estate —
+procedures, UDFs, tasks, streams, pipes, policies, shares and everything else
+listed in `CENSUS.md` and `SECURITY.md` — is inventoried and reported;
+rebuilding it on AIDP is outside the plugin's scope, as are scheduling table
+maintenance and choosing a long-term data-movement architecture
+([references/data-movement-options.md](references/data-movement-options.md)).
+On a new estate, run `diagnose_environment.ipynb`, then one small schema end
+to end, and read `MIGRATION_REPORT.md` before scaling out.
 
 ## Docs
 
-- [references/type-mapping.md](references/type-mapping.md) — the type table
-- [ASSUMPTIONS.md](ASSUMPTIONS.md) — everything this rests on, and what breaks if each is wrong
-- [references/data-movement-options.md](references/data-movement-options.md) — the ways bytes could move; one is implemented by the data plane (`snowmig_02_copy_schema`, in-AIDP INSERT-SELECT), the rest are options
+- [README.md](README.md) — this file: what the plugin does and how to run it
+- [MIGRATION-ARCHITECTURE.md](MIGRATION-ARCHITECTURE.md) — the migration design: the Snowflake-to-AIDP mapping, the run order, what is automated
+- [ARCHITECTURE.md](ARCHITECTURE.md) — the CLI engine: stages, invariants and gates
+- [data-migration-scripts/README.md](data-migration-scripts/README.md) — the in-AIDP notebooks, their parameters, report statuses and verdicts
+- [PRIVACY.md](PRIVACY.md) — what leaves your machine, and where the credentials go
+- [CHANGELOG.md](CHANGELOG.md) — release notes
+- [references/type-mapping.md](references/type-mapping.md) — the type table and view SQL portability
+- [references/dialect-translation.md](references/dialect-translation.md) — the dialect rule table
+- [references/maintenance-and-layout.md](references/maintenance-and-layout.md) — table maintenance and layout, Snowflake versus AIDP
+- [references/data-movement-options.md](references/data-movement-options.md) — the ways data could move; the in-AIDP INSERT-SELECT (`snowmig_02_copy_schema`) is the implemented one

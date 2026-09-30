@@ -92,9 +92,10 @@ _GENERIC_CONSEQUENCE = (
     "unrestricted on the target.")
 
 _AIDP_PATH = (
-    "AIDP has no masking API. The equivalent is a restricted view over the "
-    "table plus ontology sensitivity classification, granted per role -- a "
-    "design decision, not a translation.")
+    "This plugin does not translate masking policies. On AIDP the "
+    "equivalent is a restricted view over the table plus ontology "
+    "sensitivity classification, granted per role -- a design decision, not "
+    "a translation.")
 
 # Where attachments come from, and how stale that can be. Named in the
 # artifact so a clean verdict carries its own caveat.
@@ -130,9 +131,9 @@ _TAG_CONSEQUENCE = (
     "nothing to key off on the target.")
 
 _TAG_AIDP_PATH = (
-    "AIDP has no tag API verified here. The nearest equivalent is ontology "
-    "sensitivity classification applied per object, which is a design "
-    "decision rather than a translation.")
+    "This plugin does not translate tags. The nearest AIDP equivalent is "
+    "ontology sensitivity classification applied per object, which is a "
+    "design decision rather than a translation.")
 
 # What GRANTS_TO_ROLES.granted_on is asked for. Reading only TABLE / VIEW /
 # MATERIALIZED_VIEW made every grant on a schema, database, warehouse, stage,

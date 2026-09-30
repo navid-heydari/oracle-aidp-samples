@@ -137,7 +137,8 @@ def test_standard_creates_the_container_and_says_so():
     # actually is: the S10 workflow, not the refused notebook upload.
     assert "snowmig_01_structure" in res["note"]
     assert "Generate the structure script" not in res["note"]
-    assert "--upload" in res["note"] and "GAPS 13" in res["note"]
+    assert "--upload" in res["note"] and "refused" in res["note"]
+    assert "GAPS" not in res["note"]
 
 
 def test_standard_never_carries_the_source_credential():

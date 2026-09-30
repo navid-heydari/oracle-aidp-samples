@@ -79,9 +79,9 @@ def deploy_failure(identifier: str, deployed: dict | None) -> str | None:
                   if f.get("source_identifier") == identifier), {})
     target = entry.get("target_fqn")
     if target and target in set(deployed.get("poisoned_names") or []):
-        return (f"deploy failed and the name `{target}` is burned: a create "
-                f"that failed there once is refused for ever after, so only "
-                f"a retry into a fresh schema recovers it")
+        return (f"deploy failed and the name `{target}` cannot be reused in "
+                f"that schema after a failed create, so retry into a fresh "
+                f"schema")
     reason = " ".join(str(entry.get("reason") or "no reason recorded").split())
     return "deploy failed: " + (reason if len(reason) <= 300
                                 else reason[:297] + "...")

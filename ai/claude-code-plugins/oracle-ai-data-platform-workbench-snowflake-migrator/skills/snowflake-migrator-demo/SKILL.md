@@ -24,9 +24,9 @@ registration and deploy — only the two transports are replaced by the fakes in
    table, a `QUALIFY` view refused rather than guessed, a secure view, a
    masked column arriving unmasked, a task whose target table goes stale
    after cutover, the EXTERNAL/Standard fork, a deploy refusal against the
-   read-only EXTERNAL catalog, a silently-failed async create diagnosed as a
-   poisoned name, and a view whose column types the engine re-derived and
-   narrowed.
+   read-only EXTERNAL catalog, an asynchronous create that never became
+   visible and the engine's diagnosis of it, and a view whose column types
+   the engine re-derived and narrowed.
 3. **Point at the artifacts.** Every file has exactly the shape a prod run
    produces, so `SUMMARY.md`, `STAGES.md`, `DDL_PLAN.md` and
    `SOFT_CLONE_SUMMARY.md` here are the best preview of what a real

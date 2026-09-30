@@ -99,8 +99,8 @@ snowflake:
   # accepts a path instead — `key_path:`, `password_path:`. Set one or the
   # other, never both.
   #
-  # `pat` is not usable for the EXTERNAL catalog registration: the live
-  # catalog contract has no token property. Use password or keypair.
+  # The EXTERNAL catalog registration takes password or keypair
+  # authentication; use one of those two for a migration.
 
 aidp:
   # WHICH resources to use. Every one of these can also be passed as a flag,

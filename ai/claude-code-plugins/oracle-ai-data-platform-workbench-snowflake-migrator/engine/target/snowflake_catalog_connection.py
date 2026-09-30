@@ -154,8 +154,8 @@ def build_snowflake_connection_details(config: dict) -> dict:
         details["SNOWFLAKE_PASSWORD"] = password
     else:  # pat
         raise ConnectionConfigError(
-            "auth: pat is not supported by the live catalog contract — its "
-            "allowed connection properties carry no token field. Use keypair "
-            "(preferred) or password.")
+            "auth: pat is not supported for an AIDP Snowflake catalog "
+            "connection — its allowed connection properties have no token "
+            "field. Use keypair (preferred) or password.")
 
     return details

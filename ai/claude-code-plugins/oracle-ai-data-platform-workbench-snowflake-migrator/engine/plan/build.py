@@ -389,9 +389,9 @@ def build_plan(inventory: dict, dependencies: dict, *,
                 "category": "target_key_too_long",
                 "reason": (
                     f"the target key {target!r} is {len(target)} characters; "
-                    f"the destination stores at most {TARGET_KEY_MAX} and "
-                    f"answers a longer one with 202 Accepted, creates "
-                    f"nothing, and burns the name. It is over by {over}. "
+                    f"the destination stores at most {TARGET_KEY_MAX}, so "
+                    f"this object cannot be created under this key. It is "
+                    f"over by {over}. "
                     f"The limit is on the WHOLE key: catalog {catalog!r} "
                     f"({len(catalog)}) + schema {schema!r} ({len(schema)}) "
                     f"leave {max(0, TARGET_KEY_MAX - len(catalog) - len(schema) - 2)} "

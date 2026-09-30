@@ -5,7 +5,7 @@ description: First-run setup for the Snowflake to AIDP migrator. Finds or create
 
 # Bootstrap
 
-Getting from "nothing set up" to "both ends verified". Four steps, in order.
+Getting from "nothing set up" to "both ends verified". Five steps, in order.
 
 ## 1. Dependencies — nothing to install, nothing left behind
 
@@ -81,7 +81,7 @@ one file to fill in, and the secret goes *in that file*, not into the chat:
 | Snowflake account/host, user, warehouse, database, role, schema | `snowmig-config.yaml`, under `snowflake:` | created from the template; `0600` on POSIX; gitignored only inside the plugin folder — tell the user to add it to their own `.gitignore` when it lives elsewhere |
 | The Snowflake **password or private key** | the same file — `password:` or `private_key: |` inline | inline is the default; `*_path` variants exist but are not what you propose first |
 | Which AIDP resources to use (DataLake OCID, workspace, cluster, catalog) | the same file, under `aidp:` | any of them can also be passed as a flag, and a flag wins |
-| AIDP **authentication** | `~/.oci/config` (`oci setup config`) | never a value in the config file. `oci raw-request` runs with that file's `DEFAULT` profile (or `OCI_CLI_PROFILE` from the shell; `aidp.oci_profile`, when set, is announced on stdout and passed as `--profile` to every `oci` call, winning over `OCI_CLI_PROFILE`; the `aidp` CLI gets no profile flag; for the `oci` calls a session-token profile also needs `OCI_CLI_AUTH=security_token`, which the plugin does not add); every `aidp` call gets `--auth api_key --region <from the OCID>` appended, because the `aidp` CLI defaults to a session token. If a call fails with an auth error, that profile's API key is what to check |
+| AIDP **authentication** | `~/.oci/config` (`oci setup config`) | never a value in the config file. `oci raw-request` uses that file's `DEFAULT` profile, or `OCI_CLI_PROFILE` from the shell; `aidp.oci_profile`, when set, is announced on stdout and passed as `--profile` to every `oci` call, winning over `OCI_CLI_PROFILE`. A session-token profile also needs `OCI_CLI_AUTH=security_token` in the shell; the plugin does not set it. Every `aidp` call gets `--auth api_key --region <from the OCID>` appended (the `aidp` CLI defaults to a session token) and no profile flag. On an auth error, check that profile's API key |
 
 Rules that come with an inline secret, and they are not optional:
 
@@ -110,18 +110,18 @@ Then set `auth: keypair` and paste the PEM **into the same config file**, under
 `private_key: |`. A key pair is also what AIDP's own Snowflake connector uses,
 so it is not throwaway setup. (`key_path:` also works if they would rather keep
 the PEM on disk — but do not send them to a second file by default.) `pat`
-works for the engine but **not** for the EXTERNAL catalog registration: that
-live contract has no token property.
+works for the engine but **not** for the EXTERNAL catalog registration, whose
+Snowflake connection properties have no token field.
 
-SSO (`authenticator: externalbrowser`) needs a SAML IdP on the account; a plain
-Snowflake account fails it with `390190`.
+SSO (`authenticator: externalbrowser`) needs a SAML IdP configured on the
+account; without one, the login fails with `390190`.
 
 ## 4. Read the config back, then actually connect
 
-This is the step that saves hours:
+This step catches a wrong account, role or destination before anything runs:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig preflight \ --test-source
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig preflight --test-source
 ```
 
 No `--config` needed once the file is in place — the CLI discovers it and prints
@@ -156,7 +156,7 @@ was never tested rather than reporting "preflight OK".
 ## 5. Smoke-test the source
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig assess \ --database <one small database>
+${CLAUDE_PLUGIN_ROOT}/bin/snowmig assess --database <one small database>
 ```
 
 Report the account, region, role and warehouse back to the user. Then hand off

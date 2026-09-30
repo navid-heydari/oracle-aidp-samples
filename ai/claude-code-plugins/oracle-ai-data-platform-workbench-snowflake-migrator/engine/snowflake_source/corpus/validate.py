@@ -179,7 +179,7 @@ def main() -> int:
     check("customers show repeat business", repeat > 0,
           f"{repeat} customer(s) with >1 order")
 
-    print("\n-- the view is no longer vacuous (the original defect) --------------")
+    print("\n-- the view is populated, not vacuous -------------------------------")
     n, orders, items, qty, amt, cust, store = one("""
         select count(*), count(distinct ORDER_ID), sum(ITEM_COUNT),
                sum(TOTAL_ITEM_QUANTITY), sum(ITEM_TOTAL_AMOUNT),

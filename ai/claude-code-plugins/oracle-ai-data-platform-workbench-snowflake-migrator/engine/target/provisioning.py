@@ -1777,12 +1777,6 @@ def render_provision(res: dict) -> str:
         lines += ["**DRY RUN — nothing was created.** Re-run with `--execute` "
                   "after reviewing the plan below.", ""]
     lines += [
-        "The workspace, cluster, folder, upload, job and job-delete calls "
-        "here follow the documented 20260430 contract and have run against "
-        "the live API (2026-09-29). Cluster library items are still inferred "
-        "from that contract and are **not live-verified** (see "
-        "`provision_api.py`).",
-        "",
         f'Workspace: `{res["workspace"]["name"]}`'
         + (f' (translated from `{res["workspace"]["requested"]}` — '
            + "; ".join(res["workspace"]["notes"]) + ")"

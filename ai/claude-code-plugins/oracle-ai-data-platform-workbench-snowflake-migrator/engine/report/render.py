@@ -549,9 +549,9 @@ def render_catalog(res: dict) -> str:
         out += ["Registered and read back from the server.", ""]
     else:
         out += ["**The create was accepted but the catalog has not appeared "
-                "yet.** Catalog creation is asynchronous and can fail silently, "
-                "so this is *pending*, not done — list the catalogs again "
-                "before treating it as registered.", ""]
+                "yet.** Catalog creation is asynchronous, so this is "
+                "*pending*, not done — list the catalogs again before "
+                "treating it as registered.", ""]
 
     if res.get("container_only"):
         # The container existing must never read as the structure existing.
@@ -579,13 +579,10 @@ def render_catalog(res: dict) -> str:
             # a catalog whose credentials the connector proves at S6 -- a
             # known platform issue (runbook S3). "Fix the credential" sent
             # operators chasing a credential that works.
-            out += [f"**{status}** — with an empty reason. This is the known "
-                    "platform issue the runbook describes at S3: keep the "
-                    "registration and move on. Discovery and the copy read "
-                    "Snowflake through the connector, and the discovery job "
-                    "(S6) is what proves the credential. A FAILED test "
-                    "*with* a reason is a real failure; this one gives none.",
-                    ""]
+            out += [f"**{status}** — the test returned no reason. Keep the "
+                    "registration and continue: discovery (S6) validates the "
+                    "connection through the connector. A FAILED test with a "
+                    "reason should be investigated.", ""]
         elif status in ("FAILED", "CANCELED", "CANCELLED"):
             out += [f"**{status}**"
                     + (f" — {test.get('error')}" if test.get("error") else "")
@@ -625,8 +622,8 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
                f'Catalog in scope: **{scope}**', "",
                f'Created and **verified {res.get("verified", 0)}/{total}** '
                f'(executed {res.get("executed", 0)}/{total}).', "",
-               "Verification probes each object individually, because a batch can "
-               "report success while statements inside it failed. `verified` "
+               "Verification probes each object individually, so a statement "
+               "that failed inside a batch is reported. `verified` "
                "means the object exists **with the planned column list** — the "
                "DDL is `CREATE IF NOT EXISTS`, so a name that already belonged "
                "to a different table is reported below, not counted here.", "",
@@ -668,9 +665,9 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
     if res.get("schemas_not_active"):
         out += ["## Schema still settling — nothing was posted into it", "",
                 "These schemas had not reported ACTIVE when the wait ran out. "
-                "A create against a settling schema is accepted and then "
-                "silently dropped, so none was sent: **no name was burned**, "
-                "and the objects below are failed only because they were not "
+                "The plugin posts creates only into an ACTIVE schema, so none "
+                "was sent: **every planned name is still available**, and the "
+                "objects below are failed only because they were not "
                 "attempted. Re-run once the schema reports ACTIVE.", ""]
         out += [f"- `{name}` — {state}"
                 for name, state in sorted(res["schemas_not_active"].items())]
@@ -688,8 +685,9 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
 
     if res.get("diagnosis_probes"):
         out += ["### Diagnosis probe", "",
-                "To tell a burned name from a bad request, one throwaway "
-                "object was created with a novel name in the affected schema. "
+                "To tell whether a failure is specific to these names or to "
+                "the request, one throwaway object was created with a novel "
+                "name in the affected schema. "
                 "Deletes are asynchronous, so cleanup is best-effort and the "
                 "name is reported either way.", ""]
         out += [f'- `{p["schema"]}.{p["name"]}` — {p["note"]}'
@@ -697,15 +695,15 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
         out.append("")
 
     if res.get("poisoned_names"):
-        out += ["## These names are burned — retry into a FRESH schema", "",
-                "A create that failed here once is refused for ever after: "
-                "every later attempt returns `202 Accepted` and silently "
-                "creates nothing, and `DELETE` does not recover the name. "
-                "This was confirmed for this run — a **novel** name in the "
-                "same schema was created successfully, so neither the request "
-                "nor the catalog is at fault.", "",
-                "**Re-running into this schema will not work.** Change the "
-                "target schema and run again.", ""]
+        out += ["## These names cannot be created in this schema — retry "
+                "into a FRESH schema", "",
+                "Creates for these names were accepted, but the objects did "
+                "not appear, and a later create of the same name in this "
+                "schema does not create it either. A **novel** name in the "
+                "same schema was created successfully in this run, so the "
+                "request and the catalog are in order.", "",
+                "**Re-running into this schema will not create these "
+                "names.** Change the target schema and run again.", ""]
         out += [f'- `{n}`' for n in res["poisoned_names"]]
         out.append("")
 
@@ -740,9 +738,9 @@ def render_soft_clone_summary(plan: dict, res: dict) -> str:
         out.append("")
 
     if res.get("description_drift"):
-        out += ["## Descriptions the target dropped", "",
-                "The structure matches the plan; the documentation the plan "
-                "showed did not survive the create.", ""]
+        out += ["## Descriptions not found on the target", "",
+                "The structure matches the plan; the descriptions the plan "
+                "showed were not found on the created objects.", ""]
         out += [f'- `{d["target_fqn"]}` — {d["reason"]}'
                 for d in res["description_drift"]]
         out.append("")
@@ -1175,8 +1173,7 @@ def render_data_options(options: list[dict]) -> str:
     out = ["# Data-movement options — for you to choose", "",
            f"**{headline}.** {rest} They are the realistic ways data "
            "could move, with the trade-offs and the open unknowns attached, so "
-           "the choice is made deliberately rather than defaulting to whichever "
-           "path got built first.", "",
+           "the choice is made deliberately.", "",
            "| Option | Catalog | Moves bytes | Phase |", "|---|---|---|---|"]
     for o in options:
         out.append(f'| **{o["id"]}** — {o["name"]} | {o["catalog_type"]} '
@@ -1198,11 +1195,11 @@ def render_data_options(options: list[dict]) -> str:
     out += ["---", "",
             "## What happens after you choose", "",
             "`record_choice()` captures the option and the reasoning. It executes "
-            "nothing. Every unknown listed against the chosen option has to be "
-            "retired by a hand-run spike on one representative table before any "
-            "tooling is built — the outstanding one that invalidates the most is "
-            "whether `NUMBER(p,s)` survives an unload round trip with exact "
-            "precision, which has never been measured.", ""]
+            "nothing. Every unknown listed against the chosen option should be "
+            "resolved by a hand-run test on one representative table before any "
+            "tooling is built — the one with the widest impact is whether "
+            "`NUMBER(p,s)` survives an unload round trip with exact "
+            "precision.", ""]
     return "\n".join(out).rstrip() + "\n"
 
 
@@ -1262,8 +1259,9 @@ def architecture_section(plan: dict) -> list[str]:
     out += ["",
             "**The maintenance column is a real operating cost, not a "
             "footnote.** Snowflake maintains layout and reclaims storage in "
-            "the background; AIDP has `OPTIMIZE`, `VACUUM`, `ZORDER BY` and "
-            "liquid clustering and runs none of them for you. So the choice "
+            "the background; on AIDP, `OPTIMIZE`, `VACUUM`, `ZORDER BY` and "
+            "liquid clustering are explicit operations you schedule. So the "
+            "choice "
             "below decides *who inherits that work* — federating leaves it "
             "with Snowflake, landing Delta tables transfers it to you on day "
             "one.", "",
@@ -1274,13 +1272,13 @@ def architecture_section(plan: dict) -> list[str]:
         if applies is None:
             which = "unknown until the design is described"
         elif not applies:
-            which = "**none of the Delta traps apply**"
+            which = "**none of the Delta maintenance points below apply**"
         else:
-            which = f"all {len(applies)} Delta traps below apply"
+            which = f"all {len(applies)} Delta maintenance points below apply"
         out.append(f'- **{o["id"]}** — {own.get("note", "")} ({which}.)')
-    out += ["", "### The three traps", "",
-            "Each is something a Snowflake customer has never had to think "
-            "about, because Snowflake did it for them.", ""]
+    out += ["", "### Three maintenance points to plan for", "",
+            "Snowflake handles each of these in the background; on AIDP each "
+            "is a decision the customer makes and schedules.", ""]
     for i, trap in enumerate(MAINTENANCE_TRAPS, 1):
         out.append(f'{i}. **{trap["trap"]}** {trap["consequence"]}')
     out += ["",
@@ -1323,8 +1321,8 @@ def render_maintenance(maint: dict) -> str:
     out = ["# Maintenance and layout", "",
            "Snowflake exposes **no `OPTIMIZE` and no `VACUUM`** — it maintains "
            "layout through Automatic Clustering and reclaims storage in the "
-           "background. AIDP has `OPTIMIZE`, `VACUUM`, `ZORDER BY` and liquid "
-           "clustering, and **runs none of them for you**.",
+           "background. AIDP provides `OPTIMIZE`, `VACUUM`, `ZORDER BY` and "
+           "liquid clustering as **explicit operations you schedule**.",
            "",
            "Nothing is lost in the migration. The *responsibility* moves. This "
            "report records what the source does today; **it proposes no "
@@ -1385,20 +1383,18 @@ def render_maintenance(maint: dict) -> str:
     out += ["## Three things to settle before anyone commits", "",
             "1. **On Delta, `VACUUM` is what bounds time travel.** On Snowflake "
             "retention and storage reclamation are independent and automatic. A "
-            "customer used to reclaiming storage freely will delete their own "
+            "customer accustomed to reclaiming storage freely will delete their own "
             "recovery window.",
             "2. **`OPTIMIZE` increases storage until `VACUUM` runs.** It leaves "
             "the old files behind until retention expires, so compaction without "
             "reclamation is a cost regression.",
-            "3. **Nothing runs itself.** Every `OPTIMIZE`/`VACUUM` is a "
-            "scheduled AIDP Job — new operational surface the customer did not "
-            "have on Snowflake.", ""]
+            "3. **Maintenance is scheduled.** Every `OPTIMIZE`/`VACUUM` runs "
+            "as a scheduled AIDP Job, which the customer plans and owns.", ""]
 
     gaps = maint.get("no_equivalent") or []
     if gaps:
         out += ["## Capabilities with no AIDP equivalent", "",
-                "Named here because each is otherwise discovered at the worst "
-                "possible moment.", ""]
+                "Listed here so each one is planned for before cutover.", ""]
         for g in gaps:
             out += [f'**{g["capability"]}** — {g["snowflake"]}',
                     "", f'No equivalent: {g["impact"]}', ""]
@@ -1411,8 +1407,7 @@ def render_maintenance(maint: dict) -> str:
                "off — inferred from effective values, to avoid one query per table")
     out += ["---", "",
             f'History window: {maint.get("history_days")} day(s). '
-            f'Per-table parameter probing: {probing}.',
-            "", "Planned work to close this gap: `ACTION-ITEMS.md` (M3–M8)."]
+            f'Per-table parameter probing: {probing}.']
     return "\n".join(out) + "\n"
 
 
@@ -1578,10 +1573,12 @@ def render_security(sec: dict) -> str:
                 "partial, and **absence of a finding here is not evidence of "
                 "absence**.", ""]
     elif count or secure_views:
-        out += ["**This is a data-exposure regression, not a feature gap.** "
-                "The objects below are created on AIDP either way — the clone "
-                "does not fail, it succeeds without the protection. Anyone who "
-                "can read the target table sees what Snowflake was hiding.", ""]
+        out += ["**This protection has to be re-created on AIDP.** The "
+                "objects below are created on AIDP without these Snowflake "
+                "policies — the clone succeeds, and the protection does not "
+                "come with it. Until equivalent controls are in place, anyone "
+                "who can read the target table sees the data these policies "
+                "restrict on Snowflake.", ""]
 
     live = sec.get("live_attachments") or {}
     if sec.get("attachment_source"):
@@ -1590,9 +1587,9 @@ def render_security(sec: dict) -> str:
         if live.get("failed"):
             out += [f'> **{len(live["failed"])} of {live["objects"]} object(s) '
                     "could not be read directly.** Nothing in this report is a "
-                    "verdict about them; the ~2 h-stale account view is all "
-                    "there is for those. They are listed under *Could not be "
-                    "read* below.", ""]
+                    "verdict about them; for those, only the account view (up "
+                    "to ~2 h behind) was read. They are listed under *Could "
+                    "not be read* below.", ""]
         else:
             out += [f'Every one of the {live["objects"]} in-scope object(s) '
                     "was read directly, so this is current rather than "
@@ -1756,8 +1753,8 @@ def render_security(sec: dict) -> str:
 
     if sec.get("policy_references_out_of_scope"):
         out += [f'{sec["policy_references_out_of_scope"]} policy attachment(s) '
-                "exist on objects outside this migration. Context only — not a "
-                "regression this migration causes.", ""]
+                "exist on objects outside this migration. Context only; this "
+                "migration does not affect them.", ""]
 
     if sec.get("unreadable"):
         out += ["## Could not be read", ""]
@@ -1765,9 +1762,9 @@ def render_security(sec: dict) -> str:
 
     out += ["---", "",
            "This plugin **changes nothing** here and generates no equivalent. "
-           "AIDP has no masking API; the equivalent is a restricted view plus "
-           "ontology sensitivity classification granted per role, which is a "
-           "design decision rather than a translation."]
+           "On AIDP the equivalent is a restricted view plus ontology "
+           "sensitivity classification granted per role, which is a design "
+           "decision rather than a translation."]
     return "\n".join(out) + "\n"
 
 
@@ -1813,9 +1810,8 @@ def render_preflight(plan: dict, *, source: dict | None = None,
     out += ["## Naming", "",
             "**Destination names are lower-cased.** AIDP folds identifiers, so "
             "a schema created as `TEST_DB` is stored as `test_db`. The targets "
-            "below are the names the destination will really use — planning the "
-            "unfolded name would show you something that then silently "
-            "differs.", "",
+            "below are the names the destination will really use, so the "
+            "plan shows exactly what you will see on AIDP.", "",
             "Two source objects whose names differ only by case therefore fold "
             "into one, and the run **halts** rather than merging them.", ""]
 
@@ -1891,7 +1887,8 @@ def render_stages(board: dict) -> str:
            "`smoke --write-probe --execute`, which creates one probe schema "
            "and removes it again; `--write-probe` alone is a dry run. "
            "`notebook --upload` sends nothing: without `--execute` it is a "
-           "dry run, with `--execute` it is refused (GAPS.md 13).", "",
+           "dry run, with `--execute` it is refused; the structure is "
+           "created by `run --job snowmig_01_structure` (S10).", "",
            "| Stage | Needs | Runs on | Status | What it found |",
            "|---|---|---|---|---|"]
     for r in rows:

@@ -13,8 +13,7 @@ description: "Read-only PREVIEW of a Snowflake environment from the operator's m
 >
 > What follows reads Snowflake from the laptop. It is the right tool for
 > *"what is in this account?"* and the wrong one for *"migrate this
-> account"* — it leaves no workflow, no log and no evidence inside AIDP, and
-> it does not scale the way the in-AIDP path does.
+> account"* — it leaves no workflow, no log and no evidence inside AIDP.
 >
 > If the user asked to migrate, stop here and follow
 > `snowflake-migrator-overview` from S1.
@@ -23,7 +22,7 @@ description: "Read-only PREVIEW of a Snowflake environment from the operator's m
 ${CLAUDE_PLUGIN_ROOT}/bin/snowmig assess \
   [--database DB]... \
   [--row-counts metadata|exact|none] \
-  [--semi-structured block|string] [--geospatial block|string] 
+  [--semi-structured block|string] [--geospatial block|string]
 ```
 
 Every Snowflake coordinate comes from the migration config (`snowmig-config.yaml`, discovered automatically and printed as `config: <path>`). Pass `--account/--user/--auth/...` only to override a field for one run.
@@ -49,10 +48,10 @@ what it will cost first.
 
 `VARIANT`, `OBJECT` and `ARRAY` **block their table by default**, because a
 typed struct/map/array target is a design decision to make with the customer,
-not one to guess. That is the right default and the wrong dead end: if the
-estate is full of them, offer `--semi-structured string` to carry the JSON as
-text, and be explicit that this defers the problem rather than solving it —
-nothing on the target can address a field inside the string. `GEOGRAPHY` and
+not one to guess. If the estate is full of them, offer
+`--semi-structured string` to carry the JSON as text, and be explicit that
+this defers the decision rather than making it — a field inside the string is
+not addressable as a column on the target. `GEOGRAPHY` and
 `GEOMETRY` have their own switch, `--geospatial`, because they are a separate
 decision.
 
@@ -66,7 +65,7 @@ decision.
   alone is a column type with no Delta equivalent
   (`compatibility_status: blocked`, reasons in `blocked_reasons`);
   `blocked (<kind>)` is an object kind the plan refuses whatever its
-  types -- a dynamic, external, Iceberg, event or hybrid table, or a
+  types — a dynamic, external, Iceberg, event or hybrid table, or a
   secure or materialized view
 - anything whose column read failed (`compatibility_status: unassessed`,
   `columns_read: failed`, the error in `columns_read_error`). Its types were
@@ -109,9 +108,8 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig security \
 
 ### The census — say what was *not* examined
 
-`assess` used to look at tables and views only, so "N of N objects can move"
-was true of what had been examined and overstated the estate. `CENSUS.md` now
-counts procedures, UDFs and UDTFs, external functions, tasks, streams, alerts,
+`CENSUS.md` covers what the inventory does not, so a claim like "N of N
+objects can move" is stated against the whole estate. It counts procedures, UDFs and UDTFs, external functions, tasks, streams, alerts,
 materialized and dynamic tables, internal and external stages, pipes,
 sequences, file formats, secrets, network rules, Streamlit apps, notebooks
 and container services, plus the account's shares, roles, network policies,
@@ -125,8 +123,8 @@ Two things to carry to the user:
   populated after cutover.** The clone succeeds and then goes stale. This is
   the single most damaging thing in the census.
 - Procedures and UDFs come with a **language** and an effort band. JavaScript
-  is the hardest — there is no JavaScript runtime on AIDP, so the logic has to
-  be understood and rewritten, not translated.
+  carries the highest effort: its logic has to be understood and rewritten for
+  AIDP, not translated.
 
 ### Security — the only stage with an exposure consequence
 
