@@ -178,12 +178,15 @@ def render_inventory(inv: dict) -> str:
             f'| {_bytes((r.get("source_metadata") or {}).get("bytes"))} '
             f'| {len(r.get("columns") or [])} | {r.get("identifier_case_form")} '
             f'| {_compatibility_cell(r)} |')
+    # By identity: `r not in registered` compared whole record dicts, an
+    # O(N*M) scan at the scale of an estate with many external tables.
     registered = [r for r in records
                   if (kind_before_types(r) or ("",))[0] == "register_in_place"]
+    registered_ids = {id(r) for r in registered}
     kind_blocked = [r for r in records
                     if r.get("compatibility_status") != "blocked"
-                    and object_kind_block(r) and r not in registered
-                    and not snapshot_kind(r)]
+                    and id(r) not in registered_ids
+                    and object_kind_block(r) and not snapshot_kind(r)]
     if registered:
         out += ["", "`register in place (<kind>)` -- not copied: the files "
                 "are registered as an AIDP table over OCI Object Storage once "

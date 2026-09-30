@@ -182,18 +182,27 @@ def _sql_ident(identifier: str) -> str:
 _UNQUOTED_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
 
-def _sql_database(name: str) -> str:
-    """The config's database, quoted as the name Snowflake resolves it to.
+def _database_name(name: str) -> str:
+    """The name Snowflake resolves the config's database to, unquoted.
 
-    `database: snowmig_db` in the config is an unquoted identifier to the
-    connector, so it names SNOWMIG_DB; quoting it verbatim would name a
-    different (lower-case) database. A name that is not a plain identifier
-    can only have been meant verbatim.
+    `database: snowmig_db` is an unquoted identifier to the connector, so it
+    names SNOWMIG_DB. `database: '"MyDb"'` -- written with its double quotes,
+    as Snowflake SQL would -- names the mixed-case MyDb exactly. Any other
+    value that is not a plain identifier can only have been meant verbatim.
+    Every statement that names the database goes through here, so no two
+    of them can address different databases.
     """
     text = str(name).strip()
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        return text[1:-1].replace('""', '"')
     if _UNQUOTED_IDENT.match(text):
-        text = text.upper()
-    return _sql_ident(text)
+        return text.upper()
+    return text
+
+
+def _sql_database(name: str) -> str:
+    """The config's database, quoted as the name Snowflake resolves it to."""
+    return _sql_ident(_database_name(name))
 
 
 def _sql_literal(value: str) -> str:
@@ -204,6 +213,30 @@ def _sql_literal(value: str) -> str:
     SQL after it.
     """
     return str(value).replace("\\", "\\\\").replace("'", "''")
+
+
+# The /Workspace mount can serve a report that was just written before its
+# bytes are all there: an incomplete read is retried briefly, then fails
+# loudly, naming the file. Shared by every stage that re-reads a report.
+REPORT_READ_TRIES = 5
+REPORT_READ_WAIT = 2.0
+
+
+def read_report_json(path: pathlib.Path) -> dict:
+    """A report's JSON, retried briefly when the read comes back incomplete;
+    still invalid after that is a loud failure that names the file."""
+    import time
+    last = None
+    for attempt in range(REPORT_READ_TRIES):
+        try:
+            return json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            last = exc
+            if attempt + 1 < REPORT_READ_TRIES:
+                time.sleep(REPORT_READ_WAIT)
+    raise ValueError(f"{pathlib.Path(path).name} is not valid JSON after "
+                     f"{REPORT_READ_TRIES} reads ({last}); it was not "
+                     f"overwritten -- inspect it before re-running")
 
 
 def load_source_config(path: str | pathlib.Path) -> dict:

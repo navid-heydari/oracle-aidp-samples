@@ -14,7 +14,7 @@ One command, no arguments to collect, nothing to ask the user for. It runs the
 registration and deploy — only the two transports are replaced by the fakes in
 `engine/emulation/`, which is the same seam the unit tests use.
 
-For what a trial account cannot hold, run the ENTERPRISE estate (`SNOWENT`:
+For a larger enterprise estate, run the ENTERPRISE emulation (`SNOWENT`:
 external and Iceberg tables, hybrid and event tables, an outbound share to two
 consumers, masking/row-access policies and tags, search optimization, a
 container service, a native app, replication and failover groups):
@@ -24,8 +24,8 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig demo --estate enterprise --out-dir ${CLAUDE_PL
 ```
 
 It runs assess through `plan`, `ddl`, `external-registration`, `share-plan`
-and `summary`, and stops there: no AIDP step for those paths is live-verified,
-so none is emulated.
+and `summary`, and stops there: the AIDP steps for those paths are generated
+for review, not emulated.
 
 ## What to say when presenting it
 

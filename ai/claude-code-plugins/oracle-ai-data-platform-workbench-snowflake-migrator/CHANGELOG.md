@@ -10,7 +10,7 @@ migrator plugin, newest first. The format loosely follows
 - The copy reads each table with one qualified pushdown built from the plan's
   per-column read/convert spec. NUMBER(38,s), TIME and TIMESTAMP fractions and
   offsets arrive exact, and VECTOR, MAP and structured OBJECT/ARRAY arrive as
-  typed Spark columns. The connector's table read truncated NUMBER to ~9 digits.
+  typed Spark columns.
 - `--parallel N` for the copy (default 8), with source counts batched per chunk
   of 50, and `--verify counts+sums`, which sums the source in Snowflake exactly.
   A decimal total past 38 digits is reported `sum_not_comparable`.
@@ -26,8 +26,8 @@ migrator plugin, newest first. The format loosely follows
   (`share-plan`), and `plan --secure-views as-view` is an opt-in with a security
   warning.
 - `demo --estate enterprise` runs the Snowflake-side stages over an emulated
-  estate holding what a trial account cannot (shares, external and Iceberg
-  tables, replication groups, masking at scale).
+  enterprise estate (shares, external and Iceberg tables, replication groups,
+  masking at scale).
 
 ### Changed
 - Structure creates run 8 at a time by default (measured: ~5 s a table one at a
@@ -45,7 +45,8 @@ migrator plugin, newest first. The format loosely follows
 - The view phase writes its report on an interval rather than after each view,
   and a report just written is never re-read.
 - `run` shows a failed task's `errorTrace` (the fetched log is only its head),
-  and names a platform transient such as an HTTP 503 as one.
+  and identifies a transient service error (for example an HTTP 503) so the run
+  can be resumed.
 - Reconcile marks a table in the target that no structure report records as
   `structure: unrecorded`, with the re-run that checks it. A planned view no run
   has recorded is `VIEW_NOT_CREATED_YET`.

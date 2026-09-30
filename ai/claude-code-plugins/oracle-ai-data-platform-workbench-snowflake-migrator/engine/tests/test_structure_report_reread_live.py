@@ -132,7 +132,7 @@ def test_a_transiently_incomplete_read_is_retried(tmp_path, monkeypatch):
     path.write_text(good, encoding="utf-8")
     reads = iter([good[:40], good])
     monkeypatch.setattr(pathlib.Path, "read_text", lambda self, *a, **k: next(reads))
-    monkeypatch.setattr(s01, "REPORT_READ_WAIT", 0)
+    monkeypatch.setattr(sys.modules["snowmig_source"], "REPORT_READ_WAIT", 0)
     report = s01._load_report(path, "CORE", "lake.snowmig_core")
     assert report["objects"] == {"T": {"status": "created"}}
 
@@ -141,7 +141,7 @@ def test_a_report_that_stays_invalid_fails_loudly_naming_it(tmp_path, monkeypatc
     s01 = _structure()
     path = tmp_path / "structure_report_core.json"
     path.write_text("{ not json", encoding="utf-8")
-    monkeypatch.setattr(s01, "REPORT_READ_WAIT", 0)
+    monkeypatch.setattr(sys.modules["snowmig_source"], "REPORT_READ_WAIT", 0)
     with pytest.raises(ValueError) as e:
         s01._load_report(path, "CORE", "lake.snowmig_core")
     assert "structure_report_core.json" in str(e.value)
