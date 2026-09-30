@@ -214,7 +214,7 @@ def test_the_diagram_has_every_phase_in_pipeline_order():
 def test_the_diagram_groups_phases_and_marks_writers_and_options():
     mmd = phase_diagram()
     for group in ("setup", "discovery", "planning", "target", "reporting"):
-        assert f'subgraph {group.upper()}' in mmd
+        assert f'subgraph PHASE_{group.upper()}' in mmd
     assert "class " in mmd and "writer" in mmd and "optional" in mmd
 
 
@@ -499,3 +499,13 @@ def test_phases_md_lists_every_phase_with_its_stages_nested(tmp_path):
     assert "| Stage |" in disc and "`assess`" in disc and "`plan`" not in disc
     for s in STAGES:
         assert f"`{s['stage']}`" in md
+
+
+def test_no_subgraph_id_is_also_a_node_id():
+    """GitHub refused to render the diagram: the `teardown` phase and the
+    `teardown` stage both became TEARDOWN, which Mermaid reads as a cycle."""
+    import re as _re
+    mmd = phase_diagram()
+    subgraphs = set(_re.findall(r"^\s*subgraph (\w+)\[", mmd, _re.M))
+    nodes = set(_re.findall(r"^\s{4}(\w+)\[", mmd, _re.M))
+    assert subgraphs and nodes and not subgraphs & nodes, subgraphs & nodes

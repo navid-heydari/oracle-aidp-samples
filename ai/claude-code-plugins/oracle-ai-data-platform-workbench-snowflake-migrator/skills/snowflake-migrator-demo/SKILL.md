@@ -23,7 +23,7 @@ registration and deploy — only the two transports are replaced by the fakes in
    lists the lessons the estate was built to teach — a blocked `VARIANT`
    table, a `QUALIFY` view refused rather than guessed, a secure view, a
    masked column arriving unmasked, a task whose target table goes stale
-   after cutover, the EXTERNAL/Standard fork, a deploy refusal against the
+   after cutover, the EXTERNAL and Standard catalog paths, a deploy refusal against the
    read-only EXTERNAL catalog, an asynchronous create that never became
    visible and the engine's diagnosis of it, and a view whose column types
    the engine re-derived and narrowed.

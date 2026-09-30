@@ -22,7 +22,7 @@ GROUP_TITLES = {
     "planning": "Planning &nbsp;&#40;offline, no network&#41;",
     "target": "Target &nbsp;&#40;AIDP structure and data plane&#41;",
     "reporting": "Reporting",
-    "teardown": "Teardown &nbsp;&#40;release the migration's compute&#41;",
+    "teardown": "Teardown &nbsp;&#40;release or remove what the migration created&#41;",
 }
 
 
@@ -53,7 +53,10 @@ def phase_diagram(board: dict | None = None) -> str:
         if spec["phase"] not in groups:
             groups.append(spec["phase"])
     for group in groups:
-        out.append(f'  subgraph {group.upper()}["{GROUP_TITLES.get(group, group)}"]')
+        # PHASE_-prefixed: a phase and a stage may share a name (`teardown`),
+        # and Mermaid reads a subgraph id equal to a node id as a cycle.
+        out.append(f'  subgraph PHASE_{group.upper()}'
+                   f'["{GROUP_TITLES.get(group, group)}"]')
         out.append("    direction TB")
         for spec in STAGES:
             if spec["phase"] == group:

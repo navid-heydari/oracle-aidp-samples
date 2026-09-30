@@ -106,63 +106,42 @@ twin, again.
 
 ## 3. Execution graph
 
+A migration follows the runbook's fixed order (S1–S12, in
+`skills/snowflake-migrator-overview/SKILL.md`):
+
 ```
-                        ┌──────────┐
-                        │  assess  │  (Snowflake)
-                        └────┬─────┘
-             ┌───────────────┼───────────────┬──────────────┐
-             ▼               ▼               ▼              ▼
-         ┌───────┐    ┌─────────────┐  ┌──────────┐   ┌──────────┐
-         │ deps  │    │ maintenance │  │ security │   │ compute  │
-         └───┬───┘    └─────────────┘  └──────────┘   └──────────┘
-             │              (advisory — inform the report, gate nothing)
-             │
-             │        ┌──────────────┐
-             │        │ data-options │  (offline; optional, records a choice)
-             │        └──────┬───────┘
-             ▼               ▼
-          ┌────────────────────┐
-          │        plan        │  ← restrictions.json, --bronze-* naming
-          └─────────┬──────────┘
-                    ▼
-             ┌────────────┐
-             │    ddl     │
-             └─────┬──────┘
-                   │
-                   ▼
-            ┌────────────┐
-            │   smoke    │   both ends reachable? permissions? (gate)
-            └─────┬──────┘
-                  │
-        ┌─────────┴──────────────────────────────┐
-        ▼  DEFAULT                               ▼  ON EXPLICIT REQUEST ONLY
-  ┌──────────────┐                        ┌──────────────┐
-  │   catalog    │  EXTERNAL/SNOWFLAKE    │   catalog    │  STANDARD → CONTAINER only
-  │  --execute   │  read-only pointer     │  (standard)  │
-  └──────┬───────┘  copies nothing        └──────┬───────┘
-         │                                       ▼
-         │                                ┌──────────────┐
-         │                                │   notebook   │  local .ipynb only
-         │                                └──────┬───────┘
-         │                                       ▼
-         │                                run --job snowmig_01_structure
-         │                                (on AIDP compute; Spark
-         │                                 reports each statement)
-         │                                       │
-         └───────────────┬───────────────────────┘
-                         ▼
-                   ┌───────────┐
-                   │  summary  │
-                   └───────────┘
+preflight                        confirm the config; test both ends
+   │
+provision --execute              S1 workspace · S2 migration cluster · S5 notebooks and jobs
+   │
+catalog --execute                S3 EXTERNAL source pointer · S4 INTERNAL target container
+   │
+run snowmig_00_discover          S6 discovery inside AIDP; manifest backed up
+   │
+ingest → plan → ddl              S7–S9 translation plan, flagged items resolved, scope approved
+   │
+provision --reuse-existing       plan pushed to the workspace; one copy job per schema (S11)
+   │
+run snowmig_01_structure         S10 schemas and empty Delta tables, each read back
+   │
+run snowmig_02_copy_<schema>     when the customer decides; one schema per run
+   │
+run snowmig_03_reconcile         MIGRATION_REPORT.md
+   │
+teardown                         release the compute (or --scope credential | all)
 ```
 
-`deploy` is a third branch, reached only when the user asks for it by name:
-control-plane CRUD straight into a Standard catalog, with every create read
-back. For a Standard catalog the recommended path is the structure workflow,
-where Spark reports each statement's result directly. `deploy` resolves the
-target's `catalogType` before its first create and **refuses an EXTERNAL
-target** — and equally an absent catalog or an unreadable listing, because
-"could not look" is not "safe to write".
+The stages that run on the operator's machine against Snowflake —
+`assess`, `deps`, `maintenance`, `security`, `compute` — and the offline
+`data-options` are previews and advisory reports: they inform the plan and
+gate nothing. `smoke` is the exception: it checks both ends are reachable
+with the permissions the next step needs.
+
+`deploy` is a separate path, used only when the user asks for it by name:
+it creates the structure in a Standard catalog through the control-plane
+API, reading every create back. It resolves the target's `catalogType`
+before its first create and refuses an EXTERNAL target, an absent catalog
+or an unreadable listing. The runbook path is the structure workflow.
 
 ### Phase diagram
 
@@ -172,14 +151,14 @@ Generated from the stage list in the engine (`bin/snowmig stages --write-diagram
 ```mermaid
 flowchart TB
 
-  subgraph SETUP["Setup &nbsp;&#40;environment and catalogs&#41;"]
+  subgraph PHASE_SETUP["Setup &nbsp;&#40;environment and catalogs&#41;"]
     direction TB
     PREFLIGHT["<b>preflight</b><br/><i>operator machine -> Snowflake + AIDP control plane</i>"]
     PROVISION["<b>provision</b><br/>runbook S1 S2 S5<br/><i>AIDP control-plane API (no cluster)</i>"]
     CATALOG["<b>catalog</b><br/>runbook S3 S4<br/><i>AIDP control-plane API (no cluster)</i>"]
   end
 
-  subgraph DISCOVERY["Discovery &nbsp;&#40;read-only against Snowflake&#41;"]
+  subgraph PHASE_DISCOVERY["Discovery &nbsp;&#40;read-only against Snowflake&#41;"]
     direction TB
     ASSESS["<b>assess</b><br/>runbook S7 (views)<br/><i>operator machine -> Snowflake (read-only)</i>"]
     INGEST["<b>ingest</b><br/>runbook S7<br/><i>operator machine (offline)</i>"]
@@ -190,14 +169,14 @@ flowchart TB
     DISCOVER_WORKFLOW["<b>discover-workflow</b><br/>runbook S6<br/><i>migration cluster (provisioned at S2)</i>"]
   end
 
-  subgraph PLANNING["Planning &nbsp;&#40;offline, no network&#41;"]
+  subgraph PHASE_PLANNING["Planning &nbsp;&#40;offline, no network&#41;"]
     direction TB
     DATA_OPTIONS["<b>data-options</b><br/>runbook S11<br/><i>operator machine (offline)</i>"]
     PLAN["<b>plan</b><br/>runbook S7-S9<br/><i>operator machine (offline)</i>"]
     DDL["<b>ddl</b><br/>runbook S7<br/><i>operator machine (offline)</i>"]
   end
 
-  subgraph TARGET["Target &nbsp;&#40;AIDP structure and data plane&#41;"]
+  subgraph PHASE_TARGET["Target &nbsp;&#40;AIDP structure and data plane&#41;"]
     direction TB
     SMOKE["<b>smoke</b><br/><i>AIDP control-plane API (no cluster)</i>"]
     STRUCTURE_WORKFLOW["<b>structure-workflow</b><br/>runbook S10<br/><i>migration cluster (provisioned at S2)</i>"]
@@ -207,14 +186,14 @@ flowchart TB
     NOTEBOOK["<b>notebook</b><br/><i>operator machine (offline)</i>"]
   end
 
-  subgraph REPORTING["Reporting"]
+  subgraph PHASE_REPORTING["Reporting"]
     direction TB
     SUMMARY["<b>summary</b><br/>runbook S9 S12<br/><i>operator machine (offline)</i>"]
     PUBLISH["<b>publish</b><br/><i>AIDP control-plane API (no cluster)</i>"]
     TOKENS["<b>tokens</b><br/><i>operator machine (offline)</i>"]
   end
 
-  subgraph TEARDOWN["Teardown &nbsp;&#40;release the migration's compute&#41;"]
+  subgraph PHASE_TEARDOWN["Teardown &nbsp;&#40;release or remove what the migration created&#41;"]
     direction TB
     TEARDOWN["<b>teardown</b><br/><i>AIDP control-plane API (no cluster)</i>"]
   end
@@ -256,18 +235,18 @@ flowchart TB
 ```
 <!-- phase-diagram:end -->
 
-### Why the fork exists
+### EXTERNAL and INTERNAL catalogs
 
-| | EXTERNAL (default) | STANDARD (on request) |
+| | EXTERNAL (S3) | INTERNAL (S4) |
 |---|---|---|
-| What it is | A registered, read-only pointer at the live Snowflake source | Managed Delta tables in AIDP storage |
-| Copies data | No — nothing to keep in sync | No (structure only), but the storage is real |
-| Blast radius | Registration only | Creates objects the customer now owns |
-| Created by | `snowmig.py catalog --execute` | A script run on AIDP compute |
-| Failure surface | One catalog | Every schema, table and view |
+| Role | A read-only pointer at the live Snowflake database | The migration's target: managed Delta tables in AIDP storage |
+| Data | Copies nothing | Rows arrive only through the per-schema copy jobs |
+| Created by | `catalog --execute` | `catalog --catalog-type standard --execute` (the container); its schemas and tables by the structure workflow at S10 |
+| Removed by | `teardown --scope all` | `teardown --scope all --include-data` |
 
-Default to the smaller blast radius. A Standard catalog is never offered,
-never assumed, and only ever built when the user has asked for one in words.
+The runbook creates both. Outside the runbook, the stand-alone `catalog`
+command registers an EXTERNAL catalog by default and creates an INTERNAL
+one only when asked.
 
 ---
 
