@@ -86,12 +86,15 @@ def test_decimal_columns_map_with_precision(out):
         assert c["NUMERIC_PRECISION"] is not None
 
 
-def test_timestamp_ntz_maps_to_ntz(out):
+def test_timestamp_ntz_maps_to_resolved_mode(out):
     inv = json.loads((out / "inventory.json").read_text(encoding="utf-8"))
     ntz = [c for r in inv["inventory"] for c in r["columns"]
            if (c.get("DATA_TYPE") or "").upper() == "TIMESTAMP_NTZ"]
     assert ntz, "the estate should contain TIMESTAMP_NTZ columns"
-    assert all(c["target_type"] == "TIMESTAMP_NTZ" for c in ntz)
+    # The default mapping downgrades to TIMESTAMP; only `preserve` keeps NTZ.
+    want = ("TIMESTAMP_NTZ" if inv["timestamp_ntz_mode"] == "preserve"
+            else "TIMESTAMP")
+    assert all(c["target_type"] == want for c in ntz), want
 
 
 def test_deps_and_plan(out):
@@ -130,10 +133,10 @@ def test_view_lands_after_its_base_tables(out):
 
 
 def test_ddl_generates_delta_tables_and_views_and_no_replace(out):
-    # `assess` above ran with the preserved default, and the estate carries
-    # TIMESTAMP_NTZ columns (asserted earlier), so a bare `ddl` halts on the
-    # type the metastore refuses. The offline re-map is the documented way
-    # through; without it this module could not pass end to end.
+    # `--timestamp-ntz timestamp` keeps this module passing whichever mode
+    # `assess` resolved: under `preserve` the estate's TIMESTAMP_NTZ columns
+    # (asserted earlier) would halt a bare `ddl` on the type the metastore
+    # refuses, and under the default the re-map changes nothing.
     assert main(["ddl", "--out-dir", str(out),
                  "--timestamp-ntz", "timestamp"]) == 0
     ddl = json.loads((out / "ddl_plan.json").read_text(encoding="utf-8"))
@@ -224,9 +227,9 @@ def test_show_pagination_resumes_exclusively_and_in_name_order(tmp_path):
 
 
 def test_semi_structured_switch_against_real_variant_columns(tmp_path):
-    """Issue #7, verified against genuine Snowflake semi-structured columns.
+    """The semi-structured switch, against genuine Snowflake columns.
 
-    The corpus has none, so this reads SNOWFLAKE.ACCOUNT_USAGE, whose views
+    A test database may have none, so this reads SNOWFLAKE.ACCOUNT_USAGE, whose views
     carry real VARIANT, OBJECT and ARRAY columns. Read-only: the plugin cannot
     create a VARIANT column to test with, and must not.
     """

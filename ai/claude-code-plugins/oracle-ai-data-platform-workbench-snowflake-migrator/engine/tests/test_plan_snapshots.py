@@ -187,6 +187,18 @@ def test_no_captured_query_is_said_not_guessed():
     assert refresh["cadence"] is None
 
 
+def test_a_census_row_without_the_query_names_the_flag_not_the_grants():
+    """A default assess: the census saw the dynamic table (its lag is read)
+    but dropped the body without --capture-definitions. The role is fine."""
+    census = _census({"kind": "DYNAMIC_TABLE",
+                      "source_identifier": "DB.CORE.DT_ORDER_ROLLUP",
+                      "source_facts": {"target_lag": "1 day"}})
+    plan = _plan(_rec(ORDERS), _dt(), census=census)
+    refresh = _can(plan)["DB.CORE.DT_ORDER_ROLLUP"]["refresh"]
+    assert refresh["generated"] is False
+    assert "SHOW DYNAMIC TABLES" not in refresh["verdict"]
+
+
 def test_a_materialized_view_query_is_found_on_the_census_row_first():
     census = _census({"kind": "MATERIALIZED_VIEW",
                       "source_identifier": "DB.CORE.MV_ORDER_TOTALS",

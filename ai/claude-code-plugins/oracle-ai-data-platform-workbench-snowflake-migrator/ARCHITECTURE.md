@@ -254,9 +254,11 @@ one only when asked.
 
 The rules the design holds everywhere.
 
-**I1 — The source is read-only, at the transport.** Not by grant, not by
-convention. `snowflake_source/conn.py` refuses a non-read verb, so no skill,
-prompt or bug can write to the customer's Snowflake.
+**I1 — The source is read-only, at the transport and by grant.**
+`snowflake_source/conn.py` refuses any statement not led by `SELECT`, `SHOW`,
+`DESCRIBE` or `EXPLAIN` (or a CTE ending in `SELECT`), so no statement the
+plugin builds can be a write. The gate reads the verb, not the whole
+statement, so the migration's read-only role is still what prevents writes.
 
 **I2 — Read back and compare; a 2xx is not the claim.** AIDP catalog creates
 are asynchronous: they return **202 Accepted** with an empty body and no
@@ -322,10 +324,10 @@ A gate is a point where the run stops and does not proceed on its own.
 | Gate | Where | Condition |
 |---|---|---|
 | **Target collision** | `plan` | Two source objects fold to one target name (`ORDERS` / `"orders"`). Exits `HALT`. AIDP stores identifiers in lower case, so the two would map to one object |
-| **Unmappable type** | `ddl` | `VARIANT`/`OBJECT`/`ARRAY`/`GEOGRAPHY` block their table unless the operator opts into `string`, which defers the typed design rather than replacing it |
-| **`timestamp_ntz`** | `ddl` | The target catalog does not take `timestamp_ntz` as a column type. Blocked by default; `--timestamp-ntz timestamp` accepts the timezone-semantics change and records the caveat on the field |
+| **Unmappable type** | `ddl` | `GEOGRAPHY`/`GEOMETRY` block their table unless the operator opts into `string` or `wkt`. `VARIANT`/`OBJECT`/`ARRAY` are carried as `STRING` by default, with a warning (`--semi-structured block` refuses them); either way the typed design is deferred, not replaced |
+| **`timestamp_ntz`** | `ddl` | The target catalog does not take `timestamp_ntz` as a column type. Mapped to `TIMESTAMP` by default, with the timezone caveat recorded on the field; `--timestamp-ntz preserve` keeps it, and `ddl` then halts (exit 3) |
 | **Connectivity** | `smoke` | Both ends reachable with the permissions the next stage needs. The write probe is skipped, with a note, against an EXTERNAL catalog — read-only by design is not a FAIL |
-| **`--execute`** | `catalog`, `deploy`, `provision`, `teardown`, `publish`, `smoke --write-probe`, `notebook --upload` | Dry run otherwise. Nothing reaches AIDP without it. `notebook --upload` stays a dry run: with `--execute` it is refused, and the structure is created by `run --job snowmig_01_structure` |
+| **`--execute`** | `catalog`, `deploy`, `provision`, `teardown`, `publish`, `smoke --write-probe`, `notebook --upload` | Dry run otherwise. Nothing reaches AIDP without it, except `run`, `jobs --register` and the opt-in per-stage report publish (`reporting.publish_each_stage`). `notebook --upload` stays a dry run: with `--execute` it is refused, and the structure is created by `run --job snowmig_01_structure` |
 | **EXTERNAL target** | `deploy` | The target's `catalogType` is resolved before the first create; EXTERNAL, absent, or unreadable → **refused** |
 | **Managed catalog** | `catalog` | `--catalog-type standard` creates the CONTAINER only (sent as `INTERNAL`; `STANDARD` is accepted as an alias and normalised) and returns `container_only`. Its **tables** are created by the structure workflow (`run --job snowmig_01_structure`, S10), not here |
 | **Explicit request** | skill layer | A Standard catalog requires the user to have asked, in words |

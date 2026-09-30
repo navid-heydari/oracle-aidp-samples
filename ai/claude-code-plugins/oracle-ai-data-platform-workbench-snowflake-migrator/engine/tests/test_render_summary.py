@@ -220,7 +220,7 @@ def test_summary_makes_no_destination_claim_when_none_is_supplied():
 
 
 # --------------------------------------------------------------------------
-# A missing row count must carry its reason (issue #6).
+# A missing row count must carry its reason.
 # --------------------------------------------------------------------------
 
 def test_a_dash_in_the_rows_column_is_explained():

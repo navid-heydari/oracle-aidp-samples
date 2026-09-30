@@ -1,6 +1,6 @@
 """Parsed-DDL lineage reads the code, and every relation of a FROM list.
 
-Round-3 review, reproduced with the real extract_dependencies / build_plan.
+Reproduced with the real extract_dependencies / build_plan.
 The parsed_ddl path is what runs when OBJECT_DEPENDENCIES is denied (a
 silent fallback) and for every view ACCOUNT_USAGE has not caught up with
 yet. It ran `\\b(?:FROM|JOIN)\\s+<ident>` over the raw DDL, so:

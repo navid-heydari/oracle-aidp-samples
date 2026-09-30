@@ -108,6 +108,8 @@ def run_demo(out_dir) -> dict:
                 "a real system."})
 
     # 1-4 · investigate (read-only against the emulated Snowflake) ----------
+    # The demo opts into `--semi-structured block` (the default is `string`)
+    # so it can show a table the engine refuses rather than guesses.
     inv = build_inventory(demo_run_sql, None, row_counts="metadata",
                           semi_structured="block", geospatial="block",
                           timestamp_ntz="timestamp")
@@ -123,14 +125,15 @@ def run_demo(out_dir) -> dict:
           f'census found {inv["census"]["total"]} object(s) that cannot migrate '
           f'({kinds or "none"})')
     lessons.append(
-        "TIMESTAMP_NTZ was mapped to TIMESTAMP on purpose "
-        "(`--timestamp-ntz timestamp`): the AIDP catalog API takes "
+        "TIMESTAMP_NTZ was mapped to TIMESTAMP (the default, "
+        "`--timestamp-ntz timestamp`): the AIDP catalog API takes "
         "`timestamp`, not `timestamp_ntz`, and the mapping changes timezone "
-        "semantics — a decision the operator makes, never a default.")
+        "semantics, so the caveat is recorded on every affected column.")
     lessons.append(
-        "SALES.EVENTS_RAW is BLOCKED: VARIANT has no typed Delta mapping, and "
-        "the engine refuses rather than guesses. `--semi-structured string` "
-        "would carry it as text — a deferral, not a solution.")
+        "SALES.EVENTS_RAW is BLOCKED because this demo opts into "
+        "`--semi-structured block`: VARIANT has no typed Delta mapping. The "
+        "default, `--semi-structured string`, carries it as text with a "
+        "warning — a deferral of the typed design, not a solution.")
     lessons.append(
         "TASK_LOAD_ORDERS populates SALES.ORDERS and does NOT migrate: after "
         "a real cutover the cloned table quietly stops being loaded. The "

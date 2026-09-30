@@ -19,15 +19,18 @@ description: "Read-only PREVIEW of a Snowflake environment from the operator's m
 > `snowflake-migrator-overview` from S1.
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig assess \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" assess \
   [--database DB]... \
   [--row-counts metadata|exact|none] \
-  [--semi-structured block|string] [--geospatial block|string|wkt]
+  [--semi-structured block|string] [--geospatial block|string|wkt] \
+  [--capture-definitions]
 ```
 
 Every Snowflake coordinate comes from the migration config (`snowmig-config.yaml`, discovered automatically and printed as `config: <path>`). Pass `--account/--user/--auth/...` only to override a field for one run.
 
 Omit `--database` to scan every non-system database. Repeat it to scope.
+Pass `--capture-definitions` when tasks or dynamic tables should get generated
+jobs: their bodies are kept only with it.
 
 ## Row counts — pick deliberately
 
@@ -111,10 +114,10 @@ that read failed, the reason it names.
 # what is NOT a table or a view. Runs inside `assess` by default -> CENSUS.md
 # (pass --no-census to skip, and the coverage claim then says so)
 
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig maintenance \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" maintenance \
   --account <...> --user <...> --auth <...> [--key-path ...] [--history-days 30]
 
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig security \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" security \
   --account <...> --user <...> --auth <...> [--key-path ...]
 ```
 
@@ -127,8 +130,11 @@ sequences, file formats, secrets, network rules, Streamlit apps, notebooks
 and container services, plus the account's shares, roles, network policies,
 applications, compute pools, and replication and failover groups (one
 `SHOW REPLICATION GROUPS`, split by `type`, so a failover group is counted
-once: it is the account's DR contract and does not follow the migration). **None of them migrate**, and no equivalent
-is generated. An outbound share is a live contract with another account:
+once: it is the account's DR contract and does not follow the migration).
+**None of them migrate as objects**, and no procedure or UDF equivalent is
+generated. Dynamic tables and materialized views migrate as table snapshots,
+and `snowmig jobs` generates MANUAL task and refresh jobs where a translation
+is exact (README → Generated jobs). An outbound share is a live contract with another account:
 read that row first.
 
 Two things to carry to the user:

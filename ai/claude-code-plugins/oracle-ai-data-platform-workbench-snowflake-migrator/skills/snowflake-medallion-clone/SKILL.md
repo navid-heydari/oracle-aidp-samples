@@ -54,13 +54,13 @@ that go with that are the bootstrap skill's, and they apply here too:
 - **Ask the user before reading the config**, and say why you need it.
 - **Never print, echo, quote or summarise a secret value** — not in chat, not
   in a report, not in a commit. Render the config only through
-  `${CLAUDE_PLUGIN_ROOT}/bin/snowmig preflight`, which uses
+  `"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" preflight`, which uses
   `migration_config.redact()`.
 - **Never ask the user to paste a secret into the conversation.** If one
   lands in the chat anyway, say so and tell them to rotate it.
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig catalog \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" catalog \
   --catalog <cat> --config ./snowmig-config.yaml \
   --execute --datalake-ocid <ocid> --workspace <ws> --cluster-id <cl>
 ```
@@ -69,7 +69,7 @@ Without `--execute` this is a dry run: it validates the config, reports which
 connection fields were built, and creates nothing. Show `CATALOG.md`.
 
 Then validate the connection with `--test-connection` on the same command
-(`${CLAUDE_PLUGIN_ROOT}/bin/snowmig catalog ... --execute --test-connection`;
+(`"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" catalog ... --execute --test-connection`;
 it only runs with `--execute`, because the API resolves RBAC on an existing
 catalog) before claiming the catalog is usable. Report the result as it is:
 `PENDING` is pending, never a pass.
@@ -81,7 +81,7 @@ the connector. Never delete and re-register to make the test pass.
 ## Phase B — generate the DDL (offline, safe; needed only for Phase C)
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig ddl
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" ddl
 ```
 
 Show `DDL_PLAN.md`: the SQL, the rule behind each transformation, dropped
@@ -94,7 +94,8 @@ the table at all. Each table statement in `ddl_plan.json` carries that per-colum
 spec as `columns`.
 
 **Exit code 3 is a halt, not a failure:** a column uses a type the target
-refuses at CREATE TABLE, usually `TIMESTAMP_NTZ` on a default-assessed estate.
+refuses at CREATE TABLE, usually `TIMESTAMP_NTZ` on an estate assessed with
+`--timestamp-ntz preserve` or `--mapping-defaults off`.
 stderr and `DDL_PLAN.md` name the columns. The remedy is a decision for the
 user — `ddl --timestamp-ntz timestamp` (offline) maps them to `TIMESTAMP`,
 which changes timezone semantics — and until it is made, do not hand this
@@ -174,7 +175,7 @@ a catalog is merely registered.
 
 ## Backend
 
-The engine uses the `aidp` CLI when installed and falls back to `oci
-raw-request`. It prints which one it chose. If neither CLI is present it fails
-loudly rather than guessing a transport. `oci ai-data-platform` covers only the
-control plane, so the data plane goes through `raw-request`.
+The engine uses `oci raw-request` whenever `oci` is installed; workspace
+files, job cancel and delete, and catalog delete always use the `aidp` CLI, so
+both are needed. It prints which backend it chose. If neither CLI is present
+it fails loudly rather than guessing a transport.

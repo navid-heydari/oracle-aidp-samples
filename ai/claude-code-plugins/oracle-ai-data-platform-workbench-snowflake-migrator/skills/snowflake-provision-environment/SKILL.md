@@ -6,7 +6,7 @@ description: Provision the migration environment inside AIDP for the prod flow -
 # Provision the migration environment
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig provision \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" provision \
   --workspace-name "<name>" \
   [--cluster-name migration-assets] \
   [--external-catalog <registered EXTERNAL catalog>] \

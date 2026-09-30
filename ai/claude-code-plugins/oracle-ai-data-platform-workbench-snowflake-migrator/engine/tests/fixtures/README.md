@@ -1,13 +1,14 @@
 # Fixtures
 
-Recorded `SHOW` / `INFORMATION_SCHEMA` / `GET_DDL` payloads from a real Snowflake
-estate, replayed by the offline suite through `tests/fake_sql.py`.
+Field-name-only snapshots of what a live Snowflake account returns, read by
+`tests/test_enterprise_estate.py` to keep the offline emulation in line with the
+real response shape. `tests/fake_sql.py` takes canned responses in code and
+loads nothing from this folder.
 
-Re-record after a Snowflake behaviour change:
+To refresh after a Snowflake behaviour change, run the statements against a
+live account and record the field names only, as in
+`snowflake_live_field_names.json`.
 
-    SNOWMIG_LIVE=1 ... pytest tests/test_live_smoke.py
-
-then copy the relevant payloads from `inventory.json` into a new fixture file.
-
-**Never commit a fixture containing customer data, credentials, or an account
-identifier that is not the shared test account.**
+**Fixtures hold field names or synthetic values only. Never paste payloads from
+`inventory.json` or any other live run, and never commit an account identifier,
+user name, credential, or customer object name.**

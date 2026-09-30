@@ -6,7 +6,6 @@ poll-the-read-back, record-don't-swallow — is tested with no environment.
 import json
 import os
 import pathlib
-import tempfile
 import types
 
 import pytest
@@ -244,12 +243,12 @@ def test_jobs_point_straight_at_the_stage_notebook(scripts):
 # there; hand-placed, it imported a module that is inlined elsewhere and read a
 # file nothing creates.
 
-def _provisioned_with_config(scripts, fake=None):
+def _provisioned_with_config(scripts, tmp_path, fake=None):
     fake = fake or Fake()
     # provision reads the config to derive the snowflake-block copy it
     # uploads, so the file has to exist; an inline (fake) password keeps it
     # off the laptop-only *_path refusal.
-    cfg = pathlib.Path(tempfile.mkdtemp(prefix="snowmig_cfg_")) / "snowmig-config.yaml"
+    cfg = tmp_path / "snowmig-config.yaml"
     cfg.write_text("snowflake:\n  account: ACC\n  user: u\n  warehouse: WH\n"
                    "  database: DB\n  auth: password\n  password: not-a-real-one\n",
                    encoding="utf-8")
@@ -260,8 +259,8 @@ def _provisioned_with_config(scripts, fake=None):
 
 
 def test_the_diagnose_notebook_is_uploaded_beside_the_stages_without_a_job(
-        scripts):
-    fake, res = _provisioned_with_config(scripts)
+        scripts, tmp_path):
+    fake, res = _provisioned_with_config(scripts, tmp_path)
     path = f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}"
     assert path in fake.contents
     upload = next(kw for op, kw in fake.ops
@@ -278,8 +277,8 @@ def test_the_diagnose_notebook_is_uploaded_beside_the_stages_without_a_job(
 
 
 def test_the_diagnose_notebook_carries_this_run_s_config_path_and_no_mount_import(
-        scripts):
-    fake, _ = _provisioned_with_config(scripts)
+        scripts, tmp_path):
+    fake, _ = _provisioned_with_config(scripts, tmp_path)
     body = fake.contents[f"{SCRIPTS_FOLDER}/{DIAGNOSE_NOTEBOOK_NAME}"]["body"]
     assert "/Workspace/backup-snowflake-migration/plan/snowmig-config.json" \
         in body, "the same mount path the stage notebooks receive"
@@ -289,8 +288,9 @@ def test_the_diagnose_notebook_carries_this_run_s_config_path_and_no_mount_impor
     assert "EXTERNAL_CATALOG = 'ext'" in body
 
 
-def test_a_failed_diagnose_upload_is_recorded_not_swallowed(scripts):
-    fake, res = _provisioned_with_config(scripts, Fake(fail={"upload_ws_file"}))
+def test_a_failed_diagnose_upload_is_recorded_not_swallowed(scripts, tmp_path):
+    fake, res = _provisioned_with_config(scripts, tmp_path,
+                                         Fake(fail={"upload_ws_file"}))
     diagnose = [s for s in res["steps"] if s["step"] == "diagnose"]
     assert len(diagnose) == 1 and diagnose[0]["verified"] is False
 
@@ -1341,7 +1341,7 @@ def test_the_refusal_names_the_flag_that_actually_works():
 
 # ---------------- one listing per folder, not one per file
 #
-# Raised on the review PR as an efficiency note: repeated workspace
+# Repeated workspace
 # listings compound with the pagination-following in collect_pages. The
 # plan-file loop uploaded a file and then listed the WHOLE folder to verify
 # it, once per file. Each listing is a separate `aidp` CLI process; the

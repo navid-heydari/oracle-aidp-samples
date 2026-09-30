@@ -1,9 +1,4 @@
-"""The three restrictions from review/snowflake-migrator-level2, on this branch.
-
-Each was found live against a real tenancy and closed there; this module pins
-the same behaviour here so it holds on every branch that descends from this
-one. Kept in one file, apart from the per-module suites, so carrying it
-forward to a branch that already has the fix is a new file, not a conflict.
+"""Three restrictions, each found live against a real tenancy, pinned here.
 
   1. TARGET KEY LENGTH -- the destination stores at most 255 characters of
      `catalog.schema.name`. A longer key answers 202 Accepted, creates

@@ -1,7 +1,6 @@
 """A view's reference to an object outside the inventory is kept, not dropped.
 
-Round-3 review (contested, kept in its corrected form), reproduced with the
-real extractor. Migrations run one database at a time, so a view in D that
+Reproduced with the real extractor. Migrations run one database at a time, so a view in D that
 joins OTHERDB.S.FACTS is an expected shape. Both lineage sources kept only
 edges whose two ends were inventory ids: ACCOUNT_USAGE dropped the
 V_MIX -> OTHERDB.S.FACTS row and hard-coded `unresolved_references: []`.
@@ -10,7 +9,7 @@ in wave 2 under "Dependencies land before their dependents, so views follow
 their base tables", never mentioned OTHERDB, and the create failed with a
 bare 500 because the target has no FACTS.
 
-This is the extractor's half (contract C5): the outside reference is an
+This is the extractor's half: the outside reference is an
 edge, marked `outside_inventory`, from both sources, and is named in
 `unresolved_references`. The planner's half -- refusing the view as
 dependency_not_migrated -- reads exactly that edge. Only a VIEW's outside
@@ -108,10 +107,10 @@ def test_a_from_that_names_no_object_makes_no_outside_edge():
 
 
 def test_nth_value_from_first_or_last_is_not_a_from_clause():
-    # Round-3 fixup review, reproduced at the lane head: Snowflake's
+    # Snowflake's
     # `NTH_VALUE(x, n) FROM FIRST|LAST OVER (...)` was read as a FROM clause,
     # so parse_view_references returned DB.S.FIRST beside the real DB.S.T.
-    # Once an outside reference is kept as an edge (C5), that name -- an
+    # Once an outside reference is kept as an edge, that name -- an
     # object that does not exist -- refuses a valid view as
     # dependency_not_migrated whenever lineage comes from parsed DDL.
     for direction in ("first", "LAST"):

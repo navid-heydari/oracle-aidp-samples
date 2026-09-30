@@ -25,6 +25,8 @@ from __future__ import annotations
 import pathlib
 from typing import Callable
 
+from snowflake_source.dialect import lexer
+
 __all__ = ["REQUIRED_FIELDS", "SECRET_PATH_FIELDS", "SECRET_INLINE_FIELDS",
            "describe_config", "run_preflight", "render_preflight_report"]
 
@@ -150,8 +152,8 @@ def run_preflight(config: dict, *, run_sql: Callable[..., list] | None = None,
         checks.append(_check("source identity", identity))
 
         def visible():
-            db = config.get("database")
-            rows = run_sql(f'show schemas in database "{db}"')
+            db = lexer.config_name(config.get("database") or "")
+            rows = run_sql(f"show schemas in database {lexer.qualify(db)}")
             return f"{len(rows)} schema(s) visible in {db}"
 
         checks.append(_check("source database visible", visible))

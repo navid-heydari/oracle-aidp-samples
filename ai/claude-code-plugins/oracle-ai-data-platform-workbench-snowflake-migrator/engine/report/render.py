@@ -987,7 +987,9 @@ def render_translation_map(tmap: dict) -> str:
            f'**{t.get("views_without_sql", 0)}** with no SQL captured · '
            f'**{t.get("views_unparseable", 0)}** unparseable. '
            f'**{t.get("table_snapshots", 0)}** migrate as a table snapshot '
-           f'(materialized view / dynamic table).', "",
+           f'(materialized view / dynamic table)'
+           + (f', **{t["snapshots_not_planned"]}** more not in the plan'
+              if t.get("snapshots_not_planned") else "") + '.', "",
            "Every rule is either an exact rewrite or a refusal: nothing here "
            "is approximated. A refused view is left untouched and listed in "
            "`cannot_migrate` rather than translated into SQL that mostly "
@@ -1597,9 +1599,11 @@ def render_census(census: dict) -> str:
 
     out = ["# Estate census — what is not a table or a view", "",
            census.get("scope_statement", ""), "",
-           "**Nothing here is migrated by this plugin, and no equivalent is "
-           "generated.** These are code, schedulers and storage definitions "
-           "rather than structure. Each entry names the AIDP capability that "
+           "**None of these migrate as objects, and no procedure or UDF "
+           "equivalent is generated.** Dynamic tables and materialized views "
+           "migrate as table snapshots, and `snowmig jobs` generates MANUAL "
+           "task and refresh jobs where a translation is exact. The rest are "
+           "code, schedulers and storage definitions rather than structure. Each entry names the AIDP capability that "
            "would carry the workload — a pointer, not a promise: a "
            "plausible-but-wrong procedure translation is worse than an honest "
            "gap.", ""]

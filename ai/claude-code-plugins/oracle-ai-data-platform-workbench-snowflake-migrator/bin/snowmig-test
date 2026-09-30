@@ -10,6 +10,8 @@
 #
 #   snowmig-test [pytest args...]
 set -euo pipefail
+# No __pycache__ beside the plugin: bytecode is not written.
+export PYTHONDONTWRITEBYTECODE=1
 
 PLUGIN_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 REQUIREMENTS="${PLUGIN_ROOT}/engine/requirements.txt"
@@ -20,7 +22,7 @@ die() { printf 'snowmig-test: %s\n' "$1" >&2; exit 1; }
 can_test() { "$1" -c 'import pytest, yaml, snowflake.connector' >/dev/null 2>&1; }
 
 PY=""
-for candidate in "${SNOWMIG_PYTHON:-}" python3 python3.13 python3.12 python3.11 python; do
+for candidate in "${SNOWMIG_PYTHON:-}" python3 python3.14 python3.13 python3.12 python3.11 python3.10 python; do
   [ -n "${candidate}" ] || continue
   command -v "${candidate}" >/dev/null 2>&1 || continue
   if can_test "${candidate}"; then PY="${candidate}"; break; fi
@@ -28,7 +30,8 @@ done
 
 if [ -z "${PY}" ]; then
   base=""
-  for candidate in python3.13 python3.12 python3.11 python3 python; do
+  for candidate in "${SNOWMIG_PYTHON:-}" python3.13 python3.12 python3.11 python3.14 python3.10 python3 python; do
+    [ -n "${candidate}" ] || continue
     command -v "${candidate}" >/dev/null 2>&1 || continue
     if "${candidate}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
       base="${candidate}"; break
@@ -39,7 +42,9 @@ if [ -z "${PY}" ]; then
   SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/snowmig-test.XXXXXXXX")"
   trap 'rm -rf "${SCRATCH}"' EXIT INT TERM
   printf 'snowmig-test: building a throwaway environment (removed on exit)\n' >&2
-  "${base}" -m venv "${SCRATCH}/venv" >/dev/null 2>&1 || die "could not create a temporary venv"
+  # The venv module's own message (Debian prints it on stdout) says why.
+  "${base}" -m venv "${SCRATCH}/venv" >&2 \
+    || die "could not create a temporary venv (on Debian/Ubuntu: apt install python3-venv)"
   PY="${SCRATCH}/venv/bin/python"
   # A venv on Windows (Git Bash) puts the interpreter under Scripts/.
   [ -x "${PY}" ] || PY="${SCRATCH}/venv/Scripts/python.exe"
@@ -53,4 +58,5 @@ if [ -z "${PY}" ]; then
 fi
 
 cd "${PLUGIN_ROOT}"
-"${PY}" -m pytest "$@"
+# No .pytest_cache beside the plugin (this drops --lf/--ff).
+"${PY}" -m pytest -p no:cacheprovider "$@"

@@ -1,6 +1,6 @@
 """Snowflake `//` line comments are comments, not code.
 
-Round-3 review, reproduced through the real entry points. Snowflake accepts
+Reproduced through the real entry points. Snowflake accepts
 two line-comment markers, `--` and `//`; the lexer knew only `--`. So in
 
     // don't touch

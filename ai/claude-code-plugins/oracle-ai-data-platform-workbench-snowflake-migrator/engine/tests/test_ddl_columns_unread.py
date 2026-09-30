@@ -1,6 +1,6 @@
 """A table whose columns could not be READ is not a privilege problem.
 
-Round-3 review, item 6 (contract C1, the DDL half). When the
+The DDL half. When the
 INFORMATION_SCHEMA.COLUMNS read for a schema fails, every table in it has no
 columns. build_create_table blocked each one with "table has no columns
 visible to this role (Delta-shared or insufficient privilege)" -- a guess

@@ -312,8 +312,8 @@ def test_every_cli_stage_is_invoked_by_at_least_one_skill():
         # Both invocation forms count: `snowmig.py <stage>` and the
         # launcher, `bin/snowmig <stage>`, which is what the docs now use.
         # `snowmig-test` cannot match -- the pattern needs whitespace
-        # straight after the name.
-        invoked |= set(re.findall(r"snowmig(?:\.py)?\s+([a-z-]+)", text))
+        # straight after the name (or the closing quote of a quoted path).
+        invoked |= set(re.findall(r"snowmig(?:\.py)?\"?\s+([a-z-]+)", text))
 
     orphaned = sorted(stages - invoked)
     assert not orphaned, (

@@ -1,6 +1,6 @@
 """A CTE name is not a table, even when a table in the view's schema has it.
 
-Round-3 review, reproduced with the real build_create_view. The positional
+Reproduced with the real build_create_view. The positional
 rewrite qualifies every bare name after FROM or JOIN that matches a mapped
 object in the view's own schema -- which is right for `from ORDERS`, and
 wrong when ORDERS is the view's own CTE. The dbt-compiled idiom

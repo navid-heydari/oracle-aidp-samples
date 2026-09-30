@@ -29,6 +29,17 @@ Two modes: **dev** (`bin/snowmig demo --out-dir ./snowmig_demo` — the whole
 pipeline against a built-in emulation, no credentials, every artifact
 narrated in `DEMO.md`) and **prod** (the run below, with `--execute` gates).
 
+## Install
+
+Until the plugin is listed in the community marketplace, install it from a
+clone of this repository:
+
+~~~bash
+git clone https://github.com/oracle-samples/oracle-aidp-samples
+claude plugin marketplace add ./oracle-aidp-samples/ai/claude-code-plugins/oracle-ai-data-platform-workbench-snowflake-migrator
+claude plugin install oracle-ai-data-platform-workbench-snowflake-migrator@oracle-aidp-snowflake-migrator
+~~~
+
 **Start here: [How to run a migration, from zero](#how-to-run-a-migration-from-zero).**
 The design record — the full Snowflake-to-AIDP mapping and what is
 deterministic versus AI-assisted — is
@@ -43,21 +54,25 @@ A migration is twelve steps, **S1–S12, in a fixed order**.
 sequence; the sections below are its runnable form and name the steps each
 one covers. Every command reads one config file, and nothing writes to AIDP
 without `--execute` — except `run`, which has no dry run: it starts a job
-that `provision` already created.
+that `provision` already created; `jobs --register`, where the flag is the
+confirmation; and, when you set `reporting.publish_each_stage: true`, the
+report upload after each stage.
 
 > **Paths.** Commands are written `bin/snowmig <stage>`, as typed from a
 > checkout of this repository. With the plugin installed, use
 > `${CLAUDE_PLUGIN_ROOT}/bin/snowmig` (or
 > `${CLAUDE_PLUGIN_ROOT}/engine/snowmig.py`) from any directory; the in-AIDP
 > notebooks are in `${CLAUDE_PLUGIN_ROOT}/data-migration-scripts/`. The
-> config file and `--out-dir` belong in **your** working directory — an
-> installed plugin's directory may be read-only.
+> config file and the artifacts (`./migration-artifacts/` by default) live in
+> **your** working directory, so run every stage of a migration from the same
+> one — an installed plugin's directory may be read-only, and an update
+> replaces it.
 
 ### 0. Prerequisites
 
 | | |
 |---|---|
-| Snowflake | a **read-only** role and a service user, authenticated by password or key pair. Both go in the one config file (a PEM can be pasted inline under `private_key:`). No write grant is needed: the transport refuses any statement that is not a read, whatever the credential permits |
+| Snowflake | a **read-only** role and a service user, authenticated by password or key pair. Both go in the one config file (a PEM can be pasted inline under `private_key:`). No write grant is needed: the transport refuses any statement not led by a read verb, and the read-only role is what prevents writes |
 | AIDP | the `oci` CLI configured, the `aidp` CLI (`pip install aidp-python-client aidp-cli`) for workspace files, and the **aiDataPlatform OCID** |
 | Local | Python 3.10+ and `pip install -r engine/requirements.txt` (`bin/snowmig` does this for you when needed) |
 
@@ -105,13 +120,15 @@ Any field can be overridden per run with a flag (`--role`, `--warehouse`,
 **AIDP authentication is not in this file.** The plugin drives the `oci` and
 `aidp` CLIs with your OCI setup (`~/.oci/config`, from `oci setup config`):
 
-- `oci raw-request` runs with that file's `DEFAULT` profile, or the one
-  `OCI_CLI_PROFILE` selects. When the config sets `aidp.oci_profile`, it is
-  announced and passed as `--profile <name>` to every `oci` call, overriding
-  `OCI_CLI_PROFILE`. A session-token profile also needs
-  `OCI_CLI_AUTH=security_token` in your shell.
-- Every `aidp` call is given `--auth api_key` and the `--region` of the
-  DataLake OCID; it is not given a profile flag.
+- **Profile.** When the config sets `aidp.oci_profile`, it is announced and
+  passed as `--profile <name>` to every `oci` and `aidp` call. Otherwise
+  each CLI uses `OCI_CLI_PROFILE` from your shell, else `DEFAULT`.
+- **Auth mode.** Every `oci` and `aidp` call is given an explicit `--auth`:
+  `aidp.oci_auth` when set (`api_key` or `security_token`), else
+  `OCI_CLI_AUTH` from your shell, else the mode the profile implies — a
+  profile with a `security_token_file` is `security_token`, any other is
+  `api_key`.
+- Every `aidp` call is also given the `--region` of the DataLake OCID.
 
 The config names which AIDP resources to use, never a credential for them.
 
@@ -225,7 +242,9 @@ them — pick one and keep to it:
 
 `provision` does not write them back into the config, and later commands
 never read them from `provision_result.json` implicitly, so a record from
-another migration cannot redirect a write. Every command prints the
+another migration cannot redirect a write. The one exception is the opt-in
+per-stage report publish (`reporting.publish_each_stage: true`), which
+uploads reports to the workspace that record names. Every command prints the
 destination it resolved and whether each value came from a flag or from the
 config file.
 
@@ -312,7 +331,7 @@ source's schemas — and writes nothing.
 Now discovery:
 
 ```bash
-bin/snowmig run --job snowmig_00_discover
+bin/snowmig run --workspace <ws> --job snowmig_00_discover
 ```
 
 The job reads the whole database through the AIDP Snowflake connector in two
@@ -386,7 +405,7 @@ hand, then run the structure job:
 ```bash
 bin/snowmig provision --execute --reuse-existing --workspace-name <the S1 name> \
   --plan-label FULL        # REDUCED after an S9 scope reduction
-bin/snowmig run --job snowmig_01_structure
+bin/snowmig run --workspace <ws> --job snowmig_01_structure
 ```
 
 The push uploads `plan.json`, `ddl_plan.json` and their reports to `plan/`,
@@ -463,8 +482,8 @@ a re-run skips what its report already records as done.
 | `snowmig_03_reconcile` | compares the plan with what the target catalog holds | **`MIGRATION_REPORT.md`** |
 
 ```bash
-bin/snowmig run --job snowmig_02_copy_<schema>
-bin/snowmig run --job snowmig_03_reconcile
+bin/snowmig run --workspace <ws> --job snowmig_02_copy_<schema>
+bin/snowmig run --workspace <ws> --job snowmig_03_reconcile
 ```
 
 Before a copy job starts, `run` reads the job's task parameters and refuses
@@ -548,8 +567,8 @@ content is a requirement to define with the customer.
 
 | | |
 |---|---|
-| Against Snowflake | **Read-only, always.** Only `SHOW`, `SELECT`, `DESCRIBE`, `GET_DDL` |
-| Against AIDP | **Dry-run by default.** Writing needs `--execute` plus all four target coordinates |
+| Against Snowflake | **Read-only, always.** Only statements led by `SELECT`, `SHOW`, `DESCRIBE` or `EXPLAIN` (a CTE ending in `SELECT`; `GET_DDL` is called through `SELECT`), with a read-only role |
+| Against AIDP | **Dry-run by default.** Writing needs `--execute` plus all four target coordinates. The exceptions are `run`, `jobs --register` and the opt-in per-stage report publish |
 | Target coordinates | **Never used without being shown.** They come from a flag or the one config file; a value read from the file is printed before anything acts on it, and a write still needs `--execute` and a confirmation in that turn. No environment default, no cache |
 | Unmapped types and features | **Blocked with a reason.** Never approximated, never silently defaulted. The type decisions have explicit modes — see [Semi-structured, geospatial and timestamp types](#semi-structured-geospatial-and-timestamp-types) |
 | "Verified" | **Means the planned columns are there**, checked by `DESCRIBE`. A name that already belongs to a different structure is reported as a mismatch and left untouched |
@@ -699,10 +718,12 @@ mistaken for the size of the estate.
 
 For tasks, dynamic tables, materialized views and streams, the census also
 records what a generated job needs (`source_facts` in `inventory.json`): a
-task's schedule, predecessors, condition and body; a dynamic table's target
-lag and defining query; a materialized view's query; a stream's base table.
-They come from the `SHOW` rows already read, whether or not
-`--capture-definitions` is given.
+task's schedule, predecessors and condition, a dynamic table's target lag,
+and a stream's base table, from the `SHOW` rows already read. A task's body
+and a dynamic table's defining query are kept only with
+`assess --capture-definitions`; without it, the generated job or refresh
+names the flag. A materialized view's query is always captured, with the
+view text the inventory keeps.
 
 A table that `SHOW TABLES` flags as event or hybrid is not a plain table
 either: `plan` blocks it with the reason named (`unsupported_object`), under
@@ -756,6 +777,9 @@ bin/snowmig jobs              # offline: generated_jobs.json, GENERATED_JOBS.md,
 bin/snowmig jobs --register   # also create the jobs in AIDP, unscheduled
 ```
 
+Task bodies and dynamic-table queries come from `assess --capture-definitions`;
+without the flag, those jobs are stubs that name it.
+
 `jobs` reads `plan.json` and `inventory.json` and writes a notebook and a job
 spec per object. Every job is **MANUAL**: the cadence Snowflake used is
 recorded as the intended one and, where it maps exactly onto a Quartz cron,
@@ -783,9 +807,10 @@ written down as a paused proposal that is never sent.
 `backup-snowflake-migration/generated_jobs/`, reads them back, creates the
 jobs and confirms them with a job listing. A job is never pointed at a
 notebook that is not visible, and a job name that already exists is not
-adopted or overwritten (exit 1). It needs the DataLake OCID, the workspace key
-and the cluster key — from flags or the config's `aidp:` block, otherwise the
-keys `provision_result.json` records — and is held to
+adopted or overwritten (exit 1). `--register` writes to AIDP without
+`--execute`: the flag is the confirmation. It needs the DataLake OCID, the
+workspace key and the cluster key — from flags or the config's `aidp:` block
+only, never from `provision_result.json` (see Hand-off) — and is held to
 `decisions.allow_new_objects` like any `--execute`. A multi-task job has not
 yet been verified live.
 
@@ -853,10 +878,11 @@ travel** (on Snowflake the two are independent and automatic), and
 
 ## Execution backend
 
-AIDP writes go through the **`aidp` CLI** when it is installed, otherwise
-**`oci raw-request`** against the documented AIDP REST API (`oci
-ai-data-platform` covers the control plane). The engine prints which backend
-it chose and stops with an error if neither CLI is present.
+AIDP calls go through **`oci raw-request`** against the documented AIDP REST
+API whenever `oci` is installed, and provisioning requires it. Workspace
+files, job cancel and delete, and catalog delete always use the **`aidp`
+CLI**, so both CLIs are needed. The engine prints which backend it chose and
+stops with an error if neither CLI is present.
 
 ## Tests
 

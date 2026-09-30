@@ -166,7 +166,7 @@ def test_compute_report_lists_warehouses_and_proposals():
 
 # --------------------------------------------------------------------------
 # Mismatch and unverified structure must be visible, not folded into
-# "verified" or "failed" (issue #2).
+# "verified" or "failed".
 # --------------------------------------------------------------------------
 
 def test_soft_clone_summary_reports_a_structure_mismatch_prominently():
@@ -355,7 +355,7 @@ def test_the_census_report_lists_objects_with_their_effort():
 def test_the_census_report_says_nothing_is_migratable():
     md = render_census(_CENSUS).lower()
     assert "cannot" in md or "not migrat" in md
-    assert "no equivalent is generated" in md or "generates no" in md
+    assert "no procedure or udf equivalent is generated" in md
 
 
 def test_a_task_gets_the_cutover_warning():

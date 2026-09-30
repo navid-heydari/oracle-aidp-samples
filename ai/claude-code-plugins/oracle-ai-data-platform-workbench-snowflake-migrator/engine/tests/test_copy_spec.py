@@ -1,5 +1,5 @@
 """Every planned table says, per column, how to READ it from Snowflake and
-how to CONVERT it on AIDP -- the per-column copy spec (contract K1) the copy
+how to CONVERT it on AIDP -- the per-column copy spec the copy
 stage builds its one qualified pushdown from.
 
 Why the read cannot stay `SELECT "COL"`, all live 2026-09-29:

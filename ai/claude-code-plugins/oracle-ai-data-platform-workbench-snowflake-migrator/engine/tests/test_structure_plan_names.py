@@ -86,6 +86,7 @@ def run(tmp_path, monkeypatch):
         "snowmig_script_structure_names", SCRIPTS / "01_create_structure.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    mod.DEFAULT_OUTPUT_DIR = ""     # no step files outside tmp_path
     spark = _Spark()
     fake = types.ModuleType("pyspark.sql")
     fake.SparkSession = types.SimpleNamespace(

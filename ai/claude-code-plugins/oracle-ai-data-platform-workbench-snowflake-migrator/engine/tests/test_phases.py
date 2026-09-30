@@ -349,19 +349,13 @@ def _session(tmp_path, out):
 
 
 def _link_projects(home, projects):
-    """Point <home>/.claude/projects at the fake transcripts by symlink.
+    """Copy the fake transcripts to <home>/.claude/projects.
 
-    Creating a symlink needs a privilege Windows grants only to admins or in
-    Developer Mode (WinError 1314 otherwise). That is the test box, not the
-    code under test, so the test is skipped with the reason rather than
-    reported as a failure of the token roll-up."""
-    (home / ".claude").mkdir(parents=True)
-    try:
-        (home / ".claude" / "projects").symlink_to(
-            projects, target_is_directory=True)
-    except (OSError, NotImplementedError) as exc:
-        import pytest
-        pytest.skip(f"symlinks are not permitted here: {exc}")
+    A copy, not a symlink: a symlink needs admin rights or Developer Mode on
+    Windows (WinError 1314), and the code under test only reads the
+    directory."""
+    import shutil
+    shutil.copytree(projects, home / ".claude" / "projects")
 
 
 def test_the_summary_ends_with_tokens_by_phase_and_a_grand_total(
@@ -478,9 +472,8 @@ def test_the_report_rolls_stages_up_into_phases(tmp_path):
         list(dict.fromkeys(s["phase"] for s in STAGES))
 
 
-def test_a_phase_with_nothing_run_says_so():
-    import tempfile
-    rep = phase_report(tempfile.mkdtemp())
+def test_a_phase_with_nothing_run_says_so(tmp_path):
+    rep = phase_report(tmp_path)
     by = {p["phase"]: p for p in rep["phase_summary"]}
     assert by["planning"]["verdict"] == "NOT_RUN"
     assert by["teardown"]["verdict"] == "SKIPPED (optional)"

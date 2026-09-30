@@ -1,4 +1,4 @@
-"""CLUSTER BY is written with bare column names -- AIDP's Delta rejects a
+r"""CLUSTER BY is written with bare column names -- AIDP's Delta rejects a
 backticked one.
 
 Live 2026-09-29, coverage run on AIDP (Delta 3.1.0): the structure job ran

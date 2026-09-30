@@ -1,5 +1,5 @@
 ---
-description: Investigate a Snowflake environment and list every table and view with exact row counts, sizes, and column types. Read-only.
+description: Investigate a Snowflake environment and list every table and view with row counts (Snowflake's metadata count by default), sizes, and column types. Read-only.
 ---
 
 # `/snowflake-assess`

@@ -27,7 +27,7 @@ from emulation.snowflake_fake import ENTERPRISE_DB, enterprise_run_sql
 
 # What each inventoried object must become. `(list, category, words the
 # reason must contain)`. The materialized view migrates as a table snapshot
-# with a generated refresh job (the JOBS lane), so it is planned `can`.
+# with a generated refresh job, so it is planned `can`.
 EXPECTED = {
     "SNOWENT.SALES.ORDERS": ("can", None, None),
     "SNOWENT.SALES.CUSTOMERS": ("can", None, None),

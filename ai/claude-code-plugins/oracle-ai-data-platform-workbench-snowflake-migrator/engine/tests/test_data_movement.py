@@ -201,7 +201,7 @@ def test_the_rendered_per_option_note_is_not_empty():
 
 # --- the CLI's own surfaces scope the "no bytes" claim ----------------------
 #
-# Found on review. The CHANGELOG's "every surface now says the control plane
+# The CHANGELOG's "every surface now says the control plane
 # copies no data; snowmig_02_copy_schema moves rows" fix covered the docs and
 # skills, and missed the CLI itself: the snowmig.py module docstring (which
 # IS the root --help) still said the plugin "moves no bytes and implements

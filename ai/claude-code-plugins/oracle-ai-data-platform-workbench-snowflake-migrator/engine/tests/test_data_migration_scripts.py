@@ -33,6 +33,10 @@ def _load(name: str):
         f"snowmig_script_{name}", SCRIPTS / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # No step files under /Workspace/report/output (C:\Workspace on Windows)
+    # unless a test passes --output-dir.
+    if hasattr(module, "DEFAULT_OUTPUT_DIR"):
+        module.DEFAULT_OUTPUT_DIR = ""
     return module
 
 
@@ -1900,7 +1904,7 @@ def test_the_committed_discovery_notebook_matches_its_source():
 
 # --- reconcile: a schema this target has not created yet is pending --------
 #
-# Live 2026-09-25, round-3 data-plane run: schema R3 migrated and verified,
+# Seen live: schema R3 migrated and verified,
 # and reconcile still exited 1 with 22 objects TARGET_UNREADABLE. They were
 # the manifest's other schemas, never created in this target yet. `SHOW
 # TABLES IN lake.core` raised SCHEMA_NOT_FOUND, and _live_tables read ANY

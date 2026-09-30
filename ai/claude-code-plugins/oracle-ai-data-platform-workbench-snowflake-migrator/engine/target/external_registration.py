@@ -192,7 +192,7 @@ def _external_entry(rec: dict, row: dict | None, target: str) -> dict:
     stmt = f"CREATE TABLE IF NOT EXISTS {_target_sql(target)} USING {source}"
     if source == "CSV":
         stmt += f" {_CSV_OPTIONS}"
-    stmt += f" LOCATION '{oci}'"
+    stmt += " LOCATION " + quote_spark_string(oci)
     entry.update({"oci_path": oci, "statement": stmt, "registrable": True})
     notes = entry["notes"]
     virtual = _virtual_columns(rec)

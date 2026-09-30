@@ -158,8 +158,8 @@ STAGES: tuple[StageSpec, ...] = (
             "Runs on AIDP compute, where each table is read back after its "
             "CREATE and, in the default `ddl-plan` mode, compared with the "
             "approved plan column by column. `parallel` tables "
-            "are created at once (default 8); views follow every "
-            "table, one at a time, in the plan's order."),
+            "are created at once (default 8; `--mode ctas`: 1); views "
+            "follow every table, one at a time, in the plan's order."),
         # `mode` is `ddl-plan`, matching the stage's own argparse default and
         # runbook S10 ("reading the approved plan"). It used to ship
         # `manifest`, which CANNOT work alongside the `connector` source-mode

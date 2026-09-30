@@ -22,7 +22,7 @@ Nothing lands in your home or beside the plugin.
 to remember:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig preflight --test-source
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" preflight --test-source
 ```
 
 To avoid paying the install on every run, put the dependencies
@@ -30,7 +30,7 @@ To avoid paying the install on every run, put the dependencies
 you use, and the launcher picks it up:
 
 ```bash
-python3 -m pip install -r ${CLAUDE_PLUGIN_ROOT}/engine/requirements.txt
+python3 -m pip install -r "${CLAUDE_PLUGIN_ROOT}/engine/requirements.txt"
 ```
 
 **Do not hand-roll a venv and do not pass `--break-system-packages`.** If no
@@ -60,7 +60,7 @@ anywhere at all.
 If there is no config, create one where the user is working:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig init-config
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" init-config
 ```
 
 That writes `./snowmig-config.yaml` from the template, mode `0600` on POSIX
@@ -81,7 +81,7 @@ one file to fill in, and the secret goes *in that file*, not into the chat:
 | Snowflake account/host, user, warehouse, database, role, schema | `snowmig-config.yaml`, under `snowflake:` | created from the template; `0600` on POSIX; gitignored only inside the plugin folder — tell the user to add it to their own `.gitignore` when it lives elsewhere |
 | The Snowflake **password or private key** | the same file — `password:` or `private_key: |` inline | inline is the default; `*_path` variants exist but are not what you propose first |
 | Which AIDP resources to use (DataLake OCID, workspace, cluster, catalog) | the same file, under `aidp:` | any of them can also be passed as a flag, and a flag wins |
-| AIDP **authentication** | `~/.oci/config` (`oci setup config`) | never a value in the config file. `oci raw-request` uses that file's `DEFAULT` profile, or `OCI_CLI_PROFILE` from the shell; `aidp.oci_profile`, when set, is announced on stdout and passed as `--profile` to every `oci` call, winning over `OCI_CLI_PROFILE`. A session-token profile also needs `OCI_CLI_AUTH=security_token` in the shell; the plugin does not set it. Every `aidp` call gets `--auth api_key --region <from the OCID>` appended (the `aidp` CLI defaults to a session token) and no profile flag. On an auth error, check that profile's API key |
+| AIDP **authentication** | `~/.oci/config` (`oci setup config`) | never a value in the config file. `aidp.oci_profile`, when set, is announced on stdout and passed as `--profile` to every `oci` and `aidp` call; otherwise each CLI uses `OCI_CLI_PROFILE`, else `DEFAULT`. Both CLIs always get an explicit `--auth`: `aidp.oci_auth`, else `OCI_CLI_AUTH`, else `security_token` for a profile with a `security_token_file` and `api_key` for any other. Every `aidp` call also gets `--region <from the OCID>`. On an auth error, check that profile and the mode the run announced |
 
 Rules that come with an inline secret, and they are not optional:
 
@@ -121,7 +121,7 @@ account; without one, the login fails with `390190`.
 This step catches a wrong account, role or destination before anything runs:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig preflight --test-source
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" preflight --test-source
 ```
 
 No `--config` needed once the file is in place — the CLI discovers it and prints
@@ -156,7 +156,7 @@ was never tested rather than reporting "preflight OK".
 ## 5. Smoke-test the source
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig assess --database <one small database>
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" assess --database <one small database>
 ```
 
 Report the account, region, role and warehouse back to the user. Then hand off

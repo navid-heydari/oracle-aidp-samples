@@ -174,7 +174,7 @@ def test_no_generated_or_executed_statement_moves_data():
 
 
 # ==========================================================================
-# Verification means "the right structure is there" (issue #2).
+# Verification means "the right structure is there".
 #
 # The probe used to be `SHOW TABLES ... LIKE '<name>'` followed by `if rows:`.
 # Three defects compounded:

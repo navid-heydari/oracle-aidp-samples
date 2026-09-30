@@ -82,6 +82,7 @@ from snowflake_source.conn import (
     AuthError, SourceWriteRefused, build_connect_kwargs, connect,
     drop_secondary_roles, make_run_sql,
 )
+from snowflake_source.dialect import lexer
 from snowflake_source.extract.catalog import (
     ROW_COUNT_MODES, build_inventory)
 from snowflake_source.extract.maintenance import build_maintenance
@@ -248,10 +249,9 @@ def _aidp_from_config(args) -> dict:
 def _oci_profile(args) -> str | None:
     """`aidp.oci_profile` from the config, announced once.
 
-    It reaches the `oci` CLI as `--profile`, a documented flag. The `aidp`
-    CLI's flag set is unverified, so its argv is left alone and the line
-    says so -- an operator on a non-default profile then knows which calls
-    the file covered.
+    `_oci_runner` passes it as `--profile` to every `oci` and `aidp` call.
+    Without it, each CLI resolves its own profile (`OCI_CLI_PROFILE`, else
+    DEFAULT).
     """
     cached = getattr(args, "_oci_profile", None)
     if cached is not None:
@@ -287,7 +287,8 @@ def cli_environment(environ: dict | None = None) -> dict:
 
 
 def _oci_auth_mode(args) -> str | None:
-    """`aidp.oci_auth`, or the mode the chosen profile implies.
+    """`aidp.oci_auth`, else `OCI_CLI_AUTH`, else the mode the profile
+    implies -- `aidp.oci_profile`, else `OCI_CLI_PROFILE`, else DEFAULT.
 
     A profile carrying `security_token_file` is a session profile: both CLIs
     need `--auth security_token`, and without it the call is a 401 that reads
@@ -299,9 +300,11 @@ def _oci_auth_mode(args) -> str | None:
     if cached is not None:
         return cached or None
     block = aidp_block(_load_migration_config(args))
-    mode = str(block.get("oci_auth") or "").strip()
+    mode = str(block.get("oci_auth") or os.environ.get("OCI_CLI_AUTH")
+               or "").strip()
     if not mode:
         mode = _profile_auth_mode(str(block.get("oci_profile") or "").strip()
+                                  or os.environ.get("OCI_CLI_PROFILE", "").strip()
                                   or "DEFAULT")
     args._oci_auth = mode
     if mode:
@@ -530,7 +533,7 @@ def _assess_inventory(args) -> dict:
         # The config names the database being migrated; using it means the
         # documented happy path is `assess --connection-config <file>`.
         from_config = _snowflake_coords(args).get("database")
-        databases = [from_config] if from_config else None
+        databases = [lexer.config_name(from_config)] if from_config else None
     inv = build_inventory(
         run_sql, databases,
         row_counts=getattr(args, "row_counts", "metadata"),
@@ -766,10 +769,11 @@ def cmd_catalogs(args) -> int:
 
 
 def cmd_clean(args) -> int:
-    """Remove the plugin's own artifact directory.
+    """Remove the default artifact directory, and the demo output beside it.
 
     Nothing else is touched -- an --out-dir the user chose is theirs, not
-    ours to remove.
+    ours to remove, and a demo directory is removed only when it carries the
+    demo's `emulation.json` marker.
     """
     import shutil
     target = pathlib.Path(args.out_dir)
@@ -781,23 +785,23 @@ def cmd_clean(args) -> int:
               f"default artifact directory ({default}). Remove a directory "
               f"you chose yourself.", file=sys.stderr)
         return 1
-    for path in (default, plugin_root() / "snowmig_demo"):
-        if path.exists():
+    for path in (default, *_demo_dirs()):
+        if path != default and path.exists() and not (
+                path / "emulation.json").is_file():
+            print(f"  left {path}: it has no emulation.json, so it is not "
+                  f"demo output")
+        elif path.exists():
             shutil.rmtree(path)
             print(f"  removed {path}")
         else:
             print(f"  nothing at {path}")
-    # And the parent, once the last migration's directory is gone. Leaving an
-    # empty `snowmig/` behind would be exactly the stray folder this default
-    # exists to avoid.
-    parent = default.parent
-    try:
-        if parent.is_dir() and not any(parent.iterdir()):
-            parent.rmdir()
-            print(f"  removed {parent} (now empty)")
-    except OSError:
-        pass
     return 0
+
+
+def _demo_dirs() -> tuple[pathlib.Path, pathlib.Path]:
+    """The demo's default output directories, in the working directory."""
+    return (pathlib.Path.cwd() / "snowmig_demo",
+            pathlib.Path.cwd() / "snowmig_demo_enterprise")
 
 
 def cmd_build_notebooks(args) -> int:
@@ -3037,9 +3041,10 @@ def cmd_demo(args) -> int:
     # to a real run's is exactly the confusion the marker file exists to
     # prevent. (set_defaults on the subparser cannot override the parent
     # parser's already-applied default, so it is resolved here.)
-    out = pathlib.Path(plugin_root() / "snowmig_demo"
+    out = pathlib.Path(_demo_dirs()[0]
                        if args.out_dir == str(default_out_dir())
                        else args.out_dir)
+    prepare_out_dir(out)
     enterprise = getattr(args, "estate", "standard") == "enterprise"
     result = run_enterprise_demo(out) if enterprise else run_demo(out)
     print("  DEV MODE — everything below is EMULATED; nothing real was touched")
@@ -3105,10 +3110,10 @@ def _out_dir_parent(default) -> argparse.ArgumentParser:
     # holds, a README inside it, and a permanent ignore rule.
     parent.add_argument(
         "--out-dir", default=default,
-        help=f"where run artifacts go. Default: the plugin's "
-             f"{ARTIFACTS_DIRNAME}/ — one clearly-named directory that "
-             f"explains itself in a README, is gitignored permanently, and "
-             f"is removed by `snowmig clean`")
+        help=f"where run artifacts go. Default: ./{ARTIFACTS_DIRNAME}/ in "
+             f"the working directory — one clearly-named directory that "
+             f"explains itself in a README, ignores itself in git, and is "
+             f"removed by `snowmig clean`")
     return parent
 
 
@@ -3183,11 +3188,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "stages, pipes, sequences and file formats. The "
                         "coverage claim then says the estate was not examined")
     a.add_argument("--capture-definitions", action="store_true",
-                   help="also capture procedure/UDF bodies into the census "
-                        "artifact (they may contain literals). Task bodies "
-                        "and dynamic-table / materialized-view queries are "
-                        "kept regardless, as `source_facts`: `snowmig jobs` "
-                        "generates from them")
+                   help="also capture procedure/UDF bodies, task bodies "
+                        "and dynamic-table queries into the census artifact "
+                        "(they may contain literals). `snowmig jobs` "
+                        "generates task and refresh jobs from them; a "
+                        "materialized view's query is always captured with "
+                        "the view text")
     a.add_argument("--geospatial", choices=list(GEOSPATIAL_MODES),
                    default=None,
                    help="block (default, or `mapping.geospatial` in the "
@@ -3213,7 +3219,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     cln = sub.add_parser(
         "clean", parents=[common],
-        help=f"delete the plugin's {ARTIFACTS_DIRNAME}/ directory "
+        help=f"delete ./{ARTIFACTS_DIRNAME}/ and the demo output "
                   f"(offline). Refuses to touch an --out-dir you chose "
                   f"yourself")
     cln.set_defaults(func=cmd_clean)
@@ -3740,8 +3746,9 @@ ARTIFACTS_DIRNAME = "migration-artifacts"
 _ARTIFACTS_README = """\
 # migration-artifacts — output of the Snowflake -> AIDP migrator
 
-**This directory is generated. It is safe to delete, and it is never
-committed.**
+**This directory is generated, and it is never committed.** Keep it until
+the migration is torn down: `provision_result.json` and `resources.jsonl`
+are the record `teardown` works from.
 
 ## What is in here
 
@@ -3766,11 +3773,11 @@ AIDP.
 
 These files name a real Snowflake estate -- its databases, schemas, tables
 and columns. That is customer data by any reasonable reading, and it must
-not reach a public samples repository. The ignore rule lives in the plugin's
-`.gitignore`, and this directory also carries its own `.gitignore` so it
-stays ignored even if it is copied somewhere else.
+not reach a public repository. This directory carries its own `.gitignore`,
+so it stays ignored wherever it lives.
 
-Everything here is regenerable: re-run the stage.
+The reports can be regenerated by re-running their stage. The record of what
+was created on AIDP cannot: it is written when the object is created.
 
 ## Removing it
 
@@ -3786,33 +3793,39 @@ def plugin_root() -> pathlib.Path:
 
 
 def default_out_dir() -> pathlib.Path:
-    """The artifact directory: one, inside the plugin, clearly named.
+    """The artifact directory: one, in the working directory, clearly named.
 
     It persists between commands ON PURPOSE -- the stages chain, and `plan`
-    reads the `inventory.json` that `assess` wrote. What it must never be is
-    mysterious: the name says what it holds, it explains itself in a README,
-    and it ignores itself in git.
+    reads the `inventory.json` that `assess` wrote. It lives with the user's
+    project, not in the plugin: an installed plugin sits in a per-version
+    directory, and a record kept there would be left behind by an update.
+    The name says what it holds, it explains itself in a README, and it
+    ignores itself in git.
     """
-    return plugin_root() / ARTIFACTS_DIRNAME
+    return pathlib.Path.cwd() / ARTIFACTS_DIRNAME
 
 
 def prepare_out_dir(path: str | pathlib.Path) -> pathlib.Path:
     """Create the artifact directory and make it self-explanatory.
 
-    A bare directory of JSON appearing beside a plugin reads as a bug. So the
-    first time it is created it gets a README saying what it is and that it
-    is safe to delete, and a `.gitignore` of its own so it cannot be
-    committed even if it is copied out of this repo.
+    A directory this creates, or finds empty, gets a `.gitignore` of its own
+    so its contents cannot be committed from the user's repository. A folder
+    that already holds files is left alone (`--out-dir .` must not hide the
+    user's own files). The default directory also gets a README saying what
+    it is.
     """
     out = pathlib.Path(path)
     if out.exists() and not out.is_dir():
         raise ValueError(
             f"--out-dir {out} is an existing file, not a directory")
+    fresh = not out.exists() or not any(out.iterdir())
     out.mkdir(parents=True, exist_ok=True)
-    if out.resolve() == default_out_dir().resolve():
+    is_default = out.resolve() == default_out_dir().resolve()
+    if is_default:
         readme = out / "README.md"
         if not readme.exists():
             readme.write_text(_ARTIFACTS_README, encoding="utf-8")
+    if fresh or is_default:
         ignore = out / ".gitignore"
         if not ignore.exists():
             # Ignore everything here, including this rule: the contents name

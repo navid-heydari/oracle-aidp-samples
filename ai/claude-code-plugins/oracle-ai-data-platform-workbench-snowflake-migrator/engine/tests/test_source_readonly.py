@@ -125,7 +125,7 @@ def test_allowlist_is_read_verbs_only():
 
 
 # --------------------------------------------------------------------------
-# Scanner-backed guard (issue #18). The guard used to regex out comments and
+# Scanner-backed guard. The guard used to regex out comments and
 # str.split(";"), which cannot tell code from the inside of a literal.
 # --------------------------------------------------------------------------
 
@@ -205,7 +205,7 @@ def test_write_verb_inside_a_cte_body_literal_is_data_not_the_verb(run_sql):
 
 # ------------------------- the transport that runs INSIDE AIDP refuses too
 #
-# Raised by the repo owner on the review PR: conn.py was hardened against
+# conn.py was hardened against
 # CTE-prefixed writes while dataplane/snowmig_source.py's pushdown() had no
 # verb enforcement at all -- and that is the transport the migration
 # notebooks actually run on the cluster, against the customer's live

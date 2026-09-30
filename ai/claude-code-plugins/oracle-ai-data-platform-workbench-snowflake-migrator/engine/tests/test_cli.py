@@ -446,14 +446,14 @@ def test_out_dir_is_honoured_before_and_after_the_subcommand(tmp_path):
 
 def _clean_fixture(tmp_path, monkeypatch):
     import snowmig
-    plugin = tmp_path / "plugin"
-    default = plugin / snowmig.ARTIFACTS_DIRNAME
+    work = tmp_path / "work"
+    default = work / snowmig.ARTIFACTS_DIRNAME
     default.mkdir(parents=True)
     (default / "plan.json").write_text("{}", encoding="utf-8")
     chosen = tmp_path / "chosen"
     chosen.mkdir()
     (chosen / "x").write_text("x", encoding="utf-8")
-    monkeypatch.setattr(snowmig, "plugin_root", lambda: plugin)
+    monkeypatch.chdir(work)
     return default, chosen
 
 
@@ -476,6 +476,41 @@ def test_clean_removes_only_the_default_directory(tmp_path, monkeypatch):
     assert main(["clean"]) == 0
     assert not default.exists()
     assert (chosen / "x").is_file()
+    # The working directory itself is the user's and stays, empty or not.
+    assert default.parent.is_dir()
+
+
+def test_clean_removes_a_demo_directory_only_with_its_marker(
+        tmp_path, monkeypatch):
+    default, _ = _clean_fixture(tmp_path, monkeypatch)
+    demo = default.parent / "snowmig_demo"
+    demo.mkdir()
+    (demo / "emulation.json").write_text("{}", encoding="utf-8")
+    other = default.parent / "snowmig_demo_enterprise"
+    other.mkdir()
+    (other / "mine.txt").write_text("x", encoding="utf-8")
+    assert main(["clean"]) == 0
+    assert not demo.exists()
+    assert (other / "mine.txt").is_file()
+
+
+def test_default_out_dir_is_the_working_directory(tmp_path, monkeypatch):
+    import snowmig
+    monkeypatch.chdir(tmp_path)
+    assert snowmig.default_out_dir() == tmp_path / snowmig.ARTIFACTS_DIRNAME
+
+
+def test_a_new_or_empty_out_dir_ignores_itself_but_a_full_one_is_left(
+        tmp_path):
+    import snowmig
+    new = snowmig.prepare_out_dir(tmp_path / "snowmig_out")
+    assert (new / ".gitignore").read_text(encoding="utf-8").endswith("*\n")
+    assert not (new / "README.md").exists()
+    full = tmp_path / "project"
+    full.mkdir()
+    (full / "notes.md").write_text("mine", encoding="utf-8")
+    snowmig.prepare_out_dir(full)
+    assert not (full / ".gitignore").exists()
 
 
 # --- bad inputs are one `error:` line, never a traceback -------------------
@@ -875,6 +910,25 @@ def test_the_auth_mode_is_read_from_the_profile_when_the_config_is_silent(
     assert snowmig._profile_auth_mode("ABSENT") == "api_key"
 
 
+def test_the_shell_profile_and_auth_are_honoured_when_the_config_is_silent(
+        tmp_path, monkeypatch):
+    import snowmig
+    oci_dir = tmp_path / "oci"
+    oci_dir.mkdir()
+    (oci_dir / "config").write_text(
+        "[DEFAULT]\nuser=ocid1.user.oc1..x\nkey_file=~/.oci/k.pem\n\n"
+        "[SESS]\nsecurity_token_file=~/.oci/token\n", encoding="utf-8")
+    monkeypatch.setenv("OCI_CONFIG_FILE", str(oci_dir / "config"))
+    _cwd_config(tmp_path, monkeypatch, [f"datalake_ocid: {OCID}"])
+    monkeypatch.setenv("OCI_CLI_PROFILE", "SESS")
+    monkeypatch.delenv("OCI_CLI_AUTH", raising=False)
+    args = snowmig.build_parser().parse_args(["catalogs", "--out-dir", str(tmp_path)])
+    assert snowmig._oci_auth_mode(args) == "security_token"
+    monkeypatch.setenv("OCI_CLI_AUTH", "api_key")
+    args = snowmig.build_parser().parse_args(["catalogs", "--out-dir", str(tmp_path)])
+    assert snowmig._oci_auth_mode(args) == "api_key"
+
+
 def test_a_cli_child_never_inherits_our_interpreter_variables(
         tmp_path, monkeypatch):
     """Live 2026-09-22: a venv built from Microsoft Store Python exports
@@ -1186,7 +1240,7 @@ def test_security_console_stays_quiet_when_nothing_is_defined(
 
 # --------------------------- an inline PAT, like an inline password or key
 #
-# Raised by the repo owner on the review PR: `_snowflake_coords` resolved
+# `_snowflake_coords` resolved
 # `password` and `private_key` from either an inline value or a path, but a
 # PAT only from `pat_path`. The config already lists `token` as a secret
 # field, so an inline one was accepted, validated and redacted -- and then
@@ -1234,8 +1288,7 @@ def test_an_inline_token_reaches_the_connector(tmp_path, monkeypatch):
     snowmig._run_sql_from_args(args)
     assert seen["auth"] == "pat"
     assert seen["pat_path"], "an inline token has to reach the connector"
-    assert pathlib.Path(seen["pat_path"]).name.startswith("snowmig_secret_") \
-        or True
+    assert pathlib.Path(seen["pat_path"]).name.startswith("snowmig_secret_")
 
 
 def test_the_spooled_token_file_is_removed_after_the_call(tmp_path,

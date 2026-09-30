@@ -116,7 +116,7 @@ def test_note_is_always_a_sentence_not_empty():
 
 
 # --------------------------------------------------------------------------
-# A structure mismatch must not read as a clone (issue #2).
+# A structure mismatch must not read as a clone.
 # --------------------------------------------------------------------------
 
 def test_a_mismatched_object_is_blocked_not_shallow_clone():

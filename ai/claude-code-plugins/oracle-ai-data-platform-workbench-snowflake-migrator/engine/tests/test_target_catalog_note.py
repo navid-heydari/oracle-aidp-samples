@@ -126,7 +126,7 @@ def _skill(name):
 
 def test_the_runbook_skill_plans_with_the_s4_internal_catalog_as_prefix():
     text = _skill("snowflake-migrator-overview")
-    block = text.split("bin/snowmig plan", 1)[1].split("bin/snowmig ddl", 1)[0]
+    block = text.split('bin/snowmig" plan', 1)[1].split('bin/snowmig" ddl', 1)[0]
     assert "--bronze-catalog-prefix" in block, block
     flat = " ".join(block.split())
     assert "INTERNAL" in flat and "S4" in flat, block

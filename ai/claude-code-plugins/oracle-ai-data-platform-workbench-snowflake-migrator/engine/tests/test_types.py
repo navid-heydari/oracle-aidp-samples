@@ -76,7 +76,7 @@ def test_mapping_is_immutable():
 
 
 # ==========================================================================
-# Semi-structured escape hatch (issue #7) and silent lossy mappings (#17).
+# Semi-structured escape hatch and silent lossy mappings.
 # ==========================================================================
 
 def test_variant_is_still_blocked_by_default():

@@ -56,11 +56,18 @@ No bundled credentials, no MCP server, no third-party network calls.
 
 ## What it writes
 
-- **Locally**, to `--out-dir` (default `migration-artifacts/` inside the
-  plugin folder, gitignored): metadata about your estate — object and column
-  names, types, row counts, view SQL, generated DDL and notebooks, and the
-  AIDP coordinates a run used. No table rows. Treat these files as sensitive
-  as your schema.
+- **Locally**, to `--out-dir` (default `./migration-artifacts/` in your
+  working directory, with its own `.gitignore`): metadata about your estate —
+  object and column names, types, row counts, view SQL, generated DDL and
+  notebooks, and the AIDP coordinates a run used. No table rows. Treat these
+  files as sensitive as your schema.
+- **Token accounting**, in the same directory: each stage appends its start,
+  end and Claude Code session id to `run_log.jsonl`. `summary`, `tokens` and
+  the per-stage report read that session's transcripts under
+  `~/.claude/projects/` (usage fields only) and write the token counts and
+  the transcript file paths to `tokens.json`. With
+  `reporting.publish_each_stage: true`, or `publish --execute`, both files are
+  uploaded to the migration workspace with the reports.
 - **In your AIDP tenancy**, only with `--execute` (or, for `run`, when you
   start a job): the migration workspace, cluster, folder, notebooks and jobs
   (`provision --execute`); the catalogs (`catalog --execute`); the target

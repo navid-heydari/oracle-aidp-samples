@@ -420,7 +420,7 @@ def test_the_provisioning_transport_says_the_same_thing():
 
 # ------------- one home for two rules about the platform, not the caller
 #
-# Raised on the review PR: `_is_conflict` and `_active` in provisioning.py
+# `_is_conflict` and `_active` in provisioning.py
 # duplicated catalog_deploy.py -- `_is_conflict` byte for byte, and the
 # ACTIVE test as a named helper in one module and the same inline
 # expression four times in the other. Both answer a question about the

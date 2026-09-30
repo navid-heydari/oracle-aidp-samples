@@ -374,8 +374,8 @@ def _predecessors(value, db: str, schema: str) -> list[str]:
     return [_task_name(i, db, schema) for i in items]
 
 
-# Facts that are object BODIES: a task's SQL, a dynamic table's or
-# materialized view's query. A body can carry literals -- a COPY INTO's
+# Facts that are object BODIES: a task's SQL, a dynamic table's query. A
+# body can carry literals -- a COPY INTO's
 # CREDENTIALS, an EXECUTE IMMEDIATE's password -- and the census lands in
 # plan.json/inventory.json, which `provision` uploads to the workspace. So
 # they are kept only with --capture-definitions, as every other body is.
@@ -944,9 +944,10 @@ def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
                                f'writes={",".join(writes)}').strip()
 
     # A task's schedule and graph, a dynamic table's lag, a stream's base
-    # table: always kept. A task's body and a dynamic table's or
-    # materialized view's query only with --capture-definitions (see
-    # _BODY_FACTS); a job generated without one says which flag keeps it.
+    # table: always kept. A task's body and a dynamic table's query only
+    # with --capture-definitions (see _BODY_FACTS); a job generated without
+    # one says which flag keeps it. (A materialized view's query is also on
+    # SHOW VIEWS, which the inventory keeps as the view text.)
     facts = _source_facts(spec, row, db, str(schema), identifier, notes,
                           include_bodies=include_definitions)
     if facts is not None:

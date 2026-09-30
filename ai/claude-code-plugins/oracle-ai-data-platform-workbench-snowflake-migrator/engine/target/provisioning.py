@@ -1255,8 +1255,8 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
 
     # 3 · libraries (only when a fallback needs them) ------------------------
     if pypi or maven:
-        # The library item shape is the one field family still inferred
-        # (assumption B12), so a failure here is expected-possible and must
+        # The library item shape is the one field family still inferred, so
+        # a failure here is expected-possible and must
         # not cost the record of the workspace and cluster above.
         try:
             call("install_libraries", workspace=ws_key, cluster=cluster_key,

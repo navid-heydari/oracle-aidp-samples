@@ -105,7 +105,7 @@ def _show_all(run_sql: Callable[..., list[dict]], statement: str) -> list[dict]:
     while True:
         page_sql = f"{statement} limit {SHOW_PAGE_SIZE}"
         if cursor is not None:
-            literal = cursor.replace("'", "''")
+            literal = lexer.sql_literal(cursor)
             page_sql += f" from '{literal}'"
         page = run_sql(page_sql)
         rows.extend(page)
@@ -149,7 +149,7 @@ def show_paged(run_sql: Callable[..., list[dict]], statement: str
         if names.count(cursor) > 1:
             return rows, (f"{cap}: the name {cursor!r} at the page boundary "
                           f"is shared by more than one object")
-        literal = cursor.replace("'", "''")
+        literal = lexer.sql_literal(cursor)
         try:
             page = list(run_sql(
                 f"{statement} limit {SHOW_PAGE_SIZE} from '{literal}'"))

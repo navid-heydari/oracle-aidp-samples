@@ -61,9 +61,9 @@ manifest created is not thereby what the ddl plan approved. `type_drift`,
 `failed` and `not_in_plan` are looked at again every run, so fixing the
 table or the plan is enough.
 
---parallel N (default 8) creates and reads back N tables at once; each
-table's record is decided by the same create-and-read-back whatever N is,
-and the report lists them in the manifest's order. Views never run in
+--parallel N (default 8; --mode ctas: 1) creates and reads back N tables at
+once; each table's record is decided by the same create-and-read-back
+whatever N is, and the report lists them in the manifest's order. Views never run in
 parallel (below).
 
 Views are recorded under a separate `views` key, never in `objects` (the

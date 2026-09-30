@@ -581,7 +581,7 @@ def test_cancel_run_reports_the_cancel_error_instead_of_swallowing_it():
     assert "aidp not found" in seen[0]
 
 
-# ---------------- the two watch_job edge cases raised on the review PR
+# ------------------------------------------------ two watch_job edge cases
 #
 # Both were reported as "low confidence, confusing-but-not-crashing". Both
 # are real.

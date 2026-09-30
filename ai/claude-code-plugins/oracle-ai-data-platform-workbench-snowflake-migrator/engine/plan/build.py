@@ -159,13 +159,13 @@ def object_kind_block(rec: dict) -> tuple[str, str] | None:
 # table's OBJECT columns and an external table's VALUE VARIANT filed both as
 # `unmapped_type`, sending the operator to fix a type; `--semi-structured
 # string` then "fixed" it and the real refusal appeared one run later. (The
-# dynamic-table flag keeps its original place: K4, the JOBS lane, owns it.)
+# dynamic-table flag keeps its original place: it migrates as a snapshot.)
 _KIND_BEFORE_TYPES = ("is_external", "is_iceberg", "is_event", "is_hybrid")
 
 
 # The two kinds whose files already sit in object storage: not copied, but
 # registered in place over OCI Object Storage once the files are moved there
-# (target/external_registration.py writes the statements). K4: SIM lane.
+# (target/external_registration.py writes the statements).
 _REGISTER_IN_PLACE = (
     ("is_external", "external table",
      "Snowflake external table: its rows are files in the stage's object "
@@ -291,7 +291,8 @@ def _snapshot_refreshes(can: list[dict], by_id: dict[str, dict],
             source_database=db, source_schema=schema, target_fqn=c["target"],
             name_map=name_map)
         reason = result["reason"]
-        if reason == _NOT_CAPTURED and label == "dynamic table":
+        if (reason == _NOT_CAPTURED and label == "dynamic table"
+                and not captured):
             reason += (": a dynamic table's query is only on SHOW DYNAMIC "
                        "TABLES, which the census reads -- re-run `assess` "
                        "without --no-census, with a role that can see it")
@@ -365,8 +366,8 @@ def _view_verdict(rec: dict) -> tuple[bool, str, str]:
 
 
 # `plan --secure-views`. `refuse` (default) keeps the unsupported_object
-# verdict; `as-view` plans a secure view as a PLAIN view -- K4, SIM lane --
-# with a warning every report carries. Never a default: it removes a
+# verdict; `as-view` plans a secure view as a PLAIN view, with a warning
+# every report carries. Never a default: it removes a
 # security boundary.
 SECURE_VIEW_MODES = ("refuse", "as-view")
 

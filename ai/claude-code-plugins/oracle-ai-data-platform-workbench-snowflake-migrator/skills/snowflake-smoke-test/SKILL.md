@@ -6,7 +6,7 @@ description: Check connectivity and permissions on both ends before any migratio
 # Smoke test — both ends
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig smoke \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" smoke \
   [--database <db>] \
   [--datalake-ocid <ocid> --workspace <ws> --cluster-id <cl> --catalog <cat>] \
   [--write-probe --execute]

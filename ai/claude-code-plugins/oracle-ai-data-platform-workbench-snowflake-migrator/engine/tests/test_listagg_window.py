@@ -1,6 +1,6 @@
 """LISTAGG used as a window function is refused, not half-translated.
 
-Round-3 review, reproduced with translate_sql and build_create_view.
+Reproduced with translate_sql and build_create_view.
 T06 rewrites `LISTAGG(a, ',')` to `concat_ws(',', collect_list(a))`, and its
 match ends at LISTAGG's closing paren. So
 

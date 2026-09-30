@@ -29,9 +29,10 @@ __all__ = ["AuthError", "SourceWriteRefused", "READ_ONLY_VERBS",
 # for the CTE-SELECT and only for it: assert_read_only looks past the CTE
 # list, because `WITH x AS (...) INSERT ...` leads with WITH too.
 #
-# This is enforced at the transport, not by convention, so it holds even when the
-# credential has write privileges and even if a future skill, agent or prompt
-# asks for a write. Nothing is written to or dropped from the source, ever.
+# This is enforced at the transport, not by convention: any statement not led
+# by one of these verbs (or a CTE ending in SELECT) is refused, whatever the
+# credential allows. It is a verb gate -- a SELECT can still call a function
+# with side effects -- so the read-only role remains what prevents writes.
 READ_ONLY_VERBS = ("SELECT", "SHOW", "DESCRIBE", "DESC", "WITH", "EXPLAIN")
 
 _MODES = {"keypair", "pat", "password", "externalbrowser"}
@@ -78,6 +79,12 @@ def assert_read_only(sql: str) -> None:
             f"Snowflake (allowed: {', '.join(READ_ONLY_VERBS)})")
 
     for part in statements:
+        # `->>` (Snowflake's flow operator) chains a second statement into
+        # the same request, so a write could ride behind an accepted read.
+        if lexer.find_code(r"->>", part):
+            raise SourceWriteRefused(
+                "the ->> flow operator chains statements; refused. This "
+                "plugin only sends single reads.")
         verb = lexer.leading_verb(part)
         if verb is None:
             raise SourceWriteRefused(

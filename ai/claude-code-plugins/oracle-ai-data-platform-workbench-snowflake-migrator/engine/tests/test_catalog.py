@@ -166,8 +166,8 @@ def test_migration_status_starts_at_discovered():
 
 
 # ==========================================================================
-# Row-count strategy (issue #4), SHOW pagination (#5), identifier quoting
-# (#18) and count-failure reporting (#6).
+# Row-count strategy, SHOW pagination, identifier quoting and count-failure
+# reporting.
 # ==========================================================================
 
 def _session_rows():

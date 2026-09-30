@@ -68,16 +68,18 @@ attributable.
 
 Resumable: a table the report records as `verified` is skipped (--force
 re-copies). Failures are recorded and the run continues; the report is the
-deliverable. Each table's record is written the moment its copy finishes; a
-table whose rows have landed but whose chunk's source recount is still to
-come is written PROVISIONALLY as `failed` with `insert_completed` and
-`awaiting_source_recount`. `--mode append` refuses a table whose record
-says `insert_completed` (its rows are already there): re-copy it with
-`--mode overwrite`. Outside `--mode append` the report is written at most
-every REPORT_WRITE_INTERVAL seconds (and at every chunk's end), so a job
-that stops can lose its last few records; the report's `run` marker says a
-run did not finish, and `--mode append` then refuses to start -- resume in
-the stopped run's own mode first.
+deliverable. In `--mode append` each table's record is written the moment
+its copy finishes; a table whose rows have landed but whose chunk's source
+recount is still to come is written PROVISIONALLY as `failed` with
+`insert_completed` and `awaiting_source_recount`. `--mode append` refuses a
+table whose record says `insert_completed` (its rows are already there):
+re-copy it with `--mode overwrite`. Outside `--mode append` the report is
+written at most every REPORT_WRITE_INTERVAL seconds (and at every chunk's
+end), so a job that stops can lose its last few records; the report's `run`
+marker says a run did not finish, and `--mode append` then refuses the
+tables that run could have touched -- resume in the stopped run's own mode
+first. A later run over a narrower --tables scope carries the others
+forward, still refused for append, until a run covers them.
 """
 from __future__ import annotations
 
@@ -1605,22 +1607,49 @@ def main(argv: list[str] | None = None) -> int:
     # table holding rows with no record. Appending after it would add those
     # rows a second time; a resume in the stopped run's own mode re-checks
     # every table instead (skip-existing skips one that holds rows).
+    # The marker names the tables the run may touch (`todo`). A finished run
+    # over a narrower --tables scope does not clear an unfinished run's
+    # other tables: they are carried forward (`carried`), unverified, and
+    # the marker stays unfinished until a run covers them.
     prev_run = report.get("run") or {}
-    if (not args.dry_run and args.mode == "append" and prev_run
-            and not prev_run.get("finished")
-            and prev_run.get("mode") not in (None, "append")):
-        return fail(
-            f"error: the previous copy run of {args.schema} (--mode "
-            f"{prev_run.get('mode')}, started {prev_run.get('started_at')}) "
-            f"did not finish, and its last records may not have been "
-            f"written: a table it copied in its last seconds can hold rows "
-            f"with no record, and --mode append would add them a second "
-            f"time. Resume with --mode {prev_run.get('mode')} first; "
-            f"append once that run has finished.")
+    unfinished = (bool(prev_run) and not prev_run.get("finished")
+                  and prev_run.get("mode") not in (None, "append"))
+    at_risk = None
+    if unfinished and "todo" in prev_run:
+        at_risk = [n for n in dict.fromkeys(
+                       [*(prev_run.get("carried") or []),
+                        *(prev_run.get("todo") or [])])
+                   if report["tables"].get(n, {}).get("status")
+                   not in _COPY_DONE]
+    if not args.dry_run and args.mode == "append" and unfinished:
+        blocked = (todo if at_risk is None
+                   else [n for n in todo if n in set(at_risk)])
+        if blocked:
+            listed = ", ".join(blocked[:20]) + (
+                f" and {len(blocked) - 20} more" if len(blocked) > 20 else "")
+            return fail(
+                f"error: the previous copy run of {args.schema} (--mode "
+                f"{prev_run.get('mode')}, started "
+                f"{prev_run.get('started_at')}) did not finish, and its last "
+                f"records may not have been written: a table it copied in its "
+                f"last seconds can hold rows with no record, and --mode "
+                f"append would add them a second time. Tables at risk: "
+                f"{listed}. Resume with --mode {prev_run.get('mode')} first; "
+                f"append once that run has finished.")
     if not args.dry_run:
+        carried = ([n for n in at_risk if n not in set(todo)]
+                   if unfinished and at_risk is not None else [])
         report["run"] = {"mode": args.mode, "finished": False,
                          "started_at": datetime.datetime.now(
-                             datetime.timezone.utc).isoformat()}
+                             datetime.timezone.utc).isoformat(),
+                         "todo": list(todo)}
+        if carried:
+            report["run"].update(carried=carried,
+                                 carried_mode=prev_run.get("carried_mode")
+                                 or prev_run.get("mode"))
+            log(f"{len(carried)} table(s) from an unfinished earlier run are "
+                f"outside this run's scope and stay unverified; --mode append "
+                f"is refused for them until a run covers them")
         _write_report(report, path)
     # A record that says the rows already landed (a verification that
     # raised, or a provisional record a stopped run left) is refused in
@@ -1684,8 +1713,11 @@ def main(argv: list[str] | None = None) -> int:
             _write_report(report, path)
 
     if not args.dry_run:
-        report["run"].update(finished=True, finished_at=datetime.datetime.now(
-            datetime.timezone.utc).isoformat())
+        # Still unfinished while tables from an earlier stopped run remain
+        # outside every run that has finished since.
+        report["run"].update(finished=not report["run"].get("carried"),
+                             finished_at=datetime.datetime.now(
+                                 datetime.timezone.utc).isoformat())
         _write_report(report, path)
     statuses = {}
     for t in report["tables"].values():

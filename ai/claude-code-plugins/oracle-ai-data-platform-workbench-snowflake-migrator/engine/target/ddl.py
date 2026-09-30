@@ -182,7 +182,7 @@ class RewriteResult:
     # Source settings with a real AIDP equivalent that this version does not
     # apply. Distinct from omitted_properties, which have nowhere to go.
     deferred_properties: list[dict] = field(default_factory=list)
-    # How the copy reads and converts each column (contract K1): see
+    # How the copy reads and converts each column: see
     # `copy_spec`. Tables only; a view is not copied.
     copy_columns: list[dict] = field(default_factory=list)
     # Source settings carried INTO this CREATE TABLE, and the Delta clauses
@@ -532,7 +532,7 @@ def render_tblproperties(features: dict) -> str:
 
 def copy_spec(columns: list[dict], *, geospatial: str | None = None
               ) -> list[dict]:
-    """The per-column copy spec (contract K1), one entry per column in order.
+    """The per-column copy spec, one entry per column in order.
 
     `{name, source_type, target_type, read_expr, convert_expr}`: the copy
     stage selects every `read_expr AS "<name>"` in ONE qualified pushdown
@@ -1429,7 +1429,7 @@ def build_ddl_payload(inventory: dict, plan: dict) -> dict:
             # Source settings with an AIDP equivalent that this version does
             # not apply. Reported, never silently invented.
             "deferred_properties": res.deferred_properties,
-            # K1: how the copy reads and converts each column. Tables only
+            # How the copy reads and converts each column. Tables only
             # -- the STATEMENT's kind, not the source's: a materialized view
             # planned as a table snapshot is a VIEW in the inventory, and
             # asking that left its copy to read every column bare.

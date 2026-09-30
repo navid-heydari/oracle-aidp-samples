@@ -135,7 +135,7 @@ def test_notebook_name_is_recognisable():
 
 
 # --------------------------------------------------------------------------
-# The notebook's verify cell has the same obligation as deploy (issue #2).
+# The notebook's verify cell has the same obligation as deploy.
 # --------------------------------------------------------------------------
 
 def _verify_source(nb):

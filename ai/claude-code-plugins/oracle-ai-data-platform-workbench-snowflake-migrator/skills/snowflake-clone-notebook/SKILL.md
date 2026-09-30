@@ -26,7 +26,7 @@ say this before they run it.
 ## 1. Generate (offline, safe)
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig notebook \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" notebook \
   [--catalog <catalog>]
 ```
 
@@ -37,7 +37,7 @@ has several.
 ## 2. `--upload` — a dry run, refused with `--execute`
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig notebook \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" notebook \
   --upload --datalake-ocid <ocid> --workspace <ws> --cluster-id <cl> --catalog <cat>
 ```
 

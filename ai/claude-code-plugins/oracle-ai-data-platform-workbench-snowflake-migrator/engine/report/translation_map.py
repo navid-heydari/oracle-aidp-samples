@@ -206,6 +206,10 @@ def build_translation_map(inventory: dict, plan: dict,
     catalogs, schemas = _containers(records, plan or {})
     names = _names(records, plan or {})
     snapshots = _snapshots(records, plan or {})
+    # Snapshot-kind objects the plan does not migrate (restricted, blocked,
+    # cascaded out): counted, so every materialized view and dynamic table
+    # appears in some count.
+    not_planned = sum(1 for rec in records if snapshot_kind(rec)) - len(snapshots)
     return {
         "catalogs": catalogs,
         "schemas": schemas,
@@ -229,6 +233,7 @@ def build_translation_map(inventory: dict, plan: dict,
             "views_unparseable": views["unparseable"],
             "views_blocked_by_kind": len(views["blocked_by_kind"]),
             "table_snapshots": len(snapshots),
+            "snapshots_not_planned": not_planned,
             "rules_applied": sum(1 for r in rules if r["outcome"] == "applied"),
             "rules_refused": sum(1 for r in rules if r["outcome"] == "refused"),
             "renamed_objects": sum(1 for n in names if n["renamed"]),

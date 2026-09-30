@@ -79,6 +79,7 @@ def _code_only(sql: str) -> str:
         if c in ("'", '"'):
             out.append(" ")
             i += 1
+            closed = False
             while i < n:
                 if c == "'" and sql[i] == "\\" and i + 1 < n:  # escape
                     out.append("  ")
@@ -91,9 +92,13 @@ def _code_only(sql: str) -> str:
                         continue
                     out.append(" ")
                     i += 1
+                    closed = True
                     break
                 out.append("\n" if sql[i] == "\n" else " ")
                 i += 1
+            if not closed:
+                raise SourceWriteRefused(
+                    f"an unclosed {c} literal; refused (fails closed)")
             continue
         if two == "$$":
             out.append("  ")
@@ -101,6 +106,9 @@ def _code_only(sql: str) -> str:
             while i < n and sql[i:i + 2] != "$$":
                 out.append("\n" if sql[i] == "\n" else " ")
                 i += 1
+            if i >= n:
+                raise SourceWriteRefused(
+                    "an unclosed $$ string; refused (fails closed)")
             out.append("  ")
             i += 2
             continue
@@ -113,20 +121,20 @@ def _code_only(sql: str) -> str:
                 i += 1
             continue
         if two == "/*":
-            depth, i = 1, i + 2
+            # Snowflake ends a block comment at the FIRST `*/` (no nesting),
+            # as the engine's lexer does. Counting depth made
+            # `select 1 /* /* */ ; delete from t` one statement here and
+            # two to Snowflake. An unclosed comment is refused.
+            i += 2
             out.append("  ")
-            while i < n and depth:
-                if sql[i:i + 2] == "/*":
-                    depth += 1
-                    out.append("  ")
-                    i += 2
-                elif sql[i:i + 2] == "*/":
-                    depth -= 1
-                    out.append("  ")
-                    i += 2
-                else:
-                    out.append("\n" if sql[i] == "\n" else " ")
-                    i += 1
+            while i < n and sql[i:i + 2] != "*/":
+                out.append("\n" if sql[i] == "\n" else " ")
+                i += 1
+            if i >= n:
+                raise SourceWriteRefused(
+                    "an unclosed /* comment; refused (fails closed)")
+            out.append("  ")
+            i += 2
             continue
         out.append(c)
         i += 1
@@ -142,6 +150,12 @@ def assert_pushdown_read_only(sql: str) -> None:
     check.
     """
     code = _code_only(sql or "")
+    if "->>" in code:
+        # Snowflake's flow operator chains another statement into the same
+        # request: `select 1 ->> delete from t` would pass a leading-verb
+        # check. Nothing this plugin generates uses it.
+        raise SourceWriteRefused(
+            "the ->> flow operator chains statements; refused")
     statements = [s for s in code.split(";") if s.strip()]
     if not statements:
         raise SourceWriteRefused(
@@ -303,9 +317,23 @@ def load_source_config(path: str | pathlib.Path) -> dict:
             raise SourceConfigError(
                 f"{p} is YAML but PyYAML is not on the cluster; write the "
                 f"config as JSON instead") from exc
-        data = yaml.safe_load(text) or {}
+        try:
+            data = yaml.safe_load(text) or {}
+        except yaml.YAMLError as exc:
+            # The parser's message quotes the offending line, which can be
+            # the password line: only its position is reported.
+            mark = getattr(exc, "problem_mark", None)
+            where = f" at line {mark.line + 1}" if mark is not None else ""
+            raise SourceConfigError(
+                f"{p} is not valid YAML{where}; the line is withheld, "
+                f"since it may hold the credential") from None
     else:
-        data = json.loads(text) if text.strip() else {}
+        try:
+            data = json.loads(text) if text.strip() else {}
+        except json.JSONDecodeError as exc:
+            raise SourceConfigError(
+                f"{p} is not valid JSON at line {exc.lineno}; the line is "
+                f"withheld, since it may hold the credential") from None
     if not isinstance(data, dict):
         raise SourceConfigError(f"{p}: expected a mapping at the top level")
     # THE MIGRATION CONFIG IS ONE FILE FOR BOTH ENDS: the Snowflake connection

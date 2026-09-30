@@ -168,7 +168,7 @@ def test_partial_translation_is_flagged_not_claimed_complete():
 
 
 # --------------------------------------------------------------------------
-# Literal awareness (issue #18). Every rule used to run re.sub / re.search
+# Literal awareness. Every rule used to run re.sub / re.search
 # over raw SQL, so text inside a string literal was treated as code.
 # --------------------------------------------------------------------------
 

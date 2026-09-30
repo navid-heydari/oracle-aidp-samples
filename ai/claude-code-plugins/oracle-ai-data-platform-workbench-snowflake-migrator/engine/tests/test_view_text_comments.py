@@ -1,6 +1,6 @@
 """The catalog API refuses a view whose query carries a comment.
 
-Live 2026-09-25, round-3 deploy on AIDP: V_SLASH_COMMENT -- a Snowflake view
+Seen live on AIDP: V_SLASH_COMMENT -- a Snowflake view
 with a `//` line comment, which the translator correctly rewrote to `--` --
 was refused by the catalog CRUD API:
 

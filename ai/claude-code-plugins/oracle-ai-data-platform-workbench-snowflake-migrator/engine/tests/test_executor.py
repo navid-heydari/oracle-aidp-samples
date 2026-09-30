@@ -186,7 +186,7 @@ def test_notebook_operations_contain_no_destructive_verb():
 
 
 # --------------------------------------------------------------------------
-# A batch too large for argv must fail with advice, not E2BIG (issue #19).
+# A batch too large for argv must fail with advice, not E2BIG.
 # --------------------------------------------------------------------------
 
 def test_an_oversized_statement_is_refused_with_advice():

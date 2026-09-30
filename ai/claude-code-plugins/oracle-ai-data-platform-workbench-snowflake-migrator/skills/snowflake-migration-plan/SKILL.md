@@ -8,9 +8,9 @@ description: Build a high-level Snowflake to AIDP migration plan and present it 
 Two commands. The first needs Snowflake; the second is offline.
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig deps
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" deps
 
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig plan \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" plan \
   --bronze-catalog-prefix <S4 INTERNAL catalog> [--restrictions restrictions.json]
 ```
 
@@ -56,7 +56,7 @@ Categories:
 ## Secure views — refused unless the operator opts in, loudly
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig plan --secure-views as-view [--bronze-catalog-prefix ...]
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" plan --secure-views as-view [--bronze-catalog-prefix ...]
 ```
 
 Default `refuse`: a SECURE view is `unsupported_object`. `as-view` plans it as
@@ -75,7 +75,7 @@ required it.
 ## External and Iceberg tables — register in place, after the files move
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig external-registration
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" external-registration
 ```
 
 Reads Snowflake read-only (`SHOW EXTERNAL TABLES` / `SHOW ICEBERG TABLES` per
@@ -105,7 +105,7 @@ four things out loud:
 ## Outbound shares — a Delta Sharing plan, never executed
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig share-plan      # after `security`, so exposures are known
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" share-plan      # after `security`, so exposures are known
 ```
 
 For each OUTBOUND share (`SHOW SHARES`, `DESCRIBE SHARE`, read-only) it
@@ -197,7 +197,7 @@ When they do describe a design — including one not listed here — record it
 verbatim:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig data-options \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" data-options \
   --choose A6_CUSTOMER_DEFINED --chosen-by <name> --rationale "<why>" \
   --custom-name "<their name for it>" --custom-description-file <file>
 ```
@@ -216,7 +216,7 @@ whether a later migration can run unattended.
 Record a choice with:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig data-options \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" data-options \
   --choose A2_FEDERATE_EXTERNAL_CATALOG --chosen-by <name> --rationale "<why>"
 ```
 
@@ -260,7 +260,7 @@ full mapping.
 ## Finish with `summary` — it is not optional
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig summary
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" summary
 ```
 
 `SUMMARY.md` is the per-object roll-up the user asked for: one row per table,

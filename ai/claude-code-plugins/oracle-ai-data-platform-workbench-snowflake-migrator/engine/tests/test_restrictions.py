@@ -249,7 +249,7 @@ def test_upper_case_BYTES_metadata_is_still_capped():
 
 # ------------------------------- name patterns fold case, like every sibling
 #
-# Raised by the repo owner on the review PR. Snowflake upper-cases every
+# Snowflake upper-cases every
 # unquoted identifier, so a hand-written `^tmp_` matched nothing in a real
 # estate -- the one restriction that could look right and silently do
 # nothing, while `exclude_databases: [sales]` has always matched SALES.

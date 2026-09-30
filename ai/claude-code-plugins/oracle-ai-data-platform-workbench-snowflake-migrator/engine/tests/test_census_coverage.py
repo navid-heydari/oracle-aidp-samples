@@ -434,7 +434,7 @@ def test_an_external_function_is_recognised_from_a_no_yes_or_y_flag():
 
 # --------------------------- a kind readable in one database, denied in another
 #
-# Reported by the repo owner on the review PR, and required before merge. The
+# The
 # per-kind `readable` flag was one value for the whole run: a kind that answers
 # in DB A and is denied in DB B reported as "not visible to this role" with a
 # null count, while the rows counted in DB A sat in the same report's by_kind

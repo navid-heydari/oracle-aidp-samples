@@ -35,6 +35,14 @@ migrator plugin, newest first. The format loosely follows
 - A plan file over 16 MiB is pushed gzipped (`<name>.gz`), with a pointer under
   the plain name that the structure, copy and reconcile stages follow and check
   by sha256. JSON plans compress 49-75x.
+- Artifacts default to `./migration-artifacts/` in the working directory, not
+  the plugin folder, so a plugin update keeps the record `teardown` works
+  from. Any out-dir the migrator creates, or finds empty, gets its own
+  `.gitignore`; the demo writes to `./snowmig_demo`.
+- The OCI auth mode falls back to `OCI_CLI_AUTH`, and the profile it is
+  inferred from to `OCI_CLI_PROFILE`, when the config sets neither.
+- The launchers show why a temporary venv could not be created, try
+  `SNOWMIG_PYTHON` first, and write no bytecode or pytest cache.
 
 ### Fixed
 - `ddl` over a large plan no longer runs one regex per planned object for every
@@ -57,13 +65,17 @@ migrator plugin, newest first. The format loosely follows
   `SELECT * FROM (...) AS named_columns(...)`, the forms AIDP reads.
 - A `cluster by (...)` before the column list in `GET_DDL` is skipped when its
   columns are read.
-- Task bodies and dynamic-table / materialized-view queries are kept only with
+- Task bodies and dynamic-table queries are kept only with
   `--capture-definitions`; without it, the generated job or refresh names the
-  flag that keeps the body.
+  flag that keeps the body. A materialized view's query is always captured,
+  with the view text.
 - `--mode append` refuses to start after an unfinished copy run of another
-  mode, and `--tables` is deduplicated before the parallel copy.
+  mode, and `--tables` is deduplicated before the parallel copy. A later run
+  over a narrower `--tables` scope carries the unfinished run's other tables
+  forward, so append stays refused for them.
 - One rule resolves the source database name for every statement, GET_DDL
-  included; a quoted, mixed-case database name is supported.
+  included, on the laptop (`assess`, `preflight`) as in the notebooks; a
+  quoted, mixed-case database name is supported.
 - `teardown --scope all` also removes the jobs and notebooks `jobs --register`
   created.
 - The copy compares every column's live source type with the type its plan
@@ -71,8 +83,19 @@ migrator plugin, newest first. The format loosely follows
   after the plan was approved is refused by default (`type_drift`), and
   `mapping.source_type_drift: convert` copies it under its new type as
   `verified_with_conversion`, never plain `verified`.
-- An Iceberg table name placed in a Snowflake string literal escapes the
-  backslash as well as the quote, so a crafted name cannot close the literal.
+- An object name placed in a Snowflake string literal (Iceberg lookups,
+  security attachments, SHOW paging) escapes the backslash as well as the
+  quote, so a crafted name cannot close the literal. An external table's
+  LOCATION is a properly escaped Spark literal, and maintenance reads quote
+  the database, schema and table they scope.
+- Both read-only guards refuse Snowflake's `->>` statement chaining. The
+  in-AIDP guard ends a block comment at the first `*/`, as Snowflake does,
+  and refuses an unclosed literal, comment or `$$` string.
+- A stage config that does not parse reports the line number only, never the
+  line, which can hold the credential.
+- A dynamic table whose query was not captured names `--capture-definitions`,
+  not the role's grants. `TRANSLATION_MAP.md` counts the table snapshots the
+  plan leaves out.
 - `provision --delete-stale-copy-jobs` deletes only copy jobs this migration's
   records show it created (`created_jobs`, carried from push to push). Other
   `snowmig_02_copy_*` jobs on a reused workspace are reported, not deleted.

@@ -1,6 +1,6 @@
 """A view's header column list names its columns; it must not be dropped.
 
-Round-3 review, reproduced with build_ddl_payload and deploy_catalog. GET_DDL
+Reproduced with build_ddl_payload and deploy_catalog. GET_DDL
 emits a view with its column list:
 
     create or replace view V_CUST_TOTALS(

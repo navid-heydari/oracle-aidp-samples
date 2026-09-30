@@ -98,7 +98,7 @@ def test_system_databases_are_not_chosen_as_the_probe_target():
 
 
 # ==========================================================================
-# The write probe cleans up (issue #12).
+# The write probe cleans up.
 #
 # It could not before because the no-DROP rule was applied to the DESTINATION.
 # That rule is a SOURCE guarantee: nothing is ever written to or dropped from

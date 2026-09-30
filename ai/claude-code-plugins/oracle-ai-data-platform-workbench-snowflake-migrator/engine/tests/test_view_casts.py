@@ -1,6 +1,6 @@
 """A `::` cast is only "exact" when the type mapper says it is.
 
-Round-3 review, reproduced through build_create_view. T02 sends the cast
+Reproduced through build_create_view. T02 sends the cast
 type through the same mapper as table DDL, and TIME maps to STRING -- with
 the column-level warning "The text is preserved". For a TIME column that
 is true. For a cast it is not: the operand's type is unknown to a token

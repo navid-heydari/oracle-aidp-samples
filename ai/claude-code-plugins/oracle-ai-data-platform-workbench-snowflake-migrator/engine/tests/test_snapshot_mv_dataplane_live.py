@@ -22,7 +22,7 @@ A dynamic table snapshot worked, only because discovery files it under
 what is a table, whatever list discovery filed the source under -- or when
 discovery did not list it at all. A real view is still never copied.
 
-The ddl stage also left the snapshot's per-column read spec (K1 `columns`)
+The ddl stage also left the snapshot's per-column read spec (`columns`)
 and Delta features off the statement, because it asked the SOURCE record's
 kind (VIEW) rather than the statement's (TABLE); the copy would then have
 read it bare, with the connector's lossy typing.
@@ -46,7 +46,7 @@ _MV_EXPECTED = [{"name": "CUSTOMER_ID", "type": "DECIMAL(38,0)"},
 
 
 def _k1(expected):
-    """The K1 column spec, as the ddl stage writes it for a NUMBER column."""
+    """The column spec, as the ddl stage writes it for a NUMBER column."""
     return [{"name": c["name"], "target_type": c["type"],
              "read_expr": f'"{c["name"]}"::VARCHAR',
              "convert_expr": f'CAST(`{c["name"]}` AS {c["type"]})'}
@@ -220,7 +220,7 @@ def test_the_copy_scopes_and_copies_the_snapshot(monkeypatch, tmp_path,
     rec = report["tables"][MV]
     assert rec["status"] == "verified"
     assert rec["read"]["from_plan"] == ["CUSTOMER_ID", "TOTAL"], \
-        "read with the plan's K1 spec, not bare"
+        "read with the plan's column spec, not bare"
     assert spark.rows[f"`lake`.`core`.`{MV}`"] == [
         {"CUSTOMER_ID": D(1), "TOTAL": D("12.75")},
         {"CUSTOMER_ID": D(2), "TOTAL": D("7.00")}]
@@ -292,7 +292,7 @@ def test_reconcile_reports_the_snapshot_as_a_verified_table(monkeypatch,
         (reports / "MIGRATION_REPORT.md").read_text(encoding="utf-8")
 
 
-# ------------------------------------ the ddl stage carries its K1 spec
+# -------------------------------- the ddl stage carries its column spec
 
 def test_the_ddl_statement_for_a_materialized_view_carries_its_read_spec():
     from plan.build import build_plan

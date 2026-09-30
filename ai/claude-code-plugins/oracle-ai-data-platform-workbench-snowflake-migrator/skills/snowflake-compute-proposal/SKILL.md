@@ -6,7 +6,7 @@ description: Map Snowflake warehouses onto AIDP Spark compute clusters and produ
 # Compute proposal — warehouses to clusters
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig compute \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" compute \
   [--credit-price 3.0]
 ```
 

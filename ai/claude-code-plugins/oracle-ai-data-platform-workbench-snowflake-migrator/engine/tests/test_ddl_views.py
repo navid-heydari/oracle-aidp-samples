@@ -214,7 +214,7 @@ def test_quoted_column_list_still_parses():
 
 
 # --------------------------------------------------------------------------
-# Header location by scanner, not regex (issue #18).
+# Header location by scanner, not regex.
 # --------------------------------------------------------------------------
 
 def test_body_found_when_the_view_name_is_quoted_and_contains_a_space():

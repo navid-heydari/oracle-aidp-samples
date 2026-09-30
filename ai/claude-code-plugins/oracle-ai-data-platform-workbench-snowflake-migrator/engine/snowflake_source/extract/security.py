@@ -212,7 +212,7 @@ def _entity_literal(db, schema, name) -> str:
     result then sits inside a SQL string literal, so its single quotes are
     doubled in turn.
     """
-    return lexer.qualify(str(db), str(schema), str(name)).replace("'", "''")
+    return lexer.sql_literal(lexer.qualify(str(db), str(schema), str(name)))
 
 
 def _live_attachments(run_sql, records: list[dict], notes: list[str], *,

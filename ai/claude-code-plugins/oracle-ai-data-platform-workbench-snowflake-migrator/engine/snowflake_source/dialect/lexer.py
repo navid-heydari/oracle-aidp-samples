@@ -35,7 +35,8 @@ import re
 
 __all__ = ["UnterminatedLiteral", "SEGMENT_KINDS", "segments", "code_only",
            "strip_comments", "split_statements", "leading_verb", "quote_ident",
-           "qualify", "sql_literal", "like_literal", "find_code", "sub_code",
+           "qualify", "config_name", "sql_literal", "like_literal",
+           "find_code", "sub_code",
            "cte_body_verb", "cte_scopes"]
 
 SEGMENT_KINDS = ("code", "string", "ident", "comment")
@@ -233,6 +234,23 @@ def qualify(*parts: str) -> str:
     if not parts:
         raise ValueError("qualify() needs at least one identifier")
     return ".".join(quote_ident(p) for p in parts)
+
+
+def config_name(value: str) -> str:
+    """The object a config value names, unquoted, as Snowflake resolves it.
+
+    `database: sales_db` is an unquoted identifier and names SALES_DB;
+    `database: '"MyDb"'`, written with its double quotes, names MyDb exactly;
+    any other value that is not a plain identifier can only have been meant
+    verbatim. The same rule as `dataplane/snowmig_source._database_name`, so
+    the laptop and the data plane address the same database.
+    """
+    text = str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        return text[1:-1].replace('""', '"')
+    if _WORD.fullmatch(text):
+        return text.upper()
+    return text
 
 
 def sql_literal(value: str) -> str:

@@ -6,7 +6,7 @@ description: Show the Snowflake-to-AIDP migration as a stage table before runnin
 # Stage board — read the run before you execute it
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig stages
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" stages
 ```
 
 Offline. It reads the artifacts already in `--out-dir` and reports the pipeline
@@ -73,14 +73,15 @@ first: those are what blocked objects.
 **LLM token usage** — `TOKENS.md`, per stage and per phase:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig tokens
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" tokens
 ```
 
 Every stage appends its start, end and the Claude Code session id to
 `run_log.jsonl`; `tokens` reads that session's transcript (and its
 subagents') from `~/.claude/projects/` and credits each stage with the
-tokens spent after the previous stage ended. Local files only; nothing is
-sent anywhere. Say what the numbers are: **the engine calls no model — these
+tokens spent after the previous stage ended. Local files only, unless
+`reporting.publish_each_stage: true` or `publish --execute` uploads them to
+the migration workspace with the reports. Say what the numbers are: **the engine calls no model — these
 are the tokens the agent spent driving it.** Tokens outside the run are
 excluded and counted, not folded in; `--since <ISO time>` credits setup
 work to the first stage. A stage whose own session transcript was not read
@@ -95,8 +96,8 @@ When the run is done, copy its record into AIDP so it outlives the operator's
 machine:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig publish            # dry run: lists the files
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig publish --execute  # uploads and reads each back
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" publish            # dry run: lists the files
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" publish --execute  # uploads and reads each back
 ```
 
 Inputs and outputs (plans, inventory, DDL, reports, the phase diagram, the run

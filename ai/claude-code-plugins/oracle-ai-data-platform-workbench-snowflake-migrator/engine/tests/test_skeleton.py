@@ -67,11 +67,6 @@ def test_dead_weight_pruned(rel):
     assert not (ENGINE / rel).exists(), f"{rel} is dead weight for MVP-1"
 
 
-def test_corpus_relocated():
-    assert (ENGINE / "snowflake_source/corpus/00_acme_setup.sql").is_file()
-    assert (ENGINE / "snowflake_source/corpus/validate.py").is_file()
-
-
 def test_no_websocket_transport_remains():
     """The WebSocket/asyncio path is gone, not merely unused.
 
@@ -79,7 +74,7 @@ def test_no_websocket_transport_remains():
     the only code that could execute arbitrary Python on a cluster.
     """
     for path in ENGINE.rglob("*.py"):
-        if "corpus" in path.parts or "tests" in path.parts:
+        if "tests" in path.parts:
             continue
         text = path.read_text(encoding="utf-8")
         for token in ("websocket", "asyncio", "wss://"):

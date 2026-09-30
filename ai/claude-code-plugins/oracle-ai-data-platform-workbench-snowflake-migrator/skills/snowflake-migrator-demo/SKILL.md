@@ -6,7 +6,7 @@ description: Dev mode. Run the entire Snowflake-to-AIDP migration pipeline again
 # Dev mode — the pipeline, emulated
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig demo --out-dir ${CLAUDE_PLUGIN_ROOT}/snowmig_demo
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" demo --out-dir ./snowmig_demo
 ```
 
 One command, no arguments to collect, nothing to ask the user for. It runs the
@@ -20,7 +20,7 @@ consumers, masking/row-access policies and tags, search optimization, a
 container service, a native app, replication and failover groups):
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig demo --estate enterprise --out-dir ${CLAUDE_PLUGIN_ROOT}/snowmig_demo_enterprise
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" demo --estate enterprise --out-dir ./snowmig_demo_enterprise
 ```
 
 It runs assess through `plan`, `ddl`, `external-registration`, `share-plan`

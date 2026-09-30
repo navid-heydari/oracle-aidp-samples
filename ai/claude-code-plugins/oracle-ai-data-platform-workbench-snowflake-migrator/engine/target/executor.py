@@ -2,11 +2,12 @@
 
 The ladder, in order of preference:
 
-  1. `aidp` CLI      -- the official client. Preferred when installed.
-  2. `oci raw-request` -- the same REST API without the CLI. `oci ai-data-platform`
-     covers only the control plane (instance lifecycle, work requests), NOT
-     catalogs, schemas, tables or clusters, so the data plane goes through
-     raw-request.
+  1. `oci raw-request` -- the documented REST API, used whenever `oci` is
+     installed (`detect_backend`). `oci ai-data-platform` covers only the
+     control plane (instance lifecycle, work requests), NOT catalogs,
+     schemas, tables or clusters, so those go through raw-request.
+  2. `aidp` CLI -- the fallback when `oci` is absent. Workspace files, job
+     cancel/delete and catalog delete always use it (`provision_api.py`).
 
 If neither is present that is a loud failure, not a silent no-op.
 
@@ -21,8 +22,8 @@ error, not a silent partial migration.
 `/20260430/aiDataPlatforms/{id}/...` -- not this module's
 `/20240831/dataLakes/{id}/...` -- and adds an `aidp-async-operation-key`
 waiter and jobs/clusters/workspaces surfaces. The legacy family here is what
-one live migration verified, so it stays until a live run proves the new one
-(assumption B11). Everything NEW is built on the documented contract in
+one live migration verified, so it stays until a live run proves the new
+one. Everything NEW is built on the documented contract in
 `provision_api.py`. Two corrections the doc already settles: there is NO SQL
 endpoint (the 404 is real, permanently), and there is NO `notebookRuns`
 endpoint -- programmatic notebook execution is a Job with a NOTEBOOK_TASK, so

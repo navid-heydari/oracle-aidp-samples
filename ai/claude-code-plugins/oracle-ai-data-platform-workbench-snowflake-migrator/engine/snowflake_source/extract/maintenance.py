@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import datetime
 from typing import Callable
+from ..dialect import lexer
 
 __all__ = ["build_maintenance", "NO_AIDP_EQUIVALENT", "CHURN_ROWS_SIGNAL"]
 
@@ -246,14 +247,15 @@ def build_maintenance(run_sql: Callable[..., list[dict]], inventory: dict, *,
     db_retention: dict[str, int | None] = {}
     for db in databases:
         db_retention[db], _ = _parameter(
-            run_sql, "DATA_RETENTION_TIME_IN_DAYS", f'in database "{db}"', notes)
+            run_sql, "DATA_RETENTION_TIME_IN_DAYS",
+            f"in database {lexer.qualify(db)}", notes)
 
     schema_retention: dict[str, int | None] = {}
     for scope in sorted({(r["source_database"], r["source_schema"]) for r in tables}):
         db, schema = scope
         schema_retention[f"{db}.{schema}"], _ = _parameter(
             run_sql, "DATA_RETENTION_TIME_IN_DAYS",
-            f'in schema "{db}"."{schema}"', notes)
+            f"in schema {lexer.qualify(db, schema)}", notes)
 
     reclustering, churn, acct_status = _account_usage_summary(
         run_sql, history_days, notes)
@@ -310,7 +312,10 @@ def build_maintenance(run_sql: Callable[..., list[dict]], inventory: dict, *,
         if probe_table_parameters:
             value, level = _parameter(
                 run_sql, "DATA_RETENTION_TIME_IN_DAYS",
-                f'in table "{db}"."{schema}"."{ident.rsplit(".", 1)[1]}"', notes)
+                # The table part is what follows "<db>.<schema>.", so a
+                # table named `A.B` is probed as `A.B`, not as `B`.
+                f"in table {lexer.qualify(db, schema, ident[len(db) + len(schema) + 2:])}",
+                notes)
             if value is not None:
                 rec["retention_days"] = value
                 rec["retention_set_at"] = (level or "inherited").lower()

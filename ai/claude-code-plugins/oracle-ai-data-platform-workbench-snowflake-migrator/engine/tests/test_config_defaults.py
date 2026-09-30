@@ -28,7 +28,7 @@ def _resolve(argv, key):
     return snowmig._mapping(args, key)
 
 
-# ------------------------------------------------------ B10: semi-structured
+# ----------------------------------------------------------- semi-structured
 
 def test_variant_defaults_to_string_on_the_config_cli_path(tmp_path):
     assert MAPPING_DEFAULTS["semi_structured"] == "string"
@@ -74,7 +74,7 @@ def test_the_example_config_documents_the_block():
     assert mapping_block(cfg)["semi_structured"] == "string"
 
 
-# ------------------------------------------------------ B11: TIMESTAMP_NTZ
+# ------------------------------------------------------------- TIMESTAMP_NTZ
 
 def test_timestamp_ntz_defaults_to_timestamp_on_the_config_cli_path(tmp_path):
     assert MAPPING_DEFAULTS["timestamp_ntz"] == "timestamp"
@@ -106,7 +106,7 @@ def test_the_example_config_documents_timestamp():
     assert mapping_block(cfg)["timestamp_ntz"] == "timestamp"
 
 
-# ------------------------------------ B12: cluster per warehouse, or existing
+# ----------------------------------------- cluster per warehouse, or existing
 
 from migration_config import compute_block  # noqa: E402
 from sizing.warehouse_map import cluster_base_name, propose_all, propose_cluster  # noqa: E402
@@ -204,7 +204,7 @@ def test_the_compute_proposal_says_create_or_existing():
     assert "no cluster is created" in md.lower()
 
 
-# ------------------------------------ B13: approved decisions as engine inputs
+# ----------------------------------------- approved decisions as engine inputs
 
 from migration_config import decisions_block  # noqa: E402
 
@@ -251,7 +251,7 @@ def test_a_dry_run_is_never_refused_by_a_decision(tmp_path):
     assert snowmig.main(argv) == 0
 
 
-# ------------------------- B10/B11 review: a master toggle, and provenance
+# ------------------------------------------ a master toggle, and provenance
 
 def test_the_toggle_is_on_by_default():
     blk = mapping_block({})

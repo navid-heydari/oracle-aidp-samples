@@ -16,7 +16,6 @@ import pathlib
 import sys
 
 import pytest
-import sqlglot
 
 from fake_sql import FakeSql
 from snowflake_source.extract.catalog import build_inventory
@@ -89,6 +88,7 @@ def test_generated_sql_with_comments_and_not_null_parses_as_spark():
                 col("B", "TEXT", "STRING", pos=2)],
                source_metadata={"comment": "a table"}),
         "bronze.PUBLIC.ORDERS")
+    sqlglot = pytest.importorskip("sqlglot", reason="dev-only SQL parse check")
     parsed = sqlglot.parse_one(res.sql, read="spark")
     assert parsed is not None
 
@@ -190,6 +190,7 @@ def test_a_view_comment_is_emitted_and_its_body_still_extracts():
     res = build_create_view(rec, "bronze.PUBLIC.V", {})
     assert "COMMENT 'the v AS seen by sales'" in res.sql
     assert res.description == "the v AS seen by sales"
+    sqlglot = pytest.importorskip("sqlglot", reason="dev-only SQL parse check")
     assert sqlglot.parse_one(res.sql, read="spark") is not None
     payload = build_ddl_payload(
         {"inventory": [rec]},

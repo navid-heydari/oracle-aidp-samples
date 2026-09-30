@@ -114,7 +114,7 @@ database this migration covers, now, before anything is created.** Run
 again from S1.
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig catalog \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" catalog \
   --catalog <source_db_lowercased> --config ./snowmig-config.yaml \
   --execute --datalake-ocid <ocid> --workspace <ws> --cluster-id <cluster>
 ```
@@ -142,7 +142,7 @@ accepted alias that `normalize_catalog_type()` translates to `INTERNAL` before
 any call. AIDP's two catalog types are `INTERNAL` and `EXTERNAL`.
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig catalog \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" catalog \
   --catalog <target> --catalog-type standard \
   --execute --datalake-ocid <ocid> --workspace <ws> --cluster-id <cluster>
 ```
@@ -161,7 +161,7 @@ To see what is on the DataLake, and with which types, ask the server rather
 than assuming:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig catalogs \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" catalogs \
   --datalake-ocid <ocid>
 ```
 
@@ -204,7 +204,7 @@ route grows with object count. `--source-mode connector` is the default. Use
 costs before agreeing.
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig run \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" run \
   --datalake-ocid <ocid> --workspace <ws> --job snowmig_00_discover
 ```
 
@@ -221,8 +221,8 @@ the stage board holds everything behind it. Bring the record up to date from
 AIDP — nothing is submitted, cancelled or resubmitted:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig run --job snowmig_01_structure --refresh
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig run --job snowmig_02_copy_sales --run-key <key>  # started from the console
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" run --workspace <ws> --job snowmig_01_structure --refresh
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" run --workspace <ws> --job snowmig_02_copy_sales --run-key <key>  # started from the console
 ```
 
 `--run-key` records a run started from the console, which has no local
@@ -282,21 +282,21 @@ download action, read-only, bytes checked against the size the server
 reports:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig fetch        # default: reports/discovery_manifest.json
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig fetch --path backup-snowflake-migration/reports/DISCOVERY.md
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" fetch        # default: reports/discovery_manifest.json
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" fetch --path backup-snowflake-migration/reports/DISCOVERY.md
 ```
 
 Then bridge it into the shape the planning stages read:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig ingest \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" ingest \
   --manifest ./discovery_manifest.json --database-name <SOURCE_DB> \
   [--semi-structured string] [--timestamp-ntz timestamp]
 
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig plan \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" plan \
   --bronze-catalog-prefix <the INTERNAL catalog created at S4> \
   [--restrictions <file>]
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig ddl
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" ddl
 ```
 
 The prefix is required here. S10 creates each approved target name as it
@@ -365,10 +365,10 @@ two plans up **dated** into `backup/`, and registers the per-schema copy
 workflows (S11):
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig provision --execute --reuse-existing \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" provision --execute --reuse-existing \
   --workspace-name <the S1 name> --plan-label FULL      # before an S9 reduction
 # re-plan with --restrictions, then:
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig provision --execute --reuse-existing \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" provision --execute --reuse-existing \
   --workspace-name <the S1 name> --plan-label REDUCED
 ```
 
@@ -384,7 +384,7 @@ Snowflake, 32-bit in Spark), accepts with a different meaning. A table another
 mode recorded as created is re-checked by a `ddl-plan` run, not skipped.
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig run \
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" run \
   --datalake-ocid <ocid> --workspace <ws> --job snowmig_01_structure
 ```
 
@@ -460,8 +460,8 @@ that cannot be read is reported and does not block.
 scheduled ones:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig jobs              # offline: GENERATED_JOBS.md + notebooks
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig jobs --register   # create them in AIDP, UNSCHEDULED
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" jobs              # offline: GENERATED_JOBS.md + notebooks
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" jobs --register   # create them in AIDP, UNSCHEDULED
 ```
 
 A dynamic table or materialized view the plan migrated as a table snapshot
@@ -486,8 +486,8 @@ The migration cluster exists to run discovery and structure creation. When
 S10 is verified and the run's record is written, release it:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig teardown            # dry run: lists the clusters
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig teardown --execute  # stop them, read back
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" teardown            # dry run: lists the clusters
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" teardown --execute  # stop them, read back
 ```
 
 Only clusters that `provision_result.json` proves this migration **created**
@@ -514,9 +514,9 @@ migration's output and its record.
 (the default, above), and two opt-in scopes:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig teardown --scope credential   # only the Snowflake credential on the workspace
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig teardown --scope all          # UNDO the migration
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig teardown --scope all --include-data  # ...and the INTERNAL catalog with its rows
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" teardown --scope credential   # only the Snowflake credential on the workspace
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" teardown --scope all          # UNDO the migration
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" teardown --scope all --include-data  # ...and the INTERNAL catalog with its rows
 ```
 
 - `--scope credential` deletes `backup-snowflake-migration/plan/<stem>.json`
@@ -543,20 +543,24 @@ there. Say where to find it.
 
 ## Where output goes: one directory, named for what it is
 
-Every stage writes to **`${CLAUDE_PLUGIN_ROOT}/migration-artifacts/`**. One
-directory, inside the plugin folder; nothing is created anywhere else.
+Every stage writes to **`./migration-artifacts/`**, in the working directory
+the command runs from — the user's project, not the plugin folder. One
+directory; nothing is created anywhere else. Run every stage of a migration
+from the same directory.
 
 It persists between commands because the stages chain: `plan` reads the
-`inventory.json` that `assess` wrote. It carries a `README.md` describing each
-file, states that everything in it is regenerable and safe to delete, and is
-gitignored both by the plugin's `.gitignore` and by one of its own, so it stays
-ignored even if copied elsewhere. These files name a real estate's databases,
-schemas, tables and columns — customer data that must never reach a public
-repository.
+`inventory.json` that `assess` wrote. It lives outside the plugin because an
+installed plugin sits in a per-version directory that an update replaces.
+Keep it until the migration is torn down: `provision_result.json` and
+`resources.jsonl` are the record `teardown` works from. It carries a
+`README.md` describing each file and a `.gitignore` of its own, so it is never
+committed from the user's repository. These files name a real estate's
+databases, schemas, tables and columns — customer data that must never reach a
+public repository.
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig assess          # writes there by default
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig clean           # removes it
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" assess          # writes there by default
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" clean           # removes it
 ```
 
 `clean` deletes only that directory. It refuses to touch an `--out-dir` the
@@ -568,8 +572,8 @@ interpreter when it already imports the dependencies, and otherwise builds a
 venv in a temp directory that its `EXIT` trap removes — on success, on
 failure and on interrupt. `bin/snowmig-test` follows the same rule.
 
-Use `--out-dir` only when the user wants artifacts kept somewhere they chose —
-a migration whose record must outlive the plugin folder, for instance.
+Use `--out-dir` only when the user wants artifacts kept somewhere they chose.
+Any directory it creates, or finds empty, also gets its own `.gitignore`.
 
 ## Rules that apply at every step
 
@@ -633,7 +637,9 @@ a migration whose record must outlive the plugin folder, for instance.
 
 6. **Dry-run is the default; approval does not carry.** Nothing is created on
    AIDP without `--execute`, a resolved destination, and confirmation **in that
-   turn**. A config file holding a destination is not an approval.
+   turn**. A config file holding a destination is not an approval. Two
+   opt-ins write without `--execute` — `jobs --register` and
+   `reporting.publish_each_stage: true` — and need the same confirmation.
 
    AIDP coordinates come from the config's `aidp:` block or a flag, which
    wins. When a value comes from the file the CLI prints `destination from the
@@ -650,7 +656,8 @@ a migration whose record must outlive the plugin folder, for instance.
    user, never an error to retry and never one to pick a winner on. From
    `assess` or `plan` it is an identifier-case or target-name collision:
    show the collisions and stop. From `ddl` it is a column type the target
-   refuses at CREATE TABLE — on a default-assessed estate, `TIMESTAMP_NTZ`:
+   refuses at CREATE TABLE — `TIMESTAMP_NTZ`, when the estate was assessed
+   with `--timestamp-ntz preserve` or `--mapping-defaults off`:
    show the columns stderr and `DDL_PLAN.md` name, and put the remedy
    (`ddl --timestamp-ntz timestamp`, offline, which changes timezone
    semantics) to the user as a decision.
@@ -703,12 +710,13 @@ instead.
 ## Engine
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/snowmig <stage> [...]
+"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" <stage> [...]
 ```
 
-AIDP calls go through the `aidp` CLI when installed, otherwise
-`oci raw-request`. The engine prints which backend it chose and fails loudly if
-neither is present rather than guessing a transport.
+AIDP calls go through `oci raw-request` whenever `oci` is installed;
+workspace files, job cancel and delete, and catalog delete always use the
+`aidp` CLI, so both are needed. The engine prints which backend it chose and
+fails loudly if neither is present rather than guessing a transport.
 
 The in-AIDP data plane is `${CLAUDE_PLUGIN_ROOT}/data-migration-scripts/`:
 `00_discover_snowflake.ipynb`, `01_create_structure.ipynb`,
@@ -717,7 +725,7 @@ The in-AIDP data plane is `${CLAUDE_PLUGIN_ROOT}/data-migration-scripts/`:
 **Everything that runs on AIDP is `.ipynb`; the `.py` files are local only.**
 The `.py` under `${CLAUDE_PLUGIN_ROOT}/engine/dataplane/` — the four stages
 over the shared `snowmig_source.py` — are the sources the notebooks are
-generated from (`${CLAUDE_PLUGIN_ROOT}/bin/snowmig build-notebooks`). Never
+generated from (`"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" build-notebooks`). Never
 hand-edit a generated notebook; a rebuild overwrites it.
 
 ## One thing to raise even when nobody asks

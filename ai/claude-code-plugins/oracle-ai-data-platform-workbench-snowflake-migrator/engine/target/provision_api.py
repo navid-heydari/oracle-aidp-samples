@@ -28,8 +28,8 @@ validation campaign:
     `.../workspaces/{ws}/objects/{path}` with the path **percent-encoded as a
     single segment** (`a%2Fb%2Fc.json`), which returns `204`. Live-verified
     2026-09-19.
-  * **STILL INFERRED** — the per-type cluster-library item payload
-    (assumption B12). Documented envelope, undocumented artifact field.
+  * **STILL INFERRED** — the per-type cluster-library item payload.
+    Documented envelope, undocumented artifact field.
 
 Every command is printed before it runs.
 
@@ -136,7 +136,7 @@ def build_library_items(*, pypi: list[str] = (),
 
     `operation` and `type` are documented; the FIELD CARRYING THE ARTIFACT
     NAME is not (inferred: `package` for PYPI, `path` for WORKSPACE_FILE,
-    `coordinates` for MAVEN). Confirm on the first live run — assumption B12.
+    `coordinates` for MAVEN). Confirm on the first live run.
     """
     items: list[dict] = []
     items += [{"operation": "INSTALL", "type": "PYPI", "package": p}

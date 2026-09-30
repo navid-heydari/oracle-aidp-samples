@@ -63,6 +63,39 @@ def test_append_refuses_to_start_after_an_unfinished_run_of_another_mode(
     assert marker["finished"] is True
 
 
+def test_a_narrower_finished_run_does_not_clear_the_append_guard(
+        monkeypatch, tmp_path, capsys):
+    tables, lake, statements = _estate(6)
+    spark = _Dies(FakeSnowflake(tables), lake, kill="T003")
+    reports, config = _files(tmp_path, statements, _NAMES)
+    _inject_spark(monkeypatch, spark)
+    with pytest.raises(_Killed):
+        _main(reports, config, "--mode", "overwrite", "--parallel", "1")
+    spark.kill = None
+
+    # A finished run over one other table leaves the stopped run's tables
+    # carried forward, unverified: the marker stays unfinished.
+    assert _main(reports, config, "--mode", "overwrite", "--tables", "T005",
+                 "--parallel", "1") == 0
+    marker = json.loads((reports / "copy_report_bulk.json").read_text(
+        encoding="utf-8"))["run"]
+    assert marker["finished"] is False
+    assert "T003" in marker["carried"] and "T005" not in marker["carried"]
+
+    before = {n: _rows(spark, n) for n in _NAMES}
+    capsys.readouterr()
+    assert _main(reports, config, "--mode", "append", "--parallel", "1") == 1
+    cap = capsys.readouterr()
+    assert "Tables at risk" in cap.out + cap.err and "T003" in cap.out + cap.err
+    assert {n: _rows(spark, n) for n in _NAMES} == before
+
+    # A run that covers them finishes the marker.
+    assert _main(reports, config, "--mode", "overwrite", "--parallel", "1") == 0
+    marker = json.loads((reports / "copy_report_bulk.json").read_text(
+        encoding="utf-8"))["run"]
+    assert marker["finished"] is True and "carried" not in marker
+
+
 def test_a_table_named_twice_is_copied_once(monkeypatch, tmp_path):
     tables, lake, statements = _estate(2)
     spark = FakeLakeSpark(FakeSnowflake(tables), lake)
@@ -139,6 +172,18 @@ def test_the_snapshot_count_follows_the_plan():
     planned = _snapshots([mv], {"can_migrate": [
         {"source_identifier": "DB.S.MV", "refresh": {"verdict": "ok"}}]})
     assert [s["source_identifier"] for s in planned] == ["DB.S.MV"]
+
+
+def test_a_snapshot_the_plan_leaves_out_is_still_counted():
+    from report.render import render_translation_map
+    from report.translation_map import build_translation_map
+    mv = {"source_identifier": "DB.S.MV", "object_type": "VIEW",
+          "source_metadata": {"is_materialized": "Y"}, "columns": []}
+    tmap = build_translation_map({"inventory": [mv]}, {"can_migrate": []},
+                                 None)
+    assert tmap["totals"]["table_snapshots"] == 0
+    assert tmap["totals"]["snapshots_not_planned"] == 1
+    assert "**1** more not in the plan" in render_translation_map(tmap)
 
 
 @pytest.mark.parametrize("body", [

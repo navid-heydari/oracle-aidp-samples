@@ -7,7 +7,7 @@ description: Dev mode — run the whole migration pipeline against an emulated S
 Thin wrapper over
 [`snowflake-migrator-demo`](../skills/snowflake-migrator-demo/SKILL.md).
 
-1. Run `${CLAUDE_PLUGIN_ROOT}/bin/snowmig demo --out-dir
+1. Run `"${CLAUDE_PLUGIN_ROOT}/bin/snowmig" demo --out-dir
    ./snowmig_demo`. Nothing to ask the user for. For a larger enterprise
    estate (external/Iceberg/hybrid/event tables, shares, policies,
    container services, replication), add `--estate enterprise` and a separate

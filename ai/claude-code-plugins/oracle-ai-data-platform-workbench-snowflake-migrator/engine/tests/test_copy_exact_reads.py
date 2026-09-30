@@ -16,7 +16,7 @@ connector), probes 1 and 3:
 
 So the copy no longer reads through `read_table`. The approved plan carries
 each column's Snowflake read expression and Spark convert expression
-(`columns` on every TABLE statement, the cross-lane contract K1); the copy
+(`columns` on every TABLE statement); the copy
 sends `SELECT <read_expr> AS "<name>", ... FROM "DB"."SCHEMA"."TABLE"` as
 one pushdown, and inserts `SELECT <convert_expr> AS `<name>`, ...` into the
 target in the target's column order. An older plan with no `columns` falls
@@ -72,7 +72,7 @@ _LAKE = {
     "`lake`.`types`.`T_MIXED`": [("ID", "decimal(38,0)"), ("NAME", "string")],
 }
 
-# The K1 column spec, exactly as the types lane writes it into ddl_plan.json.
+# The column spec, exactly as `ddl` writes it into ddl_plan.json.
 _SPEC = {
     "T_NUM_NEG": [{"name": "N", "target_type": "DECIMAL(38,37)",
                    "read_expr": '"N"::VARCHAR',
@@ -200,7 +200,7 @@ def test_a_target_column_the_spec_does_not_cover_is_read_bare(copy_schema):
     assert out["read"]["bare"] == ["NAME"]
 
 
-# ------------------------------------ round-3 / round-4 guarantees kept
+# ------------------------------------------------- earlier guarantees kept
 
 def test_a_column_added_to_the_source_since_the_plan_is_drift(copy_schema):
     spark = _spark(tables=_estate({
