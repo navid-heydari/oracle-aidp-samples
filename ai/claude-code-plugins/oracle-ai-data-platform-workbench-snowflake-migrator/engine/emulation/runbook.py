@@ -223,7 +223,7 @@ def run_demo(out_dir) -> dict:
     # schemaless generic copy job and no plan push or dated backup.
     plan_files, copy_schemas = plan_push_inputs(out)
     prov = provision(call=None,
-                     workspace_name="SNOWDEMO account — Migração",
+                     workspace_name="SNOWDEMO account — Café Migration",
                      scripts=[dataplane_dir() / st.source for st in STAGES],
                      plan_files=plan_files, copy_schemas=copy_schemas,
                      external_catalog=DEMO_EXTERNAL_CATALOG,

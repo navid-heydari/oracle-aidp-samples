@@ -469,6 +469,16 @@ def _poll(list_fn, display_name: str, delays: tuple[float, ...], *,
     return last, (None if listed_once else error)
 
 
+def _cluster_state(item: dict | None) -> str | None:
+    """A cluster's state, upper-cased, or None when it carries none.
+
+    Clusters report it as `state` (live: CREATING, then ACTIVE), not the
+    `lifecycleState` a workspace carries -- which `is_active` reads, and
+    which reads as ACTIVE when absent, so a CREATING cluster passed it."""
+    value = (item or {}).get("state") or (item or {}).get("lifecycleState")
+    return str(value).upper() if value else None
+
+
 def _key(item: dict, fallback: str) -> str:
     return str(item.get("key") or item.get("id") or fallback)
 
@@ -803,8 +813,12 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                              "verified": verified, "detail": detail})
 
     if not execute:
-        step("workspace", "would ensure", None, ws_name.name)
-        step("cluster", "would ensure", None, cl_name.name)
+        # "create", not "ensure": a taken name halts the --execute run (it
+        # is a collision to resolve) unless --reuse-existing adopts it.
+        step("workspace", "would create" if not reuse_existing
+             else "would create or reuse", None, ws_name.name)
+        step("cluster", "would create" if not reuse_existing
+             else "would create or reuse", None, cl_name.name)
         for target in warehouse_targets:
             if target.get("uses_existing"):
                 step("warehouse-cluster", "would use existing", None,
@@ -979,13 +993,22 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         found, cl_list_error = _poll(
             lambda: call("list_clusters", workspace=ws_key), cl_name.name,
             delays)
+        # Visible is not ready: live (2026-09-29) the cluster read CREATING
+        # a minute after this step said "created, verified". The state is
+        # recorded and said, so nothing downstream reads visible as ACTIVE.
+        state = _cluster_state(found)
+        detail = (f"{cl_name.name}: read_back_failed: {cl_list_error}"
+                  if cl_list_error is not None else cl_name.name)
+        if state and state != "ACTIVE":
+            detail += (f" (state {state} -- not ACTIVE yet; a job submitted "
+                       f"now waits for it)")
         step("cluster", "create_requested" if found is None else "created",
-             found is not None,
-             f"{cl_name.name}: read_back_failed: {cl_list_error}"
-             if cl_list_error is not None else cl_name.name)
+             found is not None, detail)
         if found is not None:
             # When the compute clock started, for the billing report.
             out["cluster"].update(created=True, created_run=stamp)
+            if state:
+                out["cluster"]["state_at_create"] = state
             out["cluster"]["created_at"] = datetime.datetime.now(
                 datetime.timezone.utc).isoformat()
         else:
@@ -1113,10 +1136,19 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         try:
             call("create_ws_folder", workspace=ws_key, path=folder)
         except Exception as exc:
-            # A pre-existing folder may reject the create; existence is
-            # decided by the per-file listing below, so record and continue.
+            text = str(exc)
+            if "409" in text and "already exist" in text.lower():
+                # Every re-push meets its own folders: 409 "Directory already
+                # exists" is the folder being there, not a failure. It was
+                # recorded unconfirmed, with the raw multi-line response in
+                # the table, and the board then flagged a clean push as
+                # "5 not confirmed".
+                step("folder", "exists", True, folder)
+                continue
+            # Any other refusal: existence is decided by the per-file listing
+            # below, so record and continue.
             step("folder", "create_failed_or_exists", None,
-                 f"{folder}: {str(exc)[:120]}")
+                 f"{folder}: {' '.join(text.split())[:160]}")
 
     # The plan goes to plan/ (what S10 reads) AND, dated, to backup/ (runbook
     # S9: the full plan is backed up before scope is reduced, and every plan
@@ -1720,16 +1752,36 @@ def download_ws_file(call: Callable[..., dict], *, workspace: str,
     return {"path": path, "dest": str(dest), "size": len(data)}
 
 
+def _provision_next(res: dict) -> str:
+    """The runbook step that follows this push. It used to say "run the
+    discover job (or the script by hand)" after every push: that skipped the
+    catalogs (S3/S4), offered a hand run the runbook forbids, and was still
+    printed after the plan push, when S10 is next."""
+    tail = " Every run is a human's call; no schedule was created."
+    if res["dry_run"]:
+        return "Next: re-run with `--execute` after reviewing the plan above."
+    if res.get("copy_jobs"):
+        return ("Next: run `snowmig_01_structure` (runbook S10) with "
+                "`snowmig run`. The per-schema copy jobs are registered and "
+                "never run by the migrator: copying rows is the customer's "
+                "decision." + tail)
+    return ("Next: register the catalogs with `snowmig catalog` -- the "
+            "EXTERNAL source (runbook S3), then the INTERNAL target (S4) -- "
+            "and then run the `snowmig_00_discover` job (S6) with "
+            "`snowmig run`." + tail)
+
+
 def render_provision(res: dict) -> str:
     lines = ["# Provisioning — the migration environment inside AIDP", ""]
     if res["dry_run"]:
         lines += ["**DRY RUN — nothing was created.** Re-run with `--execute` "
                   "after reviewing the plan below.", ""]
     lines += [
-        "⚠️ Every REST shape used here follows the documented 20260430 "
-        "contract and is **not yet live-verified** by this plugin; two field "
-        "families (library items, per-task job fields) are inferred and "
-        "called out in `provision_api.py`.",
+        "The workspace, cluster, folder, upload, job and job-delete calls "
+        "here follow the documented 20260430 contract and have run against "
+        "the live API (2026-09-29). Cluster library items are still inferred "
+        "from that contract and are **not live-verified** (see "
+        "`provision_api.py`).",
         "",
         f'Workspace: `{res["workspace"]["name"]}`'
         + (f' (translated from `{res["workspace"]["requested"]}` — '
@@ -1739,6 +1791,20 @@ def render_provision(res: dict) -> str:
         f'Scripts: `{res["scripts_folder"]}` · Plan: `{res["plan_folder"]}` · '
         f'Reports: `{res["reports_folder"]}`',
         ""]
+    ws_key = (res.get("workspace") or {}).get("key")
+    cl_key = (res.get("cluster") or {}).get("key")
+    if not res["dry_run"] and ws_key and cl_key:
+        # The keys are what every later command needs, and they are not the
+        # display names above. They used to be only in provision_result.json
+        # (the steps table showed them only with --reuse-existing).
+        lines += [
+            "## Hand-off — the keys every later command needs", "",
+            "| | Key |", "|---|---|",
+            f"| workspace | `{ws_key}` |", f"| cluster | `{cl_key}` |", "",
+            f"Pass `--workspace {ws_key} --cluster-id {cl_key}` on each later "
+            "command, or put them under `aidp.workspace` / `aidp.cluster_id` "
+            "in the config -- one or the other. They are never read from "
+            "this record implicitly.", ""]
 
     if res.get("warehouse_clusters"):
         lines += ["## Snowflake warehouses → AIDP compute clusters", "",
@@ -1879,8 +1945,11 @@ def render_provision(res: dict) -> str:
         "| Step | Action | Verified | Detail |", "|---|---|---|---|"]
     for s in res["steps"]:
         verified = {True: "yes", False: "**no**", None: "—"}[s["verified"]]
+        # One line per cell: a raw CLI error carries newlines and pipes, and
+        # either one breaks the table it lands in.
+        detail = " ".join(str(s["detail"] or "").split()).replace("|", "\\|")
         lines.append(f'| {s["step"]} | {s["action"]} | {verified} | '
-                     f'{s["detail"]} |')
+                     f'{detail} |')
     lines += [
         "",
         "Pending is pending: `create_requested` means the API accepted the "
@@ -1889,8 +1958,6 @@ def render_provision(res: dict) -> str:
         "detail means the listing itself errored: the object may well exist, "
         "it just could not be looked at.",
         "",
-        "Next: run the `snowmig_00_discover` job (or the script by hand), "
-        "then structure, then copy schema-by-schema, then reconcile. Every "
-        "run is a human's call; no schedule was created.",
+        _provision_next(res),
         ""]
     return "\n".join(lines)

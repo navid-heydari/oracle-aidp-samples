@@ -50,6 +50,7 @@ import datetime
 import json
 import os
 import pathlib
+import re
 import sys
 import tempfile
 
@@ -181,8 +182,8 @@ def _refuse_dry_run_overwrite(out_dir: pathlib.Path, name: str,
     print(f"error: {out_dir / name} records an EXECUTED {stage} run "
           f"(dry_run: false). A dry run would overwrite the only local "
           f"evidence of what was created and verified, so it was not written. "
-          f"Re-run with --execute to continue that run, or pass a different "
-          f"--out-dir for a rehearsal.", file=sys.stderr)
+          f"Re-run with --execute to apply it to the same target, or pass a "
+          f"different --out-dir for a rehearsal.", file=sys.stderr)
     return 1
 
 
@@ -930,9 +931,14 @@ def cmd_plan(args) -> int:
     else:
         state = f'UNDECIDED — {len(decision["options"])} options presented'
     print(f"  architecture: {state}")
+    # A restriction's exclusion is the operator's scope, not an object that
+    # cannot move; the line said "998 cannot move" for a 4-table canary.
+    scoped_out = (s.get("cannot_by_category") or {}).get("restriction", 0)
+    rest = s["cannot_migrate"] - scoped_out
     print(f'  planned {s["can_migrate"]} object(s) '
           f'({s["tables"]} table, {s["views"]} view); '
-          f'{s["cannot_migrate"]} cannot move')
+          + (f'{scoped_out} left out by restrictions; ' if scoped_out else "")
+          + f'{rest} cannot move')
     return 0
 
 
@@ -1126,11 +1132,22 @@ def cmd_run(args) -> int:
             "--datalake-ocid.")
     args.workspace = coords["workspace"]
     if not args.workspace:
+        # Named, never used: a record in this out dir may be another
+        # migration's, and a stale record must not redirect a job run.
+        prov = (_read(out, "provision_result.json")
+                if _executed_record_exists(out, "provision_result.json")
+                else None) or {}
+        recorded = (prov.get("workspace") or {}).get("key")
         raise MissingTarget(
             "run needs the workspace: a job run belongs to one workspace. "
-            "Put its key under `aidp.workspace` in the config (provision "
-            "records it as workspace.key in provision_result.json), or pass "
-            "--workspace.")
+            "Put its key under `aidp.workspace` in the config, or pass "
+            "--workspace."
+            + (f" provision_result.json here records workspace "
+               f"{(prov.get('workspace') or {}).get('name')} with key "
+               f"{recorded} -- pass --workspace {recorded} if that is this "
+               f"migration's." if recorded else
+               " provision records it as workspace.key in "
+               "provision_result.json."))
 
     parameters = {}
     for pair in (args.param or []):
@@ -1286,6 +1303,18 @@ def cmd_run(args) -> int:
     def _on_submit(run_key: str) -> None:
         submitted.append(run_key)
         print(f"  submitted: run {run_key}", flush=True)
+        # Recorded the moment it exists, as RUNNING. The record used to be
+        # written only when the watch ended, so for the whole run the board
+        # said NOT_RUN and offered this stage -- and `deploy` -- as
+        # unblocked: an invitation to a second, concurrent write (live,
+        # 2026-09-29, during the structure job).
+        _record({"run_key": run_key, "status": "RUNNING",
+                 "message": "submitted; snowmig run is watching it",
+                 "output": "", "terminal": False, "restarts": [],
+                 "polls": 0, "unrecognised": False,
+                 "status_unreadable": False, "cancel_unconfirmed": False,
+                 "ok": False, "watching": True,
+                 "task_parameters_check": task_check})
 
     slug = (args.job or job_key).replace("/", "_")
 
@@ -1298,6 +1327,7 @@ def cmd_run(args) -> int:
         _write(out, f"run_{slug}.json", result)
         _write(out, f"RUN_{slug}.md", _render_run(result))
 
+    task_check = None
     refreshing = bool(getattr(args, "refresh", False)
                       or getattr(args, "run_key", None))
     if refreshing:
@@ -1331,8 +1361,8 @@ def cmd_run(args) -> int:
             datetime.timezone.utc).isoformat()
     else:
         result = None
-        _check_task_parameters(call, workspace=args.workspace,
-                               job_key=job_key, job=args.job)
+        task_check = _check_task_parameters(call, workspace=args.workspace,
+                                            job_key=job_key, job=args.job)
     try:
         if result is None:
             result = watch_job(call, workspace=args.workspace, job_key=job_key,
@@ -1361,6 +1391,8 @@ def cmd_run(args) -> int:
               f"until it has ended. The record is RUN_{slug}.md.",
               file=sys.stderr)
         return 1
+    if task_check is not None:
+        result.setdefault("task_parameters_check", task_check)
     _record(result)
 
     from report.stages import run_case
@@ -1457,6 +1489,12 @@ def _check_task_parameters(call, *, workspace: str, job_key: str,
     after the start-up. Both are refused here with what was meant. When the
     job definition cannot be read, or carries no task parameters, nothing
     is refused and that is said: not checked is not "checked and fine".
+
+    Returns what was established, for the run record ({"checked": bool,
+    "parameters" | "reason"}), or None for a job that is not a stage job.
+    A check that passed used to print nothing, and one that could not read
+    the parameter list returned silently -- the very case this docstring
+    promised to name.
     """
     import difflib
     from target.provisioning import COPY_JOB_PREFIX, _listed_task_parameters
@@ -1468,14 +1506,29 @@ def _check_task_parameters(call, *, workspace: str, job_key: str,
     if stage is None:
         return
     try:
-        params = _listed_task_parameters(
-            call("get_job", workspace=workspace, job_key=job_key) or {})
+        job_def = call("get_job", workspace=workspace,
+                       job_key=job_key) or {}
+        params = _listed_task_parameters(job_def)
+        tasks = job_def.get("tasks")
+        if (params is None and isinstance(tasks, list) and tasks
+                and isinstance(tasks[0], dict)
+                and tasks[0].get("parameters") is None):
+            # Live (2026-09-29): a task with no parameters answers
+            # `parameters: null` -- none, not unreadable.
+            params = {}
     except Exception as exc:
-        print(f"  task parameters NOT checked: the job definition could not "
-              f"be read ({str(exc)[:160]})", file=sys.stderr)
-        return
+        reason = f"the job definition could not be read ({str(exc)[:160]})"
+        print(f"  task parameters NOT checked: {reason}", file=sys.stderr)
+        return {"checked": False, "reason": reason}
+    if params is None:
+        reason = ("the job definition carries no readable task parameter "
+                  "list (tasks[0].parameters)")
+        print(f"  task parameters NOT checked: {reason}", file=sys.stderr)
+        return {"checked": False, "reason": reason}
     if not params:
-        return
+        print(f"  task parameters: none on the job's task; the "
+              f"{stage.key} stage runs on its PARAMS defaults")
+        return {"checked": True, "parameters": {}}
     canonical = {sp: name for name in stage.params
                  for sp in param_spellings(name)}
     unknown, bad = [], []
@@ -1502,6 +1555,10 @@ def _check_task_parameters(call, *, workspace: str, job_key: str,
               f"{', '.join(sorted(stage.params))}. Fix the job's task "
               f"parameters in the console (or re-run provision), then run "
               f"again.")
+    shown = ", ".join(f"{k}={v}" for k, v in sorted(params.items()))
+    print(f"  task parameters checked: {shown} -- each read by the "
+          f"{stage.key} stage")
+    return {"checked": True, "parameters": dict(params)}
 
 
 def _runs_submitted(result: dict) -> int:
@@ -1573,6 +1630,12 @@ def _render_run(result: dict) -> str:
                    f"and the poll budget ({polls} poll(s)) ran out with it "
                    f"still `{result.get('status')}`. Cancel it by hand and "
                    f"re-run; this is neither success nor failure.")
+    elif case == "still_running" and result.get("watching"):
+        verdict = ("**RUNNING** — submitted, and `snowmig run` is watching "
+                   "it; this record is rewritten when the run ends. If that "
+                   "command was interrupted, bring the record up to date with "
+                   "`snowmig run --job <job> --refresh` -- never start "
+                   "another run meanwhile.")
     elif case == "still_running":
         verdict = (f"**STILL RUNNING** — the poll budget ({polls} poll(s)) "
                    f"ran out with the job still `{result.get('status')}`. "
@@ -1594,8 +1657,18 @@ def _render_run(result: dict) -> str:
         f'| job key | `{result.get("job_key")}` |',
         f'| run key | `{result.get("run_key")}` |',
         f'| status | `{result.get("status")}` |',
-        "",
     ]
+    check = result.get("task_parameters_check")
+    if isinstance(check, dict):
+        if not check.get("checked"):
+            seen = f'NOT checked — {check.get("reason")}'
+        elif check.get("parameters"):
+            seen = "checked before submitting — " + ", ".join(
+                f"`{k}={v}`" for k, v in sorted(check["parameters"].items()))
+        else:
+            seen = "checked before submitting — none on the task"
+        lines.append(f"| task parameters | {seen} |")
+    lines.append("")
     if result.get("parameters"):
         lines += ["Parameters:", ""]
         lines += [f'- `{k}` = `{v}`' for k, v in result["parameters"].items()]
@@ -1635,6 +1708,24 @@ def _render_run(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _catalog_record_names(name: str) -> tuple[str, str]:
+    """The per-catalog record files: catalog_result_<name>.json, CATALOG_<name>.md."""
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("_") or "catalog"
+    return f"catalog_result_{slug}.json", f"CATALOG_{slug}.md"
+
+
+def _catalog_summary(res: dict) -> dict:
+    """What the board and the next catalog run carry of one executed catalog."""
+    test = res.get("test_connection") or {}
+    return {"catalog": res.get("catalog"),
+            "catalog_type": res.get("catalog_type"),
+            "action": res.get("action"), "key": res.get("key"),
+            "verified": res.get("verified"),
+            "test_connection": ({"status": test.get("status"),
+                                 "error": test.get("error")}
+                                if test else None)}
+
+
 def cmd_catalog(args) -> int:
     """Register the target catalog. EXTERNAL/SNOWFLAKE by default.
 
@@ -1670,7 +1761,10 @@ def cmd_catalog(args) -> int:
     if config_path:
         block = snowflake_block(_load_migration_config(args))
         connection = build_snowflake_connection_details(block)
-        if block.get("schema"):
+        # Only an EXTERNAL registration reads the Snowflake block; the note
+        # was printed for the INTERNAL container too (S4), where no part of
+        # the connection is used at all.
+        if block.get("schema") and catalog_type == "EXTERNAL":
             print(f'  note: `schema: {block["schema"]}` is not used here — an '
                   f'EXTERNAL catalog registers the whole database '
                   f'({block.get("database")}). It scopes the source side.')
@@ -1691,8 +1785,19 @@ def cmd_catalog(args) -> int:
             f"`aidp.{key}:` in {config_path or 'the migration config'}")
     name = str(name).strip()
 
+    # S3 (EXTERNAL) and S4 (INTERNAL) are two runs of this one stage. Each
+    # catalog keeps its own record, catalog_result_<name>.json and
+    # CATALOG_<name>.md; catalog_result.json is the latest EXECUTED one and
+    # carries `catalogs_recorded`, every catalog registered so far. With one
+    # shared file, the S4 dry run was refused (the S3 record is evidence)
+    # and the S4 --execute then overwrote that evidence (live, 2026-09-29).
+    own_json, own_md = _catalog_record_names(name)
+    latest = _read(out, "catalog_result.json") \
+        if _executed_record_exists(out, "catalog_result.json") else None
     if not args.execute:
-        if _executed_record_exists(out, "catalog_result.json"):
+        if _executed_record_exists(out, own_json):
+            return _refuse_dry_run_overwrite(out, own_json, "catalog")
+        if latest is not None and latest.get("catalog") == name:
             return _refuse_dry_run_overwrite(out, "catalog_result.json",
                                              "catalog")
         result = {"dry_run": True, "catalog": name,
@@ -1760,10 +1865,22 @@ def cmd_catalog(args) -> int:
               + (f' — {outcome.get("error")}' if outcome.get("error") else "")
               + (f' — {outcome.get("note")}' if outcome.get("note") else ""))
 
-    _write(out, "catalog_result.json", result)
-    _write(out, "CATALOG.md", render_catalog(result))
-    # catalog_result.json is overwritten per catalog, so the ledger is the
-    # record of every catalog this migration allocated (for billing).
+    if args.execute:
+        recorded = [c for c in ((latest or {}).get("catalogs_recorded")
+                                or ([_catalog_summary(latest)] if latest
+                                    else []))
+                    if c.get("catalog") != name]
+        result["catalogs_recorded"] = recorded + [_catalog_summary(result)]
+    _write(out, own_json, result)
+    _write(out, own_md, render_catalog(result))
+    if args.execute or latest is None:
+        _write(out, "catalog_result.json", result)
+        _write(out, "CATALOG.md", render_catalog(result))
+    else:
+        print(f"  note: catalog_result.json keeps the executed record of "
+              f"{latest.get('catalog')}; this dry run is in {own_json}")
+    # The per-catalog records keep each report; the ledger is the record of
+    # every catalog this migration allocated (for billing).
     if args.execute and result.get("action") in ("created", "reused"):
         from report.resources import record_resource
         record_resource(out, stage="catalog", kind="catalog",
@@ -1801,7 +1918,7 @@ def _target_coords(args) -> dict:
     where `_aidp_from_config` prints what it contributed.
     """
     block = _aidp_from_config(args)
-    return {
+    coords = {
         "datalake_ocid": (getattr(args, "datalake_ocid", None)
                           or block.get("datalake_ocid")),
         "workspace": getattr(args, "workspace", None) or block.get("workspace"),
@@ -1809,6 +1926,16 @@ def _target_coords(args) -> dict:
                        or block.get("cluster_id")),
         "catalog": getattr(args, "catalog", None) or block.get("catalog"),
     }
+    # The config's contribution is announced by _aidp_from_config; a value
+    # given as a flag was not shown anywhere, so the operator never saw the
+    # whole destination before an --execute (runbook rule 6).
+    flagged = {k: v for k, v in coords.items()
+               if v and getattr(args, k, None)}
+    if flagged and not getattr(args, "_flags_announced", False):
+        print("  destination from flags: "
+              + ", ".join(f"{k}={v}" for k, v in sorted(flagged.items())))
+        args._flags_announced = True
+    return coords
 
 
 def _optional_target(args):
@@ -2430,9 +2557,32 @@ def cmd_provision(args) -> int:
         return _refuse_dry_run_overwrite(out, "provision_result.json",
                                          "provision")
 
+    # The cluster name: the flag, else -- on a --reuse-existing re-push into
+    # the workspace the earlier executed record names, on the same
+    # aiDataPlatform -- the name that push used, else the default. Without
+    # this, the documented plan push (`--reuse-existing --workspace-name`,
+    # no --cluster-name) after an S1 run with --cluster-name looked for
+    # `migration_assets`, did not find it, and CREATED a second cluster and
+    # bound the jobs to it.
+    cluster_name = args.cluster_name
+    if not cluster_name and args.reuse_existing and earlier:
+        from target.naming import translate_name
+        same_ws = ((earlier.get("workspace") or {}).get("name")
+                   == translate_name(args.workspace_name,
+                                     kind="workspace").name)
+        same_lake = (not earlier.get("datalake_ocid") or not ocid
+                     or earlier.get("datalake_ocid") == ocid)
+        prior_cluster = (earlier.get("cluster") or {})
+        if same_ws and same_lake and prior_cluster.get("name"):
+            cluster_name = (prior_cluster.get("requested")
+                            or prior_cluster["name"])
+            print(f"  cluster name taken from provision_result.json: "
+                  f"{prior_cluster['name']} (pass --cluster-name to "
+                  f"override)")
     res = provision(
         call=call, workspace_name=args.workspace_name,
-        cluster_name=args.cluster_name, scripts=list(scripts),
+        cluster_name=cluster_name or "migration-assets",
+        scripts=list(scripts),
         stage_params=stage_params,
         plan_files=plan_files, requirements=requirements,
         maven=args.maven or [], external_catalog=external_catalog,
@@ -2502,6 +2652,12 @@ def cmd_provision(args) -> int:
     else:
         print(f'  provision: {len(res["steps"])} step(s), '
               f'{len(failed)} failed/unverified')
+        ws_key = (res.get("workspace") or {}).get("key")
+        cl_key = (res.get("cluster") or {}).get("key")
+        if ws_key and cl_key:
+            # The keys every later command needs; the CLI printed neither.
+            print(f"  hand-off: --workspace {ws_key} --cluster-id {cl_key} "
+                  f"(or aidp.workspace / aidp.cluster_id in the config)")
     return 1 if failed else 0
 
 
@@ -2830,7 +2986,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "the simplest safe charset ([a-z0-9_], starts with a "
                          "letter) so it cannot be rejected mid-provisioning; "
                          "the translation is reported")
-    pv.add_argument("--cluster-name", default="migration-assets")
+    pv.add_argument("--cluster-name", default=None,
+                    help="the migration cluster's name (default: "
+                         "migration-assets). A --reuse-existing re-push into "
+                         "the same workspace keeps the name the earlier push "
+                         "recorded")
     pv.add_argument("--warehouse-clusters", action="store_true",
                     help="also create ONE compute cluster per Snowflake "
                          "warehouse, named after it, on the AIDP default "
@@ -3158,6 +3318,7 @@ temporary scratch space:
     plan    -> plan.json         -> PLANNED_OBJECTS.md
     ddl     -> ddl_plan.json     -> DDL_PLAN.md
     catalog -> catalog_result.json -> CATALOG.md
+               (+ catalog_result_<name>.json, CATALOG_<name>.md per catalog)
     ...
 
 The `.json` files are the machine hand-off between stages. The `.md` files

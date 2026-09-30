@@ -10,6 +10,68 @@ first release.
 
 ## [Unreleased]
 
+### Fixed — what the 2026-09-29 live run of 0.26.0 found
+A lab run of the whole runbook (S1-S11, a 4-table plan over a 1000-table
+estate, two schemas copied and reconciled) surfaced these. Evidence and the
+measured copy speed are in GAPS.md (P0 items 8 and 9, "What is actually
+proven").
+- **Stage board follows the runbook.** "Next" walked the laptop-preview order
+  and suggested `assess`, then `maintenance`, after every runbook step. Once a
+  migration is on the runbook (a provision executed, or no laptop assess), it
+  now proposes S1 `provision`, S3/S4 `catalog`, S6, S7, S10 and S12 in order;
+  never the copy (the customer's call); reconcile after a copy.
+- **A running job is RUNNING on the board.** `run` wrote its record only when
+  the watch ended, so during a structure run the board said NOT_RUN and
+  offered `structure-workflow` and `deploy` as unblocked. The record is now
+  written as RUNNING the moment the run is submitted, and the board shows
+  "Waiting on" instead of a next step.
+- **`assess` is not DONE when only `ingest` ran.** Both write
+  `inventory.json`; an inventory built from the in-AIDP manifest now makes
+  `assess` SATISFIED by `ingest`.
+- **S3 and S4 keep separate records.** The two `catalog` runs shared
+  `catalog_result.json`: the S4 dry run was refused (exit 1) after S3 had
+  executed, and the S4 `--execute` then overwrote the S3 record, connection
+  test included. Each catalog now writes `catalog_result_<name>.json` and
+  `CATALOG_<name>.md`; `catalog_result.json` is the latest executed run and
+  lists every catalog registered so far, which the board shows with its
+  connection test.
+- **Catalog report wording.** An EXTERNAL catalog is titled "Source catalog";
+  a connection test that FAILS with an empty reason points at the known
+  platform issue (runbook S3) instead of "fix the credential or role"; the
+  `schema:` note is printed only for an EXTERNAL registration.
+- **A re-push keeps the cluster name.** `--cluster-name` defaulted to
+  `migration-assets` on every push, so the documented plan push after an S1
+  run with a custom name would have created a second cluster and bound the
+  jobs to it. A `--reuse-existing` re-push into the same workspace now keeps
+  the recorded name.
+- **Cluster state is reported.** PROVISION.md said "created, verified" for a
+  cluster the API still reported CREATING: clusters carry `state`, not the
+  `lifecycleState` the workspace check reads.
+- **Hand-off keys are printed.** The workspace and cluster keys every later
+  command needs are printed by the CLI and in a PROVISION.md hand-off block;
+  a flag-given destination is announced like a config-given one; README and
+  runbook now describe the same two routes (flags, or the config).
+- **PROVISION.md.** A folder that already exists (409 on every re-push) is
+  `exists`, not "not confirmed" with a raw multi-line error inside the table;
+  table cells are single-line; "Next" names the step that actually follows
+  (the catalogs after S1, the structure job after the plan push) and no
+  longer offers a hand run; the "not yet live-verified" banner now says what
+  has run live and what (library items) has not; the dry run says "would
+  create".
+- **`run` says what the task-parameter check did.** A pass printed nothing,
+  and an unreadable parameter list returned silently. Both are now printed and
+  recorded in RUN_*.md; a task with `parameters: null` reads as none.
+- **Structure and copy logs.** The structure job no longer prints one line
+  per table outside the plan (996 lines for a 4-table plan); each created and
+  each copied table now logs its elapsed time.
+- **Reconcile: `NOT_IN_PLAN`.** Tables the approved plan leaves out read
+  `NOT_IN_PLAN` instead of `NOT_MIGRATED` ("expected while the migration is
+  still running"); they are not pending under that plan.
+- **Plan summary.** Objects left out by restrictions are reported as such,
+  not as "cannot move", and no longer raise a warning on the board.
+- **English only.** The demo's workspace name and two test fixtures used
+  Portuguese; they now use English with accents to exercise the folding.
+
 ### Changed — faster structure creation, and the follow-ups of the round-4 review
 - **Structure:** one `SHOW TABLES` per schema replaces the failing before-DESCRIBE for tables known to be absent; creates run `--parallel` (default 4) at a time within a schema, each read back on its own; the schema report is written every few seconds and at the end of the schema instead of after every table. `parallel=1` restores one at a time.
 - **Reconcile:** a view the structure report calls created is looked for in the target (SHOW TABLES, SHOW VIEWS, DESCRIBE); absent is `VIEW_MISSING_DESPITE_REPORT` (a problem verdict), unlookable is `TARGET_UNREADABLE`.

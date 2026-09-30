@@ -208,12 +208,22 @@ def pipeline_status(board: dict) -> dict:
         else:
             unblocked.append(r["stage"])
     optional = {r["stage"] for r in rows if r.get("optional")}
+    if board.get("route") == "runbook":
+        # On the runbook the board has already walked its order (S1-S12,
+        # report.stages.RUNBOOK_ROUTE) and knows when the next step is a
+        # job still running -- then there is nothing to start. Re-deciding
+        # here from the preview order is how "Suggested next" kept naming a
+        # laptop stage after the structure job had run.
+        suggested = board.get("next_stage")
+    else:
+        suggested = next((s for s in unblocked if s not in optional),
+                         unblocked[0] if unblocked else None)
     return {
         "total": len(rows),
         "complete": complete,
         "unblocked": unblocked,
         "blocked": blocked,
         "needs_attention": [r["stage"] for r in rows if r.get("attention")],
-        "next": next((s for s in unblocked if s not in optional),
-                     unblocked[0] if unblocked else None),
+        "next": suggested,
+        "waiting_on": board.get("waiting_on"),
     }

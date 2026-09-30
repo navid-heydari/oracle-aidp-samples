@@ -59,9 +59,11 @@ per-stage register is `GAPS.md` → "What is actually proven"; its sentence:
 SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in
 two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
 ran on a cluster from the approved plan, a healthy 23-minute run left alone
-by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
-and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
-authors**. Say so if the user asks whether the copy is proven.
+by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_<schema>`)
+and reconcile (`snowmig_03_reconcile`) jobs ran live on 2026-09-29, on a
+4-table canary across two schemas: 4/4 copied and verified by row count,
+reconcile 4 `MIGRATED_VERIFIED` -- at ~340 s per 10-row table, one table at a
+time, which does not scale as it stands (GAPS P0 item 8). Say so if the user asks whether the copy is proven.
 
 ---
 
@@ -90,6 +92,18 @@ warehouse-equivalent sizing as a separate, explicit decision.
 S1, S2 and S5 are all produced by one `provision` call; they are numbered
 separately because each is a distinct object with its own *may I create* gate,
 not because each needs its own command.
+
+**Hand-off.** `provision --execute` prints the workspace key and the cluster
+key (and records them in `provision_result.json`). Every later command below
+needs them: pass `--workspace <key> --cluster-id <key>`, as the commands in
+this runbook do, or put them under `aidp.workspace` / `aidp.cluster_id` in
+the config -- one or the other, never a mix. They are never read from the
+record implicitly.
+
+**Re-pushing.** A `--reuse-existing` re-push into this workspace (the plan
+push at S9/S10) keeps the cluster name the first push recorded when no
+`--cluster-name` is given, so it re-adopts this migration's cluster instead
+of creating a second one under the default name.
 
 **A workspace reports `ACTIVE` some seconds after its POST returns.** Creating
 the cluster immediately is a race, and losing it is a `409 Conflict — not in
@@ -152,6 +166,13 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig catalog \
 
 The result carries `container_only: true`. Pass that on: the container
 existing must never be reported as the structure existing.
+
+S3 and S4 are two runs of the one `catalog` stage, and each keeps its own
+record -- `catalog_result_<name>.json` and `CATALOG_<name>.md` -- so the
+S4 dry run is allowed after S3 has executed and never overwrites it.
+`catalog_result.json` is the latest executed run and lists every catalog
+registered so far (`catalogs_recorded`), which is what the stage board
+shows, connection test included.
 
 To see what is actually on the DataLake, and with which types, ask the
 server rather than assuming:

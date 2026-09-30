@@ -310,12 +310,20 @@ only), and so is `tables` with two or more copy schemas: the one shared
 
 **Hand-off.** After `--execute`, `provision_result.json` records the
 **workspace key** under `workspace.key` and the **cluster key** under
-`cluster.key`. `PROVISION.md` shows the display names, which are NOT the
-keys (its steps table carries the key only with `--reuse-existing`), and
-the CLI output prints neither. Paste those two values into `aidp.workspace`
-and `aidp.cluster_id` of `snowmig-config.yaml` (the commented lines in the
-template) before the next step — `provision` does not write them back, and
-the next step cannot run without them.
+`cluster.key`, and the CLI and `PROVISION.md` print both in a hand-off
+block. Every later AIDP command needs them, and there are two equivalent
+ways to give them -- pick one and keep to it:
+
+- pass `--workspace <key> --cluster-id <key>` on each command (what the
+  runbook's commands show; the config file stays untouched), or
+- paste them into `aidp.workspace` and `aidp.cluster_id` of
+  `snowmig-config.yaml` (the commented lines in the template).
+
+`provision` does not write them back into the config, and the coordinates
+are never read from `provision_result.json` behind your back: a stale
+record from another migration must not be able to redirect a write. Every
+command prints the destination it resolved, and says for each value
+whether it came from a flag or from the config file.
 
 `--source-config` places the config's `snowflake:` block — and only that
 block, re-serialised as JSON — on the workspace mount as
@@ -356,7 +364,10 @@ container and nothing more:
 bin/snowmig catalog --catalog <internal catalog> --catalog-type standard --execute
 ```
 
-(runbook S4, live-verified). The container is not the structure — its
+(runbook S4, live-verified). Each catalog keeps its own record
+(`catalog_result_<name>.json`, `CATALOG_<name>.md`), so dry-running S4
+after S3 has executed is allowed and leaves the S3 record intact. The
+container is not the structure — its
 schemas and tables are created later, on AIDP compute, by the structure
 workflow at S10, because a control-plane table create can return
 `202 Accepted` and create nothing.
@@ -401,7 +412,7 @@ resumable: a re-run skips what its report already records as done.
 
 **`MIGRATION_REPORT.md` is the deliverable.** A table reads `NOT_MIGRATED`
 when it was never attempted — expected while the migration is still running —
-and only `MISSING_DESPITE_REPORT`, `STRUCTURE_FAILED`, `STRUCTURE_TYPE_DRIFT`,
+and `NOT_IN_PLAN` when the approved plan leaves it out (not pending); only `MISSING_DESPITE_REPORT`, `STRUCTURE_FAILED`, `STRUCTURE_TYPE_DRIFT`,
 `STRUCTURE_ONLY_COPY_FAILED`, `COUNT_DRIFT` (with `--counts`),
 `TARGET_UNREADABLE`, `VIEW_FAILED` or `VIEW_MISSING_DESPITE_REPORT` mean something is wrong (the full status
 vocabulary is in `data-migration-scripts/README.md`). Views are listed there
@@ -686,9 +697,11 @@ proven", and this is its sentence:
 SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in
 two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
 ran on a cluster from the approved plan, a healthy 23-minute run left alone
-by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
-and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
-authors**.
+by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_<schema>`)
+and reconcile (`snowmig_03_reconcile`) jobs ran live on 2026-09-29, on a
+4-table canary across two schemas: 4/4 copied and verified by row count,
+reconcile 4 `MIGRATED_VERIFIED` -- at ~340 s per 10-row table, one table at a
+time, which does not scale as it stands (GAPS P0 item 8).
 
 Not yet proven: anything at full-estate scale (the largest run was one
 schema), the EXTERNAL catalog crawler, the cluster-library item shape.

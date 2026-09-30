@@ -159,9 +159,12 @@ before it is called done; a 2xx is never the claim.
   cluster, reading 1065 relations and 9935 columns in two
   `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
   ran on a cluster from the approved plan, a healthy 23-minute run left alone
-  by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
-  and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
-  authors**. Still unproven: anything at real scale (the largest run was one
+  by the cold-start guard (2026-09-19); the copy
+  (`snowmig_02_copy_<schema>`) and reconcile (`snowmig_03_reconcile`) jobs
+  ran live on 2026-09-29, on a 4-table canary across two schemas: 4/4 copied
+  and verified by row count, reconcile 4 `MIGRATED_VERIFIED` -- at ~340 s
+  per 10-row table, one table at a time, which does not scale as it stands
+  (GAPS P0 item 8). Still unproven: anything at real scale (the largest run was one
   schema), the external catalog's crawl, and the cluster-library item shape.
 - **Job startup dominates small work** — ~5–6 minutes per run, measured. The
   operating unit is a schema; per-table runs are the wrong shape.

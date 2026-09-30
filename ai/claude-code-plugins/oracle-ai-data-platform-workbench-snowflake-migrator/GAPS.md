@@ -87,6 +87,25 @@ first.
    size, largest, smallest, totals per schema — `inventory.json` carries the
    inputs, no stage rolls them up.
 
+8. **The copy does not scale as it stands.** Measured live on 2026-09-29
+   (two per-schema copy jobs, two tables each): ~340 s per table for
+   10-11-row tables, one table at a time, plus ~110 s per table for the
+   source count after the batched count failed with `CONNECTOR_0099` -- about
+   7.5 minutes a table. A 1000-table estate would take ~125 hours of copy
+   jobs. Row volume is not the cost; the per-table connector round trips
+   are. Before a real copy: find where the per-table time goes (each read
+   through the connector, the count queries, the verify), make the batched
+   count work, and copy several tables at a time. The per-table elapsed time
+   is now in the copy log and in the structure log.
+
+9. **The Snowflake credential placed on the workspace has no command to
+   remove it.** `provision --source-config` uploads
+   `backup-snowflake-migration/plan/<stem>.json` (the `snowflake:` block,
+   secret included) and says to remove it when the migration is done, but no
+   stage removes it -- `teardown` keeps the workspace and everything in it.
+   Today it is removed in the console. A `teardown --remove-credential`
+   (dry run by default, read back gone) is the missing piece.
+
 ### Behaviour changed in this pass
 
 - **Never reuse.** `provision(reuse_existing=False)` is the default: a
@@ -135,9 +154,11 @@ skill repeat the sentence below and point here rather than keeping their own.
 SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in
 two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
 ran on a cluster from the approved plan, a healthy 23-minute run left alone
-by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
-and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
-authors**.
+by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_<schema>`)
+and reconcile (`snowmig_03_reconcile`) jobs ran live on 2026-09-29, on a
+4-table canary across two schemas: 4/4 copied and verified by row count,
+reconcile 4 `MIGRATED_VERIFIED` -- at ~340 s per 10-row table, one table at a
+time, which does not scale as it stands (GAPS P0 item 8).
 
 | Surface | Status |
 |---|---|
@@ -154,9 +175,9 @@ authors**.
 | Provisioning (workspace/cluster reuse, folder tree, uploads, jobs) | **Live-verified end to end, exit 0** — via the `workspace-object` surface; the Jupyter contents API on that build 200s on PUT and then 404/500s on read-back, and cannot create directories |
 | Jobs | **Live-verified**: creation, run and output fetch for NOTEBOOK_TASK (driver notebooks). PYTHON_TASK is accepted at creation and fails every run resolving the file; job `parameters` reach the notebook neither as argv nor env — but that probe never tried the platform route: a NOTEBOOK_TASK's `parameters` ARE read in the notebook with `oidlUtils.parameters.getParameter` (live-verified 2026-09-29), which every stage notebook now does over its PARAMS literals. `/Workspace` mount on cluster FS probed and confirmed |
 | Data plane: `00_discover` | **Live-verified** — ran to SUCCESS as a job on a migration cluster: 11 schemas / 1065 relations / 9935 columns in two `INFORMATION_SCHEMA` queries |
-| Data plane: `01_create_structure` | **Live-verified** in `ddl-plan` mode from the approved plan (2026-09-19, a healthy 23-minute run); `ctas` mode is not scale-tested (14a) |
-| Data plane: `02_copy_schema` | **Not yet confirmed by the authors.** The data-plane README described a five-table copy verified by counts and decimal sums (2026-09-16); the 0.25.0 changelog (2026-09-19) says the copy had not executed. Until the person who ran the cluster jobs states which is right, treat the copy as unproven and canary one small schema first |
-| Data plane: `03_reconcile` | **Not yet confirmed by the authors.** No run outcome (PASS/FAIL) is recorded anywhere in the repository |
+| Data plane: `01_create_structure` | **Live-verified** in `ddl-plan` mode from the approved plan (2026-09-19, a healthy 23-minute run; 2026-09-29, 0.26.0 with `--parallel` 4: 4 tables in 2 schemas, a 76 s task, no metastore concurrency error -- too small to measure per-table speed at scale); `ctas` mode is not scale-tested (14a) |
+| Data plane: `02_copy_schema` | **Live-verified, slow** (2026-09-29): one job per schema, `schema` passed as a task parameter and read in the notebook; 2 schemas x 2 tables copied and verified by row count (10-11 rows each). ~340 s per table, one table at a time, plus ~110 s per table for the source count once the batched count failed (`CONNECTOR_0099`) -- see P0 item 8. Decimal sums (`--verify counts+sums`) not exercised |
+| Data plane: `03_reconcile` | **Live-verified** (2026-09-29): 4 `MIGRATED_VERIFIED`, 2 `VIEW_NOT_IN_PLAN`, in a 55 s job; the 996 tables the plan left out now read `NOT_IN_PLAN` (they read `NOT_MIGRATED`, "expected while the migration is still running") |
 | Not yet proven | Anything at full-estate scale (the largest run was one schema); the EXTERNAL catalog crawler (B16); the cluster-library item shape (B12); `NUMBER(p,s)` through a Parquet/Delta round trip |
 | **AIDP Snowflake connector** as the source | **Live-verified** — read a table and ran pushdown from the cluster with no extra library. Now the DEFAULT source mode |
 | EXTERNAL catalog **crawler** | **Fails on the validated deployment** — `CONNECTOR_0067, Login has timed out`, with credentials the connector accepts. Not an FQDN form (both host forms resolve identically and both fail). Suspect: the crawler's network path, which is not the cluster's. Raised as B16 |

@@ -741,8 +741,9 @@ def test_live_status_register_has_one_home_and_one_wording():
     register = gaps.split("## What is actually proven", 1)[1].split("\n## ", 1)[0]
     for stage in ("00_discover", "01_create_structure", "02_copy", "03_reconcile"):
         assert stage in register, stage
-    statement = re.search(r"\*\*What has run live:\*\*.*?not yet confirmed by "
-                          r"the authors\*\*\.", _flat(register))
+    # The sentence ends where the live copy's verdict does (2026-09-29).
+    statement = re.search(r"\*\*What has run live:\*\*.*?does not scale as "
+                          r"it stands \(GAPS P0 item 8\)\.", _flat(register))
     assert statement, "GAPS.md must carry the canonical live-status sentence"
     canonical = statement.group(0)
     for rel in _LIVE_STATUS_DOCS:

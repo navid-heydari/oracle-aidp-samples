@@ -849,7 +849,10 @@ def main(argv: list[str] | None = None) -> int:
                               "either blocked it or it was outside "
                               "the plan's scope. NOT created."}
                 flush.maybe()
-                log(f"{schema}.{name}: not in the approved plan")
+                # Counted, not logged one line each: live, a 4-table plan
+                # over a 1000-table estate printed 996 such lines and buried
+                # the four that mattered. The schema's summary line carries
+                # the count, and its report lists every name.
                 not_in_plan_total += 1
                 continue
             work.append(table)
@@ -858,6 +861,7 @@ def main(argv: list[str] | None = None) -> int:
             """One table's create and read-back: (name, record, outcome).
             Touches no shared state; the caller applies the record."""
             name = table["name"]
+            started = time.monotonic()
             notes: list[str] = []
             tgt_name = (planned_targets.get((schema, name))
                         or (target_schema, name))[1]
@@ -912,7 +916,11 @@ def main(argv: list[str] | None = None) -> int:
                         "there before this run; --mode ctas has no plan "
                         "to compare its layout with, so the layout was "
                         "NOT compared")
-                log(f"{schema}.{name}: {status}")
+                elapsed = time.monotonic() - started
+                entry["elapsed_s"] = round(elapsed, 1)
+                # The elapsed time is what shows a create's real cost (live
+                # ~25 s per table, sequentially): the report had none.
+                log(f"{schema}.{name}: {status} ({elapsed:.1f}s)")
                 return name, entry, ("created" if status in
                                      ("created", "already_existed")
                                      else "other")

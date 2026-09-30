@@ -491,6 +491,18 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
 
     if stage == "plan":
         s = data.get("summary") or {}
+        # An object the operator's restrictions left out is a scope choice
+        # (S9), not a failure to migrate: "4 can migrate, 998 cannot" with a
+        # warning read a 4-table canary as 998 problems.
+        by_cat = s.get("cannot_by_category") or {}
+        scoped_out = by_cat.get("restriction", 0) if isinstance(by_cat, dict) else 0
+        cannot = s.get("cannot_migrate")
+        if isinstance(cannot, int) and scoped_out:
+            rest = cannot - scoped_out
+            text = (f'{s.get("can_migrate", "?")} can migrate, '
+                    f'{scoped_out} left out by restrictions'
+                    + (f', {rest} cannot' if rest else ""))
+            return (text, bool(rest))
         text = (f'{s.get("can_migrate", "?")} can migrate, '
                 f'{s.get("cannot_migrate", "?")} cannot')
         return (text, bool(s.get("cannot_migrate")))
@@ -539,14 +551,35 @@ def _finding(stage: str, data: dict) -> tuple[str, bool]:
             return (f'DRY RUN — {data.get("catalog", "?")} '
                     f'({data.get("catalog_type", "?")}) would be registered; '
                     f'nothing was', False)
-        action = data.get("action", _UNKNOWN)
-        text = (f'{data.get("catalog", "?")} '
-                f'({data.get("catalog_type", "?")}): {action}')
-        if action == "create_requested":
-            # The create was accepted but the catalog never became visible.
-            # Pending is pending; it must not read as success.
-            return (text + " — **requested, never became visible**", True)
-        return (text, False)
+        # Every catalog the migration registered (S3 EXTERNAL, S4 INTERNAL),
+        # not only the last one run: the board used to show just the
+        # INTERNAL container once S4 ran, and never a failed connection test.
+        recorded = data.get("catalogs_recorded") or [data]
+        parts, attention = [], False
+        for c in recorded:
+            action = c.get("action", _UNKNOWN)
+            text = (f'{c.get("catalog", "?")} '
+                    f'({c.get("catalog_type", "?")}): {action}')
+            if action == "create_requested":
+                # The create was accepted but the catalog never became
+                # visible. Pending is pending; it must not read as success.
+                text += " — **requested, never became visible**"
+                attention = True
+            test = c.get("test_connection") or {}
+            status = str(test.get("status") or "").upper()
+            if status and status not in ("SUCCEEDED", "SUCCESS"):
+                reason = str(test.get("error") or "").strip()
+                empty = (not reason or reason.rstrip(":").strip().lower()
+                         in ("test connection failed", "failed"))
+                if status == "FAILED" and empty:
+                    # The known platform issue (runbook S3): shown, and not
+                    # a stop -- the connector proves the credential at S6.
+                    text += ", connection test FAILED with an empty reason"
+                else:
+                    text += f", **connection test {status}**"
+                    attention = True
+            parts.append(text)
+        return ("; ".join(parts), attention)
 
     if stage == "deploy":
         if data.get("dry_run"):
@@ -620,6 +653,61 @@ def _unsatisfied(twin: dict) -> str:
     return f"not satisfied: `{twin['stage']}` {twin['found']}"
 
 
+# The runbook's order (overview skill, S1-S12), for the board's "next" once
+# a migration is on it. The STAGES order is the laptop-preview order, which
+# put `assess` and then `maintenance` first: live (2026-09-29), after every
+# runbook step up to the structure job, the board still suggested a laptop
+# read the runbook says does not count. The copy is deliberately absent: it
+# is the customer's decision and never proposed on their behalf; reconcile
+# is proposed only after a copy has run.
+RUNBOOK_ROUTE = ("provision", "catalog", "discover-workflow", "ingest",
+                 "plan", "ddl", "structure-workflow", "compute")
+
+
+def _inventory_from_ingest(data) -> bool:
+    """inventory.json is written by `assess` (a laptop read) AND by `ingest`
+    (the in-AIDP manifest). Only the first is `assess` having run; reading
+    the second as it made the board say DONE for a stage nobody ran."""
+    session = data.get("session") if isinstance(data, dict) else None
+    return (isinstance(session, dict)
+            and "discovery workflow" in str(session.get("source") or ""))
+
+
+def _route_mode(ran: dict) -> bool:
+    """On the runbook route unless this is a laptop preview: a live `assess`
+    ran and no provision has been executed. With neither, a migration starts
+    at S1 (`provision`)."""
+    prov = ran.get("provision")
+    provisioned = bool(prov and not prov.get("dry_run")
+                       and prov["status"] == "DONE")
+    return provisioned or "assess" not in ran
+
+
+def _route_next(rows: list[dict]) -> tuple[str | None, str | None]:
+    """(next, waiting_on) along RUNBOOK_ROUTE: the first route stage not yet
+    done, or -- when that stage is still running -- nothing to start, and
+    the stage to wait for. Reconcile follows a copy the operator ran."""
+    by = {r["stage"]: r for r in rows}
+    finished = ("DONE", "SATISFIED")
+    for stage in RUNBOOK_ROUTE:
+        row = by.get(stage)
+        if row is None or (row["status"] in finished
+                           and not row.get("dry_run")):
+            continue
+        if row["status"] in ("RUNNING", "PENDING"):
+            return None, stage
+        return stage, None
+    copy, rec = by.get("copy-workflow"), by.get("reconcile-workflow")
+    if copy and copy["status"] in ("RUNNING", "PARTIAL"):
+        return None, "copy-workflow" if copy["status"] == "RUNNING" else None
+    if (copy and copy["status"] == "DONE" and rec
+            and rec["status"] not in finished):
+        if rec["status"] in ("RUNNING", "PENDING"):
+            return None, "reconcile-workflow"
+        return "reconcile-workflow", None
+    return None, None
+
+
 def build_stage_board(out_dir) -> dict:
     out_dir = pathlib.Path(out_dir)
     rows: list[dict] = []
@@ -629,6 +717,8 @@ def build_stage_board(out_dir) -> dict:
     ran = {}
     for spec in STAGES:
         data = _load_stage(out_dir, spec)
+        if spec["stage"] == "assess" and _inventory_from_ingest(data):
+            continue
         if data is not None:
             ran[spec["stage"]] = _done_row(spec, data)
     for spec in STAGES:
@@ -661,7 +751,13 @@ def build_stage_board(out_dir) -> dict:
         # proceeds without it.
         if next_stage is None and not spec.get("optional"):
             next_stage = spec["stage"]
+    route = _route_mode(ran)
+    waiting_on = None
+    if route:
+        next_stage, waiting_on = _route_next(rows)
     return {"out_dir": str(out_dir), "stages": rows, "next_stage": next_stage,
+            "route": "runbook" if route else "preview",
+            "waiting_on": waiting_on,
             "needs_attention": [r["stage"] for r in rows if r["attention"]]}
 
 

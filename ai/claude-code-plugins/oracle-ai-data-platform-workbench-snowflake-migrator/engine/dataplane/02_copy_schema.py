@@ -760,6 +760,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         log(f"{args.schema}.{name}: copying ({args.mode})")
         started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        clock = time.monotonic()
         try:
             result = copy_table(source, args.schema, name, tgt, mode=args.mode,
                                 verify=args.verify,
@@ -811,8 +812,12 @@ def main(argv: list[str] | None = None) -> int:
         report["updated_at"] = datetime.datetime.now(
             datetime.timezone.utc).isoformat()
         path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        # The elapsed time per table is the number that sizes a real copy:
+        # live (2026-09-29) ~340 s for a 10-row table, which the log never
+        # showed -- only the report's two timestamps held it.
         log(f"{args.schema}.{name}: {result['status']} "
-            f"({result.get('target_count', '?')} row(s))")
+            f"({result.get('target_count', '?')} row(s), "
+            f"{time.monotonic() - clock:.0f}s)")
 
     statuses = {}
     for t in report["tables"].values():

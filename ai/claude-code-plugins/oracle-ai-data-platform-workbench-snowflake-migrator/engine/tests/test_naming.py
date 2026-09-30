@@ -18,8 +18,8 @@ def test_spaces_dots_and_hyphens_become_single_underscores():
 
 
 def test_accents_are_folded_not_dropped_silently():
-    t = translate_name("Migração São Paulo")
-    assert t.name == "migracao_sao_paulo"
+    t = translate_name("Café Résumé Zoë")
+    assert t.name == "cafe_resume_zoe"
     assert any("ASCII" in n for n in t.notes)
 
 

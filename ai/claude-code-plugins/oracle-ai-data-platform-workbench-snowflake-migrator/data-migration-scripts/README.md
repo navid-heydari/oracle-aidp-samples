@@ -162,7 +162,8 @@ live catalog)
 | `MIGRATED_VERIFIED` | copy verified, table present (and, with `--counts`, still at the verified row count) | no |
 | `PRESENT_NOT_REVERIFIED` | rows were already there at the source's count; sums not re-checked | no |
 | `STRUCTURE_ONLY` | table present, no copy yet | no |
-| `NOT_MIGRATED` | never attempted, or intentionally not in the plan | no |
+| `NOT_MIGRATED` | never attempted yet (expected while the migration runs schema by schema) | no |
+| `NOT_IN_PLAN` | the approved plan leaves it out (an S9 scope reduction, or a table the engine blocked); the structure report records it `not_in_plan`. Not pending | no |
 | `VIEW_CREATED` | a view the structure job created from the approved plan | no |
 | `VIEW_NOT_IN_PLAN` | a manifest view the approved plan does not carry; NOT created | no |
 | `VIEW_NOT_CREATED_YET` | a planned view not created yet (`--dry-run`) | no |
@@ -274,9 +275,11 @@ sentence, repeated here so this file cannot drift from it:
 SUCCESS on a migration cluster, reading 1065 relations and 9935 columns in
 two `INFORMATION_SCHEMA` queries; the structure job (`snowmig_01_structure`)
 ran on a cluster from the approved plan, a healthy 23-minute run left alone
-by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_schema`)
-and reconcile (`snowmig_03_reconcile`) jobs are **not yet confirmed by the
-authors**.
+by the cold-start guard (2026-09-19); the copy (`snowmig_02_copy_<schema>`)
+and reconcile (`snowmig_03_reconcile`) jobs ran live on 2026-09-29, on a
+4-table canary across two schemas: 4/4 copied and verified by row count,
+reconcile 4 `MIGRATED_VERIFIED` -- at ~340 s per 10-row table, one table at a
+time, which does not scale as it stands (GAPS P0 item 8).
 
 Also live-verified (2026-09-16, a real DataLake and a real Snowflake
 account): the connector read and pushdown; the structure step's refusal of

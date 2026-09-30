@@ -287,8 +287,15 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                 # The CREATE raised. Whether or not something by that name
                 # is there now, nobody has checked it: the operator has to
                 # act, so this is not "never attempted". `not_in_plan` and
-                # `dry_run` stay NOT_MIGRATED -- those are intentional.
+                # `dry_run` are intentional, and not problems.
                 verdict = "STRUCTURE_FAILED"
+            elif not exists and s_status == "not_in_plan":
+                # Left out of the approved plan (an S9 scope reduction, or a
+                # table the engine blocked): not pending. Live (2026-09-29)
+                # a 4-table plan reported its 996 out-of-scope tables as
+                # "not migrated yet -- expected while the migration is still
+                # running", which they never will be under that plan.
+                verdict = "NOT_IN_PLAN"
             elif not exists:
                 verdict = "NOT_MIGRATED"
             elif s_status == "type_drift":
@@ -546,7 +553,12 @@ def main(argv: list[str] | None = None) -> int:
                   and k not in ("MIGRATED_VERIFIED",
                                 "PRESENT_NOT_REVERIFIED",
                                 "VIEW_CREATED", "VIEW_NOT_IN_PLAN",
-                                "VIEW_NOT_CREATED_BY_THIS_PATH"))
+                                "VIEW_NOT_CREATED_BY_THIS_PATH",
+                                "NOT_IN_PLAN"))
+    scoped_out = rec["totals"].get("NOT_IN_PLAN", 0)
+    if scoped_out:
+        log(f"{scoped_out} table(s) are not in the approved plan "
+            f"(NOT_IN_PLAN) -- left out by its scope, not pending.")
     if pending:
         log(f"{pending} table(s) not migrated yet — expected while the "
             f"migration is still running, schema by schema. Not an error.")

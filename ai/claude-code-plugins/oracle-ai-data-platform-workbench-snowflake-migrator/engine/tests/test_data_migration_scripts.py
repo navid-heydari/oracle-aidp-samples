@@ -1337,8 +1337,9 @@ def test_a_structure_create_that_raised_is_a_problem_not_pending(reconcile,
     assert by_name["BAD"]["verdict"] == "STRUCTURE_FAILED"
     assert by_name["BAD"]["reason"].startswith("DataType decimal(45,2)")
     assert by_name["UNTOUCHED"]["verdict"] == "NOT_MIGRATED"
-    assert by_name["SKIPPED"]["verdict"] == "NOT_MIGRATED", \
-        "an intentional engine block is not done yet, not broken"
+    assert by_name["SKIPPED"]["verdict"] == "NOT_IN_PLAN", \
+        "a table the plan leaves out is neither pending nor broken"
+    assert "NOT_IN_PLAN" not in reconcile.PROBLEM_VERDICTS
     assert by_name["GOOD"]["verdict"] == "STRUCTURE_ONLY"
     md = reconcile.render(rec)
     assert "1 object(s) need attention" in md

@@ -481,6 +481,14 @@ def render_planned_objects(plan: dict) -> str:
     return "\n".join(out) + "\n"
 
 
+def _empty_failure_reason(error) -> bool:
+    """A connection-test error that names no reason ("Test connection
+    failed: " and nothing after it)."""
+    text = str(error or "").strip()
+    return not text or text.rstrip(":").strip().lower() in (
+        "test connection failed", "failed")
+
+
 def render_catalog(res: dict) -> str:
     """Report on the target catalog. EXTERNAL registers; it copies nothing."""
     name = res.get("catalog")
@@ -497,7 +505,10 @@ def render_catalog(res: dict) -> str:
                     'Would create the **STANDARD** catalog **container**, and '
                     'nothing inside it — its schemas and tables are created '
                     'on AIDP compute by the structure workflow (runbook S10)')
-        out = [f"# Target catalog `{name}` — DRY RUN", "",
+        # The EXTERNAL catalog is the SOURCE pointer (S3); only the INTERNAL
+        # one is the migration's target (S4).
+        role = "Source" if is_external else "Target"
+        out = [f"# {role} catalog `{name}` — DRY RUN", "",
                f'{headline}; **nothing was created**.', ""]
         if not is_external:
             out += ["A STANDARD catalog is managed storage, so it carries no "
@@ -507,8 +518,8 @@ def render_catalog(res: dict) -> str:
             # The NAMES are what a human checks against their deployment, and
             # they carry no secret; the values never appear.
             out += ["Connection properties that would be sent, by name only "
-                    "(every value comes from the config file, and a "
-                    "credential is a path read at call time):", ""]
+                    "(every value is read from the config file at call time; "
+                    "no value, and no secret, is written here):", ""]
             out += [f"- `{field}`" for field in fields]
             out.append("")
         else:
@@ -525,7 +536,8 @@ def render_catalog(res: dict) -> str:
     source = (f' (source type `{res.get("source_type", "n/a")}`)'
               if kind == "EXTERNAL" else
               " — managed storage, no source")
-    out = [f"# Target catalog `{name}`", "",
+    role = "Source" if kind == "EXTERNAL" else "Target"
+    out = [f"# {role} catalog `{name}`", "",
            f'- Type: **{res.get("catalog_type")}**{source}',
            f'- Action: **{res.get("action")}**',
            f'- Key: `{res.get("key")}`', ""]
@@ -543,8 +555,9 @@ def render_catalog(res: dict) -> str:
 
     if res.get("container_only"):
         # The container existing must never read as the structure existing.
+        note = str(res.get("note") or "")
         out += ["**This is the CONTAINER only — it holds no schemas and no "
-                "tables.** " + str(res.get("note") or ""), ""]
+                "tables.** " + (note[:1].upper() + note[1:]), ""]
     else:
         out += ["An EXTERNAL catalog is a registered, read-only pointer at the "
                 "live Snowflake source. It holds no managed tables of its own "
@@ -561,6 +574,18 @@ def render_catalog(res: dict) -> str:
         if status in ("SUCCEEDED", "SUCCESS"):
             out += [f"**{status}** — the API reached Snowflake with the "
                     f"registered connection details.", ""]
+        elif status == "FAILED" and _empty_failure_reason(test.get("error")):
+            # Live on the validated DataLake: FAILED with an EMPTY reason for
+            # a catalog whose credentials the connector proves at S6 -- a
+            # known platform issue (runbook S3). "Fix the credential" sent
+            # operators chasing a credential that works.
+            out += [f"**{status}** — with an empty reason. This is the known "
+                    "platform issue the runbook describes at S3: keep the "
+                    "registration and move on. Discovery and the copy read "
+                    "Snowflake through the connector, and the discovery job "
+                    "(S6) is what proves the credential. A FAILED test "
+                    "*with* a reason is a real failure; this one gives none.",
+                    ""]
         elif status in ("FAILED", "CANCELED", "CANCELLED"):
             out += [f"**{status}**"
                     + (f" — {test.get('error')}" if test.get("error") else "")
@@ -572,6 +597,18 @@ def render_catalog(res: dict) -> str:
                     + str(test.get("error") or test.get("note")
                           or "the verdict was not read")
                     + ". **PENDING is not a pass.**", ""]
+    recorded = res.get("catalogs_recorded") or []
+    if len(recorded) > 1:
+        # S3 and S4 are two runs of this stage; each keeps its own
+        # CATALOG_<name>.md, and this list says what the migration holds.
+        out += ["## Catalogs this migration has registered", "",
+                "| Catalog | Type | Action | Connection test |",
+                "|---|---|---|---|"]
+        for c in recorded:
+            t = c.get("test_connection") or {}
+            out.append(f'| `{c.get("catalog")}` | {c.get("catalog_type")} | '
+                       f'{c.get("action")} | {t.get("status") or "—"} |')
+        out.append("")
     return "\n".join(out)
 
 
@@ -1893,6 +1930,17 @@ def render_stages(board: dict) -> str:
         out += [f'## Next: `{board["next_stage"]}`', "",
                 next(f'{r["purpose"]}' for r in rows
                      if r["stage"] == board["next_stage"]), ""]
+    elif board.get("waiting_on"):
+        out += [f'## Waiting on `{board["waiting_on"]}`', "",
+                "It is still running (or its state is not established). "
+                "Start nothing that depends on it, and do not start it "
+                "again: wait for it to end, or bring a stale record up to "
+                "date with `snowmig run --job <job> --refresh`.", ""]
+    elif board.get("route") == "runbook":
+        out += ["## The runbook's steps have run", "",
+                "Copying rows (`snowmig_02_copy_<schema>`) is the customer's "
+                "decision and is never proposed here; run `reconcile` after "
+                "any copy.", ""]
     else:
         out += ["## Every stage has run", ""]
 

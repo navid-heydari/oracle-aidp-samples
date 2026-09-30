@@ -118,11 +118,11 @@ def test_a_dry_run_calls_nothing_and_plans_everything(scripts):
 
 def test_the_workspace_name_is_translated_before_any_create(scripts):
     fake = Fake()
-    res = provision(call=fake, workspace_name="Acme PROD — Migração",
+    res = provision(call=fake, workspace_name="Acme PROD — Café Migration",
                     scripts=scripts, execute=True, delays=())
     created = [kw["body"]["displayName"] for op, kw in fake.ops
                if op == "create_workspace"]
-    assert created == ["acme_prod_migracao"]
+    assert created == ["acme_prod_cafe_migration"]
     assert res["workspace"]["renamed"] is True
     assert res["workspace"]["notes"], "a silent rename is not attributable"
 
@@ -369,7 +369,8 @@ def test_the_report_carries_the_unverified_warning():
                     execute=False)
     md = render_provision(res)
     assert "DRY RUN" in md
-    assert "not yet live-verified" in md
+    # What has run live is said, and what has not (library items) still is.
+    assert "not live-verified" in md and "library items" in md
 
 
 # --- provision_api ---------------------------------------------------------
