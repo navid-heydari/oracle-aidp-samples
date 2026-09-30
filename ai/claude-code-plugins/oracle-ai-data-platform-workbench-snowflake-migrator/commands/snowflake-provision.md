@@ -23,4 +23,5 @@ Thin wrapper over
 6. The plan push (S9/S10) re-runs this stage against the same workspace:
    `provision --execute --reuse-existing --workspace-name <the S1 name>
    --plan-label FULL|REDUCED`. Report any copy job listed as `stale` (exit 1)
-   and offer `--delete-stale-copy-jobs` to remove it.
+   and offer `--delete-stale-copy-jobs` to remove it (it removes only a job
+   this migration's records show it created; others stay listed as stale).

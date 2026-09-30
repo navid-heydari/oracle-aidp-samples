@@ -5,6 +5,8 @@ names (and the schemaless generic job) as stale, and deletes nothing: the
 operator used to have to remove them in the console. `aidp workflow
 delete-job` answers 204 live (2026-09-29), so on request provision deletes
 them -- and records a job deleted only once it is gone from the listing.
+Only a job this migration's records show it created is deleted: on a
+reused workspace a `snowmig_02_copy_*` job may be someone else's.
 """
 import pytest
 
@@ -51,11 +53,12 @@ def _push(fake, schemas, **kw):
 
 def _reduced(fake, **kw):
     """First a push without a plan (generic job), then SALES and HR, then
-    a plan reduced to SALES -- the push under test."""
-    provision(call=fake, workspace_name="acme", scripts=[], execute=True,
-              delays=(), copy_schemas=[])
-    _push(fake, ["SALES", "HR"])
-    return _push(fake, ["SALES"], **kw)
+    a plan reduced to SALES -- the push under test. Each push gets the
+    record before it, as `provision` passes provision_result.json."""
+    first = provision(call=fake, workspace_name="acme", scripts=[],
+                      execute=True, delays=(), copy_schemas=[])
+    second = _push(fake, ["SALES", "HR"], prior=first)
+    return _push(fake, ["SALES"], prior=second, **kw)
 
 
 def _jobs(fake):
@@ -121,3 +124,60 @@ def test_a_planned_job_listed_in_another_case_is_not_stale():
     res = _push(fake, ["SALES"], delete_stale_copy_jobs=True)
     assert res["stale_copy_jobs"] == []
     assert fake.deleted == []
+
+
+def test_a_stale_job_this_migration_did_not_create_is_left_alone():
+    """Someone else's copy job on the reused workspace matches the prefix
+    and is in no plan of ours; it is reported, never deleted."""
+    fake = Deletes()
+    first = _push(fake, ["SALES"])
+    fake.jobs.append({"key": "theirs-1", "name": "snowmig_02_copy_finance",
+                      "displayName": "snowmig_02_copy_finance"})
+    res = _push(fake, ["SALES"], prior=first, delete_stale_copy_jobs=True)
+    assert fake.deleted == []
+    assert "snowmig_02_copy_finance" in _jobs(fake)
+    assert res["stale_copy_jobs"] == ["snowmig_02_copy_finance"]
+    stale = [s for s in res["steps"] if s["action"] == "stale"]
+    assert stale and "NOT deleted" in stale[0]["detail"]
+
+
+def test_without_an_earlier_record_nothing_is_ours_to_delete():
+    fake = Deletes()
+    _push(fake, ["SALES", "HR"])
+    res = _push(fake, ["SALES"], delete_stale_copy_jobs=True)
+    assert fake.deleted == []
+    assert res["deleted_copy_jobs"] == []
+
+
+def test_ownership_survives_a_re_push_that_records_the_job_reused():
+    """Push 2 finds HR and records it `reused`; push 3 must still know
+    push 1 created it."""
+    fake = Deletes()
+    first = _push(fake, ["SALES", "HR"])
+    second = _push(fake, ["SALES", "HR"], prior=first)
+    assert not [s for s in second["steps"]
+                if s["action"] == "created" and s["step"] == "job"]
+    assert "snowmig_02_copy_hr" in {e["name"] for e in second["created_jobs"]}
+    res = _push(fake, ["SALES"], prior=second, delete_stale_copy_jobs=True)
+    assert res["deleted_copy_jobs"] == ["snowmig_02_copy_hr"]
+    assert "snowmig_02_copy_hr" not in {e["name"] for e in res["created_jobs"]}
+
+
+def test_a_recreated_job_under_our_name_but_another_key_is_not_ours():
+    fake = Deletes()
+    first = _push(fake, ["SALES", "HR"])
+    for job in fake.jobs:
+        if job["name"] == "snowmig_02_copy_hr":
+            job["key"] = "someone-elses-key"
+    res = _push(fake, ["SALES"], prior=first, delete_stale_copy_jobs=True)
+    assert fake.deleted == []
+    assert "snowmig_02_copy_hr" in _jobs(fake)
+
+
+def test_a_record_of_another_workspace_proves_nothing():
+    fake = Deletes()
+    first = _push(fake, ["SALES", "HR"])
+    other = {**first, "workspace": {**first["workspace"], "key": "ws-other"}}
+    res = _push(fake, ["SALES"], prior=other, delete_stale_copy_jobs=True)
+    assert fake.deleted == []
+    assert res["created_jobs"] == []

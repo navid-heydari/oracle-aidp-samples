@@ -29,7 +29,7 @@ import re
 from dataclasses import asdict, dataclass, field
 
 from snowflake_source.dialect import lexer
-from snowflake_source.dialect.types import copy_expressions
+from snowflake_source.dialect.types import copy_expressions, source_type_key
 from snowflake_source.dialect.views import (  # noqa: F401  (re-exported)
     detect_unsupported_constructs, extract_view_body, extract_view_columns,
     translate_view_body,
@@ -534,12 +534,15 @@ def copy_spec(columns: list[dict], *, geospatial: str | None = None
               ) -> list[dict]:
     """The per-column copy spec (contract K1), one entry per column in order.
 
-    `{name, target_type, read_expr, convert_expr}`: the copy stage selects
-    every `read_expr AS "<name>"` in ONE qualified pushdown and inserts
-    `convert_expr AS `<name>`` by name. The expressions come from the same
-    module as the type mapping (`copy_expressions`), so the read is always
-    the one the mapped `target_type` was decided for; `geospatial` is the
-    inventory's recorded mode, which decides WKT versus GeoJSON.
+    `{name, source_type, target_type, read_expr, convert_expr}`: the copy
+    stage selects every `read_expr AS "<name>"` in ONE qualified pushdown
+    and inserts `convert_expr AS `<name>`` by name. The expressions come
+    from the same module as the type mapping (`copy_expressions`), so the
+    read is always the one the mapped `target_type` was decided for;
+    `geospatial` is the inventory's recorded mode, which decides WKT versus
+    GeoJSON. `source_type` is the type those expressions were decided FOR:
+    the copy compares it with the live source and does not run a
+    conversion planned for a type the column no longer has.
     """
     out = []
     for c in columns:
@@ -548,7 +551,11 @@ def copy_spec(columns: list[dict], *, geospatial: str | None = None
             type_detail=c.get("type_detail"),
             datetime_precision=c.get("DATETIME_PRECISION"),
             geospatial=geospatial)
-        out.append({"name": c["COLUMN_NAME"], "target_type": c["target_type"],
+        out.append({"name": c["COLUMN_NAME"],
+                    "source_type": source_type_key(
+                        c.get("DATA_TYPE"), c.get("NUMERIC_PRECISION"),
+                        c.get("NUMERIC_SCALE")),
+                    "target_type": c["target_type"],
                     "read_expr": read, "convert_expr": convert})
     return out
 

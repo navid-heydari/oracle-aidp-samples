@@ -275,6 +275,13 @@ bin/snowmig catalog --catalog <internal catalog> --catalog-type standard --execu
 `standard` is the CLI's name for AIDP's `INTERNAL` catalog type. Each catalog
 keeps its own record (`catalog_result_<name>.json`, `CATALOG_<name>.md`), so
 dry-running S4 after S3 has executed leaves the S3 record intact.
+
+A catalog that already carries the name (in any case) is reused only when
+the resource ledger (`resources.jsonl`) records this migration creating it
+on this DataLake — re-running `catalog --execute` is safe — or when you pass
+`--reuse-existing`. Otherwise the stage refuses it, exit 1, and nothing is
+written into it. A catalog of the other type (an INTERNAL one where the
+EXTERNAL registration was asked for, or the reverse) is refused either way.
 `bin/snowmig catalogs` lists the catalogs the DataLake holds, with their
 types.
 
@@ -402,7 +409,10 @@ environment, as `provision_result.json` records it.
 - A schema reduced out of the plan gets no new copy job. A copy job an
   earlier push registered for it is reported `stale` (exit 1) until it is
   deleted — in the console, or by re-pushing with
-  `--delete-stale-copy-jobs`.
+  `--delete-stale-copy-jobs`. That flag deletes only a job this migration's
+  records show it created (`created_jobs` in `provision_result.json`,
+  carried from push to push); any other `snowmig_02_copy_*` job on a reused
+  workspace is reported stale and left alone.
 
 `snowmig_01_structure` works schema by schema: it creates the schemas, then
 the empty Delta tables, then the approved plan's views, and reads each table
@@ -495,8 +505,9 @@ bin/snowmig teardown --scope all [--include-data] [--execute]   # undo the migra
   catalog holds the migrated rows; `teardown --scope all` deletes it only
   with `--include-data`.
 
-Anything adopted with `--reuse-existing`, or reused by the catalog stage, is
-never deleted, and a cluster whose provenance the record cannot establish is
+Anything adopted with `--reuse-existing` is never deleted; a catalog the
+catalog stage created stays this migration's even after a re-run records it
+`reused`, and a cluster whose provenance the record cannot establish is
 left alone and reported (exit 1) for you to confirm in the console. Every
 scope is a dry run unless `--execute`, and `TEARDOWN.md` lists what was, or
 would be, removed.
@@ -651,6 +662,7 @@ Rows are verified by the copy job, after the copy.
 | `VARIANT`, `OBJECT`, `ARRAY` | carried as JSON text (`STRING`), with a warning on every affected column (`mapping.semi_structured: string`) | `--semi-structured block`: the table is blocked until a typed struct/map/array design exists |
 | `GEOGRAPHY`, `GEOMETRY` | the table is blocked | `--geospatial string` (GeoJSON) or `--geospatial wkt` (WKT, which does not carry a `GEOMETRY`'s SRID): carried as text, with no spatial type, index or predicate support |
 | `TIMESTAMP_NTZ` | carried as `TIMESTAMP`, with the timezone caveat recorded on every affected column (`mapping.timestamp_ntz: timestamp`); values are read through the session timezone, so keep sessions on UTC | `--timestamp-ntz preserve`: kept as `TIMESTAMP_NTZ`, which the target refuses at CREATE TABLE, so `ddl` halts (exit 3) |
+| a column whose type changed after the plan was approved | the copy refuses the table, `type_drift`, before any row is read (`mapping.source_type_drift: refuse`); re-run `assess` and `plan` to pick up the new type | `mapping.source_type_drift: convert`, then re-run `ddl`: the column is copied under the mapping rules for its new type into the existing target column, with a warning on the column, and the table is recorded `verified_with_conversion`, never `verified` |
 
 **Structured** types are typed, so neither switch applies to them:
 `VECTOR(FLOAT, n)` becomes `ARRAY<FLOAT>`, `MAP(K, V)` `MAP<STRING, v>`, a

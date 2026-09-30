@@ -159,7 +159,8 @@ def test_every_table_statement_carries_the_spec_for_every_column():
     names = [c["name"] for c in stmt["expected_columns"]]
     assert [c["name"] for c in stmt["columns"]] == names
     by = {c["name"]: c for c in stmt["columns"]}
-    assert by["TINY"] == {"name": "TINY", "target_type": "DECIMAL(38,37)",
+    assert by["TINY"] == {"name": "TINY", "source_type": "decimal(38,37)",
+                          "target_type": "DECIMAL(38,37)",
                           "read_expr": '"TINY"::VARCHAR',
                           "convert_expr": "CAST(`TINY` AS DECIMAL(38,37))"}
     assert by["V"]["convert_expr"] == "from_json(`V`, 'array<float>')"
@@ -223,6 +224,7 @@ def test_an_older_inventory_without_modes_still_gets_a_spec():
         "c.s.t")
     # No recorded geospatial mode: the STRING it was mapped to under the
     # only text mode that existed then, GeoJSON.
-    assert res.copy_columns == [{"name": "G", "target_type": "STRING",
+    assert res.copy_columns == [{"name": "G", "source_type": "geography",
+                                 "target_type": "STRING",
                                  "read_expr": 'ST_ASGEOJSON("G")::VARCHAR',
                                  "convert_expr": "`G`"}]

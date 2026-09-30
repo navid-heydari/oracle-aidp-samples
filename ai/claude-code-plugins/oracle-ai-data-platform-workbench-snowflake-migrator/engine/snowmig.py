@@ -471,7 +471,8 @@ def _mapping_resolution(args) -> dict:
     block = mapping_block(config, enabled=toggle)
     written = config.get("mapping") or {}
     out = {"enabled": block["enabled"]}
-    for key in ("semi_structured", "timestamp_ntz", "geospatial"):
+    for key in ("semi_structured", "timestamp_ntz", "geospatial",
+                "source_type_drift"):
         flag = getattr(args, key, None)
         if flag is not None:
             out[key] = {"value": flag, "source": "flag"}
@@ -1063,6 +1064,14 @@ def cmd_ddl(args) -> int:
                   "re-upgraded.", file=sys.stderr)
 
     payload = build_ddl_payload(inv, built)
+    # Read by the copy stage, which has no config of its own: a source
+    # column whose live type is not the one its spec was planned for is
+    # refused, or converted and recorded `verified_with_conversion`.
+    drift = _mapping_resolution(args)["source_type_drift"]
+    payload["source_type_drift"] = drift["value"]
+    print(f'  mapping.source_type_drift = {drift["value"]} '
+          f'({drift["source"]}): what the copy does with a source column '
+          f'whose type changed after this plan')
     if remapped is not None:
         payload["timestamp_ntz_mode"] = (
             "timestamp" if mode == "timestamp" else recorded)
@@ -1815,6 +1824,31 @@ def _catalog_summary(res: dict) -> dict:
                                 if test else None)}
 
 
+def _catalogs_created_here(out: pathlib.Path,
+                           datalake_ocid: str | None) -> list[str]:
+    """The keys and names of every catalog the resource ledger records this
+    migration CREATING -- on this aiDataPlatform, when the row says which.
+    `catalog --execute` reuses an existing catalog only if it is one of
+    these, or --reuse-existing is passed."""
+    from report.resources import LEDGER
+    path = out / LEDGER
+    names: list[str] = []
+    if not path.is_file():
+        return names
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("kind") != "catalog" or row.get("action") != "created":
+            continue
+        if (datalake_ocid and row.get("datalake_ocid")
+                and row["datalake_ocid"] != datalake_ocid):
+            continue
+        names += [str(v) for v in (row.get("key"), row.get("name")) if v]
+    return names
+
+
 def cmd_catalog(args) -> int:
     """Register the target catalog. EXTERNAL/SNOWFLAKE by default.
 
@@ -1907,7 +1941,9 @@ def cmd_catalog(args) -> int:
             catalog_type=catalog_type, source_type=args.source_type.upper(),
             connection=connection,
             description=args.description or
-            f"Snowflake {name}, registered by the snowflake-migrator")
+            f"Snowflake {name}, registered by the snowflake-migrator",
+            created_here=_catalogs_created_here(out, coords["datalake_ocid"]),
+            reuse_existing=getattr(args, "reuse_existing", False))
         result["dry_run"] = False
         result["source_type"] = args.source_type.upper()
 
@@ -1974,7 +2010,8 @@ def cmd_catalog(args) -> int:
         record_resource(out, stage="catalog", kind="catalog",
                         name=name, type=catalog_type,
                         key=result.get("key") or name,
-                        action=result.get("action"))
+                        action=result.get("action"),
+                        datalake_ocid=coords["datalake_ocid"])
     print(f'  catalog {name}: '
           f'{"dry run — nothing created" if not args.execute else result["action"]}')
     return 0
@@ -2242,8 +2279,9 @@ def _publish_stage(args) -> None:
             return
         from report.stage_output import publish_stage_output
         from target.provisioning import make_provision_call
-        res = publish_stage_output(make_provision_call(ocid), workspace, out,
-                                   rep["workspace_dir"])
+        res = publish_stage_output(
+            make_provision_call(ocid, run_process=_oci_runner(args)),
+            workspace, out, rep["workspace_dir"])
         total = len([s for s in res["steps"] if s["file"]])
         print(f'  stage report -> workspace {rep["workspace_dir"]}/: '
               f'{res["verified"]}/{total} file(s) read back '
@@ -2285,7 +2323,8 @@ def cmd_teardown(args) -> int:
     if args.execute and not ocid:
         raise MissingTarget("teardown --execute needs --datalake-ocid (or "
                             "aidp.datalake_ocid in the config)")
-    call = make_provision_call(ocid) if args.execute else None
+    call = (make_provision_call(ocid, run_process=_oci_runner(args))
+            if args.execute else None)
     scope = getattr(args, "scope", None) or "compute"
     if scope != "compute":
         return _teardown_scoped(args, out, prov, call, ocid, scope)
@@ -2489,7 +2528,8 @@ def cmd_publish(args) -> int:
     if not ocid or not workspace:
         raise MissingTarget("publish needs --datalake-ocid and --workspace "
                             "(or both in the config's aidp: block)")
-    call = make_provision_call(ocid) if args.execute else None
+    call = (make_provision_call(ocid, run_process=_oci_runner(args))
+            if args.execute else None)
     res = publish_report(call, workspace, out, execute=args.execute)
     _write(out, "publish_result.json", res)
     if res["dry_run"]:
@@ -3528,6 +3568,12 @@ def build_parser() -> argparse.ArgumentParser:
                           "documented testConnection action with the "
                           "connection details and poll the async result; "
                           "PENDING is reported as pending, never as pass")
+    cat.add_argument("--reuse-existing", action="store_true",
+                     help="reuse a catalog of this name and type that this "
+                          "migration did not create. Without it, only a "
+                          "catalog the resource ledger records this "
+                          "migration creating is reused; a catalog of the "
+                          "other type is refused either way")
     cat.add_argument("--execute", action="store_true")
     cat.set_defaults(func=cmd_catalog)
 

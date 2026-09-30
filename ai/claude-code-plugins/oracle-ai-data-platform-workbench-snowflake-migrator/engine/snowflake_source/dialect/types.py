@@ -39,7 +39,8 @@ from dataclasses import dataclass, field
 __all__ = ["TypeMapping", "map_type", "SEMI_STRUCTURED_MODES",
            "GEOSPATIAL_MODES", "TIMESTAMP_NTZ_MODES", "needs_type_detail",
            "TYPE_DETAIL_BASES", "TypeSyntaxError", "parse_type",
-           "structured_spark_type", "time_format", "copy_expressions"]
+           "structured_spark_type", "time_format", "copy_expressions",
+           "source_type_key"]
 
 SEMI_STRUCTURED_MODES = ("block", "string")
 # TIMESTAMP_NTZ is preserved by default because bare TIMESTAMP is
@@ -335,6 +336,23 @@ def copy_expressions(data_type, target_type: str, *, name: str,
     if key in _UNTYPED_JSON and upper == "STRING":
         return f"TO_JSON({col}::VARIANT)", out
     return col, out
+
+
+def source_type_key(data_type, precision=None, scale=None) -> str:
+    """One column's source type as the copy's pre-flight compares it.
+
+    NUMBER(p,s) is `decimal(p,s)`; anything else is INFORMATION_SCHEMA's own
+    type name lower-cased. The plan records this per column (`source_type`)
+    and the copy stage reads the live source the same way
+    (`SnowflakeSource.live_columns`), so a column whose type changed after
+    the plan was approved is caught before its old conversion runs. A
+    parity test holds the two spellings together.
+    """
+    kind = str(data_type or "").strip()
+    if kind.upper() in ("NUMBER", "DECIMAL", "NUMERIC") and \
+            precision is not None:
+        kind = f"decimal({int(precision)},{int(scale or 0)})"
+    return kind.lower()
 
 
 def _detail_precision(node: _Node | None):

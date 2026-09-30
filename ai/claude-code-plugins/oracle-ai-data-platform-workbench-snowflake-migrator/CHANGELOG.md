@@ -66,6 +66,23 @@ migrator plugin, newest first. The format loosely follows
   included; a quoted, mixed-case database name is supported.
 - `teardown --scope all` also removes the jobs and notebooks `jobs --register`
   created.
+- The copy compares every column's live source type with the type its plan
+  spec was decided for, not only DECIMAL columns. A column whose type changed
+  after the plan was approved is refused by default (`type_drift`), and
+  `mapping.source_type_drift: convert` copies it under its new type as
+  `verified_with_conversion`, never plain `verified`.
+- An Iceberg table name placed in a Snowflake string literal escapes the
+  backslash as well as the quote, so a crafted name cannot close the literal.
+- `provision --delete-stale-copy-jobs` deletes only copy jobs this migration's
+  records show it created (`created_jobs`, carried from push to push). Other
+  `snowmig_02_copy_*` jobs on a reused workspace are reported, not deleted.
+- `catalog --execute` reuses an existing catalog only when this migration
+  created it or `--reuse-existing` is passed, and refuses a catalog of the
+  other type in every case.
+- A catalog recorded `created` stays a teardown target after a re-run of
+  `catalog --execute` records it `reused`.
+- `teardown`, `publish` and the per-stage publish pass the configured OCI
+  profile and auth mode, like every other stage.
 
 ## [0.27.0] — 2026-09-29
 

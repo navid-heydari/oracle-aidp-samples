@@ -446,7 +446,9 @@ copy job an earlier push registered for it is still on the workspace and
 runnable, so the push reports it as `stale` (and exits 1) until it is deleted —
 in the console, or by re-pushing with `--delete-stale-copy-jobs`, which deletes
 it (and the schemaless generic job) and records a job as deleted only once it
-is gone from the listing.
+is gone from the listing. It deletes only a job this migration's records show
+it created (`created_jobs` in `provision_result.json`); a same-prefix job on a
+reused workspace that no record names is reported and left alone.
 
 **Task-parameter check.** Before a copy job runs, `run` reads the job's task
 parameters and refuses a name that matches no spelling of a stage parameter
@@ -525,9 +527,9 @@ ${CLAUDE_PLUGIN_ROOT}/bin/snowmig teardown --scope all --include-data  # ...and 
   credential, the jobs, the clusters, the catalogs the migration created and
   the workspace, in that order, each only where the record proves this
   migration created it (`provision_result.json` provenance, the catalog
-  ledger) and each read back gone. A workspace or cluster adopted with
-  `--reuse-existing` and a catalog the catalog stage reused are never
-  deleted. The INTERNAL catalog holds the migrated tables, so it goes only
+  ledger) and each read back gone. A workspace, cluster or catalog adopted
+  with `--reuse-existing` is never deleted; a catalog the catalog stage
+  created stays this migration's even after a re-run records it `reused`. The INTERNAL catalog holds the migrated tables, so it goes only
   with `--include-data`. Deleting is final: show the dry run's list and get
   an explicit yes in that turn.
 

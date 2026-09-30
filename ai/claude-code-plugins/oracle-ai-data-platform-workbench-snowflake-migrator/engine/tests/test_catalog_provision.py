@@ -101,14 +101,47 @@ def test_an_absent_external_catalog_is_created():
     assert creates[0]["body"]["sourceType"] == "SNOWFLAKE"
 
 
-def test_an_existing_catalog_is_reused_and_never_re_created():
+def test_a_catalog_this_migration_created_is_reused_and_never_re_created():
     # Re-POSTing an existing catalog re-triggers asynchronous work; the schema
     # path already learned that the hard way.
     call = Recorder(existing=["sales_db"])
     res = ensure_catalog(display_name="SALES_DB", call=call,
-                         connection=CONNECTION)
+                         connection=CONNECTION, created_here=["sales_db"])
     assert res["action"] == "reused"
+    assert res["reused_because"] == "created by this migration"
     assert [op for op, _ in call.ops] == ["list_catalogs"]
+
+
+def test_a_catalog_this_migration_did_not_create_is_refused():
+    """Same name, any case: without a record or --reuse-existing the
+    migration would write into someone else's catalog."""
+    call = Recorder(existing=["Sales_DB"])
+    with pytest.raises(RefusedToExecute, match="--reuse-existing"):
+        ensure_catalog(display_name="sales_db", call=call,
+                       connection=CONNECTION, created_here=["other_cat"])
+    assert [op for op, _ in call.ops] == ["list_catalogs"]
+
+
+def test_reuse_existing_adopts_a_catalog_of_the_same_type():
+    call = Recorder(existing=["sales_db"])
+    res = ensure_catalog(display_name="sales_db", call=call,
+                         connection=CONNECTION, reuse_existing=True)
+    assert res["action"] == "reused"
+    assert res["reused_because"] == "--reuse-existing"
+
+
+@pytest.mark.parametrize("listed", ["INTERNAL", None])
+def test_a_catalog_of_another_type_is_refused_even_with_reuse_existing(listed):
+    """An EXTERNAL request adopting an INTERNAL catalog would register no
+    Snowflake connection at all; a type the listing does not state cannot
+    be checked, so it is refused the same way."""
+    call = Recorder(existing=["sales_db"])
+    call.catalogs[0]["catalogType"] = listed
+    with pytest.raises(RefusedToExecute, match="NOT reused"):
+        ensure_catalog(display_name="sales_db", call=call,
+                       connection=CONNECTION, reuse_existing=True,
+                       created_here=["sales_db"])
+    assert not [op for op, _ in call.ops if op == "create_catalog"]
 
 
 def test_a_catalog_that_never_appears_is_pending_not_created():

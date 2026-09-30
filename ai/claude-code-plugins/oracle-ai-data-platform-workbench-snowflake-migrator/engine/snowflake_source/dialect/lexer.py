@@ -35,7 +35,7 @@ import re
 
 __all__ = ["UnterminatedLiteral", "SEGMENT_KINDS", "segments", "code_only",
            "strip_comments", "split_statements", "leading_verb", "quote_ident",
-           "qualify", "like_literal", "find_code", "sub_code",
+           "qualify", "sql_literal", "like_literal", "find_code", "sub_code",
            "cte_body_verb", "cte_scopes"]
 
 SEGMENT_KINDS = ("code", "string", "ident", "comment")
@@ -233,6 +233,18 @@ def qualify(*parts: str) -> str:
     if not parts:
         raise ValueError("qualify() needs at least one identifier")
     return ".".join(quote_ident(p) for p in parts)
+
+
+def sql_literal(value: str) -> str:
+    """`value` as the body of a single-quoted Snowflake string literal.
+
+    The backslash goes first: Snowflake reads `\\'` inside '...' as an escaped
+    quote, so doubling only the `'` let a name ending in a backslash close the
+    literal early and run the rest of the name as SQL.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"value must be a string, got {value!r}")
+    return value.replace("\\", "\\\\").replace("'", "''")
 
 
 def like_literal(name: str) -> str:

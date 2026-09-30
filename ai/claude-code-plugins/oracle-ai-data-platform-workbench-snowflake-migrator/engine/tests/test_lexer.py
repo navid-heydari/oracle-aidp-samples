@@ -329,3 +329,16 @@ def test_doubled_backtick_inside_identifier_does_not_end_it():
 def test_unterminated_backtick_identifier_is_reported():
     with pytest.raises(lexer.UnterminatedLiteral, match="identifier"):
         lexer.segments("select `oops from t")
+
+
+# ----------------------------------------------------------- sql_literal
+
+@pytest.mark.parametrize("value", ["o'brien", "a\\", "x\\'); drop table t --",
+                                   "\\\\'", ""])
+def test_sql_literal_stays_one_string_segment(value):
+    sql = f"select '{lexer.sql_literal(value)}' X"
+    assert [k for k, _ in lexer.segments(sql)] == ["code", "string", "code"]
+
+
+def test_sql_literal_escapes_the_backslash_before_the_quote():
+    assert lexer.sql_literal("a\\'b") == "a\\\\''b"

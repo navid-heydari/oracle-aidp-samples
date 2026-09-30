@@ -34,7 +34,16 @@ plan), has no right place to land, so that table is recorded `type_drift`
 and NOT copied. The source's DECIMAL columns are then checked against the
 target's types: a target column that is not DECIMAL, or a DECIMAL with fewer
 integer digits or a smaller scale, would be rounded or truncated by the
-INSERT with the row count intact -- `type_drift` too, and NOT copied.
+INSERT with the row count intact -- `type_drift` too, and NOT copied. In
+connector mode EVERY column's live type is then checked against the type the
+plan's spec was decided for (`source_type`): a column whose type changed
+after the plan was approved would run a conversion chosen for its old type.
+With `mapping.source_type_drift: refuse` (the default, recorded in
+ddl_plan.json by `ddl`) the table is `type_drift` and NOT copied; with
+`convert` the column is read under its NEW type into the existing target
+column, the table's record names it under `source_type_drift` with a
+warning, and a table whose counts then verify is `verified_with_conversion`,
+never plain `verified`.
 
 CONNECTOR MODE READS EACH TABLE WITH ONE QUALIFIED PUSHDOWN, never the
 connector's table read (minutes a table, and lossy for NUMBER, TIME and
@@ -87,7 +96,8 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from snowmig_source import (  # noqa: E402
     SOURCE_MODES, SnowflakeSource, SourceConfigError, _sql_ident,
-    load_source_config, read_plan_json, read_report_json, write_step_output)
+    live_copy_expressions, load_source_config, read_plan_json,
+    read_report_json, write_step_output)
 
 # /Workspace is the live-verified mount of the workspace tree on cluster
 # filesystems (probed 2026-09-16 on a real cluster).
@@ -103,6 +113,14 @@ _DECIMAL = re.compile(r"^decimal\((\d+)\s*,\s*(\d+)\)$", re.IGNORECASE)
 # nothing (skip-existing over a table with rows) never softens one of these.
 _COPY_FAILURES = ("count_mismatch", "sum_mismatch", "sum_not_comparable",
                   "type_drift", "failed")
+
+# Copy statuses that mean the table is done and verified. The second is a
+# table with a column copied under `mapping.source_type_drift: convert`: its
+# counts verified, but a column was converted from a type nobody reviewed.
+_COPY_DONE = ("verified", "verified_with_conversion")
+
+# `mapping.source_type_drift`, recorded in ddl_plan.json by `ddl`.
+SOURCE_TYPE_DRIFT_MODES = ("refuse", "convert")
 
 # Structure statuses that mean the table IS there. A copy that then cannot
 # find it has not "nothing to do": it failed to copy into a created table.
@@ -345,6 +363,32 @@ def _type_drift(src_types: dict[str, str], tgt_types: dict[str, str]) -> dict:
     return drift
 
 
+def _planned_type_drift(live_types: dict[str, str],
+                        spec: list[dict] | None) -> dict:
+    """Columns whose LIVE source type is not the one the plan's spec was
+    decided for: `{column: {"planned": ..., "live": ...}}`.
+
+    Every column, not only DECIMAL ones. The spec's read and conversion were
+    chosen for the planned type; run on another type they can round values
+    or turn them NULL with the row count intact. A spec entry without a
+    `source_type` (a plan written before it was recorded) cannot be
+    compared and is left out.
+    """
+    live = {k.casefold(): (k, v) for k, v in live_types.items()}
+    drift = {}
+    for entry in spec or []:
+        if not isinstance(entry, dict) or not entry.get("source_type"):
+            continue
+        found = live.get(str(entry.get("name") or "").casefold())
+        if found is None:
+            continue            # a missing column is the layout check's
+        name, live_type = found
+        planned = str(entry["source_type"]).strip().lower()
+        if live_type.strip().lower() != planned:
+            drift[name] = {"planned": planned, "live": live_type}
+    return drift
+
+
 def _decimal_sums(spark, fqn: str,
                   columns: list[tuple[str, int]]) -> tuple[dict, dict]:
     """`({column: total text or None}, {column: non-NULL count or None})`.
@@ -477,7 +521,8 @@ def copy_table(source, schema: str, table: str, tgt: str, *, mode: str,
                source_count: int | None = None,
                live_columns: dict | list | None = None,
                column_spec: list[dict] | None = None,
-               defer_recount: bool = False) -> dict:
+               defer_recount: bool = False,
+               source_type_drift: str = "refuse") -> dict:
     """Copy ONE table and verify it.
 
     Connector mode reads the table with ONE qualified pushdown built from
@@ -515,7 +560,8 @@ def copy_table(source, schema: str, table: str, tgt: str, *, mode: str,
             spec=column_spec, mode=mode, verify=verify, retries=retries,
             retry_base_delay=retry_base_delay,
             retry_multiplier=retry_multiplier, started=started,
-            source_count=source_count, defer_recount=defer_recount)
+            source_count=source_count, defer_recount=defer_recount,
+            source_type_drift=source_type_drift)
 
     view = _view_name(schema, table)
     src = source.register_temp_view(schema, table, view)
@@ -674,7 +720,8 @@ def _copy_pushdown(source, schema: str, table: str, tgt: str, *,
                    mode: str, verify: str, retries: int,
                    retry_base_delay: float, retry_multiplier: float,
                    started: str, source_count: int | None,
-                   defer_recount: bool = False) -> dict:
+                   defer_recount: bool = False,
+                   source_type_drift: str = "refuse") -> dict:
     """The connector-mode copy: ONE qualified pushdown per table.
 
     `live_types` is the live source's `{column: type}` from
@@ -704,8 +751,43 @@ def _copy_pushdown(source, schema: str, table: str, tgt: str, *,
     if skipped:
         return skipped
 
+    drift = _planned_type_drift(live_types, spec)
+    if drift and source_type_drift != "convert":
+        cols = ", ".join(f"{c} ({d['planned']} -> {d['live']})"
+                         for c, d in drift.items())
+        return {"status": "type_drift", "source_type_drift": drift,
+                "source_count": source_count, "started_at": started,
+                "reason": f"{len(drift)} source column(s) changed type "
+                          f"since the plan was approved: {cols}. The plan's "
+                          f"conversion was decided for the old type and "
+                          f"could round values or turn them NULL with the "
+                          f"row count intact. NOT copied. Re-run assess and "
+                          f"plan to pick up the new type, or set "
+                          f"mapping.source_type_drift: convert and re-run "
+                          f"ddl (mapping.source_type_drift: refuse)."}
+
     reads = column_reads(_column_pairs(live_types, tgt_types), spec)
+    converted = {}
+    by_fold = {k.casefold(): k for k in tgt_types}
+    for r in reads:
+        if r["name"] not in drift:
+            continue
+        target_type = tgt_types[by_fold[r["target"].casefold()]]
+        r["read_expr"], r["convert_expr"] = live_copy_expressions(
+            drift[r["name"]]["live"], target_type, name=r["name"])
+        converted[r["name"]] = {
+            **drift[r["name"]], "target": target_type,
+            "read_expr": r["read_expr"], "convert_expr": r["convert_expr"],
+            "warning": f"copied under the mapping rules for its NEW type "
+                       f"{drift[r['name']]['live']} into the existing "
+                       f"{target_type} column (mapping.source_type_drift: "
+                       f"convert). This conversion was never reviewed: "
+                       f"values the target type cannot hold may be "
+                       f"rounded or NULL, which the row count does not "
+                       f"show"}
     read = _read_record(reads)
+    if converted:
+        read["converted"] = converted
     view = _view_name(schema, table)
     try:
         try:
@@ -738,6 +820,8 @@ def _copy_pushdown(source, schema: str, table: str, tgt: str, *,
                "finished_at": datetime.datetime.now(
                    datetime.timezone.utc).isoformat(),
                "mode": mode, "read": read}
+        if converted:
+            out["source_type_drift"] = converted
         try:
             return _verify(spark, src, tgt, out, verify=verify,
                            source_count=source_count, src_types=live_types,
@@ -972,7 +1056,10 @@ def _settle(out: dict, *, source_count: int, src_after: int, tgt_after: int,
                   "to accept the count check, or compare those columns "
                   "another way.")
             return out
-    out["status"] = "verified"
+    # A converted column verified by counts is still a conversion nobody
+    # reviewed: never plain `verified`.
+    out["status"] = ("verified_with_conversion"
+                     if out.get("source_type_drift") else "verified")
     return out
 
 
@@ -1043,7 +1130,8 @@ def _batched_counts(source, schema: str, tables: list[str],
 
 def _copy_chunk(source, args, chunk: list[str], *, target_schema: str,
                 connector: bool, specs: dict,
-                on_done=None) -> dict[str, dict]:
+                on_done=None,
+                source_type_drift: str = "refuse") -> dict[str, dict]:
     """Copy one chunk of tables, `args.parallel` at a time; `{table: result}`.
 
     Every table's result comes from the same `copy_table` on the same facts
@@ -1102,7 +1190,8 @@ def _copy_chunk(source, args, chunk: list[str], *, target_schema: str,
                               live_columns=(live.get(name, {}) if connector
                                             else None),
                               column_spec=specs.get(name),
-                              defer_recount=connector)
+                              defer_recount=connector,
+                              source_type_drift=source_type_drift)
         except Exception as exc:
             # A failure is a finding, not the end of the run: live, one
             # connector login timeout would otherwise end the schema with
@@ -1201,7 +1290,7 @@ def _record(report: dict, path: pathlib.Path, args, name: str, result: dict,
             f"is not there -- 01_create_structure has not created it "
             f"there (run it first), or it was dropped since. NOT copied.")
         failure = 1
-    elif result["status"] not in ("verified", "skipped_nonempty",
+    elif result["status"] not in (*_COPY_DONE, "skipped_nonempty",
                                   "target_missing"):
         failure = 1
     report["tables"][name] = result
@@ -1466,7 +1555,7 @@ def main(argv: list[str] | None = None) -> int:
 
     todo = [n for n in names
             if args.force
-            or report["tables"].get(n, {}).get("status") != "verified"]
+            or report["tables"].get(n, {}).get("status") not in _COPY_DONE]
     for name in names:
         if name not in todo:
             log(f"skip {args.schema}.{name}: already verified")
@@ -1484,11 +1573,25 @@ def main(argv: list[str] | None = None) -> int:
     # first. External-catalog mode reads the three-part name as before.
     connector = getattr(source, "mode", None) == "connector"
     specs = column_specs(ddl_plan, args.schema) if ddl_plan else {}
+    # What to do with a column whose live type is not the planned one. An
+    # unknown value is refused like the default: `convert` is opt-in.
+    drift_mode = str((ddl_plan or {}).get("source_type_drift")
+                     or "refuse").strip().lower()
+    if drift_mode not in SOURCE_TYPE_DRIFT_MODES:
+        log(f"ddl_plan.json carries source_type_drift={drift_mode!r}, not "
+            f"one of {', '.join(SOURCE_TYPE_DRIFT_MODES)}; refusing drifted "
+            f"columns")
+        drift_mode = "refuse"
     if connector and todo:
         without = [n for n in todo if n not in specs]
         log(f"reads: {len(todo) - len(without)} table(s) with the plan's "
             f"per-column read spec, {len(without)} read bare"
             + (" (an older ddl_plan.json, or no plan)" if without else ""))
+        log(f"source type drift: {drift_mode} (mapping.source_type_drift in "
+            f"ddl_plan.json) -- a column whose live type is not the planned "
+            f"one is " + ("copied under its new type and the table recorded "
+                          "verified_with_conversion" if drift_mode == "convert"
+                          else "refused and its table recorded type_drift"))
     elif specs and todo:
         log("the plan's per-column read spec is NOT applied in "
             "external-catalog mode (its read expressions are Snowflake SQL); "
@@ -1565,7 +1668,8 @@ def main(argv: list[str] | None = None) -> int:
                 recorded.add(name)
 
         results = _copy_chunk(source, args, chunk, target_schema=target_schema,
-                              connector=connector, specs=specs, on_done=done)
+                              connector=connector, specs=specs, on_done=done,
+                              source_type_drift=drift_mode)
         with lock:
             for name in chunk:
                 if name not in recorded:

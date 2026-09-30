@@ -444,6 +444,40 @@ def _match(items: list[dict], display_name: str) -> dict | None:
     return None
 
 
+def _prior_created_jobs(prior: dict | None, ws_key: str | None,
+                        datalake_ocid: str | None) -> list[dict]:
+    """The jobs an earlier EXECUTED record of this out dir proves this
+    migration created on workspace `ws_key`: its `created_jobs`, plus -- for
+    a record that predates that field -- every job step or copy job it
+    recorded as `created`. A record of another workspace key, or of another
+    aiDataPlatform, proves nothing about this one."""
+    if not prior or prior.get("dry_run") is not False or not ws_key:
+        return []
+    if (prior.get("workspace") or {}).get("key") != ws_key:
+        return []
+    if (datalake_ocid and prior.get("datalake_ocid")
+            and prior["datalake_ocid"] != datalake_ocid):
+        return []
+    deleted = {str(n).lower() for n in prior.get("deleted_copy_jobs") or []}
+    jobs, seen = [], set()
+
+    def add(entry: dict) -> None:
+        name = str(entry.get("name") or "")
+        if name and name.lower() not in seen and name.lower() not in deleted:
+            seen.add(name.lower())
+            jobs.append(entry)
+    for entry in prior.get("created_jobs") or []:
+        add(dict(entry))
+    for st in prior.get("steps") or []:
+        if st.get("step") == "job" and st.get("action") == "created":
+            add({"name": str(st.get("detail") or "").split(" ", 1)[0]
+                 .rstrip(":"), "created_run": prior.get("run")})
+    for job in prior.get("copy_jobs") or []:
+        if job.get("status") == "created":
+            add({"name": job.get("job"), "created_run": prior.get("run")})
+    return jobs
+
+
 def _poll(list_fn, display_name: str, delays: tuple[float, ...], *,
           require_active: bool = False) -> tuple[dict | None, str | None]:
     """`(item, listing_error)`: the item once it is visible (and ACTIVE, when
@@ -906,6 +940,12 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         "stale_copy_jobs": [],
         # Stale copy jobs this push deleted, on --delete-stale-copy-jobs.
         "deleted_copy_jobs": [],
+        # Every job on this workspace that a push of THIS migration created,
+        # as {name, key, created_run}, carried from the earlier record of
+        # the same workspace. A re-push records the same job as `reused`,
+        # so this list, not the steps, is the proof of ownership that
+        # --delete-stale-copy-jobs acts on.
+        "created_jobs": [],
         "steps": [],
     }
 
@@ -1019,6 +1059,7 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
         return out
     ws_key = _key(found or {}, ws_name.name)
     out["workspace"]["key"] = ws_key
+    out["created_jobs"] = _prior_created_jobs(prior, ws_key, datalake_ocid)
     if ws_created:
         out["workspace"].update(created=True, created_run=stamp)
     if inherit_from is not None and found is not None:
@@ -1444,16 +1485,47 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
                  found is not None,
                  f'{spec["name"]}: read_back_failed: {job_list_error}'
                  if job_list_error is not None else spec["name"])
+            if found is not None:
+                _own(spec["name"], found)
             _outcome(spec, "created" if found else
                      "create requested, not confirmed")
         except Exception as exc:
             step("job", "failed", False, f'{spec["name"]}: {str(exc)[:200]}')
             _outcome(spec, "failed, not registered")
 
+    def _own(name: str, job: dict) -> None:
+        key = job.get("key") or job.get("id")
+        out["created_jobs"] = [e for e in out["created_jobs"]
+                               if str(e.get("name")).lower() != name.lower()]
+        out["created_jobs"].append({"name": name,
+                                    "key": str(key) if key else None,
+                                    "created_run": stamp})
+
+    def _created_here(job: dict, name: str) -> bool:
+        """This migration's records show it created this job. A recorded
+        key must match the listed one: a job of the same name made later by
+        someone else is not ours."""
+        entry = next((e for e in out["created_jobs"]
+                      if str(e.get("name")).lower() == name.lower()), None)
+        if entry is None:
+            return False
+        listed = job.get("key") or job.get("id")
+        return not (entry.get("key") and listed
+                    and str(listed) != str(entry["key"]))
+
     def _delete_stale(job: dict, name: str, why: str) -> None:
         """Delete one copy job the plan no longer names, and READ IT BACK:
         only a job gone from the listing is recorded deleted. Asked for
-        explicitly (--delete-stale-copy-jobs); never done by default."""
+        explicitly (--delete-stale-copy-jobs); never done by default, and
+        only for a job this migration's records show it created -- on a
+        reused workspace a job of that name may be someone else's."""
+        if not _created_here(job, name):
+            step("job", "stale", False,
+                 f"{name}: {why}; NOT deleted -- no record of this "
+                 f"migration shows it created this job, so it may belong "
+                 f"to someone else on this workspace. Delete it in the "
+                 f"console if it is this migration's")
+            return
         key = job.get("key") or job.get("id")
         if not key:
             step("job", "stale", False,
@@ -1477,6 +1549,9 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
             return
         if _match(listed, name) is None:
             out["deleted_copy_jobs"].append(name)
+            out["created_jobs"] = [
+                e for e in out["created_jobs"]
+                if str(e.get("name")).lower() != name.lower()]
             step("job", "stale_deleted", True,
                  f"{name}: {why}; deleted, and gone from the listing")
         else:
@@ -1602,9 +1677,12 @@ def provision(*, call: Callable[..., dict] | None, workspace_name: str,
             step("job", "stale", False,
                  f"{name} is on the workspace but its schema is not in this "
                  f"plan (reduced out, or renamed); it is still runnable. "
-                 f"Delete it in the console, re-run provision with "
-                 f"--delete-stale-copy-jobs, or re-plan to include the "
-                 f"schema")
+                 f"Delete it in the console, "
+                 + ("re-run provision with --delete-stale-copy-jobs, "
+                    if _created_here(job, name) else
+                    "(no record shows this migration created it, so "
+                    "--delete-stale-copy-jobs will not), ")
+                 + "or re-plan to include the schema")
 
     # 6 · the environment diagnosis, beside the stages, with NO job --------
     # README step 8 has the operator open it from scripts/ before the jobs;

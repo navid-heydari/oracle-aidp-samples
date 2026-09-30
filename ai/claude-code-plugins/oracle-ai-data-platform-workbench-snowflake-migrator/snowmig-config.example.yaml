@@ -161,6 +161,16 @@ mapping:
   #   wkt             -- carried as WKT text (ST_ASWKT), with a warning; a
   #                      GEOMETRY's SRID is not in WKT.
   geospatial: block
+  #
+  # source_type_drift: a source column whose type changed after the plan was
+  #   approved. Recorded in ddl_plan.json by `ddl`; the copy job applies it.
+  #   refuse (default) -- the table is not copied and is recorded `type_drift`;
+  #                       re-run assess and plan to pick up the new type.
+  #   convert          -- the column is copied using the mapping rules for its
+  #                       NEW type, with a warning on the column. The table is
+  #                       recorded `verified_with_conversion`, never plain
+  #                       `verified`.
+  source_type_drift: refuse
 
 compute:
   # Warehouse-equivalent compute (runbook S12; always proposed, created only

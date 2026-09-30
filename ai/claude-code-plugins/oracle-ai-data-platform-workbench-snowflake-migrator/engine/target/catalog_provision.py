@@ -17,7 +17,7 @@ unverifiable. That narrower refusal is the one that still stands.
 from __future__ import annotations
 
 import time
-from typing import Callable
+from typing import Callable, Iterable
 
 from .catalog_api import (CATALOG_TYPES, build_catalog_body,
                           normalize_catalog_type)
@@ -87,14 +87,25 @@ def ensure_catalog(*, display_name: str, call: Callable[..., dict],
                    connection: dict | None = None, description: str = "",
                    properties: dict | None = None,
                    verify_delays: tuple[float, ...] = (3.0, 5.0, 10.0, 15.0),
+                   created_here: Iterable[str] = (),
+                   reuse_existing: bool = False,
                    ) -> dict:
-    """Create `display_name` if absent, or report the existing catalog.
+    """Create `display_name` if absent, or reuse the existing catalog only
+    when this migration may.
 
     EXTERNAL registers a read-only pointer at the source. INTERNAL -- which the
     runbook calls STANDARD, and which is accepted as an alias -- creates the
     managed CONTAINER only (runbook S4) and reports `container_only`, so a
     caller can never read it as "the tables exist"; those are made on compute
     by the structure workflow. Any other shape is refused.
+
+    A catalog already carrying the name (matched case-insensitively, as the
+    server does) is reused only when `created_here` -- the keys and names the
+    resource ledger records this migration creating -- includes it, or the
+    caller passed `reuse_existing`. Otherwise it is refused: the migration
+    would write into a catalog it never created. A catalog of the other type
+    is refused in every case; an EXTERNAL request "reusing" an INTERNAL
+    catalog registers no Snowflake connection at all.
     """
     requested = str(catalog_type or "").strip().upper()
     catalog_type = normalize_catalog_type(catalog_type)
@@ -107,9 +118,28 @@ def ensure_catalog(*, display_name: str, call: Callable[..., dict],
 
     found = _find_catalog(call, display_name)
     if found is not None:
+        listed_name = found.get("displayName") or found.get("key")
+        listed_type = str(found.get("catalogType") or "").upper() or "UNKNOWN"
+        key = found.get("key") or listed_name
+        if listed_type != catalog_type:
+            raise RefusedToExecute(
+                f"a catalog named {listed_name!r} already exists as "
+                f"{listed_type}, not {catalog_type}; it was NOT reused, "
+                f"with or without --reuse-existing. Choose another catalog "
+                f"name")
+        mine = {str(n).lower() for n in created_here if n}
+        owned = bool({str(key).lower(), str(listed_name).lower()} & mine)
+        if not owned and not reuse_existing:
+            raise RefusedToExecute(
+                f"a catalog named {listed_name!r} ({listed_type}, key "
+                f"{key}) already exists and no record of this migration "
+                f"shows it created it; it was NOT reused. Choose another "
+                f"catalog name, or pass --reuse-existing if you really "
+                f"mean to migrate into it")
         return {"catalog": display_name, "action": "reused",
-                "catalog_type": found.get("catalogType", catalog_type),
-                "key": found.get("key") or found.get("displayName")}
+                "catalog_type": listed_type, "key": key,
+                "reused_because": ("created by this migration" if owned
+                                   else "--reuse-existing")}
 
     # A STANDARD catalog carries no sourceType and no connectionDetails: it is
     # managed storage, not a pointer at a source. Passing a Snowflake
