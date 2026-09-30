@@ -402,7 +402,8 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
             if live is None:
                 verdict = "TARGET_UNREADABLE"
             elif not exists and (s_status in ("created", "already_existed")
-                                 or c_status == "verified"):
+                                 or c_status in ("verified",
+                                                 "verified_with_conversion")):
                 verdict = "MISSING_DESPITE_REPORT"
             elif s_status == "failed":
                 # The CREATE raised. Whether or not something by that name
@@ -436,6 +437,15 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                           + str(c_rec.get("reason") or "no reason") + ")")
             elif c_status == "verified":
                 verdict = "MIGRATED_VERIFIED"
+            elif c_status == "verified_with_conversion":
+                # Counts verified, but a column was copied under a type the
+                # plan never reviewed (mapping.source_type_drift: convert).
+                # Opted into, so not a problem; never a plain pass either.
+                verdict = "MIGRATED_WITH_CONVERSION"
+                reason = "converted after a source type change: " + ", ".join(
+                    f'{c} ({d.get("planned")} -> {d.get("live")}, into '
+                    f'{d.get("target")})' for c, d in
+                    (c_rec.get("source_type_drift") or {}).items())
             elif c_status in ("count_mismatch", "sum_mismatch",
                               "sum_not_comparable", "type_drift", "failed"):
                 verdict = "STRUCTURE_ONLY_COPY_FAILED"
@@ -473,7 +483,8 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                 # not drift, and a report that never recorded one has
                 # nothing to compare against.
                 reported = c_rec.get("target_count")
-                if verdict == "MIGRATED_VERIFIED" \
+                if verdict in ("MIGRATED_VERIFIED",
+                               "MIGRATED_WITH_CONVERSION") \
                         and row["target_count"] is not None \
                         and isinstance(reported, int) \
                         and row["target_count"] != reported:
@@ -691,6 +702,7 @@ def main(argv: list[str] | None = None) -> int:
     pending = sum(v for k, v in rec["totals"].items()
                   if k not in PROBLEM_VERDICTS
                   and k not in ("MIGRATED_VERIFIED",
+                                "MIGRATED_WITH_CONVERSION",
                                 "PRESENT_NOT_REVERIFIED",
                                 "VIEW_CREATED", "VIEW_NOT_IN_PLAN",
                                 "VIEW_NOT_CREATED_BY_THIS_PATH",

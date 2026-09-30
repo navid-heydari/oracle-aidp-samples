@@ -303,3 +303,32 @@ def test_the_cli_with_nothing_to_register_says_so(tmp_path, monkeypatch):
     assert len(fake.calls) == 1
     md = (tmp_path / "EXTERNAL_REGISTRATION.md").read_text(encoding="utf-8")
     assert "No external or Iceberg table" in md
+
+
+def test_a_backslash_in_an_iceberg_name_cannot_close_the_literal():
+    """Snowflake reads `\\'` as an escaped quote, so the name's backslash must
+    be doubled too, or a crafted name ends the literal and runs as SQL."""
+    from snowflake_source.dialect import lexer
+    name = "X\\') union select current_user() --"
+    ident = f"DB.SC.{name}"
+    inv = {"databases_in_scope": [],
+           "inventory": [{"source_identifier": ident, "source_database": "DB",
+                          "source_schema": "SC",
+                          "source_metadata": {"is_iceberg": "Y"}}]}
+    plan = {"cannot_migrate": [{"source_identifier": ident,
+                                "category": "register_in_place"}]}
+    sent = []
+
+    def run_sql(sql, params=None):
+        sent.append(sql)
+        if sql.startswith("show iceberg tables"):
+            return [{"database_name": "DB", "schema_name": "SC", "name": name,
+                     "catalog_name": "SNOWFLAKE"}]
+        return [{"INFO": "{}"}]
+
+    build_external_registration(run_sql, inv, plan)
+    probe = next(s for s in sent if "get_iceberg_table_information" in s)
+    assert_read_only(probe)
+    strings = [text for kind, text in lexer.segments(probe) if kind == "string"]
+    assert len(strings) == 1 and "union select" in strings[0]
+    assert "union" not in lexer.code_only(probe).lower()

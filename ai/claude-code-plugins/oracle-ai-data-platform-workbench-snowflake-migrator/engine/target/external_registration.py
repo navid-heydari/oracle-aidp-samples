@@ -408,7 +408,7 @@ def build_external_registration(run_sql: Callable[..., list[dict]],
         if not row or str(row.get("catalog_name") or "").upper() != "SNOWFLAKE":
             continue
         db, schema, name = _split_ident(rec)
-        literal = lexer.qualify(db, schema, name).replace("'", "''")
+        literal = lexer.sql_literal(lexer.qualify(db, schema, name))
         try:
             info = run_sql(
                 f"select system$get_iceberg_table_information('{literal}') INFO")

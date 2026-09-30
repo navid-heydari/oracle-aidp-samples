@@ -363,11 +363,12 @@ class FakeLakeSpark:
         m = re.fullmatch(r"`((?:[^`]|``)*)`", expr)
         if m:
             return get(m.group(1))
-        m = re.fullmatch(r"CAST\(`([^`]+)` AS DECIMAL\((\d+),(\d+)\)\)", expr)
+        m = re.fullmatch(r"CAST\(`([^`]+)` AS DECIMAL\((\d+),(\d+)\)\)", expr,
+                         re.IGNORECASE)
         if m:
             v = get(m.group(1))
             return None if v is None else decimal.Decimal(str(v))
-        m = re.fullmatch(r"CAST\(`([^`]+)` AS DOUBLE\)", expr)
+        m = re.fullmatch(r"CAST\(`([^`]+)` AS DOUBLE\)", expr, re.IGNORECASE)
         if m:
             v = get(m.group(1))
             return None if v is None else float(v)

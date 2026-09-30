@@ -265,7 +265,16 @@ def test_disabling_it_restores_the_strict_modes_and_ignores_the_fields():
     # geospatial joined the block as a third decision (`wkt` is new); its
     # strict mode is the `block` it always defaulted to.
     assert blk == {"enabled": False, "semi_structured": "block",
-                   "timestamp_ntz": "preserve", "geospatial": "block"}
+                   "timestamp_ntz": "preserve", "geospatial": "block",
+                   "source_type_drift": "refuse"}
+
+
+def test_source_type_drift_defaults_to_refuse_and_accepts_convert():
+    assert mapping_block({})["source_type_drift"] == "refuse"
+    assert mapping_block({"mapping": {"source_type_drift": "convert"}})[
+        "source_type_drift"] == "convert"
+    with pytest.raises(ConfigError, match="source_type_drift"):
+        mapping_block({"mapping": {"source_type_drift": "ignore"}})
 
 
 def test_the_toggle_must_be_a_boolean():

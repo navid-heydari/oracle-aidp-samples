@@ -205,6 +205,55 @@ def _sql_database(name: str) -> str:
     return _sql_ident(_database_name(name))
 
 
+# The copy expressions for a column whose live type is not the planned one,
+# used only under `mapping.source_type_drift: convert`. A mirror of
+# snowflake_source/dialect/types.copy_expressions -- this module is inlined
+# into every notebook and cannot import the engine -- held to it by a parity
+# test. The TIME precision is the live read's default (all nine digits);
+# GEOGRAPHY reads as GeoJSON, as a plan without a recorded mode does.
+_DRIFT_NUMERIC = {"NUMBER", "DECIMAL", "NUMERIC", "INT", "INTEGER", "BIGINT",
+                  "SMALLINT", "TINYINT", "BYTEINT"}
+_DRIFT_FLOATS = {"FLOAT", "FLOAT4", "FLOAT8", "DOUBLE", "REAL",
+                 "DOUBLE PRECISION"}
+_DRIFT_ZONED = ("TIMESTAMP_TZ", "TIMESTAMP_LTZ", "TIMESTAMP")
+_DRIFT_JSON = ("VARIANT", "OBJECT", "ARRAY", "MAP")
+_DRIFT_GEO = ("GEOGRAPHY", "GEOMETRY")
+
+
+def live_copy_expressions(data_type: str, target_type: str, *,
+                          name: str) -> tuple[str, str]:
+    """(read_expr, convert_expr) for `name` read as its LIVE `data_type`
+    and converted to the EXISTING target column's `target_type`."""
+    col = '"' + str(name).replace('"', '""') + '"'
+    out = "`" + str(name).replace("`", "``") + "`"
+    key = str(data_type or "").strip().upper().split("(")[0].strip()
+    target = str(target_type or "")
+    upper = target.upper()
+    if upper.startswith(("ARRAY<", "MAP<", "STRUCT<")):
+        read = f"{col}::ARRAY::VARCHAR" if key == "VECTOR" \
+            else f"{col}::VARIANT::VARCHAR"
+        schema = target if "STRUCT<" in upper else target.lower()
+        literal = "'" + schema.replace("\\", "\\\\").replace("'", "\\'") + "'"
+        return read, f"from_json({out}, {literal})"
+    if key in _DRIFT_NUMERIC:
+        return f"{col}::VARCHAR", f"CAST({out} AS {target})"
+    if key in _DRIFT_FLOATS:
+        return f"TO_VARCHAR({col}, 'TME')", f"CAST({out} AS {target})"
+    if key == "TIME":
+        return f"TO_VARCHAR({col}, 'HH24:MI:SS.FF9')", out
+    if key == "TIMESTAMP_NTZ":
+        return (f"TO_VARCHAR({col}, 'YYYY-MM-DD HH24:MI:SS.FF9')",
+                f"CAST({out} AS {target})")
+    if key in _DRIFT_ZONED:
+        return (f"TO_VARCHAR({col}, 'YYYY-MM-DD\"T\"HH24:MI:SS.FF9TZH:TZM')",
+                f"CAST({out} AS {target})")
+    if key in _DRIFT_GEO:
+        return f"ST_ASGEOJSON({col})::VARCHAR", out
+    if key in _DRIFT_JSON and upper == "STRING":
+        return f"TO_JSON({col}::VARIANT)", out
+    return col, out
+
+
 def _sql_literal(value: str) -> str:
     """Escape a string literal for Snowflake SQL.
 

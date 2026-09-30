@@ -149,3 +149,45 @@ def test_dry_run_refuses_to_overwrite_an_executed_record(tmp_path, rec, capsys):
     assert "EXECUTED" in err and "catalog_result.json" in err
     assert _result(tmp_path)["action"] == "created"
     assert _result(tmp_path)["dry_run"] is False
+
+
+def test_a_re_run_reuses_the_catalog_it_created_and_teardown_still_owns_it(
+        tmp_path, rec):
+    """Run twice: the second run finds the catalog the first created. It
+    is reused (the ledger proves it is ours) and stays a teardown target."""
+    from target.teardown import catalogs_created
+    cfg = _cfg(tmp_path, AIDP)
+    argv = ["catalog", "--config", cfg, "--out-dir", str(tmp_path), "--execute"]
+    assert snowmig.main(argv) == 0
+    assert snowmig.main(argv) == 0
+    assert len(rec.creates()) == 1
+    assert _result(tmp_path)["action"] == "reused"
+    ledger = [json.loads(line) for line in
+              (tmp_path / "resources.jsonl").read_text().splitlines()]
+    assert [r["action"] for r in ledger] == ["created", "reused"]
+    assert all(r["datalake_ocid"] == OCID for r in ledger)
+    assert [c["name"] for c in catalogs_created(ledger)] == ["my_ext"]
+
+
+def test_a_catalog_someone_else_created_is_refused(tmp_path, rec, capsys):
+    rec.catalogs.append({"displayName": "MY_EXT", "key": "theirs",
+                         "catalogType": "EXTERNAL"})
+    cfg = _cfg(tmp_path, AIDP)
+    argv = ["catalog", "--config", cfg, "--out-dir", str(tmp_path), "--execute"]
+    assert snowmig.main(argv) == 1
+    assert "--reuse-existing" in capsys.readouterr().err
+    assert rec.creates() == []
+    assert not (tmp_path / "resources.jsonl").exists()
+    assert snowmig.main([*argv, "--reuse-existing"]) == 0
+    assert _result(tmp_path)["action"] == "reused"
+
+
+def test_a_ledger_row_from_another_datalake_proves_nothing(tmp_path, rec):
+    rec.catalogs.append({"displayName": "my_ext", "key": "k",
+                         "catalogType": "EXTERNAL"})
+    (tmp_path / "resources.jsonl").write_text(json.dumps(
+        {"kind": "catalog", "name": "my_ext", "key": "k", "type": "EXTERNAL",
+         "action": "created", "datalake_ocid": "ocid1.other"}) + "\n")
+    cfg = _cfg(tmp_path, AIDP)
+    assert snowmig.main(["catalog", "--config", cfg, "--out-dir",
+                         str(tmp_path), "--execute"]) == 1

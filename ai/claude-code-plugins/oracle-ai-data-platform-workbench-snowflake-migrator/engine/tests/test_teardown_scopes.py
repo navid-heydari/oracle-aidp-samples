@@ -163,6 +163,19 @@ def test_a_reused_workspace_is_kept_and_only_created_jobs_go():
     assert any("did not create it" in k for k in res["kept"])
 
 
+def test_a_job_the_carried_record_says_we_created_goes_on_a_reused_workspace():
+    """A re-push records the job `reused`; `created_jobs` is still the
+    proof a push of this migration created it."""
+    prov = _prov(workspace={"name": "lab_ws", "key": "ws-1",
+                            "created": False},
+                 created_jobs=[{"name": "snowmig_02_copy_sales",
+                                "key": "j-1"}])
+    res = teardown_everything(None, prov, scope="all", execute=False,
+                              ledger=LEDGER)
+    jobs = [s["name"] for s in res["steps"] if s["kind"] == "job"]
+    assert jobs == ["snowmig_02_copy_sales"]
+
+
 def test_a_failed_async_delete_is_not_verified():
     res = _run(Lake(async_status="FAILED"), include_data=True)
     cat = next(s for s in res["steps"] if s.get("catalog") == "src")
@@ -192,6 +205,17 @@ def test_a_record_for_another_platform_is_refused():
 
 def test_only_catalogs_the_ledger_says_were_created_are_candidates():
     assert [c["catalog"] for c in catalogs_created(LEDGER)] == ["src", "tgt"]
+
+
+def test_a_re_run_that_records_created_then_reused_still_owns_the_catalog():
+    """`catalog --execute` run twice: the second run finds the catalog the
+    first created and records `reused`. Teardown must still reach it."""
+    ledger = [*LEDGER,
+              {"kind": "catalog", "name": "tgt", "key": "tgt",
+               "type": "INTERNAL", "action": "reused"},
+              {"kind": "catalog", "name": "theirs", "key": "theirs",
+               "type": "INTERNAL", "action": "reused"}]
+    assert [c["catalog"] for c in catalogs_created(ledger)] == ["src", "tgt"]
 
 
 # --- request shapes (live 2026-09-29) ------------------------------------------

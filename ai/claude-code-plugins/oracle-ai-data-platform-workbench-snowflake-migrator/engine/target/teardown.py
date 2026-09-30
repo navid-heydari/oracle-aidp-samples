@@ -324,14 +324,19 @@ _ASYNC_DELAYS = (5.0, 10.0, 10.0, 15.0, 15.0, 20.0, 30.0, 30.0, 30.0, 60.0,
 
 def catalogs_created(ledger: list[dict]) -> list[dict]:
     """The catalogs the resource ledger says this migration CREATED (the
-    catalog stage records one row per create or reuse), latest row per key.
-    A reused catalog is not this migration's and is never deleted."""
+    catalog stage records one row per create or reuse), one per key.
+    A reused catalog is not this migration's and is never deleted -- but
+    once a key is recorded `created`, a later `reused` row does not change
+    that: re-running `catalog --execute` finds the catalog this migration
+    created and records it reused, which is no proof someone else owns it.
+    The same rule report/resources.py follows."""
     by_key: dict[str, dict] = {}
     for row in ledger or []:
         if row.get("kind") != "catalog":
             continue
         key = str(row.get("key") or row.get("name") or "")
-        if key:
+        if key and (row.get("action") == "created"
+                    or (by_key.get(key) or {}).get("action") != "created"):
             by_key[key] = row
     return [{"catalog": key, "name": row.get("name") or key,
              "type": str(row.get("type") or "").upper()}
@@ -355,7 +360,7 @@ def _job_names(prov: dict) -> list[str]:
     """Jobs the record names on this migration's workspace, minus the ones
     a push already deleted. On a workspace this migration CREATED every one
     of them is its own; on a reused workspace only a job a push recorded as
-    `created`."""
+    `created`, or one the carried `created_jobs` record names."""
     ws_created = bool((prov.get("workspace") or {}).get("created"))
     deleted = set(prov.get("deleted_copy_jobs") or [])
     names = []
@@ -373,6 +378,12 @@ def _job_names(prov: dict) -> list[str]:
         name = job.get("job")
         if name and name not in deleted and name not in names and (
                 ws_created or job.get("status") == "created"):
+            names.append(name)
+    # Created by an earlier push and recorded `reused` by this one: the
+    # carried ownership record still names it.
+    for job in prov.get("created_jobs") or []:
+        name = job.get("name")
+        if name and name not in deleted and name not in names:
             names.append(name)
     return names
 

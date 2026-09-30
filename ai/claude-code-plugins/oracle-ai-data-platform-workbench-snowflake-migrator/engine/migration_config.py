@@ -73,6 +73,7 @@ MAPPING_MODES = {
     "semi_structured": ("block", "string"),
     "timestamp_ntz": ("preserve", "timestamp"),
     "geospatial": ("block", "string", "wkt"),
+    "source_type_drift": ("refuse", "convert"),
 }
 MAPPING_DEFAULTS = {
     # VARIANT/OBJECT/ARRAY carried as JSON text, warned on every column,
@@ -86,6 +87,13 @@ MAPPING_DEFAULTS = {
     # geography as text is a decision. `string` carries GeoJSON, `wkt` WKT
     # (ST_ASWKT, live-verified 2026-09-29).
     "geospatial": "block",
+    # A source column whose type changed after the plan was approved. The
+    # other defaults convert types that were reviewed when the plan was
+    # approved; this type never was, so the table is refused (`type_drift`)
+    # until assess and plan are re-run. `convert` copies the column under
+    # the mapping rules for its NEW type and records the table
+    # `verified_with_conversion`, never plain `verified`.
+    "source_type_drift": "refuse",
 }
 
 # Top-level blocks that are neither end's connection settings.
@@ -271,7 +279,7 @@ def snowflake_block(config: dict) -> dict:
 # modes fall back to these -- the pure mapper's refuse-rather-than-guess
 # behaviour -- and the per-field values in `mapping:` are ignored.
 MAPPING_STRICT = {"semi_structured": "block", "timestamp_ntz": "preserve",
-                  "geospatial": "block"}
+                  "geospatial": "block", "source_type_drift": "refuse"}
 
 
 def mapping_block(config: dict, *, enabled: bool | None = None) -> dict:

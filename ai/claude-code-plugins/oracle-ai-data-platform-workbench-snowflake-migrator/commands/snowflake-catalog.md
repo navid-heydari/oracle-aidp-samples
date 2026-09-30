@@ -18,7 +18,11 @@ Thin wrapper over the registration phase of
    confirmed in that same turn; a value sitting in the config is not an
    approval.
 4. Report `action` and `verified` from `catalog_result.json` — never
-   `executed`. `create_requested` means the create was accepted but the
+   `executed`. If a catalog of that name exists and this migration did not
+   create it, the stage stops (exit 1) without touching it: report it as a
+   name collision and ask for another name. Pass `--reuse-existing` only when
+   the user explicitly says to migrate into that existing catalog; a catalog
+   of the other type stops the stage either way. `create_requested` means the create was accepted but the
    catalog never became visible: say it is pending, not done.
 5. Validate the EXTERNAL catalog with `--test-connection` (with `--execute`)
    and report the result as it is; `PENDING` is not a pass. If it returns

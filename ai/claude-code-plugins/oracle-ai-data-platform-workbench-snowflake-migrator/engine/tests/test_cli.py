@@ -923,6 +923,57 @@ def test_catalogs_hands_the_profile_runner_to_the_transport(tmp_path, monkeypatc
     assert captured["run_process"] is not None
 
 
+class _CallCaptured(Exception):
+    pass
+
+
+@pytest.mark.parametrize("stage", ["teardown", "publish", "stage-publish"])
+def test_teardown_and_publish_state_the_profile_and_auth_mode(
+        tmp_path, monkeypatch, stage):
+    """Teardown, publish and the per-stage publish built their transport
+    without the runner, so on a session-token or non-DEFAULT profile they
+    failed while every other stage worked."""
+    import subprocess
+    import types
+
+    import snowmig
+    import target.provisioning as provisioning
+    _cwd_config(tmp_path, monkeypatch,
+                [f"datalake_ocid: {OCID}", "workspace: ws-key",
+                 "oci_profile: FAKE_PROFILE", "oci_auth: security_token"])
+    if stage == "stage-publish":
+        with (tmp_path / "snowmig-config.yaml").open("a", encoding="utf-8") as fh:
+            fh.write("reporting:\n  publish_each_stage: true\n")
+    write(tmp_path, "provision_result.json",
+          {"dry_run": False, "workspace": {"key": "ws-key"}})
+    captured = {}
+
+    def fake_make_call(ocid, *, backend="oci_raw", run_process=None):
+        captured["run_process"] = run_process
+        raise _CallCaptured
+    monkeypatch.setattr(provisioning, "make_provision_call", fake_make_call)
+    seen = []
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: (
+        seen.append(list(argv))
+        or types.SimpleNamespace(returncode=0, stdout="{}", stderr="")))
+
+    out = ["--out-dir", str(tmp_path)]
+    if stage == "stage-publish":
+        monkeypatch.delenv("SNOWMIG_NO_STAGE_PUBLISH", raising=False)
+        args = snowmig.build_parser().parse_args(["teardown", *out])
+        snowmig._publish_stage(args)
+    else:
+        try:
+            main([stage, *out, "--execute"])
+        except _CallCaptured:
+            pass
+    run_process = captured.get("run_process")
+    assert run_process is not None, f"{stage} built its call without the runner"
+    run_process(["oci", "raw-request", "--http-method", "GET"])
+    assert seen[-1][:5] == ["oci", "--auth", "security_token",
+                            "--profile", "FAKE_PROFILE"]
+
+
 def test_provision_dry_run_takes_the_catalogs_from_the_config(
         tmp_path, monkeypatch, capsys):
     _cwd_config(tmp_path, monkeypatch,

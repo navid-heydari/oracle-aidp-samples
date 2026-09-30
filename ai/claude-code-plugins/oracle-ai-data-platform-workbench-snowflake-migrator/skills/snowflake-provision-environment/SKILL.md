@@ -119,7 +119,8 @@ that the database is empty. Use it only when the user explicitly asks for it.
   cluster name the first push recorded when no `--cluster-name` is given. A
   copy job for a schema no longer in the plan is reported `stale` (exit 1)
   until it is deleted in the console or by re-pushing with
-  `--delete-stale-copy-jobs`.
+  `--delete-stale-copy-jobs`, which deletes only a job this migration's
+  records show it created.
 - **Never reuse, never "ensure".** Do not list existing workspaces or
   clusters and offer the user a choice among them. The only question is *may
   I create this*.

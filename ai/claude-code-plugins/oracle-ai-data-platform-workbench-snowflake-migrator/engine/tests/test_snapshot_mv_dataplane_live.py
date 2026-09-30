@@ -305,7 +305,8 @@ def test_the_ddl_statement_for_a_materialized_view_carries_its_read_spec():
                 if s["source_identifier"] == "DB.CORE.MV_ORDER_TOTALS")
     assert stmt["object_type"] == "TABLE"
     assert stmt["columns"] == [{
-        "name": "CUSTOMER_ID", "target_type": "DECIMAL(38,0)",
+        "name": "CUSTOMER_ID", "source_type": "number",
+        "target_type": "DECIMAL(38,0)",
         "read_expr": '"CUSTOMER_ID"::VARCHAR',
         "convert_expr": "CAST(`CUSTOMER_ID` AS DECIMAL(38,0))"}]
     assert "delta_features" in stmt and "carried_properties" in stmt
