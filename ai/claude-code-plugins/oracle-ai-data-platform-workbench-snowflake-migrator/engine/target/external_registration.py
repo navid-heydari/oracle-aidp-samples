@@ -54,7 +54,7 @@ from typing import Callable
 
 from snowflake_source.dialect import lexer
 from snowflake_source.extract.catalog import show_paged
-from target.ddl import quote_backtick
+from target.ddl import quote_backtick, quote_spark_string
 
 __all__ = ["REGISTER_CATEGORY", "build_external_registration",
            "render_external_registration"]
@@ -298,9 +298,11 @@ def _register_table_call(target: str, metadata_file: str) -> str:
     """`register_table` adopts existing snapshots; CREATE TABLE ... LOCATION
     would make a new, empty table. `<iceberg_catalog>` is unquoted, so an
     unfilled CALL is a parse error, not a call against some catalog."""
-    name = _iceberg_name(target).replace("'", "''")
+    # Spark escapes with a backslash: a doubled quote reads as two adjacent
+    # literals, so `db.o'brien` registered as `db.obrien`.
     return (f"CALL <iceberg_catalog>.system.register_table("
-            f"table => '{name}', metadata_file => '{metadata_file}')")
+            f"table => {quote_spark_string(_iceberg_name(target))}, "
+            f"metadata_file => {quote_spark_string(metadata_file)})")
 
 
 def _base(rec: dict, kind: str, target: str) -> dict:

@@ -93,9 +93,11 @@ def _stream_row(**over):
     return row
 
 
-def _census(**rows):
+def _census(bodies: bool = True, **rows):
+    """A census over `rows`; `bodies` is --capture-definitions, which keeps
+    task bodies and dynamic-table / materialized-view queries."""
     fake = FakeSql(_responses(**rows))
-    return build_census(fake, ["DB"]), fake
+    return build_census(fake, ["DB"], include_definitions=bodies), fake
 
 
 def _one(census, kind):
@@ -116,14 +118,24 @@ def test_a_task_keeps_its_schedule_graph_place_and_body():
     assert facts["allow_overlapping_execution"] == "false"
 
 
-def test_the_body_is_kept_without_capture_definitions():
-    """Generation cannot work from a body it was never given. A view's text
-    is always captured for the same reason; the opt-in stays what it says it
-    is -- procedure and UDF bodies."""
-    census, _ = _census(**{"show tasks": [_task_row()]})
+def test_a_body_is_kept_only_with_capture_definitions():
+    """A task body or a snapshot query can carry literals (a COPY INTO's
+    CREDENTIALS, an EXECUTE IMMEDIATE's password), and the census lands in
+    files `provision` uploads. Without the opt-in the body is not kept, the
+    record says so, and the scheduling facts a job needs still are."""
+    census, _ = _census(False, **{"show tasks": [_task_row()],
+                                  "show dynamic tables": [_dynamic_row()],
+                                  "show materialized views": [_mv_row()]})
     task = _one(census, "TASK")
-    assert "definition" in task["source_facts"]
-    assert "definition" not in task, "the opt-in key is still opt-in"
+    assert "definition" not in task["source_facts"]
+    assert task["source_facts"]["body_captured"] is False
+    assert task["source_facts"]["schedule"] == "60 MINUTE"
+    for kind in ("DYNAMIC_TABLE", "MATERIALIZED_VIEW"):
+        facts = _one(census, kind)["source_facts"]
+        assert "text" not in facts and facts["body_captured"] is False, kind
+    kept, _ = _census(True, **{"show tasks": [_task_row()]})
+    assert _one(kept, "TASK")["source_facts"]["definition"].startswith(
+        "INSERT INTO STAGING_EVENTS")
 
 
 @pytest.mark.parametrize("raw,expected", [

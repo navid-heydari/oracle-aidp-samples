@@ -32,6 +32,7 @@ is a data-loss defect, not something to resolve by picking a winner.
 from __future__ import annotations
 
 import collections
+import re
 import datetime
 import json
 
@@ -254,7 +255,8 @@ def _snapshot_cadence(label: str, facts: dict, captured: bool
             f"is MANUAL and nothing schedules it")
 
 
-_NOT_CAPTURED = "the defining query was not captured"
+_NOT_CAPTURED = ("the defining query was not captured (re-run "
+                 "`assess --capture-definitions` to keep it)")
 
 
 def _snapshot_refreshes(can: list[dict], by_id: dict[str, dict],
@@ -410,7 +412,9 @@ def _secure_as_view_verdict(rec: dict, mode: str
     if not ok:
         return ok, category, reason, None
     body = str(rec.get("view_ddl_get_ddl") or rec.get("view_text_show") or "")
-    code = body.upper().replace(" (", "(")
+    # Any whitespace between the name and "(" -- `CURRENT_ROLE  ()` and
+    # `IS_ROLE_IN_SESSION\n('X')` are the same call.
+    code = re.sub(r"\s+\(", "(", body.upper())
     used = [f for f in _ROLE_FUNCTIONS if f"{f}(" in code]
     warning = _SECURE_AS_VIEW_WARNING
     if used:

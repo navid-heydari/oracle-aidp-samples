@@ -99,7 +99,7 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from snowmig_source import (  # noqa: E402
     SOURCE_MODES, SnowflakeSource, SourceConfigError, load_source_config, q,
-    read_plan_json, write_step_output)
+    read_plan_json, read_report_json, write_step_output)
 
 # /Workspace is the live-verified mount of the workspace tree on cluster
 # filesystems (probed 2026-09-16 on a real cluster).
@@ -121,6 +121,15 @@ DEFAULT_PARALLEL = 8
 STRUCTURE_CHUNK = 50
 # Seconds between report writes in the view phase (and always at its end).
 REPORT_WRITE_INTERVAL = 15.0
+
+
+def effective_parallel(requested: int | None, mode: str) -> int:
+    """Tables created at once: the flag when given; else 1 for --mode ctas
+    (each CTAS reads the whole source table through the connector, so eight
+    at once multiplies the warehouse load) and DEFAULT_PARALLEL otherwise."""
+    if requested is not None:
+        return requested
+    return 1 if mode == "ctas" else DEFAULT_PARALLEL
 
 
 def _in_parallel(fn, items: list, parallel: int) -> list:
@@ -166,25 +175,7 @@ def _report_path(reports: pathlib.Path, schema: str) -> pathlib.Path:
 
 # Live 2026-09-29: the /Workspace mount served a just-written report
 # incompletely (JSONDecodeError on a file that was valid a minute later).
-REPORT_READ_TRIES = 5
-REPORT_READ_WAIT = 2.0
-
-
-def _read_report_json(path: pathlib.Path) -> dict:
-    """A report's JSON, retried briefly when the read comes back incomplete;
-    still invalid after that is a loud failure that names the file."""
-    import time
-    last = None
-    for attempt in range(REPORT_READ_TRIES):
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            last = exc
-            if attempt + 1 < REPORT_READ_TRIES:
-                time.sleep(REPORT_READ_WAIT)
-    raise ValueError(f"{path.name} is not valid JSON after {REPORT_READ_TRIES} "
-                     f"reads ({last}); it was not overwritten -- inspect it "
-                     f"before re-running")
+_read_report_json = read_report_json
 
 
 def _load_report(path: pathlib.Path, schema: str, target: str) -> dict:
@@ -872,12 +863,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--force", action="store_true",
                     help="re-check tables the report already records as "
                          "created or already_existed")
-    ap.add_argument("--parallel", type=int, default=DEFAULT_PARALLEL,
+    ap.add_argument("--parallel", type=int, default=None,
                     help=f"tables created at once (default "
-                         f"{DEFAULT_PARALLEL}; 1 = one after another). Views "
-                         f"are always created after every table, one at a "
-                         f"time, in the plan's order")
+                         f"{DEFAULT_PARALLEL}; --mode ctas defaults to 1, "
+                         f"since each CTAS is a full Snowflake read; 1 = one "
+                         f"after another). Views are always created after "
+                         f"every table, one at a time, in the plan's order")
     args = ap.parse_args(argv)
+    args.parallel = effective_parallel(args.parallel, args.mode)
 
     if args.parallel < 1:
         return fail(f"error: --parallel {args.parallel}: at least 1 (1 creates "

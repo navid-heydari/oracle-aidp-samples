@@ -69,13 +69,18 @@ def _types(records: list[dict]) -> list[dict]:
 
 def _snapshots(records: list[dict], plan: dict) -> list[dict]:
     """Objects the plan migrates as a TABLE SNAPSHOT, with the refresh
-    verdict it recorded (None when the plan has no entry for it)."""
+    verdict it recorded. With a plan, only what it migrates: one it blocked,
+    restricted out or cascaded out is not "migrated as a snapshot". Without
+    a plan (no can_migrate list), every snapshot-kind object, refresh None.
+    """
+    planned = plan.get("can_migrate")
     refresh = {c["source_identifier"]: (c.get("refresh") or {}).get("verdict")
-               for c in plan.get("can_migrate") or []}
+               for c in planned or []}
     return [{"source_identifier": rec["source_identifier"], "kind": kind,
              "refresh": refresh.get(rec["source_identifier"])}
             for rec in records
-            if (kind := snapshot_kind(rec))]
+            if (kind := snapshot_kind(rec))
+            and (planned is None or rec["source_identifier"] in refresh)]
 
 
 def _dialect(records: list[dict]) -> tuple[list[dict], dict]:

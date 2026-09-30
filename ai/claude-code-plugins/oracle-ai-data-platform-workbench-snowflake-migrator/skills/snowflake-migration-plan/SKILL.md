@@ -99,8 +99,8 @@ four things out loud:
   path catalog rejects it) that reads 0 rows. `register_table` adopts it. An
   Iceberg table catalogued in Glue (or another external catalog) forks when a
   copy is registered on AIDP.
-- **None of it is live-verified on AIDP** — the report's last section lists
-  the checks.
+- **The statements are generated, never executed** — the report's last
+  section lists the checks to make before running them.
 
 ## Outbound shares — a Delta Sharing plan, never executed
 
@@ -114,8 +114,7 @@ consumer account, each shared object with its AIDP target and status, and the
 `aidp delta-share` steps (create → manage-data-asset → create-recipient →
 manage-access). Carry to the user: a recipient is **not a Snowflake account**
 (consumers switch to a Delta Sharing client); a shared table with a masking or
-row-access policy is **HELD**, because Delta Sharing ships raw values; only
-`list` / `list-recipients` are live-verified, so the bodies come from `--help`;
+row-access policy is **HELD**, because Delta Sharing ships raw values; the step bodies follow the `aidp delta-share` CLI reference;
 nothing is run by `snowmig`, and every step publishes data outside the
 tenancy.
 

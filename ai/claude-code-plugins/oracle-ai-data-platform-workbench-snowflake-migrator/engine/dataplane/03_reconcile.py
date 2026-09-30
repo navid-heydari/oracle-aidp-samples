@@ -54,7 +54,7 @@ import sys
 # filesystems (probed 2026-09-16 on a real cluster).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from snowmig_source import (  # noqa: E402
-    read_plan_json, write_step_output)
+    read_plan_json, read_report_json, write_step_output)
 
 DEFAULT_REPORTS_DIR = "/Workspace/backup-snowflake-migration/reports"
 # The step's own values also go here, next to the accumulated run report
@@ -102,7 +102,7 @@ def fail(msg: str) -> int:
 
 def _load(reports: pathlib.Path, name: str) -> dict | None:
     path = reports / name
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+    return read_report_json(path) if path.exists() else None
 
 
 def _for_catalog(report: dict | None,
@@ -449,8 +449,12 @@ def reconcile(spark, *, manifest: dict, target_catalog: str,
                 verdict = "PRESENT_NOT_REVERIFIED"
             else:
                 verdict = "STRUCTURE_ONLY"
-            if (exists and verdict == "STRUCTURE_ONLY"
-                    and name not in (structure or {}).get("objects", {})):
+            # Only against a structure report for THIS target: with none
+            # (tables made by `deploy`, which writes no report, or a report
+            # for another target), "a structure run stopped after creating
+            # it" would send the operator to the wrong fix.
+            if (exists and verdict == "STRUCTURE_ONLY" and structure
+                    and name not in structure.get("objects", {})):
                 s_status, reason = "unrecorded", UNRECORDED_REASON
 
             row = {"table": name, "structure": s_status, "copy": c_status,

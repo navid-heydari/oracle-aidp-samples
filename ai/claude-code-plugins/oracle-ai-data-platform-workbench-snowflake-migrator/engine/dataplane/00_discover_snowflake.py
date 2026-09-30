@@ -49,8 +49,8 @@ import traceback
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from snowmig_source import (  # noqa: E402
-    SOURCE_MODES, SnowflakeSource, SourceConfigError, _sql_literal,
-    load_source_config, q, write_step_output)
+    SOURCE_MODES, SnowflakeSource, SourceConfigError, _database_name,
+    _sql_literal, load_source_config, q, write_step_output)
 
 # /Workspace is the live-verified mount of the workspace tree on cluster
 # filesystems (probed 2026-09-16 on a real cluster).
@@ -323,9 +323,14 @@ def _ddl_column_types(ddl: str) -> dict[str, str]:
 
 
 def _qualified_literal(database: str, schema: str, table: str) -> str:
-    """'"DB"."SCHEMA"."TABLE"' as a Snowflake string literal, for GET_DDL."""
+    """'"DB"."SCHEMA"."TABLE"' as a Snowflake string literal, for GET_DDL.
+
+    The database is the config's value resolved the way every other
+    pushdown resolves it (`_database_name`): quoted verbatim, a config's
+    `snowmig_db` named a lower-case database that does not exist, and every
+    type-detail read failed while the counts and copies worked."""
     name = ".".join('"' + str(p).replace('"', '""') + '"'
-                    for p in (database, schema, table))
+                    for p in (_database_name(database), schema, table))
     return "'" + _sql_literal(name) + "'"
 
 

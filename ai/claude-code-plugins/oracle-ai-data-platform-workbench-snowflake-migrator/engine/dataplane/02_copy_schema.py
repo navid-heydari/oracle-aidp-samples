@@ -62,10 +62,13 @@ re-copies). Failures are recorded and the run continues; the report is the
 deliverable. Each table's record is written the moment its copy finishes; a
 table whose rows have landed but whose chunk's source recount is still to
 come is written PROVISIONALLY as `failed` with `insert_completed` and
-`awaiting_source_recount`, so a job that dies mid-chunk leaves no table
-holding rows without a record. `--mode append` refuses a table whose record
+`awaiting_source_recount`. `--mode append` refuses a table whose record
 says `insert_completed` (its rows are already there): re-copy it with
-`--mode overwrite`.
+`--mode overwrite`. Outside `--mode append` the report is written at most
+every REPORT_WRITE_INTERVAL seconds (and at every chunk's end), so a job
+that stops can lose its last few records; the report's `run` marker says a
+run did not finish, and `--mode append` then refuses to start -- resume in
+the stopped run's own mode first.
 """
 from __future__ import annotations
 
@@ -84,7 +87,7 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from snowmig_source import (  # noqa: E402
     SOURCE_MODES, SnowflakeSource, SourceConfigError, _sql_ident,
-    load_source_config, read_plan_json, write_step_output)
+    load_source_config, read_plan_json, read_report_json, write_step_output)
 
 # /Workspace is the live-verified mount of the workspace tree on cluster
 # filesystems (probed 2026-09-16 on a real cluster).
@@ -1333,7 +1336,7 @@ def main(argv: list[str] | None = None) -> int:
     structure_path = reports / f"structure_report_{args.schema.lower()}.json"
     objects = None
     if structure_path.is_file():
-        s_prior = json.loads(structure_path.read_text(encoding="utf-8"))
+        s_prior = read_report_json(structure_path)
         s_target = s_prior.get("target")
         if s_target and not _same(s_target, target):
             if not args.tables:
@@ -1358,7 +1361,7 @@ def main(argv: list[str] | None = None) -> int:
 
     report = {"schema": args.schema, "tables": {}, "target": target}
     if path.exists():
-        prior = json.loads(path.read_text(encoding="utf-8"))
+        prior = read_report_json(path)
         # Resumability is keyed by SOURCE schema, so a report written against
         # a DIFFERENT target must not let this run skip copies as already
         # verified (the same trap the structure script hit live). Compared
@@ -1386,7 +1389,10 @@ def main(argv: list[str] | None = None) -> int:
     report["source"] = source.describe()
 
     if args.tables:
-        names = list(args.tables)
+        # Deduplicated: the copies run in parallel, and a name given twice
+        # was copied by two workers at once (both count 0 rows, both INSERT,
+        # and they share one temp view).
+        names = list(dict.fromkeys(args.tables))
     else:
         # Default to what the structure step created for THIS target, when it
         # left a report: the manifest is the whole estate, and copying into
@@ -1491,6 +1497,28 @@ def main(argv: list[str] | None = None) -> int:
         f"chunk(s) of {COUNT_CHUNK}")
 
     failures = 0
+    # The run marker. A run outside --mode append writes its report at most
+    # every REPORT_WRITE_INTERVAL seconds, so one that stops can leave a
+    # table holding rows with no record. Appending after it would add those
+    # rows a second time; a resume in the stopped run's own mode re-checks
+    # every table instead (skip-existing skips one that holds rows).
+    prev_run = report.get("run") or {}
+    if (not args.dry_run and args.mode == "append" and prev_run
+            and not prev_run.get("finished")
+            and prev_run.get("mode") not in (None, "append")):
+        return fail(
+            f"error: the previous copy run of {args.schema} (--mode "
+            f"{prev_run.get('mode')}, started {prev_run.get('started_at')}) "
+            f"did not finish, and its last records may not have been "
+            f"written: a table it copied in its last seconds can hold rows "
+            f"with no record, and --mode append would add them a second "
+            f"time. Resume with --mode {prev_run.get('mode')} first; "
+            f"append once that run has finished.")
+    if not args.dry_run:
+        report["run"] = {"mode": args.mode, "finished": False,
+                         "started_at": datetime.datetime.now(
+                             datetime.timezone.utc).isoformat()}
+        _write_report(report, path)
     # A record that says the rows already landed (a verification that
     # raised, or a provisional record a stopped run left) is refused in
     # append mode: appending adds every one of those rows a second time.
@@ -1551,6 +1579,10 @@ def main(argv: list[str] | None = None) -> int:
                                 if n in report["tables"]}
             _write_report(report, path)
 
+    if not args.dry_run:
+        report["run"].update(finished=True, finished_at=datetime.datetime.now(
+            datetime.timezone.utc).isoformat())
+        _write_report(report, path)
     statuses = {}
     for t in report["tables"].values():
         statuses[t["status"]] = statuses.get(t["status"], 0) + 1

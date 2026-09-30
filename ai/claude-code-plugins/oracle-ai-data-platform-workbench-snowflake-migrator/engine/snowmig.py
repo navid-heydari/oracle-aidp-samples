@@ -2574,6 +2574,23 @@ def cmd_jobs(args) -> int:
                                       jobs=res["jobs"], notebook_dir=out)
         payload["registered"] = True
         payload["registration"] = reg
+        # The ledger is the record of what this migration allocated;
+        # generated_jobs.json is rewritten by every run, so a job the first
+        # --register created would drop out of it. `teardown --scope all`
+        # reads these rows (a create not yet confirmed is tried too).
+        from report.resources import record_resource
+        leaves = {t["notebook"].rsplit("/", 1)[-1]: j["name"]
+                  for j in res["jobs"] for t in j["tasks"]}
+        for name in reg["created"] + reg["unconfirmed"]:
+            record_resource(out, stage="jobs", kind="job", name=name,
+                            workspace=workspace,
+                            action=("created" if name in reg["created"]
+                                    else "create_requested"))
+        for leaf, job_name in leaves.items():
+            if job_name in reg["created"] + reg["unconfirmed"]:
+                record_resource(out, stage="jobs", kind="ws_object",
+                                name=f'{reg["folder"]}/{leaf}',
+                                workspace=workspace, action="created")
         if reg["failed"] or reg["name_taken"] or reg["unconfirmed"]:
             code = 1
     _write(out, "generated_jobs.json", payload)

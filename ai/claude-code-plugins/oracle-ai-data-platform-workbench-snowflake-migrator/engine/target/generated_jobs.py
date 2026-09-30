@@ -74,7 +74,8 @@ def refresh_query(ddl: str | None, *, source_identifier: str,
     target name; `reads` is those target names.
     """
     if not ddl or not str(ddl).strip():
-        return _refused("the defining query was not captured")
+        return _refused("the defining query was not captured (re-run "
+                        "`assess --capture-definitions` to keep it)")
     try:
         mask = lexer.code_only(str(ddl))
     except lexer.UnterminatedLiteral as exc:
@@ -710,7 +711,9 @@ def translate_task_body(body: str | None, *, task: str, db: str, schema: str,
 
     streams = streams or {}
     if not body or not str(body).strip():
-        return _stub("the task body was not captured")
+        return _stub("the task body was not captured -- re-run `assess "
+                     "--capture-definitions` to keep task bodies, then "
+                     "`plan` and `jobs` again")
     try:
         statements = lexer.split_statements(str(body))
     except lexer.UnterminatedLiteral as exc:

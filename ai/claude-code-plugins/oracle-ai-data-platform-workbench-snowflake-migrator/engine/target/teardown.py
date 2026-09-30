@@ -32,8 +32,8 @@ from .provenance import (CREATED, NOT_CREATED, REQUESTED, UNKNOWN,
                          cluster_records)
 
 __all__ = ["ACTIONS", "RELEASED_ACTIONS", "SCOPES", "STOPPED_STATES",
-           "catalogs_created", "teardown", "teardown_everything",
-           "render_teardown"]
+           "catalogs_created", "ledger_workspace_rows", "teardown",
+           "teardown_everything", "render_teardown"]
 
 ACTIONS = ("stop", "delete")
 # One stopped set, shared with the billing report (report/resources.py).
@@ -338,6 +338,19 @@ def catalogs_created(ledger: list[dict]) -> list[dict]:
             for key, row in by_key.items() if row.get("action") == "created"]
 
 
+def ledger_workspace_rows(ledger: list[dict], kind: str,
+                          workspace: str) -> list[str]:
+    """Names the ledger records this migration creating on `workspace`
+    (`jobs --register`'s jobs and notebooks), each once, in order."""
+    names: list[str] = []
+    for row in ledger or []:
+        if (row.get("kind") == kind and row.get("workspace") == workspace
+                and row.get("action") in ("created", "create_requested")
+                and row.get("name") and row["name"] not in names):
+            names.append(str(row["name"]))
+    return names
+
+
 def _job_names(prov: dict) -> list[str]:
     """Jobs the record names on this migration's workspace, minus the ones
     a push already deleted. On a workspace this migration CREATED every one
@@ -464,8 +477,20 @@ def teardown_everything(call, prov: dict, *, scope: str, execute: bool,
             "why": f'placed on another workspace ({other.get("workspace")}) '
                    f'by an earlier push; remove it there'})
     if scope == "all":
-        for name in _job_names(prov):
+        # The provisioned jobs, then the ones `jobs --register` created
+        # (recorded in the ledger, not in provision_result.json).
+        job_names = _job_names(prov)
+        for name in ledger_workspace_rows(ledger or [], "job", ws_key):
+            if name not in job_names:
+                job_names.append(name)
+        for name in job_names:
             plan.append({"kind": "job", "name": name})
+        if not ws_created:
+            # On a workspace this migration did not create, its generated
+            # notebooks go one by one; on its own, with the workspace.
+            for path in ledger_workspace_rows(ledger or [], "ws_object",
+                                              ws_key):
+                plan.append({"kind": "notebook", "name": path})
         targets, left, unresolved = _targets(prov)
         for t in targets:
             plan.append({"kind": "cluster", **t})
@@ -504,7 +529,7 @@ def teardown_everything(call, prov: dict, *, scope: str, execute: bool,
     for p in plan:
         step = dict(p)
         try:
-            if p["kind"] == "credential":
+            if p["kind"] in ("credential", "notebook"):
                 parent, _, leaf = p["name"].rstrip("/").rpartition("/")
                 verified, detail = _gone_after(
                     call,

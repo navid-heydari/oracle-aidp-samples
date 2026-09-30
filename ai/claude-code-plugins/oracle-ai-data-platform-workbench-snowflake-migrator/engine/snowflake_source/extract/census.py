@@ -374,15 +374,30 @@ def _predecessors(value, db: str, schema: str) -> list[str]:
     return [_task_name(i, db, schema) for i in items]
 
 
+# Facts that are object BODIES: a task's SQL, a dynamic table's or
+# materialized view's query. A body can carry literals -- a COPY INTO's
+# CREDENTIALS, an EXECUTE IMMEDIATE's password -- and the census lands in
+# plan.json/inventory.json, which `provision` uploads to the workspace. So
+# they are kept only with --capture-definitions, as every other body is.
+_BODY_FACTS = ("definition", "text")
+
+
 def _source_facts(spec: dict, row: dict, db: str | None, schema: str,
-                  identifier: str, notes: list[str]) -> dict | None:
+                  identifier: str, notes: list[str], *,
+                  include_bodies: bool = False) -> dict | None:
     """What a generated job needs, copied from the row the census already
     read -- no statement is added for it. Only fields the row CARRIES are
-    kept: an absent column stays absent rather than reading as "none"."""
+    kept: an absent column stays absent rather than reading as "none". A
+    body (`_BODY_FACTS`) is kept only with `include_bodies`; without it
+    `body_captured: false` says so, and a generated job names the flag."""
     keep = spec.get("facts")
     if not keep:
         return None
-    facts = {f: _iso(row[f]) for f in keep if f in row}
+    facts = {f: _iso(row[f]) for f in keep if f in row
+             and (include_bodies or f not in _BODY_FACTS)}
+    if not include_bodies and any(f in row for f in keep
+                                  if f in _BODY_FACTS):
+        facts["body_captured"] = False
     if "predecessors" in facts and db is not None:
         raw = facts.pop("predecessors")
         if raw in (None, ""):
@@ -928,11 +943,12 @@ def _entry(kind: str, spec: dict, db: str | None, row: dict, *,
             entry["detail"] = (f'{entry["detail"]} '
                                f'writes={",".join(writes)}').strip()
 
-    # A task's schedule, graph and body; a dynamic table's lag and query; a
-    # materialized view's query; a stream's base table. Kept whether or not
-    # --capture-definitions was given: a job cannot be generated from a body
-    # nobody kept, and a view's text is always captured for the same reason.
-    facts = _source_facts(spec, row, db, str(schema), identifier, notes)
+    # A task's schedule and graph, a dynamic table's lag, a stream's base
+    # table: always kept. A task's body and a dynamic table's or
+    # materialized view's query only with --capture-definitions (see
+    # _BODY_FACTS); a job generated without one says which flag keeps it.
+    facts = _source_facts(spec, row, db, str(schema), identifier, notes,
+                          include_bodies=include_definitions)
     if facts is not None:
         entry["source_facts"] = facts
 

@@ -8,8 +8,8 @@ Thin wrapper over
 [`snowflake-migrator-demo`](../skills/snowflake-migrator-demo/SKILL.md).
 
 1. Run `${CLAUDE_PLUGIN_ROOT}/bin/snowmig demo --out-dir
-   ./snowmig_demo`. Nothing to ask the user for. For what a trial account
-   cannot hold (external/Iceberg/hybrid/event tables, shares, policies,
+   ./snowmig_demo`. Nothing to ask the user for. For a larger enterprise
+   estate (external/Iceberg/hybrid/event tables, shares, policies,
    container services, replication), add `--estate enterprise` and a separate
    `--out-dir ./snowmig_demo_enterprise`; that run stops before any AIDP step.
 2. Lead with the banner: **everything in the output is emulated.**
