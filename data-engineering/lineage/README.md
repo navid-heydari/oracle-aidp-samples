@@ -8,7 +8,7 @@ Two complementary artifacts:
 | [`Verify_Data_Lineage.ipynb`](./Verify_Data_Lineage.ipynb) | Derives lineage from Spark's analyzed plan and verifies it against a known DAG. 19/19 checks for the pipeline shapes below. |
 
 > **Read this before you set up a profile.** The API is released. On the one tenancy tested —
-> **observed 2026-08-16, a single DataLake in us-ashburn-1, SDK v4.2.1** — no graph came back:
+> **observed 2026-08-16, a single DataLake in us-ashburn-1, API version `20260430`** — no graph came back:
 > `fetchLineage` rejected every `anchorNode` we could construct with `400 Invalid anchorNode` (see
 > [Known gap](#known-gap-no-graph-came-back-on-the-tenancy-tested)). You can confirm the endpoint
 > exists and enforces its contract. Whether you get a graph may differ on your tenancy — Part B
@@ -62,7 +62,7 @@ not a wholesale one. `test_A2` and `test_A7` encode both halves of the trap.
 
 ### Known gap: no graph came back on the tenancy tested
 
-Observed 2026-08-16, one DataLake in us-ashburn-1, SDK v4.2.1. `fetchLineage` reaches its own
+Observed 2026-08-16, one DataLake in us-ashburn-1, API version `20260430`. `fetchLineage` reaches its own
 parameter validation and rejected every `anchorNode` we could construct:
 
 ```
@@ -107,11 +107,11 @@ other suite collected in the same run. The skip is reported once, as `SKIPPED`, 
 medallion suites still run when pytest is invoked from the repository root.
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-test.txt     # local only; the notebook needs no cluster libraries
 
 export AIDP_DATALAKE=ocid1.aidataplatform.oc1.<region>.<unique-id>   # required
 export AIDP_PROFILE=DEFAULT                                         # optional, defaults to DEFAULT
-export AIDP_REGION=us-ashburn-1                                     # optional
+export AIDP_REGION=us-ashburn-1                                     # optional, defaults to the profile's region
 
 pytest test_aidp_lineage_api.py -v                 # everything
 pytest test_aidp_lineage_api.py -v -m existence    # just the existence checks
@@ -124,7 +124,7 @@ pytest test_aidp_lineage_api.py -m "existence and not legacy"   # skip the legac
 |---|---|---|
 | `AIDP_DATALAKE` | **yes** | none -- the module is skipped if unset |
 | `AIDP_PROFILE` | no | `DEFAULT` |
-| `AIDP_REGION` | no | `us-ashburn-1` |
+| `AIDP_REGION` | no | the profile's `region`, else `us-ashburn-1` |
 | `AIDP_SCHEMA` | no | `default.lin_demo` |
 | `AIDP_ANCHOR_TABLE` | no | `<AIDP_SCHEMA>.mart_customer_revenue` |
 
@@ -266,5 +266,6 @@ or Kernel → Restart & Clear Output) before opening a PR.
 ## Environment as tested
 
 Spark 3.5.0 · Delta 3.2.0-oci-1.0.0 · `spark.sql.sources.default=delta` · catalog impl `hive` ·
-region `us-ashburn-1` · aidp SDK `oracle-samples/aidataplatform-sdk` v4.2.1, lineage operations on
-`/20260430`.
+region `us-ashburn-1` · lineage operations on `/20260430`, called as signed REST requests (no SDK
+client). Service and operation names checked against aidp SDK `oracle-samples/aidataplatform-sdk`
+v4.2.1.

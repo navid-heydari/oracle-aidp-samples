@@ -1,0 +1,6 @@
+# Local dependencies for test_aidp_lineage_api.py. Not for the AIDP cluster:
+# Verify_Data_Lineage.ipynb needs no extra libraries, and installing oci there would
+# shadow the cluster's own OCI SDK.
+oci>=2.131.0
+requests>=2.31.0
+pytest>=8.0.0

@@ -140,6 +140,17 @@ def spark(request, tmp_path_factory):
     pytest.importorskip("pyspark", reason="pyspark not installed")
     from pyspark.sql import SparkSession
 
+    existing = SparkSession.getActiveSession()
+    if existing is not None:
+        # Another suite in this pytest process (e.g. `pytest data-engineering/` from the
+        # repository root) left a session running. Static configs -- Delta's extensions and
+        # jars, the warehouse dir -- cannot be applied to it, and builder.getOrCreate() would
+        # hand it back with the Delta catalog setting but no Delta jars, failing every query.
+        # Borrow it as-is for the plain-SQL tests and leave it running for its owner; the
+        # Delta end-to-end test skips itself when the session has no Delta extensions.
+        yield existing
+        return
+
     builder = (
         SparkSession.builder.master("local[1]")
         .appName("scd2_template_tests")
@@ -298,6 +309,11 @@ def test_expire_then_insert_end_to_end(notebook_ns, spark):
     Skipped when delta-spark is not installed.
     """
     pytest.importorskip("delta", reason="delta-spark not installed")
+    if "DeltaSparkSessionExtension" not in spark.conf.get("spark.sql.extensions", ""):
+        pytest.skip(
+            "the SparkSession has no Delta extensions: another suite started Spark first in "
+            "this pytest process. Run this suite on its own to include the Delta test."
+        )
     from datetime import datetime
 
     from pyspark.sql.types import (BooleanType, DateType, IntegerType, StringType,

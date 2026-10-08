@@ -5,7 +5,8 @@ Purpose: prove, from live responses, that the lineage feature is actually releas
 reachable — and separately, report whether the lineage *graph* is populated for the
 tables under test.
 
-Observed 2026-08-16 against one AI Data Platform instance in us-ashburn-1, SDK v4.2.1.
+Observed 2026-08-16 against one AI Data Platform instance in us-ashburn-1, API version
+20260430. The suite signs REST calls itself, so no SDK client version is involved.
 The Part B result below is that one observation, not a statement about the service.
 
 The suite is deliberately split:
@@ -31,7 +32,8 @@ Run (AIDP_DATALAKE must be exported -- there is no default):
     pytest test_aidp_lineage_api.py -rP -k B0           # B0's anchor-candidate matrix
     pytest test_aidp_lineage_api.py -m "existence and not legacy"   # skip the legacy host
 
-Requires: oci, requests, pytest  ·  a working ~/.oci/config profile  ·  AIDP_DATALAKE.
+Requires: requirements-test.txt (oci, requests, pytest)  ·  a working ~/.oci/config profile  ·
+AIDP_DATALAKE.
 """
 import json
 import os
@@ -44,7 +46,6 @@ import requests
 # Configuration
 # --------------------------------------------------------------------------------------
 PROFILE = os.environ.get("AIDP_PROFILE", "DEFAULT")
-REGION = os.environ.get("AIDP_REGION", "us-ashburn-1")
 # Required: the OCID of YOUR AI Data Platform instance. There is deliberately no
 # default -- a default would point every reader's signed requests at someone else's
 # resource and fail with an ambiguous 404.
@@ -61,6 +62,20 @@ if not DATALAKE:
         "-- see README.md for the full list of environment variables.",
         allow_module_level=True,
     )
+
+
+
+def _profile_region():
+    """The `region` in the OCI profile, or None if there is no readable profile."""
+    try:
+        return oci.config.from_file(profile_name=PROFILE).get("region")
+    except (oci.exceptions.ConfigFileNotFound, oci.exceptions.ProfileNotFound):
+        return None
+
+
+# The profile's region by default, so a reader outside us-ashburn-1 reaches their own host
+# instead of getting a 404 from someone else's region.
+REGION = os.environ.get("AIDP_REGION") or _profile_region() or "us-ashburn-1"
 
 SCHEMA_KEY = os.environ.get("AIDP_SCHEMA", "default.lin_demo")
 ANCHOR_TABLE = os.environ.get("AIDP_ANCHOR_TABLE", "%s.mart_customer_revenue" % SCHEMA_KEY)
@@ -290,25 +305,44 @@ def test_A7_lineage_absent_from_legacy_api_generation(signer):
     code_cat, _ = _req(signer, "GET", LEGACY_BASE + "/catalogs")
     assert code_cat == 200, "legacy base should still serve catalogs (%s)" % code_cat
 
-    code_lin, _ = _req(signer, "GET", LEGACY_BASE + "/lineage")
-    assert code_lin == 404, "legacy generation unexpectedly has /lineage (%s)" % code_lin
+    # The same operation and body Part A sends to the data-plane host. A made-up path such
+    # as GET /lineage would 404 on every host, so it could not show that this one lacks it.
+    code_lin, _ = _req(signer, "POST", LEGACY_BASE + "/actions/fetchLineage", {
+        "anchorNode": UNRESOLVABLE_ANCHOR, "maxDepth": 3, "level": "ENTITY",
+        "direction": "BOTH", "shouldIncludeEdges": True,
+    })
+    assert code_lin == 404, (
+        "legacy generation unexpectedly serves actions/fetchLineage (%s)" % code_lin)
 
 
 # ======================================================================================
 # Part B — GRAPH POPULATION.  Known open gap: no anchorNode value is accepted yet.
 # ======================================================================================
-ANCHOR_CANDIDATES = [
-    "default.lin_demo.mart_customer_revenue",           # table key (as ListTables returns)
-    "mart_customer_revenue",                            # bare display name
-    "hive.lin_demo.mart_customer_revenue",              # catalogGuid-qualified
-    "default.cat/lin_demo.db/mart_customer_revenue",    # storage-style path
-    "TABLE:default.lin_demo.mart_customer_revenue",     # type-prefixed
-    DATALAKE,                                           # the platform OCID itself
-]
+def _anchor_candidates(table):
+    """Every id form B0 probes, derived from ANCHOR_TABLE so it follows AIDP_SCHEMA."""
+    parts = table.split(".")
+    cands = [
+        table,                                          # table key (as ListTables returns)
+        parts[-1],                                      # bare display name
+    ]
+    if len(parts) == 3:
+        cat, sch, tbl = parts
+        cands += [
+            "hive.%s.%s" % (sch, tbl),                  # catalogGuid-qualified
+            "%s.cat/%s.db/%s" % (cat, sch, tbl),        # storage-style path
+        ]
+    cands += [
+        "TABLE:%s" % table,                             # type-prefixed
+        DATALAKE,                                       # the platform OCID itself
+    ]
+    return list(dict.fromkeys(cands))                   # de-duplicated, order kept
+
+
+ANCHOR_CANDIDATES = _anchor_candidates(ANCHOR_TABLE)
 
 BLOCKED = (
     "No accepted anchorNode format known (observed 2026-08-16, one DataLake in "
-    "us-ashburn-1, SDK v4.2.1): every candidate returns 400 'Invalid anchorNode'. "
+    "us-ashburn-1, API version 20260430): every candidate returns 400 'Invalid anchorNode'. "
     "Either the lineage graph is not populated for that DataLake, or the node-id format "
     "is undocumented -- the CLI reference lists anchorNode with an empty description. "
     "Not yet separated."
