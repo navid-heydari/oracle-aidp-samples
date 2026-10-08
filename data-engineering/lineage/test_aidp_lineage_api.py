@@ -38,9 +38,7 @@ AIDP_DATALAKE.
 import json
 import os
 
-import oci
 import pytest
-import requests
 
 # --------------------------------------------------------------------------------------
 # Configuration
@@ -62,6 +60,12 @@ if not DATALAKE:
         "-- see README.md for the full list of environment variables.",
         allow_module_level=True,
     )
+
+# Imported after the AIDP_DATALAKE check, and as skips: a missing package must not be a
+# collection error that aborts the other suites in the same run either.
+oci = pytest.importorskip("oci", reason="oci is not installed: pip install -r requirements-test.txt")
+requests = pytest.importorskip(
+    "requests", reason="requests is not installed: pip install -r requirements-test.txt")
 
 
 def _profile_region():
