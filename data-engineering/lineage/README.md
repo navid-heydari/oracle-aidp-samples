@@ -1,4 +1,4 @@
-# Data Lineage in AIDP — API conformance tests + an independent oracle
+# Data Lineage in AIDP — API conformance tests + a plan-derived cross-check
 
 Two complementary artifacts:
 
@@ -154,18 +154,18 @@ implementation is behind the route.
 `B1` entity graph · `B2` upstream contains `stg_orders` + `raw_customers` · `B3` column-level edges ·
 `B4` CSV export. Marked `xfail(strict=False)` rather than skipped or deleted, so if lineage becomes
 populated they flip to **XPASS** and the suite reports that the gap closed. `B2` asserts the same DAG
-the notebook derives from Spark — so when it goes green, the platform's graph is confirmed against
-independently derived ground truth.
+the notebook derives from Spark — so when it goes green, the platform's graph agrees with the
+lineage read from the Spark plan.
 
 Part B is the only place `AIDP_ANCHOR_TABLE` is used. Part A probes with a deliberately unresolvable
 sentinel instead, so Part A stays green on a populated tenancy rather than failing the day Part B
 starts passing.
 
-## The notebook: independent ground truth
+## The notebook: a plan-derived cross-check
 
-The API is the platform's *claim* about lineage. The notebook is the oracle you check it against,
-deriving lineage from the Catalyst analyzed plan — the one signal that cannot disagree with what
-actually ran.
+The API is the platform's *claim* about lineage. The notebook derives lineage from the Catalyst
+analyzed plan of each write and checks it against the pipeline the notebook itself built — so it
+validates the extractor on known shapes, and gives you something to compare the platform graph with.
 
 ```
 raw_orders ──filter status='PAID'──> stg_orders ──┐
@@ -198,7 +198,9 @@ gives temporal provenance, not a graph.
 ### How the extraction works
 
 - **Table level** — `df._jdf.queryExecution().analyzed().collectLeaves()`, then
-  `leaf.catalogTable().get().qualifiedName()` for a clean `catalog.schema.table`.
+  `leaf.catalogTable().get().qualifiedName()` for a clean `catalog.schema.table`. A v2
+  `DataSourceV2Relation` (for example a DataFrame read from an external catalog) has no
+  `catalogTable()`, so it is named from `catalog()` + `identifier()` instead.
 - **Column level** — the top plan node's `projectList()` (Project) or `aggregateExpressions()`
   (Aggregate); each output expression's `references()` are `AttributeReference`s carrying an `exprId`,
   mapped back to the leaf relations' output attributes.

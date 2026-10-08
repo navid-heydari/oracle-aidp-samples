@@ -1,10 +1,8 @@
 """Local pytest configuration for the lineage conformance suite.
 
-This is a conftest.py rather than a pytest.ini on purpose: an ini file is only read
-when it is the rootdir's config, so running `pytest data-engineering/lineage/` from the
-repository root silently ignored it and every marker below came back as an unknown-mark
-warning. conftest.py is collected relative to the test file, so the markers register
-wherever pytest is invoked from.
+Registers the suite's markers. A conftest.py is collected relative to the test file, so
+the markers register wherever pytest is invoked from; a pytest.ini is only read when it is
+the rootdir's config, so it would be ignored when running from the repository root.
 """
 
 

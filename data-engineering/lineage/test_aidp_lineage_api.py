@@ -106,10 +106,10 @@ def signer():
 def unresolvable_message(signer):
     """The server's own wording for an anchorNode it cannot resolve, captured once.
 
-    Pinning the literal string "Invalid anchorNode" made A4/A5 fail on any Preview-API
-    message change that merely echoed the value back. Capturing it from one probe and
-    comparing the rest against that keeps the discrimination the tests are actually
-    about -- reached anchor resolution vs. rejected earlier -- without pinning wording.
+    The tests compare against this captured message rather than a pinned literal, so a
+    Preview-API wording change (or a message that echoes the value back) does not break
+    them. What they check is unchanged -- the request reached anchor resolution rather
+    than being rejected earlier.
     """
     code, body = fetch_lineage(signer)
     assert code == 400, "expected 400 for an unresolvable anchor, got %s: %s" % (code, body)
