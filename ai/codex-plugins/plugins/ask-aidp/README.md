@@ -4,20 +4,66 @@ This plugin connects Codex to Oracle AI Data Platform Workbench through every do
 
 ## Requirements
 
-- Codex CLI with the `plugin` subcommand and Node.js available to Codex. The
-  installation flow is verified on `codex-cli 0.147.0`.
+- Codex CLI with the `plugin` subcommand and Node.js 18 or later available to
+  Codex. The installation flow is verified on `codex-cli 0.147.0`.
 - OCI config and credentials that can access the target AIDP instance.
-- The latest `aidp-cli` from
+- AIDP CLI (`aidp`), required for full plugin functionality. Install the latest `aidp-cli` from
   [`oracle-samples/aidataplatform-sdk`](https://github.com/oracle-samples/aidataplatform-sdk),
   either on `PATH` or selected with `AIDP_CLI_BIN`.
+- OCI CLI (`oci`), required to create the initial token when using the documented
+  session-token authentication flow (`oci session authenticate`). It can be
+  skipped when configuring API-key credentials directly.
 - The latest `aidp-typescript-client` and `oci-common` packages when using the
-  native SDK workspace upload and Git tools.
+  native SDK workspace upload and Git tools; `oci-common` is also required for
+  signed REST calls.
+
+AIDP CLI (`aidp`) and OCI CLI (`oci`) are different tools. Installing OCI CLI
+does not install AIDP CLI. The AIDP CLI itself defaults to `security_token`. When
+`AIDP_AUTH` is unset, Ask-AIDP's connection check, typed tools, and SDK/REST tools
+default to `api_key`, but the generic `aidp_cli` and `aidp_command_help` tools pass
+no `--auth` flag, so the CLI default applies to them. Set `AIDP_AUTH` explicitly
+(`api_key` or `security_token`) so every tool uses the same mode. The environment
+samples below use the API-key alternative.
 
 This GitHub directory is the plugin's source distribution. It does **not** contain
 generated `dist/` tarballs, zip files, or a vendored `node_modules` tree. Install the
 plugin from the GitHub marketplace as described below. The build script can create
 offline archives for a separate release process, but those archives are not published
 here.
+
+### Set up and verify AIDP CLI
+
+Before connecting the plugin, follow the
+[AIDP CLI installation instructions](https://github.com/oracle-samples/aidataplatform-sdk#cli)
+to install the CLI and its matching SDK package. Installing this plugin from
+GitHub does not install those dependencies. Then verify in the shell that will
+launch Codex:
+
+```sh
+node --version
+aidp --help
+```
+
+If `aidp` is not on `PATH`, set `AIDP_CLI_BIN` to its absolute executable path.
+Verify that executable with `"$AIDP_CLI_BIN" --help` on macOS/Linux or
+`& $env:AIDP_CLI_BIN --help` in PowerShell. Restart Codex after changing its
+environment.
+
+For `aidp_rest` and the native SDK workspace upload and Git tools, the MCP server
+loads `oci-common` and `aidp-typescript-client` only from
+`<plugin-root>/vendor/node_modules`, `<plugin-root>/node_modules`, or the directory
+named by `AIDP_VENDOR_NODE_MODULES`, where `<plugin-root>` is the installed
+directory that contains `mcp/ask-aidp-server.mjs`; it does not search the working
+directory or the global npm root. Either run
+`npm install --no-save oci-common /path/to/aidp-typescript-client-1.0.0.tgz` inside
+`<plugin-root>`, or, if you installed those packages globally as the SDK README
+shows, set `AIDP_VENDOR_NODE_MODULES="$(npm root -g)"` (PowerShell:
+`$env:AIDP_VENDOR_NODE_MODULES = (npm root -g)`) in the shell that launches Codex.
+
+Without AIDP CLI, CLI-backed tools such as connection checks, notebook workflows,
+and catalog operations fail. Reference tools may still respond, and direct
+SDK/REST tools can work with their own dependencies and credentials, but that
+does not verify full plugin functionality.
 
 For file work in notebooks, use AIDP Workbench path patterns such as `/Volumes/<catalog>/<schema>/<volume>/<file>`, `/Workspace/<folder>/<file>`, `file:///Volumes/...`, `file:///Workspace/...`, and `oci://<bucket>@<namespace>/<folder-or-file>`.
 
@@ -73,7 +119,7 @@ Restart the Codex app, then start another new thread.
 
 ## Verify The Install
 
-Confirm that Codex installed and enabled version `0.9.1` and registered the MCP
+Confirm that Codex installed and enabled version `0.10.0` and registered the MCP
 server:
 
 ```bash
@@ -90,9 +136,36 @@ cd ai/codex-plugins/plugins/ask-aidp
 node scripts/qa.mjs
 ```
 
-Expected: `"ok": true`, 43 MCP tools, 242 CLI commands, and 257 REST operations.
+Expected: `"ok": true`, 43 MCP tools, 256 CLI commands, and 271 REST operations.
 
 ## Configure AIDP
+
+### Configure OCI credentials
+
+For session-token authentication, install
+[OCI CLI](https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliinstall.htm)
+and create the initial token with `oci session authenticate`. Then set
+`AIDP_AUTH=security_token` and `OCI_PROFILE` to the generated profile name before
+launching the assistant. AIDP CLI consumes the existing session credentials;
+setting `AIDP_AUTH` does not create a token or perform the initial login. Follow
+[Oracle's session-token instructions](https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/clitoken.htm)
+to validate, refresh, or reauthenticate the session when needed.
+
+For API-key authentication, OCI CLI is not required. Reuse a valid OCI profile or
+follow [Oracle's API signing key instructions](https://docs.oracle.com/en-us/iaas/Content/API/Concepts/apisigningkey.htm#two):
+
+1. Use an IAM user with permission to access the target AIDP resources and upload
+   the public API signing key under that user's API Keys in OCI Console.
+2. Save the generated profile in `~/.oci/config` on macOS/Linux or
+   `%USERPROFILE%\.oci\config` on Windows. Include `user`, `tenancy`,
+   `fingerprint`, `region`, and `key_file`, pointing to the private PEM key.
+3. Restrict private-key access to your user. Set `AIDP_AUTH=api_key` and
+   `OCI_PROFILE` to the profile name; set `OCI_CONFIG_FILE` for a custom location.
+
+If OCI CLI is already installed, `oci setup config` can also help create an
+API-key profile.
+
+### Set the plugin environment
 
 Use [`examples/aidp.env.sample`](./examples/aidp.env.sample) as the template. Do
 not distribute a completed `aidp.env`, because it identifies a user's OCI profile,
@@ -141,10 +214,20 @@ export AIDP_CLI_BIN="/absolute/path/to/aidp"
 $env:AIDP_CLI_BIN = "C:\path\to\aidp.cmd"
 ```
 
-If `oci login` does not work, configure OCI API key authentication using
-[Oracle's API signing key instructions](https://docs.oracle.com/en-us/iaas/Content/API/Concepts/apisigningkey.htm#two).
-Set `AIDP_AUTH=api_key`, select the profile with `OCI_PROFILE`, and set
-`OCI_CONFIG_FILE` when the OCI config is not in its default location.
+## Refresh CLI Reference - Maintainers
+
+To regenerate the CLI catalog, supply the upstream CLI README and the matching
+installed CLI operation manifest. The manifest identifies the root request model;
+the README also lists nested models, whose order must not determine the payload.
+
+```bash
+node scripts/generate-cli-command-reference.mjs /path/to/cli/README.md /path/to/node_modules/aidp-cli/dist/operation_manifest.json
+```
+
+Alternatively, set `AIDP_CLI_MANIFEST` to that manifest path. Generation rejects
+ambiguous models and mismatched root fields instead of guessing. MLflow field
+names retain their documented JSON spelling. The catalog records the manifest's
+specification hash. Run `node scripts/qa.mjs` after regeneration.
 
 ## Build Offline Archives — Maintainers
 
@@ -225,7 +308,37 @@ Use Ask AIDP to list my agents and retrieve the trace for this agent session mes
 
 For generic commands, the plugin passes an argument array to `aidp-cli` and appends common endpoint, instance, profile, auth, and timeout flags from the environment. The plugin also has typed `aidp_create_agent`, `aidp_deploy_agent`, `aidp_list_agents`, and `aidp_get_agent_session_trace` helpers for common Agent work.
 
-The generated CLI reference covers all 242 current documented commands in these groups: `agent`, `async-operations`, `audit`, `bundle`, `catalog`, `cluster`, `credentials`, `delta-share`, `mlops`, `notebook`, `role`, `schema`, `user-setting`, `volume`, `workflow`, `workspace`, and `workspace-object`. Use `aidp_cli_reference` to list groups, list commands in a group, fetch one command reference, or search all documented commands. The generated REST reference covers all 257 current documented `/20260430` operations across 18 categories. Use `aidp_rest_api_reference` to search or inspect an endpoint, then use `aidp_rest` for the signed call.
+The generated CLI reference, refreshed on September 21, 2026, covers 256 documented commands in these groups: `agent`, `async-operations`, `audit`, `bundle`, `catalog`, `cluster`, `credentials`, `data-lineage`, `delta-share`, `mlops`, `notebook`, `role`, `schema`, `user-setting`, `volume`, `workflow`, `workspace`, and `workspace-object`. Use `aidp_cli_reference` to list groups, list commands in a group, fetch one command reference, or search all documented commands. The generated REST reference covers 271 documented `/20260430` operations across 19 categories. Use `aidp_rest_api_reference` to search or inspect an endpoint, then use `aidp_rest` for the signed call.
+
+Version 0.10.0 adds references for Data Lineage export and retrieval, bundle
+publishing and publish status, Compute cloning and configuration import/export,
+Maven package search, volume/workspace ZIP operations, and task-run retry details.
+These operations use the existing generic tools; the number of dedicated MCP
+tools remains 43.
+
+Update the separately installed `aidp-cli` and SDK as well as the plugin. Refreshing
+the plugin catalog does not update an external CLI executable. If a command is
+unknown to the installed CLI, inspect `aidp_command_help`, update the CLI using
+the SDK repository's instructions, or use its documented REST equivalent.
+
+For new bundle publishing requests, use `bundle publish-bundle-action` and
+`bundle fetch-publish-status-action` through `aidp_cli`. Their REST equivalents
+are POST `actions/publishBundle` and POST `actions/getBundlePublishStatus` under
+the workspace path. The latter uses POST according to its operation reference,
+despite the GET entry in Oracle's What's New page. The `aidp_deploy_bundle`
+convenience tool retains the legacy deployment commands for compatibility;
+Oracle marks those endpoints deprecated. Follow preview restrictions documented
+on the individual endpoint pages.
+
+Example prompts for the new operations:
+
+```text
+Use Ask AIDP to look up data-lineage fetch-entity-lineage for this table.
+Use Ask AIDP to export this Compute configuration and plan a clone.
+Use Ask AIDP to publish my bundle and retrieve its publish status.
+Use Ask AIDP to list retry attempts for this workflow task run.
+Use Ask AIDP to look up how to upload and extract a workspace ZIP file.
+```
 
 AI Compute convenience tool prompts:
 
@@ -298,6 +411,28 @@ Use Ask AIDP to dry-run auto-healing job run <job-run-key>.
 ```
 
 `aidp_auto_heal_workflow` inspects the job run, selects failed task keys by default, and wraps `aidp workflow repair-job-run`. It can also accept explicit `taskKeys`, rerun parameters, and `pollToCompletion`.
+
+## Compute Configuration Export
+
+The [export operation](https://docs.oracle.com/en/cloud/paas/ai-data-platform/aiwap/op-aidataplatforms-aidataplatformid-workspaces-workspacekey-clusters-clusterkey-actions-exportcomputeconfiguration-post.html)
+uses `ExportComputeConfigurationDetails` as its root request model, with
+`clusterScopedLibraries`, `environmentVariables`, `destinationPath`, and `fileName`.
+Library entries belong inside `clusterScopedLibraries`, not at the root.
+
+`aidp_rest` automatically uses `Accept: application/x-yaml` for this export POST
+and `Content-Type: application/json` for its JSON body. Dry runs show the same
+effective headers as live requests. Explicit header overrides are case-insensitive;
+duplicate header names with different casing are rejected.
+
+Live acceptance test (requires an instance with Compute Configuration enabled):
+
+1. Preview the request with `dryRun: true`; use non-secret values and a unique YAML filename.
+2. Export on a test cluster, then record HTTP 200, the request ID, response headers, and YAML.
+3. Retrieve the created file using the returned workspace path; parse its YAML and compare the selected libraries and environment variables.
+
+A 403 stating that Compute Configuration is not enabled is a feature-availability
+blocker, not successful payload validation. Offline QA tests headers and YAML
+response handling with a mocked transport; it does not replace this live test.
 
 ## Evidence
 
