@@ -30,7 +30,7 @@ write to the SDK version you checked.
 | Fetch entity lineage | `POST /20260430/aiDataPlatforms/{aiDataPlatformId}/actions/fetchLineage` |
 | Export lineage (CSV) | `POST /20260430/aiDataPlatforms/{aiDataPlatformId}/actions/exportLineage` |
 
-- **Host:** `https://datalake.{region}.oci.oraclecloud.com` (service endpoint prefix `datahub-dp`)
+- **Host:** `https://datalake.{region}.oci.oraclecloud.com`
 - **API version:** `20260430`
 - **Request:** `anchorNode` (required), `direction` (`UPSTREAM|DOWNSTREAM|BOTH`), `level`
   (`ENTITY|COLUMN`), `maxDepth`, `nodeFilters`, `pathFilters`, `shouldIncludeEdges`
@@ -38,15 +38,13 @@ write to the SDK version you checked.
   `id / qualifiedName / displayName / parentId / type / depth / properties` and links carry
   `fromNodeId / toNodeId / type / providerType / properties`
 - **Maturity:** both operations are marked **(Preview)** in the official CLI reference
-- **Backing store:** Oracle Data Catalog — table properties carry `com.oracle.dcat.*` keys and
-  `request-mode: DATAHUB_EXECUTE`
 
 Column-level lineage (`level: COLUMN`) is part of the released contract, not just table-level.
 
 ### Reading a 404
 
 A 404 means different things depending on which host you sent it to, and the response body cannot
-tell you which — it is **byte-identical** (111 bytes, same `code`/`message`) for an absent route and
+tell you which — it is **identical** (same `code`/`message`) for an absent route and
 for a resource you are not authorised to see.
 
 | Host | A 404 here means |
@@ -84,7 +82,7 @@ Two candidate explanations, not yet separated:
 
 1. the lineage graph is not populated for this DataLake (no harvest configured, and interactive
    notebook writes may not register a process node — lineage may require Job/Workflow execution); or
-2. `anchorNode` expects an internal Data Catalog node id whose format is undocumented — the CLI
+2. `anchorNode` expects an internal node id whose format is undocumented — the CLI
    reference lists the field with an **empty description**.
 
 `test_B0` probes the full candidate matrix on every run. It always passes, so pytest **captures** its
