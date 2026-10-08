@@ -19,7 +19,7 @@ oracle-aidp-samples/
 │   └── migration/            # Migrating workloads to AIDP
 ├── data-engineering/
 │   ├── ingestion/            # Connectors and data loading patterns
-│   ├── lineage/              # Deriving and verifying data lineage
+│   ├── lineage/              # Reading and visualizing AIDP data lineage
 │   └── transformation/       # Pipeline architectures and table formats
 │       ├── delta-clone-metadata/
 │       ├── liquid-clustering/
@@ -95,9 +95,11 @@ Patterns for connecting to and loading data from a wide range of sources.
 
 ### Data Engineering — Lineage
 
+Working with the lineage AIDP records automatically for every notebook and workflow run: which tables fed which, through which job, and how each column was derived.
+
 | Notebook | Description |
 |---|---|
-| [Verify Data Lineage](data-engineering/lineage/Verify_Data_Lineage.ipynb) | Derive table- and column-level lineage from Spark's analyzed plan and verify it against a known DAG, using negative controls and the Delta commit log as corroboration. |
+| [Visualize AIDP Lineage](data-engineering/lineage/Visualize_AIDP_Lineage.ipynb) | Fetch a table's upstream and downstream lineage through the DataLineage API, draw the table and column graphs inline in the notebook, and hand the lineage to other tools as DataFrames or OpenLineage events. |
 
 ---
 

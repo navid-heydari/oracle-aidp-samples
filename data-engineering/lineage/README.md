@@ -1,281 +1,67 @@
-# Data Lineage in AIDP — API conformance tests + a plan-derived cross-check
+# See your data lineage in a notebook
 
-Two complementary artifacts:
+AIDP records lineage on its own whenever a notebook or a workflow task runs: which tables were read,
+which were written, by which job, and how each column was derived.
+[`Visualize_AIDP_Lineage.ipynb`](./Visualize_AIDP_Lineage.ipynb) reads that lineage through the
+AIDP **DataLineage** REST API and draws it inline:
 
-| File | What it does |
+| Graph | What it shows |
 |---|---|
-| [`test_aidp_lineage_api.py`](./test_aidp_lineage_api.py) | Maintainer harness. Confirms the lineage API is released and reachable, from real responses. 13 passed / 4 xfailed as of 2026-08-16 (A7 has since moved from `GET /lineage` to the real `POST actions/fetchLineage` and has not been re-run live). |
-| [`Verify_Data_Lineage.ipynb`](./Verify_Data_Lineage.ipynb) | Derives lineage from Spark's analyzed plan and verifies it against a known DAG. 19/19 checks for the pipeline shapes below. |
+| Tables | Upstream and downstream tables around an anchor table, and the jobs or notebooks that wrote each one. Hover a box for its full name, or a job or notebook for its workspace and last run. |
+| Columns | Which column feeds which, coloured by how it was derived: copied as is, transformed, or aggregated. |
 
-> **Read this before you set up a profile.** The API is released. On the one tenancy tested —
-> **observed 2026-08-16, a single DataLake in us-ashburn-1, API version `20260430`** — no graph came back:
-> `fetchLineage` rejected every `anchorNode` we could construct with `400 Invalid anchorNode` (see
-> [Known gap](#known-gap-no-graph-came-back-on-the-tenancy-tested)). You can confirm the endpoint
-> exists and enforces its contract. Whether you get a graph may differ on your tenancy — Part B
-> reports **XPASS** if it does. The notebook does not depend on the API and runs independently.
+The same response is then turned into two pandas DataFrames, nodes and edges, ready for a graph
+library, a catalog or your own reports. A last section turns it into [OpenLineage](https://openlineage.io/)
+events, the open format that DataHub, Marquez and OpenMetadata accept, column lineage included. The
+events validate against the OpenLineage schemas; posting them to a catalog is shown but has not been
+tested. Nothing is written to disk: for a file, use **Export** in the
+Lineage view or the `exportLineage` operation, which return CSV.
 
-> **Requires your own tenancy.** `test_aidp_lineage_api.py` signs real requests with your OCI profile
-> and needs `AIDP_DATALAKE` exported (see [Running the tests](#running-the-tests)). It is a maintainer
-> conformance harness, not a self-contained demo.
+## What you need
 
-## Status: the lineage API is released
+- A credential of type **Service account** in the AIDP Credential Store. The notebook reads its
+  `userId`, `tenancyId`, `fingerprint` and `privateKey` fields.
+- That service account granted **access to AIDP** and **read access to the data**. It is a separate
+  identity and sees nothing until you grant it; the notebook stops after building the demo tables so
+  you can do this by hand (step 3).
+- A compute created, or restarted, after lineage became available in your instance. Only those
+  capture lineage.
+- Your AI Data Platform OCID and its region.
 
-AIDP ships lineage under the **`DataLineage`** service (`DataLineageClient`, CLI group
-`data-lineage`). It shipped as `SemanticCatalog` in SDK v4.1.0 (2026-08-07) and was renamed in
-**v4.1.1 (2026-08-31)**, which the SDK changelog flags as a breaking change -- pin any reference you
-write to the SDK version you checked.
+No extra libraries: requests are signed with the `oci` package the cluster already has. Outside AIDP
+the notebook falls back to your local `~/.oci/config`, so it also runs on a laptop.
 
-| Operation | Call |
-|---|---|
-| Fetch entity lineage | `POST /20260430/aiDataPlatforms/{aiDataPlatformId}/actions/fetchLineage` |
-| Export lineage (CSV) | `POST /20260430/aiDataPlatforms/{aiDataPlatformId}/actions/exportLineage` |
+## Running it
 
-- **Host:** `https://datalake.{region}.oci.oraclecloud.com`
-- **API version:** `20260430`
-- **Request:** `anchorNode` (required), `direction` (`UPSTREAM|DOWNSTREAM|BOTH`), `level`
-  (`ENTITY|COLUMN`), `maxDepth`, `nodeFilters`, `pathFilters`, `shouldIncludeEdges`
-- **Response:** `EntityLineage { nodes[], links[] }`, where nodes carry
-  `id / qualifiedName / displayName / parentId / type / depth / properties` and links carry
-  `fromNodeId / toNodeId / type / providerType / properties`
-- **Maturity:** both operations are marked **(Preview)** in the official CLI reference
+Fill in the configuration cell and run top to bottom. Step 2 builds four small demo tables in
+`default.lineage_sample` so there is something to draw, and the run stops at step 3 on purpose: grant
+the service account access to AIDP and to that schema, set `ACCESS_GRANTED = True`, and run on. The
+last cell drops the demo tables.
 
-Column-level lineage (`level: COLUMN`) is part of the released contract, not just table-level.
+To draw one of your own tables instead, skip step 2, set `ANCHOR_TABLE`, and make sure the service
+account can read that table's schema.
 
-### Reading a 404
+## Things worth knowing about lineage on AIDP
 
-A 404 means different things depending on which host you sent it to, and the response body cannot
-tell you which — it is **identical** (same `code`/`message`) for an absent route and
-for a resource you are not authorised to see.
+- **The anchor id is `aidp://catalogs@<AI Data Platform OCID>/o/<catalog.schema.table>`.** The API
+  reference page shows this example with the OCID part missing. A bare `catalog.schema.table` is
+  rejected with `400 Invalid anchorNode`; a well-formed id for a table that does not exist returns
+  `404`.
+- **Lineage lands seconds after the write**, while the run is still going (about 30 seconds in our
+  test). The fetch cell waits up to two minutes for the demo tables it has just built.
+- **Only the latest run of each job is kept.** If a job runs again without writing a table, that
+  table's lineage from the earlier run disappears.
+- **Only computes created or restarted after lineage became available capture it.** Setting
+  `spark.aidp.lineage.enabled = false` on a compute turns capture off for that compute.
+- **A task that writes several tables comes back as one node**, with every link tagged by the Spark
+  stage that produced it. The drawing splits the task per stage, so the graph reads left to right
+  instead of looping back on itself.
+- **Prefer the SDK?** `DataLineageClient.fetch_entity_lineage` in
+  [`aidp-python-client`](https://github.com/oracle-samples/aidataplatform-sdk) sends the same request.
+  It has to be installed with `pip`, which needs the cluster to reach PyPI.
 
-| Host | A 404 here means |
-|---|---|
-| `aidp.{region}` + `/20240831/dataLakes/{ocid}` | the route genuinely does not exist — lineage is not on this generation. It still serves `/catalogs` and `/schemas`. |
-| `datalake.{region}` + `/20260430` | **not** a missing route. Almost always a wrong or unauthorised `AIDP_DATALAKE`, which returns the same `NotAuthorizedOrNotFound`. |
+## About the committed outputs
 
-`test_A0` is the disambiguator: it lists `/catalogs` on the data-plane host, so if A0 passes, your
-profile and OCID are good and a 404 from the lineage route means something else. If A0 fails, fix the
-credentials before reading anything into the rest.
-
-The lineage operations are published at `datalake.{region}` + `/20260430`; the SDK CLI reference still
-documents `aidp.{region}` as the default endpoint for other operations, so this is a per-service move,
-not a wholesale one. `test_A2` and `test_A7` encode both halves of the trap.
-
-### Known gap: no graph came back on the tenancy tested
-
-Observed 2026-08-16, one DataLake in us-ashburn-1, API version `20260430`. `fetchLineage` reaches its own
-parameter validation and rejected every `anchorNode` we could construct:
-
-```
-default.lin_demo.mart_customer_revenue            -> 400 Invalid anchorNode
-mart_customer_revenue                             -> 400 Invalid anchorNode
-hive.lin_demo.mart_customer_revenue               -> 400 Invalid anchorNode
-default.cat/lin_demo.db/mart_customer_revenue     -> 400 Invalid anchorNode
-TABLE:default.lin_demo.mart_customer_revenue      -> 400 Invalid anchorNode
-<the DataLake OCID>                               -> 400 Invalid anchorNode
-```
-
-Omitting the field instead returns `anchorNode must not be null`, so the server distinguishes *missing*
-from *unresolvable* — it is doing a real lookup and finding nothing. `POST .../tables/{key}/actions/refresh`
-returns `202` but does not change the outcome.
-
-Two candidate explanations, not yet separated:
-
-1. the lineage graph is not populated for this DataLake (no harvest configured, and interactive
-   notebook writes may not register a process node — lineage may require Job/Workflow execution); or
-2. `anchorNode` expects an internal node id whose format is undocumented — the CLI
-   reference lists the field with an **empty description**.
-
-`test_B0` probes the full candidate matrix on every run. It always passes, so pytest **captures** its
-output rather than displaying it — with `-v`, `-m existence` or `-rX` you will never see the table.
-Read it with:
-
-```bash
-pytest test_aidp_lineage_api.py -rP -k B0      # or -s
-```
-
-## Running the tests
-
-**Prerequisites.** An OCI config profile (API key or session token) with access to your own AI Data
-Platform instance, and `AIDP_DATALAKE` exported. There is deliberately no default: without it the
-whole module is **skipped** with a message naming the variable, rather than signing requests against
-someone else's resource.
-
-That stop is a module-level `pytest.skip(..., allow_module_level=True)` — not a session fixture and
-not a raise, deliberately. A session fixture calling `pytest.fail` would be absorbed by Part B's
-`xfail` markers, turning a missing variable into the same `xfail` the known gap produces (the
-confusion the note below warns about); a raise at import is a collection error that also aborts every
-other suite collected in the same run. The skip is reported once, as `SKIPPED`, and the SCD and
-medallion suites still run when pytest is invoked from the repository root.
-
-```bash
-pip install -r requirements-test.txt     # local only; the notebook needs no cluster libraries
-
-export AIDP_DATALAKE=ocid1.aidataplatform.oc1.<region>.<unique-id>   # required
-export AIDP_PROFILE=DEFAULT                                         # optional, defaults to DEFAULT
-export AIDP_REGION=us-ashburn-1                                     # optional, defaults to the profile's region
-
-pytest test_aidp_lineage_api.py -v                 # everything
-pytest test_aidp_lineage_api.py -v -m existence    # just the existence checks
-pytest test_aidp_lineage_api.py -v -rx             # show why Part B is blocked (xfail reasons)
-pytest test_aidp_lineage_api.py -rP -k B0          # read B0's anchor-candidate matrix
-pytest test_aidp_lineage_api.py -m "existence and not legacy"   # skip the legacy-host probe
-```
-
-| Variable | Required | Default |
-|---|---|---|
-| `AIDP_DATALAKE` | **yes** | none -- the module is skipped if unset |
-| `AIDP_PROFILE` | no | `DEFAULT` |
-| `AIDP_REGION` | no | the profile's `region`, else `us-ashburn-1` |
-| `AIDP_SCHEMA` | no | `default.lin_demo` |
-| `AIDP_ANCHOR_TABLE` | no | `<AIDP_SCHEMA>.mart_customer_revenue` |
-
-Part B's `xfail` markers absorb only `AssertionError` -- a response that does not show a graph. A
-credential, network or response-parsing problem is reported as an **error** or failure instead of
-looking like the known gap. API-key and session-token (`oci session authenticate`) profiles both work.
-
-### Part A — API existence and contract (green)
-
-| Test | Proves |
-|---|---|
-| `A0_auth_works_on_dataplane_host` | authenticated on the new host, so later 4xx are unambiguous |
-| `A1_fetchLineage_route_exists` | route deployed: `400 InvalidParameter`, not `404` |
-| `A2_control_bogus_action_is_404` | **control** — a fake sibling action *does* 404, giving A1 meaning |
-| `A3_exportLineage_route_exists` | the CSV export operation is deployed too |
-| `A4_request_contract_is_enforced_server_side` | missing vs invalid `anchorNode` produce different errors |
-| `A5_documented_enums_are_accepted` | `level=ENTITY/COLUMN`, `direction=UPSTREAM/DOWNSTREAM/BOTH` all parse |
-| `A6_invalid_enum_is_rejected` | **control** — `direction=SIDEWAYS` → `Invalid LineageDirection: SIDEWAYS` |
-| `A7_lineage_absent_from_legacy_api_generation` | documents the wrong-generation trap: `POST actions/fetchLineage` on the legacy host reaches no handler (also marked `legacy` — it is the only test that needs the old gateway up) |
-
-A5+A6 together are the strongest evidence: a stub that ignored the body and always complained about
-`anchorNode` would pass A5 but **fail A6**. The server really parses `LineageDirection`, so a genuine
-implementation is behind the route.
-
-### Part B — graph population (xfail; the open gap)
-
-`B1` entity graph · `B2` upstream contains `stg_orders` + `raw_customers` · `B3` column-level edges ·
-`B4` CSV export. Marked `xfail(strict=False)` rather than skipped or deleted, so if lineage becomes
-populated they flip to **XPASS** and the suite reports that the gap closed. `B2` asserts the same DAG
-the notebook derives from Spark — so when it goes green, the platform's graph agrees with the
-lineage read from the Spark plan.
-
-Part B is the only place `AIDP_ANCHOR_TABLE` is used. Part A probes with a deliberately unresolvable
-sentinel instead, so Part A stays green on a populated tenancy rather than failing the day Part B
-starts passing.
-
-## The notebook: a plan-derived cross-check
-
-The API is the platform's *claim* about lineage. The notebook derives lineage from the Catalyst
-analyzed plan of each write and checks it against the pipeline the notebook itself built — so it
-validates the extractor on known shapes, and gives you something to compare the platform graph with.
-
-It works in `SCHEMA` (default `default.lin_demo`, created if absent), and its cleanup drops only the
-tables it created, and the schema only if it created it. If the schema already holds a table named
-like one of the five demo tables, setup stops before changing anything rather than overwrite it.
-Ownership is tracked in the kernel, so after a failed run and a kernel restart the leftover tables
-count as not the notebook's -- drop them, or the schema, and re-run. (The scorecard raises on a failed
-check, so a failed Run All stops before the cleanup cell.)
-
-```
-raw_orders ──filter status='PAID'──> stg_orders ──┐
-                                                 ├─join + GROUP BY──> mart_customer_revenue
-raw_customers ───────────────────────────────────┘
-
-unrelated_table                     (decoy — must produce no edges)
-```
-
-`mart_customer_revenue` reads **`stg_orders`**, not `raw_orders`; `raw_orders` is only *transitively*
-upstream, and the notebook asserts the direct edge only.
-
-Three layers must agree:
-
-| Layer | Source of truth | Proves |
-|---|---|---|
-| 1. Plan-derived graph | Catalyst analyzed plan | which tables/columns fed each write |
-| 2. Delta history | `_delta_log` commit log | the write happened, with row counts |
-| 3. File provenance | `inputFiles()` + `DESCRIBE DETAIL` | bytes read live under the claimed table |
-
-Plus **negative controls**, which are what make the result meaningful — an extractor that reported
-*every* table would satisfy "no missing edges" while being useless: the decoy appears in no edge; no
-direct `mart → raw_orders` edge; no unresolved leaves. Clean run **19/19**, observed 2026-08-16 on
-Spark 3.5.0 / Delta 3.2.0-oci-1.0.0. Two of the 19 have changed since that run: the Delta-history
-"commit exists" checks, which could not fail once the write succeeded, now assert that the commit
-`write_tracked` recorded is still the table's latest. That version has not yet been run on a cluster.
-
-`DESCRIBE HISTORY` deserves a specific warning: it is commonly mistaken for lineage, but a CTAS commit's
-`operationParameters` holds only `partitionBy` / `properties` / `isManaged` — **no source tables**. It
-gives temporal provenance, not a graph.
-
-### How the extraction works
-
-- **Table level** — `df._jdf.queryExecution().analyzed().collectLeaves()`, then
-  `leaf.catalogTable().get().qualifiedName()` for a clean `catalog.schema.table`. A v2
-  `DataSourceV2Relation` (for example a DataFrame read from an external catalog) has no
-  `catalogTable()`, so it is named from `catalog()` + `identifier()` instead.
-- **Column level** — the top plan node's `projectList()` (Project) or `aggregateExpressions()`
-  (Aggregate); each output expression's `references()` are `AttributeReference`s carrying an `exprId`,
-  mapped back to the leaf relations' output attributes.
-
-  Resolution *must* go through `references()`. Aliases and aggregates mint **fresh** `exprId`s —
-  `SUM(o.amount) AS revenue` is a new attribute — so output `exprId`s never equal leaf `exprId`s, and
-  comparing them directly silently yields no column lineage.
-
-### Scope — what the 19/19 does and does not cover
-
-The 19 checks are proven for **the pipeline shapes in this notebook**: writes whose top plan node is a
-`Project` or an `Aggregate` **and where every attribute that node references is emitted directly by a
-leaf relation**. Column resolution reads that node's `projectList()` / `aggregateExpressions()` and
-maps each reference back through `colmap`, which is built only from `collectLeaves()` — so it is
-accurate for aliases, aggregates, `COALESCE`/`CASE` across two sources, `SELECT *` expansion and
-self-joins over base tables.
-
-The leaf condition is the one that actually bites, and the top-node shape alone does not predict it. An
-attribute minted by an *intermediate* `Project` never appears in `colmap`, so it resolves to nothing
-even though the top node is a plain `Project`:
-
-```sql
-SELECT * FROM (SELECT cust_id, amount * 2 AS amt FROM raw_orders) s   -- amt <- (nothing)
-```
-
-The same happens for `df.withColumn("x", ...).withColumn("y", col("x") + 1)` and for an aggregate over
-a subquery. Cell 14 renders those as `(no source columns resolved)`, which is indistinguishable from
-a genuine constant.
-
-It is **not** a general-purpose lineage extractor. Outside those shapes it can return an incomplete or
-empty column map, in some cases without warning:
-
-| Shape | Behaviour |
-|---|---|
-| Alias computed in a `FROM`-subquery, or by an earlier `.withColumn()` / `.select()` — i.e. `Project` over `Project`, `Aggregate` over `Project` | that column's lineage is empty, printed as `(no source columns resolved)` |
-| Window function, `Project` over `Aggregate`, `LATERAL VIEW explode`, second branch of a `UNION` | column lineage may be wrong or empty |
-| Top node is `Sort` / `GlobalLimit` / `Distinct` / `Filter` (HAVING) / `WithCTE` / `Union` / `Except` | column map empty |
-| CTE | adds a spurious `<CTERelationRef>` leaf |
-| Scalar / `IN` subquery sources | missing from table-level lineage |
-
-Extending it would mean resolving attributes transitively through `Project`/`Aggregate`/`Window`/`Union`,
-including `subqueriesAll()`, and resolving `CTERelationRef` through `cteDefs`. Treat the current version
-as a worked demonstration of the technique on a known DAG, not as production tooling.
-
-Capture covers writes routed through the notebook's `write_tracked()` helper, and the graph lives in
-kernel memory for the session. Columns used only in `WHERE` / `JOIN ON` (e.g. `raw_orders.status`) are
-real dependencies but not top-level outputs, so they do not appear in the column map.
-
-`DataLineage` exposes **no lineage write/ingest operation** — only `fetchLineage` and
-`exportLineage` — so a client cannot push this graph into AIDP. Population is the platform's job. For
-durable local capture, register a JVM `QueryExecutionListener` on `spark.listenerManager`, or install the
-OpenLineage Spark listener
-(`spark.extraListeners=io.openlineage.spark.agent.OpenLineageSparkListener`) and point
-`spark.openlineage.transport.*` at a collector.
-
-## Clear outputs before committing
-
-`DESCRIBE DETAIL` returns a `location` that embeds your object-storage bucket and namespace, and
-`inputFiles()` returns full `oci://` URIs. The notebook prints only the path portion for this reason,
-but a committed run can still carry tenancy identifiers in other cells. Strip outputs (`nbstripout`,
-or Kernel → Restart & Clear Output) before opening a PR.
-
-## Environment as tested
-
-Spark 3.5.0 · Delta 3.2.0-oci-1.0.0 · `spark.sql.sources.default=delta` · catalog impl `hive` ·
-region `us-ashburn-1` · lineage operations on `/20260430`, called as signed REST requests (no SDK
-client). Service and operation names checked against aidp SDK `oracle-samples/aidataplatform-sdk`
-v4.2.1.
+The outputs in this notebook come from a reference run on a test instance, with the configuration
+cell reset to placeholders. Your own outputs show your catalog, schema, table, job and workspace
+names, so clear them before committing your copy anywhere public.
