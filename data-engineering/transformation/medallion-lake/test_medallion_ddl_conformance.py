@@ -74,11 +74,15 @@ def _code_cells(demo):
 
 
 def _narrow_bronze_columns(cells):
-    """-> {column: declared_type} for every narrow-typed column in a bronze CREATE TABLE."""
+    """-> {(table, column): declared_type} for every narrow-typed column in a bronze CREATE TABLE.
+
+    Keyed by table as well as column, so two bronze tables that declare the same column name
+    with different types are both checked instead of one silently overwriting the other.
+    """
     declared = {}
-    for _table, body in BRONZE_DDL.findall("\n".join(cells)):
+    for table, body in BRONZE_DDL.findall("\n".join(cells)):
         for col, typ in NARROW_TYPE.findall(body):
-            declared[col] = typ.upper().replace(" ", "")
+            declared[(table, col)] = typ.upper().replace(" ", "")
     return declared
 
 
@@ -123,11 +127,16 @@ def test_bronze_frame_is_cast_to_declared_types(demo, request):
     cell = _generating_cell(cells)
     assert cell is not None, "%s has no createDataFrame cell" % demo
     # Every declared narrow column must be cast to exactly that type; any `.cast(` in the
-    # cell is not enough (dropping one cast would still fail the Delta schema check).
-    casts = {c: _normalise_type(t) for c, t in COLUMN_CAST.findall(cell)}
-    wrong = {c: (t, casts.get(c)) for c, t in declared.items() if casts.get(c) != t}
+    # cell is not enough (dropping one cast would still fail the Delta schema check). One cell
+    # can build several bronze frames, so a column passes if any of its casts in the cell is
+    # to the type its own table declares.
+    casts = {}
+    for c, t in COLUMN_CAST.findall(cell):
+        casts.setdefault(c, set()).add(_normalise_type(t))
+    wrong = {"%s.%s" % tc: (t, sorted(casts.get(tc[1], ())) or None)
+             for tc, t in declared.items() if t not in casts.get(tc[1], ())}
     assert not wrong, (
-        "%s: bronze columns not cast to their declared type {column: (declared, cast)}: %s "
+        "%s: bronze columns not cast to their declared type {table.column: (declared, casts)}: %s "
         "-- createDataFrame's inferred double/bigint frame will fail the Delta schema check"
         % (demo, wrong)
     )

@@ -12,9 +12,12 @@ Demonstrates two Delta capabilities on AIDP, with explicit expected counts at ea
 
 Attach to an AIDP cluster with Delta and run top to bottom. Set `CATALOG` in the configuration cell
 to a catalog you can create schemas in; the notebook creates the scratch schema
-`clone_metadata_demo` if it does not exist, and the final cell drops the four tables it created and
-the schema only if the notebook created it (no `CASCADE`), so pointing `DB` at an existing schema is
-safe.
+`clone_metadata_demo` if it does not exist, and the final cell drops the tables it created and the
+schema only if the notebook created it (no `CASCADE`). You can point `DB` at an existing schema: if it
+already holds a table named `customers`, `customers_shallow`, `customers_empty` or `column_tags`, the
+configuration cell stops before changing anything rather than overwrite it. Ownership is tracked in
+the kernel, so after a kernel restart, tables left by an interrupted run count as not the notebook's
+-- drop them, or the scratch schema, and re-run.
 
 Statements are executed directly rather than through a try/except wrapper, so anything unsupported on
 your build fails at that cell instead of being silently recorded. Each step also `assert`s its expected

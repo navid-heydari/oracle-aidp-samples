@@ -4,7 +4,7 @@ Two complementary artifacts:
 
 | File | What it does |
 |---|---|
-| [`test_aidp_lineage_api.py`](./test_aidp_lineage_api.py) | Maintainer harness. Confirms the lineage API is released and reachable, from real responses. 13 passed / 4 xfailed as of 2026-08-16. |
+| [`test_aidp_lineage_api.py`](./test_aidp_lineage_api.py) | Maintainer harness. Confirms the lineage API is released and reachable, from real responses. 13 passed / 4 xfailed as of 2026-08-16 (A7 has since moved from `GET /lineage` to the real `POST actions/fetchLineage` and has not been re-run live). |
 | [`Verify_Data_Lineage.ipynb`](./Verify_Data_Lineage.ipynb) | Derives lineage from Spark's analyzed plan and verifies it against a known DAG. 19/19 checks for the pipeline shapes below. |
 
 > **Read this before you set up a profile.** The API is released. On the one tenancy tested —
@@ -95,9 +95,10 @@ pytest test_aidp_lineage_api.py -rP -k B0      # or -s
 
 ## Running the tests
 
-**Prerequisites.** An OCI config profile with access to your own AI Data Platform instance, and
-`AIDP_DATALAKE` exported. There is deliberately no default: without it the whole module is **skipped**
-with a message naming the variable, rather than signing requests against someone else's resource.
+**Prerequisites.** An OCI config profile (API key or session token) with access to your own AI Data
+Platform instance, and `AIDP_DATALAKE` exported. There is deliberately no default: without it the
+whole module is **skipped** with a message naming the variable, rather than signing requests against
+someone else's resource.
 
 That stop is a module-level `pytest.skip(..., allow_module_level=True)` — not a session fixture and
 not a raise, deliberately. A session fixture calling `pytest.fail` would be absorbed by Part B's
@@ -128,9 +129,9 @@ pytest test_aidp_lineage_api.py -m "existence and not legacy"   # skip the legac
 | `AIDP_SCHEMA` | no | `default.lin_demo` |
 | `AIDP_ANCHOR_TABLE` | no | `<AIDP_SCHEMA>.mart_customer_revenue` |
 
-Without a usable OCI profile the session fixture fails rather than skipping, and Part B reports
-`xfail` without a request being sent -- so a credential problem can look like the known gap. Check
-that Part A passes before reading anything into Part B.
+Part B's `xfail` markers absorb only `AssertionError` -- a response that does not show a graph. A
+credential, network or response-parsing problem is reported as an **error** or failure instead of
+looking like the known gap. API-key and session-token (`oci session authenticate`) profiles both work.
 
 ### Part A — API existence and contract (green)
 
@@ -143,7 +144,7 @@ that Part A passes before reading anything into Part B.
 | `A4_request_contract_is_enforced_server_side` | missing vs invalid `anchorNode` produce different errors |
 | `A5_documented_enums_are_accepted` | `level=ENTITY/COLUMN`, `direction=UPSTREAM/DOWNSTREAM/BOTH` all parse |
 | `A6_invalid_enum_is_rejected` | **control** — `direction=SIDEWAYS` → `Invalid LineageDirection: SIDEWAYS` |
-| `A7_lineage_absent_from_legacy_api_generation` | documents the wrong-generation trap (also marked `legacy` — it is the only test that needs the old gateway up) |
+| `A7_lineage_absent_from_legacy_api_generation` | documents the wrong-generation trap: `POST actions/fetchLineage` on the legacy host reaches no handler (also marked `legacy` — it is the only test that needs the old gateway up) |
 
 A5+A6 together are the strongest evidence: a stub that ignored the body and always complained about
 `anchorNode` would pass A5 but **fail A6**. The server really parses `LineageDirection`, so a genuine
@@ -189,7 +190,9 @@ Three layers must agree:
 Plus **negative controls**, which are what make the result meaningful — an extractor that reported
 *every* table would satisfy "no missing edges" while being useless: the decoy appears in no edge; no
 direct `mart → raw_orders` edge; no unresolved leaves. Clean run **19/19**, observed 2026-08-16 on
-Spark 3.5.0 / Delta 3.2.0-oci-1.0.0.
+Spark 3.5.0 / Delta 3.2.0-oci-1.0.0. Two of the 19 have changed since that run: the Delta-history
+"commit exists" checks, which could not fail once the write succeeded, now assert that the commit
+`write_tracked` recorded is still the table's latest. That version has not yet been run on a cluster.
 
 `DESCRIBE HISTORY` deserves a specific warning: it is commonly mistaken for lineage, but a CTAS commit's
 `operationParameters` holds only `partitionBy` / `properties` / `isManaged` — **no source tables**. It

@@ -314,7 +314,7 @@ def test_expire_then_insert_end_to_end(notebook_ns, spark):
             "the SparkSession has no Delta extensions: another suite started Spark first in "
             "this pytest process. Run this suite on its own to include the Delta test."
         )
-    from datetime import datetime
+    from datetime import date, datetime
 
     from pyspark.sql.types import (BooleanType, DateType, IntegerType, StringType,
                                    StructField, StructType)
@@ -356,7 +356,7 @@ def test_expire_then_insert_end_to_end(notebook_ns, spark):
         notebook_ns["run_scd2_merge"](**BASE_KW)
 
         rows = spark.sql(
-            "SELECT customer_id, current_flag FROM scd_test.dim_customer"
+            "SELECT customer_id, current_flag, effective_start_date FROM scd_test.dim_customer"
         ).collect()
         expired = sorted(r["customer_id"] for r in rows if not r["current_flag"])
         current = sorted(r["customer_id"] for r in rows if r["current_flag"])
@@ -367,6 +367,7 @@ def test_expire_then_insert_end_to_end(notebook_ns, spark):
         # Bob was untouched: still his original start date, one row only.
         bob = [r for r in rows if r["customer_id"] == 2]
         assert len(bob) == 1 and bob[0]["current_flag"], "Bob should not have been rewritten"
+        assert bob[0]["effective_start_date"] == date(2025, 1, 1), bob
 
         # Re-running is a no-op.
         before = spark.table("scd_test.dim_customer").count()
@@ -374,5 +375,10 @@ def test_expire_then_insert_end_to_end(notebook_ns, spark):
         assert spark.table("scd_test.dim_customer").count() == before, "second run was not a no-op"
     finally:
         # The session is session-scoped and shared; only clean up what this test made.
-        spark.sql("DROP TABLE IF EXISTS scd_test.dim_customer")
-        spark.sql("DROP SCHEMA IF EXISTS scd_test")
+        # Best effort, so a cleanup error (e.g. a borrowed session where scd_test holds
+        # other tables) cannot replace the assertion that actually failed.
+        try:
+            spark.sql("DROP TABLE IF EXISTS scd_test.dim_customer")
+            spark.sql("DROP SCHEMA IF EXISTS scd_test")
+        except Exception:
+            pass

@@ -64,12 +64,16 @@ if not DATALAKE:
     )
 
 
-
 def _profile_region():
-    """The `region` in the OCI profile, or None if there is no readable profile."""
+    """The `region` in the OCI profile, or None if the profile cannot be read.
+
+    Runs at import, so it must not raise: a missing file, missing profile, stale key path or
+    malformed entry would otherwise be a collection error that aborts every other suite in the
+    same pytest run. The `signer` fixture reports the real problem when a test needs it.
+    """
     try:
         return oci.config.from_file(profile_name=PROFILE).get("region")
-    except (oci.exceptions.ConfigFileNotFound, oci.exceptions.ProfileNotFound):
+    except (oci.exceptions.ClientError, ValueError):
         return None
 
 
@@ -107,6 +111,13 @@ TIMEOUT = 60
 @pytest.fixture(scope="session")
 def signer():
     cfg = oci.config.from_file(profile_name=PROFILE)
+    if cfg.get("security_token_file"):
+        # Session-token profile (`oci session authenticate`): it has no `user` key and is
+        # signed with the session token rather than as an API-key user.
+        with open(os.path.expanduser(cfg["security_token_file"])) as fh:
+            token = fh.read().strip()
+        key = oci.signer.load_private_key_from_file(cfg["key_file"], cfg.get("pass_phrase"))
+        return oci.auth.signers.SecurityTokenSigner(token, key)
     oci.config.validate_config(cfg)
     return oci.signer.Signer(
         tenancy=cfg["tenancy"],
@@ -146,15 +157,25 @@ def _req(signer, method, url, body=None):
         return r.status_code, r.text
 
 
+# A valid-by-schema fetchLineage body. The anchor never resolves; Part B overrides it.
+DEFAULT_FETCH_BODY = {
+    "anchorNode": UNRESOLVABLE_ANCHOR,
+    "maxDepth": 3,
+    "level": "ENTITY",
+    "direction": "BOTH",
+    "shouldIncludeEdges": True,
+}
+
+
+def _field(body, key):
+    """body[key] for a JSON object, else None -- so a non-JSON error response fails the
+    assertion with its status and text instead of raising AttributeError."""
+    return body.get(key) if isinstance(body, dict) else None
+
+
 def fetch_lineage(signer, **overrides):
     """POST actions/fetchLineage with a valid-by-schema body."""
-    body = {
-        "anchorNode": UNRESOLVABLE_ANCHOR,
-        "maxDepth": 3,
-        "level": "ENTITY",
-        "direction": "BOTH",
-        "shouldIncludeEdges": True,
-    }
+    body = dict(DEFAULT_FETCH_BODY)
     body.update(overrides)
     body = {k: v for k, v in body.items() if v is not _OMIT}
     return _req(signer, "POST", DP_BASE + "/actions/fetchLineage", body)
@@ -196,9 +217,9 @@ def test_A1_fetchLineage_route_exists(signer, unresolvable_message):
     code, body = fetch_lineage(signer)
     assert code != 404, "lineage route missing (404): %s" % body
     assert code == 400, "expected 400 from body validation, got %s: %s" % (code, body)
-    assert body.get("code") == "InvalidParameter", body
+    assert _field(body, "code") == "InvalidParameter", body
     # It reached the operation's own parameter validation — proof of a real handler.
-    assert body.get("message") == unresolvable_message, body
+    assert _field(body, "message") == unresolvable_message, body
 
 
 @pytest.mark.existence
@@ -225,7 +246,7 @@ def test_A3_exportLineage_route_exists(signer):
         {"anchorNode": UNRESOLVABLE_ANCHOR, "direction": "UPSTREAM"},
     )
     assert code != 404, "exportLineage route missing (404): %s" % body
-    assert code == 400 and body.get("code") == "InvalidParameter", (code, body)
+    assert code == 400 and _field(body, "code") == "InvalidParameter", (code, body)
 
 
 @pytest.mark.existence
@@ -237,13 +258,13 @@ def test_A4_request_contract_is_enforced_server_side(signer, unresolvable_messag
     """
     code_missing, body_missing = fetch_lineage(signer, anchorNode=_OMIT)
     assert code_missing == 400, (code_missing, body_missing)
-    assert "must not be null" in body_missing.get("message", ""), body_missing
+    assert "must not be null" in (_field(body_missing, "message") or ""), body_missing
 
     code_bad, body_bad = fetch_lineage(signer, anchorNode=UNRESOLVABLE_ANCHOR)
     assert code_bad == 400, (code_bad, body_bad)
-    assert body_bad.get("message") == unresolvable_message, body_bad
+    assert _field(body_bad, "message") == unresolvable_message, body_bad
 
-    assert body_missing["message"] != body_bad["message"], (
+    assert _field(body_missing, "message") != _field(body_bad, "message"), (
         "server must distinguish missing from invalid anchorNode"
     )
 
@@ -270,7 +291,7 @@ def test_A5_documented_enums_are_accepted(signer, unresolvable_message, field, v
     """
     code, body = fetch_lineage(signer, **{field: value})
     assert code == 400, (code, body)
-    assert body.get("message") == unresolvable_message, (
+    assert _field(body, "message") == unresolvable_message, (
         "%s=%s was rejected before anchor resolution: %s" % (field, value, body)
     )
 
@@ -284,7 +305,7 @@ def test_A6_invalid_enum_is_rejected(signer, unresolvable_message):
     """
     code, body = fetch_lineage(signer, direction="SIDEWAYS")
     assert code == 400, (code, body)
-    assert body.get("message") != unresolvable_message, (
+    assert _field(body, "message") != unresolvable_message, (
         "bogus enum should be rejected as an enum, not fall through to anchor: %s" % body
     )
 
@@ -307,12 +328,15 @@ def test_A7_lineage_absent_from_legacy_api_generation(signer):
 
     # The same operation and body Part A sends to the data-plane host. A made-up path such
     # as GET /lineage would 404 on every host, so it could not show that this one lacks it.
-    code_lin, _ = _req(signer, "POST", LEGACY_BASE + "/actions/fetchLineage", {
-        "anchorNode": UNRESOLVABLE_ANCHOR, "maxDepth": 3, "level": "ENTITY",
-        "direction": "BOTH", "shouldIncludeEdges": True,
-    })
-    assert code_lin == 404, (
-        "legacy generation unexpectedly serves actions/fetchLineage (%s)" % code_lin)
+    # A handler shows itself the way it does on the data plane -- 200, or 400
+    # InvalidParameter from its own validation. Any other answer (404 expected; this POST
+    # form has not been run live yet) means no handler.
+    code_lin, body_lin = _req(signer, "POST", LEGACY_BASE + "/actions/fetchLineage",
+                              DEFAULT_FETCH_BODY)
+    reached_handler = code_lin == 200 or (
+        code_lin == 400 and _field(body_lin, "code") == "InvalidParameter")
+    assert not reached_handler, (
+        "legacy generation unexpectedly serves actions/fetchLineage (%s): %s" % (code_lin, body_lin))
 
 
 # ======================================================================================
@@ -379,7 +403,7 @@ def test_B0_report_all_anchor_candidates(signer):
 
 
 @pytest.mark.population
-@pytest.mark.xfail(reason=BLOCKED, strict=False)
+@pytest.mark.xfail(reason=BLOCKED, raises=AssertionError, strict=False)
 def test_B1_entity_lineage_returns_graph(signer):
     """Entity-level lineage for a known table returns nodes (and edges)."""
     code, body = fetch_lineage(
@@ -391,7 +415,7 @@ def test_B1_entity_lineage_returns_graph(signer):
 
 
 @pytest.mark.population
-@pytest.mark.xfail(reason=BLOCKED, strict=False)
+@pytest.mark.xfail(reason=BLOCKED, raises=AssertionError, strict=False)
 def test_B2_upstream_contains_expected_sources(signer):
     """UPSTREAM of the mart reaches stg_orders and raw_customers.
 
@@ -408,7 +432,7 @@ def test_B2_upstream_contains_expected_sources(signer):
 
 
 @pytest.mark.population
-@pytest.mark.xfail(reason=BLOCKED, strict=False)
+@pytest.mark.xfail(reason=BLOCKED, raises=AssertionError, strict=False)
 def test_B3_column_level_lineage_returns_links(signer):
     """COLUMN-level lineage returns column nodes and edges.
 
@@ -427,7 +451,7 @@ def test_B3_column_level_lineage_returns_links(signer):
 
 
 @pytest.mark.population
-@pytest.mark.xfail(reason=BLOCKED, strict=False)
+@pytest.mark.xfail(reason=BLOCKED, raises=AssertionError, strict=False)
 def test_B4_export_lineage_returns_csv(signer):
     """exportLineage returns a CSV document for the anchor."""
     code, body = _req(
