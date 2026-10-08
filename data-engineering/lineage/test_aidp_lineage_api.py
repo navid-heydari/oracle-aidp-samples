@@ -337,6 +337,9 @@ def test_A7_lineage_absent_from_legacy_api_generation(signer):
     # form has not been run live yet) means no handler.
     code_lin, body_lin = _req(signer, "POST", LEGACY_BASE + "/actions/fetchLineage",
                               DEFAULT_FETCH_BODY)
+    assert code_lin < 500, (
+        "legacy host returned a server error (%s), which shows nothing either way: %s"
+        % (code_lin, body_lin))
     reached_handler = code_lin == 200 or (
         code_lin == 400 and _field(body_lin, "code") == "InvalidParameter")
     assert not reached_handler, (

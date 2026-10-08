@@ -129,7 +129,9 @@ def test_bronze_frame_is_cast_to_declared_types(demo, request):
     # Every declared narrow column must be cast to exactly that type; any `.cast(` in the
     # cell is not enough (dropping one cast would still fail the Delta schema check). One cell
     # can build several bronze frames, so a column passes if any of its casts in the cell is
-    # to the type its own table declares.
+    # to the type its own table declares. Limit: casts are not attributed to a frame, so if two
+    # bronze tables declare the same column with the same type, one cast covers both. Every
+    # demo today has a single bronze table.
     casts = {}
     for c, t in COLUMN_CAST.findall(cell):
         casts.setdefault(c, set()).add(_normalise_type(t))

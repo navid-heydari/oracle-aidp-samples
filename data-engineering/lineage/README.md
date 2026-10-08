@@ -168,6 +168,13 @@ The API is the platform's *claim* about lineage. The notebook derives lineage fr
 analyzed plan of each write and checks it against the pipeline the notebook itself built — so it
 validates the extractor on known shapes, and gives you something to compare the platform graph with.
 
+It works in `SCHEMA` (default `default.lin_demo`, created if absent), and its cleanup drops only the
+tables it created, and the schema only if it created it. If the schema already holds a table named
+like one of the five demo tables, setup stops before changing anything rather than overwrite it.
+Ownership is tracked in the kernel, so after a failed run and a kernel restart the leftover tables
+count as not the notebook's -- drop them, or the schema, and re-run. (The scorecard raises on a failed
+check, so a failed Run All stops before the cleanup cell.)
+
 ```
 raw_orders ──filter status='PAID'──> stg_orders ──┐
                                                  ├─join + GROUP BY──> mart_customer_revenue
