@@ -1,0 +1,1448 @@
+{
+  "modelType": "INTEGRATION_TASK",
+  "key": "t-orders-daily",
+  "name": "IT_ORDERS_DAILY",
+  "identifier": "IT_ORDERS_DAILY",
+  "modelVersion": "20200430",
+  "objectVersion": 1,
+  "parentRef": {
+    "parent": "fld-marts"
+  },
+  "dataFlow": {
+    "modelType": "DATA_FLOW",
+    "key": "df-orders-daily",
+    "name": "DF_ORDERS_DAILY",
+    "identifier": "DF_ORDERS_DAILY",
+    "modelVersion": "20200430",
+    "objectVersion": 1,
+    "parentRef": {
+      "parent": "fld-marts"
+    },
+    "nodes": [
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-orders-daily-SOURCE_ORDERS",
+        "name": "SOURCE_ORDERS",
+        "operator": {
+          "modelType": "SOURCE_OPERATOR",
+          "entity": {
+            "modelType": "TABLE_ENTITY",
+            "key": "ent-source_orders",
+            "name": "ORDERS",
+            "resourceName": "ORDERS",
+            "shape": {
+              "modelType": "SHAPE",
+              "key": "ent-source_orders-shape",
+              "type": {
+                "modelType": "COMPOSITE_TYPE",
+                "key": "ent-source_orders-ctype",
+                "elements": [
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-orders-daily-SOURCE_ORDERS-ORDER_ID",
+                    "name": "ORDER_ID",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 10
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-orders-daily-SOURCE_ORDERS-CUSTOMER_ID",
+                    "name": "CUSTOMER_ID",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 10
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-orders-daily-SOURCE_ORDERS-PRODUCT_ID",
+                    "name": "PRODUCT_ID",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 10
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-orders-daily-SOURCE_ORDERS-ORDER_DATE",
+                    "name": "ORDER_DATE",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-DATE",
+                      "name": "DATE",
+                      "dtType": "DATE"
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-orders-daily-SOURCE_ORDERS-AMOUNT",
+                    "name": "AMOUNT",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 12
+                          },
+                          "scale": {
+                            "intValue": 2
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-orders-daily-SOURCE_ORDERS-STATUS",
+                    "name": "STATUS",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-VARCHAR2",
+                      "name": "VARCHAR2",
+                      "dtType": "VARCHAR2"
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-orders-daily-SOURCE_ORDERS-UPDATED_AT",
+                    "name": "UPDATED_AT",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-TIMESTAMP",
+                      "name": "TIMESTAMP",
+                      "dtType": "TIMESTAMP"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "opConfigValues": {
+            "configParamValues": {
+              "dataAssetParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_DATA_ASSET",
+                  "key": "da-adw-sales",
+                  "name": "ADW_SALES"
+                }
+              },
+              "connectionParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_CONNECTION",
+                  "key": "conn-adw-sales",
+                  "name": "ADW_SALES_CONN"
+                }
+              },
+              "schemaParam": {
+                "refValue": {
+                  "modelType": "SCHEMA",
+                  "key": "sch-sales",
+                  "name": "SALES"
+                }
+              }
+            }
+          },
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-orders-daily-SOURCE_ORDERS-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": [
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-orders-daily-SOURCE_ORDERS-ORDER_ID",
+                  "name": "ORDER_ID",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-NUMBER",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-NUMBER",
+                      "name": "NUMBER",
+                      "dtType": "NUMBER"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "precision": {
+                          "intValue": 10
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-orders-daily-SOURCE_ORDERS-CUSTOMER_ID",
+                  "name": "CUSTOMER_ID",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-NUMBER",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-NUMBER",
+                      "name": "NUMBER",
+                      "dtType": "NUMBER"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "precision": {
+                          "intValue": 10
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-orders-daily-SOURCE_ORDERS-PRODUCT_ID",
+                  "name": "PRODUCT_ID",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-NUMBER",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-NUMBER",
+                      "name": "NUMBER",
+                      "dtType": "NUMBER"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "precision": {
+                          "intValue": 10
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-orders-daily-SOURCE_ORDERS-ORDER_DATE",
+                  "name": "ORDER_DATE",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-DATE",
+                    "name": "DATE",
+                    "dtType": "DATE"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-orders-daily-SOURCE_ORDERS-AMOUNT",
+                  "name": "AMOUNT",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-NUMBER",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-NUMBER",
+                      "name": "NUMBER",
+                      "dtType": "NUMBER"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "precision": {
+                          "intValue": 12
+                        },
+                        "scale": {
+                          "intValue": 2
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-orders-daily-SOURCE_ORDERS-STATUS",
+                  "name": "STATUS",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-VARCHAR2",
+                    "name": "VARCHAR2",
+                    "dtType": "VARCHAR2"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-orders-daily-SOURCE_ORDERS-UPDATED_AT",
+                  "name": "UPDATED_AT",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-TIMESTAMP",
+                    "name": "TIMESTAMP",
+                    "dtType": "TIMESTAMP"
+                  }
+                }
+              ]
+            }
+          ],
+          "readOperationConfig": {
+            "modelType": "READ_OPERATION_CONFIG",
+            "key": "roc-orders",
+            "incrementalReadConfig": {
+              "lastExtractedFieldDate": [
+                {
+                  "incrementalFieldName": "UPDATED_AT",
+                  "incrementalComparator": "GREATERTHAN"
+                }
+              ]
+            }
+          },
+          "key": "df-orders-daily-SOURCE_ORDERS-op",
+          "identifier": "SOURCE_ORDERS",
+          "name": "SOURCE_ORDERS",
+          "inputPorts": []
+        },
+        "inputLinks": [],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-orders-daily-ol1",
+            "port": "df-orders-daily-SOURCE_ORDERS-out",
+            "toLinks": [
+              "df-orders-daily-il1"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-orders-daily-SOURCE_CUSTOMERS",
+        "name": "SOURCE_CUSTOMERS",
+        "operator": {
+          "modelType": "SOURCE_OPERATOR",
+          "entity": {
+            "modelType": "TABLE_ENTITY",
+            "key": "ent-source_customers",
+            "name": "CUSTOMERS",
+            "resourceName": "CUSTOMERS",
+            "shape": {
+              "modelType": "SHAPE",
+              "key": "ent-source_customers-shape",
+              "type": {
+                "modelType": "COMPOSITE_TYPE",
+                "key": "ent-source_customers-ctype",
+                "elements": [
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-orders-daily-SOURCE_CUSTOMERS-CUSTOMER_ID",
+                    "name": "CUSTOMER_ID",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 10
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-orders-daily-SOURCE_CUSTOMERS-COUNTRY",
+                    "name": "COUNTRY",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-VARCHAR2",
+                      "name": "VARCHAR2",
+                      "dtType": "VARCHAR2"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "opConfigValues": {
+            "configParamValues": {
+              "dataAssetParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_DATA_ASSET",
+                  "key": "da-adw-sales",
+                  "name": "ADW_SALES"
+                }
+              },
+              "connectionParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_CONNECTION",
+                  "key": "conn-adw-sales",
+                  "name": "ADW_SALES_CONN"
+                }
+              },
+              "schemaParam": {
+                "refValue": {
+                  "modelType": "SCHEMA",
+                  "key": "sch-sales",
+                  "name": "SALES"
+                }
+              }
+            }
+          },
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-orders-daily-SOURCE_CUSTOMERS-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": [
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-orders-daily-SOURCE_CUSTOMERS-CUSTOMER_ID",
+                  "name": "CUSTOMER_ID",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-NUMBER",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-NUMBER",
+                      "name": "NUMBER",
+                      "dtType": "NUMBER"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "precision": {
+                          "intValue": 10
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-orders-daily-SOURCE_CUSTOMERS-COUNTRY",
+                  "name": "COUNTRY",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-VARCHAR2",
+                    "name": "VARCHAR2",
+                    "dtType": "VARCHAR2"
+                  }
+                }
+              ]
+            }
+          ],
+          "key": "df-orders-daily-SOURCE_CUSTOMERS-op",
+          "identifier": "SOURCE_CUSTOMERS",
+          "name": "SOURCE_CUSTOMERS",
+          "inputPorts": []
+        },
+        "inputLinks": [],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-orders-daily-ol3",
+            "port": "df-orders-daily-SOURCE_CUSTOMERS-out",
+            "toLinks": [
+              "df-orders-daily-il3"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-orders-daily-SOURCE_PRODUCTS",
+        "name": "SOURCE_PRODUCTS",
+        "operator": {
+          "modelType": "SOURCE_OPERATOR",
+          "entity": {
+            "modelType": "TABLE_ENTITY",
+            "key": "ent-source_products",
+            "name": "PRODUCTS",
+            "resourceName": "PRODUCTS",
+            "shape": {
+              "modelType": "SHAPE",
+              "key": "ent-source_products-shape",
+              "type": {
+                "modelType": "COMPOSITE_TYPE",
+                "key": "ent-source_products-ctype",
+                "elements": [
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-orders-daily-SOURCE_PRODUCTS-PRODUCT_ID",
+                    "name": "PRODUCT_ID",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 10
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-orders-daily-SOURCE_PRODUCTS-CATEGORY",
+                    "name": "CATEGORY",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-VARCHAR2",
+                      "name": "VARCHAR2",
+                      "dtType": "VARCHAR2"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "opConfigValues": {
+            "configParamValues": {
+              "dataAssetParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_DATA_ASSET",
+                  "key": "da-adw-sales",
+                  "name": "ADW_SALES"
+                }
+              },
+              "connectionParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_CONNECTION",
+                  "key": "conn-adw-sales",
+                  "name": "ADW_SALES_CONN"
+                }
+              },
+              "schemaParam": {
+                "refValue": {
+                  "modelType": "SCHEMA",
+                  "key": "sch-sales",
+                  "name": "SALES"
+                }
+              }
+            }
+          },
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-orders-daily-SOURCE_PRODUCTS-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": [
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-orders-daily-SOURCE_PRODUCTS-PRODUCT_ID",
+                  "name": "PRODUCT_ID",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-NUMBER",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-NUMBER",
+                      "name": "NUMBER",
+                      "dtType": "NUMBER"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "precision": {
+                          "intValue": 10
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-orders-daily-SOURCE_PRODUCTS-CATEGORY",
+                  "name": "CATEGORY",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-VARCHAR2",
+                    "name": "VARCHAR2",
+                    "dtType": "VARCHAR2"
+                  }
+                }
+              ]
+            }
+          ],
+          "key": "df-orders-daily-SOURCE_PRODUCTS-op",
+          "identifier": "SOURCE_PRODUCTS",
+          "name": "SOURCE_PRODUCTS",
+          "inputPorts": []
+        },
+        "inputLinks": [],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-orders-daily-ol5",
+            "port": "df-orders-daily-SOURCE_PRODUCTS-out",
+            "toLinks": [
+              "df-orders-daily-il5"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-orders-daily-FILTER_VALID",
+        "name": "FILTER_VALID",
+        "operator": {
+          "modelType": "FILTER_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-orders-daily-FILTER_VALID-in0",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-orders-daily-FILTER_VALID-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "filterCondition": {
+            "modelType": "EXPRESSION",
+            "exprString": "SOURCE_ORDERS.ORDERS.STATUS <> 'CANCELLED'"
+          },
+          "key": "df-orders-daily-FILTER_VALID-op",
+          "identifier": "FILTER_VALID",
+          "name": "FILTER_VALID"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-orders-daily-il1",
+            "port": "df-orders-daily-FILTER_VALID-in0",
+            "fromLink": "df-orders-daily-ol1"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-orders-daily-ol2",
+            "port": "df-orders-daily-FILTER_VALID-out",
+            "toLinks": [
+              "df-orders-daily-il2"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-orders-daily-JOIN_CUST",
+        "name": "JOIN_CUST",
+        "operator": {
+          "modelType": "JOINER_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-orders-daily-JOIN_CUST-in0",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            },
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-orders-daily-JOIN_CUST-in1",
+              "name": "INPUT2",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-orders-daily-JOIN_CUST-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "joinType": "INNER",
+          "joinCondition": {
+            "modelType": "EXPRESSION",
+            "exprString": "FILTER_VALID.ORDERS.CUSTOMER_ID = SOURCE_CUSTOMERS.CUSTOMERS.CUSTOMER_ID"
+          },
+          "key": "df-orders-daily-JOIN_CUST-op",
+          "identifier": "JOIN_CUST",
+          "name": "JOIN_CUST"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-orders-daily-il2",
+            "port": "df-orders-daily-JOIN_CUST-in0",
+            "fromLink": "df-orders-daily-ol2"
+          },
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-orders-daily-il3",
+            "port": "df-orders-daily-JOIN_CUST-in1",
+            "fromLink": "df-orders-daily-ol3"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-orders-daily-ol4",
+            "port": "df-orders-daily-JOIN_CUST-out",
+            "toLinks": [
+              "df-orders-daily-il4"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-orders-daily-LOOKUP_PROD",
+        "name": "LOOKUP_PROD",
+        "operator": {
+          "modelType": "LOOKUP_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-orders-daily-LOOKUP_PROD-in0",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            },
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-orders-daily-LOOKUP_PROD-in1",
+              "name": "INPUT2",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-orders-daily-LOOKUP_PROD-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "lookupCondition": {
+            "modelType": "EXPRESSION",
+            "exprString": "JOIN_CUST.ORDERS.PRODUCT_ID = SOURCE_PRODUCTS.PRODUCTS.PRODUCT_ID"
+          },
+          "multiMatchStrategy": "RETURN_ANY",
+          "isSkipNoMatch": false,
+          "nullFillValues": {
+            "CATEGORY": "UNKNOWN"
+          },
+          "key": "df-orders-daily-LOOKUP_PROD-op",
+          "identifier": "LOOKUP_PROD",
+          "name": "LOOKUP_PROD"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-orders-daily-il4",
+            "port": "df-orders-daily-LOOKUP_PROD-in0",
+            "fromLink": "df-orders-daily-ol4"
+          },
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-orders-daily-il5",
+            "port": "df-orders-daily-LOOKUP_PROD-in1",
+            "fromLink": "df-orders-daily-ol5"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-orders-daily-ol6",
+            "port": "df-orders-daily-LOOKUP_PROD-out",
+            "toLinks": [
+              "df-orders-daily-il6"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-orders-daily-EXPR_ENRICH",
+        "name": "EXPR_ENRICH",
+        "operator": {
+          "modelType": "EXPRESSION_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-orders-daily-EXPR_ENRICH-in0",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-orders-daily-EXPR_ENRICH-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": [
+                {
+                  "modelType": "DERIVED_FIELD",
+                  "key": "en-month",
+                  "name": "ORDER_MONTH",
+                  "type": "VARCHAR",
+                  "expr": {
+                    "modelType": "EXPRESSION",
+                    "key": "en-month-x",
+                    "exprString": "TO_CHAR(LOOKUP_PROD.ORDERS.ORDER_DATE, 'yyyy-MM')"
+                  }
+                },
+                {
+                  "modelType": "DERIVED_FIELD",
+                  "key": "en-net",
+                  "name": "NET_AMOUNT",
+                  "type": "DECIMAL",
+                  "expr": {
+                    "modelType": "EXPRESSION",
+                    "key": "en-net-x",
+                    "exprString": "ROUND(NVL(LOOKUP_PROD.ORDERS.AMOUNT, 0) * (1 - $P_DISCOUNT), 2)"
+                  }
+                },
+                {
+                  "modelType": "DERIVED_FIELD",
+                  "key": "en-large",
+                  "name": "IS_LARGE",
+                  "type": "VARCHAR",
+                  "expr": {
+                    "modelType": "EXPRESSION",
+                    "key": "en-large-x",
+                    "exprString": "CASE WHEN LOOKUP_PROD.ORDERS.AMOUNT >= 1000 THEN 'Y' ELSE 'N' END"
+                  }
+                }
+              ]
+            }
+          ],
+          "key": "df-orders-daily-EXPR_ENRICH-op",
+          "identifier": "EXPR_ENRICH",
+          "name": "EXPR_ENRICH"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-orders-daily-il6",
+            "port": "df-orders-daily-EXPR_ENRICH-in0",
+            "fromLink": "df-orders-daily-ol6"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-orders-daily-ol7",
+            "port": "df-orders-daily-EXPR_ENRICH-out",
+            "toLinks": [
+              "df-orders-daily-il7"
+            ]
+          },
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-orders-daily-ol8",
+            "port": "df-orders-daily-EXPR_ENRICH-out",
+            "toLinks": [
+              "df-orders-daily-il8"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-orders-daily-SPLIT_SIZE",
+        "name": "SPLIT_SIZE",
+        "operator": {
+          "modelType": "SPLIT_OPERATOR",
+          "dataRoutingStrategy": "FIRST",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-orders-daily-SPLIT_SIZE-in",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "CONDITIONAL_OUTPUT_PORT",
+              "key": "split-large",
+              "name": "LARGE",
+              "portType": "DATA",
+              "fields": [],
+              "splitCondition": {
+                "modelType": "EXPRESSION",
+                "exprString": "EXPR_ENRICH.ORDERS.IS_LARGE = 'Y'"
+              }
+            },
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "split-unmatched",
+              "name": "UNMATCHED",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "key": "df-orders-daily-SPLIT_SIZE-op",
+          "identifier": "SPLIT_SIZE",
+          "name": "SPLIT_SIZE"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-orders-daily-il7",
+            "port": "df-orders-daily-SPLIT_SIZE-in",
+            "fromLink": "df-orders-daily-ol7"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-orders-daily-ol10",
+            "port": "split-large",
+            "toLinks": [
+              "df-orders-daily-il10"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-orders-daily-AGG_DAILY",
+        "name": "AGG_DAILY",
+        "operator": {
+          "modelType": "AGGREGATOR_OPERATOR",
+          "groupByColumns": {
+            "modelType": "DYNAMIC_PROXY_FIELD",
+            "key": "agg-gb",
+            "name": "GB",
+            "type": {
+              "modelType": "DYNAMIC_TYPE",
+              "key": "agg-gb-t",
+              "typeHandler": {
+                "modelType": "RULE_TYPE_CONFIGS",
+                "key": "rtc",
+                "projectionRules": [
+                  {
+                    "modelType": "NAME_LIST_RULE",
+                    "key": "nlr",
+                    "ruleType": "INCLUDE",
+                    "names": [
+                      "ORDER_DATE",
+                      "COUNTRY",
+                      "CATEGORY"
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-orders-daily-AGG_DAILY-in",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-orders-daily-AGG_DAILY-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": [
+                {
+                  "modelType": "DERIVED_FIELD",
+                  "key": "agg-total",
+                  "name": "TOTAL_NET",
+                  "type": "DECIMAL",
+                  "expr": {
+                    "modelType": "EXPRESSION",
+                    "key": "agg-total-x",
+                    "exprString": "SUM(EXPR_ENRICH.ORDERS.NET_AMOUNT)"
+                  }
+                },
+                {
+                  "modelType": "DERIVED_FIELD",
+                  "key": "agg-count",
+                  "name": "ORDER_COUNT",
+                  "type": "INTEGER",
+                  "expr": {
+                    "modelType": "EXPRESSION",
+                    "key": "agg-count-x",
+                    "exprString": "COUNT(*)"
+                  }
+                }
+              ]
+            }
+          ],
+          "key": "df-orders-daily-AGG_DAILY-op",
+          "identifier": "AGG_DAILY",
+          "name": "AGG_DAILY"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-orders-daily-il8",
+            "port": "df-orders-daily-AGG_DAILY-in",
+            "fromLink": "df-orders-daily-ol8"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-orders-daily-ol9",
+            "port": "df-orders-daily-AGG_DAILY-out",
+            "toLinks": [
+              "df-orders-daily-il9"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-orders-daily-TARGET_DAILY",
+        "name": "TARGET_DAILY",
+        "operator": {
+          "modelType": "TARGET_OPERATOR",
+          "entity": {
+            "modelType": "TABLE_ENTITY",
+            "key": "ent-fact_orders_daily",
+            "name": "FACT_ORDERS_DAILY",
+            "resourceName": "FACT_ORDERS_DAILY",
+            "shape": {
+              "modelType": "SHAPE",
+              "key": "ent-fact_orders_daily-shape",
+              "type": {
+                "modelType": "COMPOSITE_TYPE",
+                "key": "ent-fact_orders_daily-ctype",
+                "elements": [
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-fact_orders_daily-ORDER_DATE",
+                    "name": "ORDER_DATE",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-DATE",
+                      "name": "DATE",
+                      "dtType": "DATE"
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-fact_orders_daily-COUNTRY",
+                    "name": "COUNTRY",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-VARCHAR2",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-VARCHAR2",
+                        "name": "VARCHAR2",
+                        "dtType": "VARCHAR2"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "length": {
+                            "intValue": 2
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-fact_orders_daily-CATEGORY",
+                    "name": "CATEGORY",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-VARCHAR2",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-VARCHAR2",
+                        "name": "VARCHAR2",
+                        "dtType": "VARCHAR2"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "length": {
+                            "intValue": 50
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-fact_orders_daily-TOTAL_NET",
+                    "name": "TOTAL_NET",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 14
+                          },
+                          "scale": {
+                            "intValue": 2
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-fact_orders_daily-ORDER_COUNT",
+                    "name": "ORDER_COUNT",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-INTEGER",
+                      "name": "INTEGER",
+                      "dtType": "INTEGER"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "opConfigValues": {
+            "configParamValues": {
+              "dataAssetParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_DATA_ASSET",
+                  "key": "da-adw-sales",
+                  "name": "ADW_SALES"
+                }
+              },
+              "connectionParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_CONNECTION",
+                  "key": "conn-adw-sales",
+                  "name": "ADW_SALES_CONN"
+                }
+              },
+              "schemaParam": {
+                "refValue": {
+                  "modelType": "SCHEMA",
+                  "key": "sch-sales_dw",
+                  "name": "SALES_DW"
+                }
+              }
+            }
+          },
+          "writeOperationConfig": {
+            "modelType": "WRITE_OPERATION_CONFIG",
+            "key": "TARGET_DAILY-woc",
+            "writeMode": "OVERWRITE"
+          },
+          "loadOrder": 2,
+          "isPredefinedShape": true,
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-orders-daily-TARGET_DAILY-in",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "key": "df-orders-daily-TARGET_DAILY-op",
+          "identifier": "TARGET_DAILY",
+          "name": "TARGET_DAILY",
+          "outputPorts": []
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-orders-daily-il9",
+            "port": "df-orders-daily-TARGET_DAILY-in",
+            "fromLink": "df-orders-daily-ol9",
+            "fieldMap": {
+              "modelType": "RULE_BASED_FIELD_MAP",
+              "key": "rb-daily",
+              "mapType": "MAPBYNAME"
+            }
+          }
+        ],
+        "outputLinks": []
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-orders-daily-TARGET_LARGE",
+        "name": "TARGET_LARGE",
+        "operator": {
+          "modelType": "TARGET_OPERATOR",
+          "entity": {
+            "modelType": "TABLE_ENTITY",
+            "key": "ent-large_orders",
+            "name": "LARGE_ORDERS",
+            "resourceName": "LARGE_ORDERS",
+            "shape": {
+              "modelType": "SHAPE",
+              "key": "ent-large_orders-shape",
+              "type": {
+                "modelType": "COMPOSITE_TYPE",
+                "key": "ent-large_orders-ctype",
+                "elements": [
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-large_orders-ORDER_ID",
+                    "name": "ORDER_ID",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 10
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-large_orders-CUSTOMER_ID",
+                    "name": "CUSTOMER_ID",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 10
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-large_orders-AMOUNT",
+                    "name": "AMOUNT",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 12
+                          },
+                          "scale": {
+                            "intValue": 2
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-large_orders-NET_AMOUNT",
+                    "name": "NET_AMOUNT",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 12
+                          },
+                          "scale": {
+                            "intValue": 2
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-large_orders-ORDER_MONTH",
+                    "name": "ORDER_MONTH",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-VARCHAR2",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-VARCHAR2",
+                        "name": "VARCHAR2",
+                        "dtType": "VARCHAR2"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "length": {
+                            "intValue": 7
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "opConfigValues": {
+            "configParamValues": {
+              "dataAssetParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_DATA_ASSET",
+                  "key": "da-adw-sales",
+                  "name": "ADW_SALES"
+                }
+              },
+              "connectionParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_CONNECTION",
+                  "key": "conn-adw-sales",
+                  "name": "ADW_SALES_CONN"
+                }
+              },
+              "schemaParam": {
+                "refValue": {
+                  "modelType": "SCHEMA",
+                  "key": "sch-sales_dw",
+                  "name": "SALES_DW"
+                }
+              }
+            }
+          },
+          "writeOperationConfig": {
+            "modelType": "WRITE_OPERATION_CONFIG",
+            "key": "TARGET_LARGE-woc",
+            "writeMode": "APPEND"
+          },
+          "loadOrder": 1,
+          "isPredefinedShape": true,
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-orders-daily-TARGET_LARGE-in",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "key": "df-orders-daily-TARGET_LARGE-op",
+          "identifier": "TARGET_LARGE",
+          "name": "TARGET_LARGE",
+          "outputPorts": []
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-orders-daily-il10",
+            "port": "df-orders-daily-TARGET_LARGE-in",
+            "fromLink": "df-orders-daily-ol10",
+            "fieldMap": {
+              "modelType": "RULE_BASED_FIELD_MAP",
+              "key": "rb-large",
+              "mapType": "MAPBYNAME"
+            }
+          }
+        ],
+        "outputLinks": []
+      }
+    ],
+    "parameters": [
+      {
+        "modelType": "PARAMETER",
+        "key": "df-orders-daily-p-P_DISCOUNT",
+        "name": "P_DISCOUNT",
+        "typeName": "DECIMAL",
+        "defaultValue": "0.10"
+      }
+    ]
+  }
+}

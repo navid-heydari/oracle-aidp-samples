@@ -1,0 +1,42 @@
+{
+  "modelType": "SQL_TASK",
+  "key": "t-sql-stats",
+  "name": "SQL_REFRESH_STATS",
+  "identifier": "SQL_REFRESH_STATS",
+  "modelVersion": "20200430",
+  "objectVersion": 1,
+  "parentRef": {
+    "parent": "fld-marts"
+  },
+  "sqlScriptType": "STORED_PROCEDURE",
+  "script": {
+    "modelType": "SCRIPT",
+    "key": "scr-stats",
+    "name": "SALES_DW.REFRESH_STATS"
+  },
+  "opConfigValues": {
+    "configParamValues": {
+      "dataAssetParam": {
+        "refValue": {
+          "modelType": "ORACLE_ADWC_DATA_ASSET",
+          "key": "da-adw-sales",
+          "name": "ADW_SALES"
+        }
+      },
+      "connectionParam": {
+        "refValue": {
+          "modelType": "ORACLE_ADWC_CONNECTION",
+          "key": "conn-adw-sales",
+          "name": "ADW_SALES_CONN"
+        }
+      },
+      "schemaParam": {
+        "refValue": {
+          "modelType": "SCHEMA",
+          "key": "sch-sales_dw",
+          "name": "SALES_DW"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,663 @@
+{
+  "modelType": "INTEGRATION_TASK",
+  "key": "t-crm-contacts",
+  "name": "IT_CRM_CONTACTS",
+  "identifier": "IT_CRM_CONTACTS",
+  "modelVersion": "20200430",
+  "objectVersion": 1,
+  "parentRef": {
+    "parent": "fld-ingest"
+  },
+  "dataFlow": {
+    "modelType": "DATA_FLOW",
+    "key": "df-crm-contacts",
+    "name": "DF_CRM_CONTACTS",
+    "identifier": "DF_CRM_CONTACTS",
+    "modelVersion": "20200430",
+    "objectVersion": 1,
+    "parentRef": {
+      "parent": "fld-ingest"
+    },
+    "nodes": [
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-crm-contacts-SOURCE_CONTACTS",
+        "name": "SOURCE_CONTACTS",
+        "operator": {
+          "modelType": "SOURCE_OPERATOR",
+          "entity": {
+            "modelType": "TABLE_ENTITY",
+            "key": "ent-source_contacts",
+            "name": "contacts",
+            "resourceName": "contacts",
+            "shape": {
+              "modelType": "SHAPE",
+              "key": "ent-source_contacts-shape",
+              "type": {
+                "modelType": "COMPOSITE_TYPE",
+                "key": "ent-source_contacts-ctype",
+                "elements": [
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-crm-contacts-SOURCE_CONTACTS-CONTACT_ID",
+                    "name": "CONTACT_ID",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-INTEGER",
+                      "name": "INTEGER",
+                      "dtType": "INTEGER"
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-crm-contacts-SOURCE_CONTACTS-EMAIL",
+                    "name": "EMAIL",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-VARCHAR2",
+                      "name": "VARCHAR2",
+                      "dtType": "VARCHAR2"
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-crm-contacts-SOURCE_CONTACTS-UPDATED_AT",
+                    "name": "UPDATED_AT",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-TIMESTAMP",
+                      "name": "TIMESTAMP",
+                      "dtType": "TIMESTAMP"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "opConfigValues": {
+            "configParamValues": {
+              "dataAssetParam": {
+                "refValue": {
+                  "modelType": "GENERIC_JDBC_DATA_ASSET",
+                  "key": "da-pg-crm",
+                  "name": "PG_CRM"
+                }
+              },
+              "connectionParam": {
+                "refValue": {
+                  "modelType": "GENERIC_JDBC_CONNECTION",
+                  "key": "conn-pg-crm",
+                  "name": "PG_CRM_CONN"
+                }
+              },
+              "schemaParam": {
+                "refValue": {
+                  "modelType": "SCHEMA",
+                  "key": "sch-public",
+                  "name": "public"
+                }
+              }
+            }
+          },
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-crm-contacts-SOURCE_CONTACTS-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": [
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-crm-contacts-SOURCE_CONTACTS-CONTACT_ID",
+                  "name": "CONTACT_ID",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-INTEGER",
+                    "name": "INTEGER",
+                    "dtType": "INTEGER"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-crm-contacts-SOURCE_CONTACTS-EMAIL",
+                  "name": "EMAIL",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-VARCHAR2",
+                    "name": "VARCHAR2",
+                    "dtType": "VARCHAR2"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-crm-contacts-SOURCE_CONTACTS-UPDATED_AT",
+                  "name": "UPDATED_AT",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-TIMESTAMP",
+                    "name": "TIMESTAMP",
+                    "dtType": "TIMESTAMP"
+                  }
+                }
+              ]
+            }
+          ],
+          "key": "df-crm-contacts-SOURCE_CONTACTS-op",
+          "identifier": "SOURCE_CONTACTS",
+          "name": "SOURCE_CONTACTS",
+          "inputPorts": []
+        },
+        "inputLinks": [],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-crm-contacts-ol1",
+            "port": "df-crm-contacts-SOURCE_CONTACTS-out",
+            "toLinks": [
+              "df-crm-contacts-il1"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-crm-contacts-SOURCE_LEGACY",
+        "name": "SOURCE_LEGACY",
+        "operator": {
+          "modelType": "SOURCE_OPERATOR",
+          "entity": {
+            "modelType": "FILE_ENTITY",
+            "key": "ent-source_legacy",
+            "name": "contacts_legacy/*.json",
+            "resourceName": "contacts_legacy/*.json",
+            "shape": {
+              "modelType": "SHAPE",
+              "key": "ent-source_legacy-shape",
+              "type": {
+                "modelType": "COMPOSITE_TYPE",
+                "key": "ent-source_legacy-ctype",
+                "elements": [
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-crm-contacts-SOURCE_LEGACY-CONTACT_ID",
+                    "name": "CONTACT_ID",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-INTEGER",
+                      "name": "INTEGER",
+                      "dtType": "INTEGER"
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-crm-contacts-SOURCE_LEGACY-EMAIL",
+                    "name": "EMAIL",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-VARCHAR2",
+                      "name": "VARCHAR2",
+                      "dtType": "VARCHAR2"
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-crm-contacts-SOURCE_LEGACY-UPDATED_AT",
+                    "name": "UPDATED_AT",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-TIMESTAMP",
+                      "name": "TIMESTAMP",
+                      "dtType": "TIMESTAMP"
+                    }
+                  }
+                ]
+              }
+            },
+            "dataFormat": {
+              "type": "JSON",
+              "formatAttribute": {
+                "modelType": "JSON_FORMAT",
+                "encoding": "UTF-8"
+              }
+            }
+          },
+          "opConfigValues": {
+            "configParamValues": {
+              "dataAssetParam": {
+                "refValue": {
+                  "modelType": "ORACLE_OBJECT_STORAGE_DATA_ASSET",
+                  "key": "da-os-landing",
+                  "name": "OS_LANDING"
+                }
+              },
+              "connectionParam": {
+                "refValue": {
+                  "modelType": "ORACLE_OBJECT_STORAGE_CONNECTION",
+                  "key": "conn-os-landing",
+                  "name": "OS_LANDING_CONN"
+                }
+              },
+              "schemaParam": {
+                "refValue": {
+                  "modelType": "SCHEMA",
+                  "key": "sch-landing",
+                  "name": "landing"
+                }
+              }
+            }
+          },
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-crm-contacts-SOURCE_LEGACY-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": [
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-crm-contacts-SOURCE_LEGACY-CONTACT_ID",
+                  "name": "CONTACT_ID",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-INTEGER",
+                    "name": "INTEGER",
+                    "dtType": "INTEGER"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-crm-contacts-SOURCE_LEGACY-EMAIL",
+                  "name": "EMAIL",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-VARCHAR2",
+                    "name": "VARCHAR2",
+                    "dtType": "VARCHAR2"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-crm-contacts-SOURCE_LEGACY-UPDATED_AT",
+                  "name": "UPDATED_AT",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-TIMESTAMP",
+                    "name": "TIMESTAMP",
+                    "dtType": "TIMESTAMP"
+                  }
+                }
+              ]
+            }
+          ],
+          "key": "df-crm-contacts-SOURCE_LEGACY-op",
+          "identifier": "SOURCE_LEGACY",
+          "name": "SOURCE_LEGACY",
+          "inputPorts": []
+        },
+        "inputLinks": [],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-crm-contacts-ol2",
+            "port": "df-crm-contacts-SOURCE_LEGACY-out",
+            "toLinks": [
+              "df-crm-contacts-il2"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-crm-contacts-UNION_ALL",
+        "name": "UNION_ALL",
+        "operator": {
+          "modelType": "UNION_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-crm-contacts-UNION_ALL-in0",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            },
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-crm-contacts-UNION_ALL-in1",
+              "name": "INPUT2",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-crm-contacts-UNION_ALL-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "unionType": "NAME",
+          "isAll": true,
+          "key": "df-crm-contacts-UNION_ALL-op",
+          "identifier": "UNION_ALL",
+          "name": "UNION_ALL"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-crm-contacts-il1",
+            "port": "df-crm-contacts-UNION_ALL-in0",
+            "fromLink": "df-crm-contacts-ol1"
+          },
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-crm-contacts-il2",
+            "port": "df-crm-contacts-UNION_ALL-in1",
+            "fromLink": "df-crm-contacts-ol2"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-crm-contacts-ol3",
+            "port": "df-crm-contacts-UNION_ALL-out",
+            "toLinks": [
+              "df-crm-contacts-il3"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-crm-contacts-EXPR_HASH",
+        "name": "EXPR_HASH",
+        "operator": {
+          "modelType": "EXPRESSION_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-crm-contacts-EXPR_HASH-in0",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-crm-contacts-EXPR_HASH-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": [
+                {
+                  "modelType": "DERIVED_FIELD",
+                  "key": "hash-bucket",
+                  "name": "EMAIL_BUCKET",
+                  "type": "INTEGER",
+                  "expr": {
+                    "modelType": "EXPRESSION",
+                    "key": "hash-bucket-x",
+                    "exprString": "MOD(ORA_HASH(UNION_ALL.CONTACTS.EMAIL), 16)"
+                  }
+                }
+              ]
+            }
+          ],
+          "key": "df-crm-contacts-EXPR_HASH-op",
+          "identifier": "EXPR_HASH",
+          "name": "EXPR_HASH"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-crm-contacts-il3",
+            "port": "df-crm-contacts-EXPR_HASH-in0",
+            "fromLink": "df-crm-contacts-ol3"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-crm-contacts-ol4",
+            "port": "df-crm-contacts-EXPR_HASH-out",
+            "toLinks": [
+              "df-crm-contacts-il4"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-crm-contacts-DISTINCT_1",
+        "name": "DISTINCT_1",
+        "operator": {
+          "modelType": "DISTINCT_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-crm-contacts-DISTINCT_1-in0",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-crm-contacts-DISTINCT_1-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "key": "df-crm-contacts-DISTINCT_1-op",
+          "identifier": "DISTINCT_1",
+          "name": "DISTINCT_1"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-crm-contacts-il4",
+            "port": "df-crm-contacts-DISTINCT_1-in0",
+            "fromLink": "df-crm-contacts-ol4"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-crm-contacts-ol5",
+            "port": "df-crm-contacts-DISTINCT_1-out",
+            "toLinks": [
+              "df-crm-contacts-il5"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-crm-contacts-SORT_1",
+        "name": "SORT_1",
+        "operator": {
+          "modelType": "SORT_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-crm-contacts-SORT_1-in0",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-crm-contacts-SORT_1-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "sortKey": {
+            "sortRules": [
+              {
+                "isAscending": false,
+                "wrappedRule": {
+                  "modelType": "NAME_LIST_RULE",
+                  "key": "sr1",
+                  "names": [
+                    "UPDATED_AT"
+                  ]
+                }
+              }
+            ]
+          },
+          "key": "df-crm-contacts-SORT_1-op",
+          "identifier": "SORT_1",
+          "name": "SORT_1"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-crm-contacts-il5",
+            "port": "df-crm-contacts-SORT_1-in0",
+            "fromLink": "df-crm-contacts-ol5"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-crm-contacts-ol6",
+            "port": "df-crm-contacts-SORT_1-out",
+            "toLinks": [
+              "df-crm-contacts-il6"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-crm-contacts-TARGET_CONTACTS",
+        "name": "TARGET_CONTACTS",
+        "operator": {
+          "modelType": "TARGET_OPERATOR",
+          "entity": {
+            "modelType": "TABLE_ENTITY",
+            "key": "ent-contacts",
+            "name": "CONTACTS",
+            "resourceName": "CONTACTS",
+            "shape": {
+              "modelType": "SHAPE",
+              "key": "ent-contacts-shape",
+              "type": {
+                "modelType": "COMPOSITE_TYPE",
+                "key": "ent-contacts-ctype",
+                "elements": [
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-contacts-CONTACT_ID",
+                    "name": "CONTACT_ID",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-INTEGER",
+                      "name": "INTEGER",
+                      "dtType": "INTEGER"
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-contacts-EMAIL",
+                    "name": "EMAIL",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-VARCHAR2",
+                      "name": "VARCHAR2",
+                      "dtType": "VARCHAR2"
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-contacts-UPDATED_AT",
+                    "name": "UPDATED_AT",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-TIMESTAMP",
+                      "name": "TIMESTAMP",
+                      "dtType": "TIMESTAMP"
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-contacts-EMAIL_BUCKET",
+                    "name": "EMAIL_BUCKET",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-INTEGER",
+                      "name": "INTEGER",
+                      "dtType": "INTEGER"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "opConfigValues": {
+            "configParamValues": {
+              "dataAssetParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_DATA_ASSET",
+                  "key": "da-adw-sales",
+                  "name": "ADW_SALES"
+                }
+              },
+              "connectionParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_CONNECTION",
+                  "key": "conn-adw-sales",
+                  "name": "ADW_SALES_CONN"
+                }
+              },
+              "schemaParam": {
+                "refValue": {
+                  "modelType": "SCHEMA",
+                  "key": "sch-sales_dw",
+                  "name": "SALES_DW"
+                }
+              }
+            }
+          },
+          "writeOperationConfig": {
+            "modelType": "WRITE_OPERATION_CONFIG",
+            "key": "TARGET_CONTACTS-woc",
+            "writeMode": "OVERWRITE"
+          },
+          "loadOrder": 1,
+          "isPredefinedShape": true,
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-crm-contacts-TARGET_CONTACTS-in",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "key": "df-crm-contacts-TARGET_CONTACTS-op",
+          "identifier": "TARGET_CONTACTS",
+          "name": "TARGET_CONTACTS",
+          "outputPorts": []
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-crm-contacts-il6",
+            "port": "df-crm-contacts-TARGET_CONTACTS-in",
+            "fromLink": "df-crm-contacts-ol6"
+          }
+        ],
+        "outputLinks": []
+      }
+    ],
+    "parameters": []
+  }
+}

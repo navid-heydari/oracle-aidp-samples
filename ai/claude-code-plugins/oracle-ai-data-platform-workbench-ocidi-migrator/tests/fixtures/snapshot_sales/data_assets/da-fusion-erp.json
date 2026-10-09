@@ -1,0 +1,7 @@
+{
+  "modelType": "FUSION_APP_DATA_ASSET",
+  "key": "da-fusion-erp",
+  "name": "FUSION_ERP",
+  "identifier": "FUSION_ERP",
+  "serviceUrl": "https://fa-example.oraclecloud.com"
+}

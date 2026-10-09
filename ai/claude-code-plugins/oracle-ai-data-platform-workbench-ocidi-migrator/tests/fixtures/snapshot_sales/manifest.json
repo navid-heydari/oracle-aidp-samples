@@ -1,0 +1,7 @@
+{
+  "workspace_name": "SALES_DI",
+  "region": "us-ashburn-1",
+  "extracted_at": "2026-10-09T00:00:00Z",
+  "tool": "hand-built fixture",
+  "note": "Shapes follow oci.data_integration models 2.165.1; not a real export."
+}

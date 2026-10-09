@@ -1,0 +1,341 @@
+{
+  "modelType": "INTEGRATION_TASK",
+  "key": "po-enrich-sentiment",
+  "name": "IT_ENRICH_SENTIMENT",
+  "identifier": "IT_ENRICH_SENTIMENT",
+  "modelVersion": "20200430",
+  "objectVersion": 1,
+  "parentRef": {
+    "parent": "app-prod"
+  },
+  "dataFlow": {
+    "modelType": "DATA_FLOW",
+    "key": "df-enrich-sentiment",
+    "name": "DF_ENRICH_SENTIMENT",
+    "identifier": "DF_ENRICH_SENTIMENT",
+    "modelVersion": "20200430",
+    "objectVersion": 1,
+    "parentRef": {
+      "parent": "fld-marts"
+    },
+    "nodes": [
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-enrich-sentiment-SOURCE_REVIEWS",
+        "name": "SOURCE_REVIEWS",
+        "operator": {
+          "modelType": "SOURCE_OPERATOR",
+          "entity": {
+            "modelType": "TABLE_ENTITY",
+            "key": "ent-source_reviews",
+            "name": "REVIEWS",
+            "resourceName": "REVIEWS",
+            "shape": {
+              "modelType": "SHAPE",
+              "key": "ent-source_reviews-shape",
+              "type": {
+                "modelType": "COMPOSITE_TYPE",
+                "key": "ent-source_reviews-ctype",
+                "elements": [
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-enrich-sentiment-SOURCE_REVIEWS-REVIEW_ID",
+                    "name": "REVIEW_ID",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 10
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-enrich-sentiment-SOURCE_REVIEWS-REVIEW_TEXT",
+                    "name": "REVIEW_TEXT",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-VARCHAR2",
+                      "name": "VARCHAR2",
+                      "dtType": "VARCHAR2"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "opConfigValues": {
+            "configParamValues": {
+              "dataAssetParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_DATA_ASSET",
+                  "key": "da-adw-sales",
+                  "name": "ADW_SALES"
+                }
+              },
+              "connectionParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_CONNECTION",
+                  "key": "conn-adw-sales",
+                  "name": "ADW_SALES_CONN"
+                }
+              },
+              "schemaParam": {
+                "refValue": {
+                  "modelType": "SCHEMA",
+                  "key": "sch-sales",
+                  "name": "SALES"
+                }
+              }
+            }
+          },
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-enrich-sentiment-SOURCE_REVIEWS-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": [
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-enrich-sentiment-SOURCE_REVIEWS-REVIEW_ID",
+                  "name": "REVIEW_ID",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-NUMBER",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-NUMBER",
+                      "name": "NUMBER",
+                      "dtType": "NUMBER"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "precision": {
+                          "intValue": 10
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-enrich-sentiment-SOURCE_REVIEWS-REVIEW_TEXT",
+                  "name": "REVIEW_TEXT",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-VARCHAR2",
+                    "name": "VARCHAR2",
+                    "dtType": "VARCHAR2"
+                  }
+                }
+              ]
+            }
+          ],
+          "key": "df-enrich-sentiment-SOURCE_REVIEWS-op",
+          "identifier": "SOURCE_REVIEWS",
+          "name": "SOURCE_REVIEWS",
+          "inputPorts": []
+        },
+        "inputLinks": [],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-enrich-sentiment-ol1",
+            "port": "df-enrich-sentiment-SOURCE_REVIEWS-out",
+            "toLinks": [
+              "df-enrich-sentiment-il1"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-enrich-sentiment-SENTIMENT_FN",
+        "name": "SENTIMENT_FN",
+        "operator": {
+          "modelType": "FUNCTION_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-enrich-sentiment-SENTIMENT_FN-in0",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-enrich-sentiment-SENTIMENT_FN-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": [
+                {
+                  "modelType": "OUTPUT_FIELD",
+                  "key": "fn-score",
+                  "name": "SENTIMENT_SCORE",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-NUMBER",
+                    "name": "NUMBER",
+                    "dtType": "NUMBER"
+                  }
+                }
+              ]
+            }
+          ],
+          "ociFunction": {
+            "modelType": "OCI_FUNCTION",
+            "functionId": "ocid1.fnfunc.oc1.iad.exampleexampleexample",
+            "regionId": "us-ashburn-1",
+            "payloadFormat": "JSON"
+          },
+          "key": "df-enrich-sentiment-SENTIMENT_FN-op",
+          "identifier": "SENTIMENT_FN",
+          "name": "SENTIMENT_FN"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-enrich-sentiment-il1",
+            "port": "df-enrich-sentiment-SENTIMENT_FN-in0",
+            "fromLink": "df-enrich-sentiment-ol1"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-enrich-sentiment-ol2",
+            "port": "df-enrich-sentiment-SENTIMENT_FN-out",
+            "toLinks": [
+              "df-enrich-sentiment-il2"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-enrich-sentiment-TARGET_SENTIMENT",
+        "name": "TARGET_SENTIMENT",
+        "operator": {
+          "modelType": "TARGET_OPERATOR",
+          "entity": {
+            "modelType": "TABLE_ENTITY",
+            "key": "ent-review_sentiment",
+            "name": "REVIEW_SENTIMENT",
+            "resourceName": "REVIEW_SENTIMENT",
+            "shape": {
+              "modelType": "SHAPE",
+              "key": "ent-review_sentiment-shape",
+              "type": {
+                "modelType": "COMPOSITE_TYPE",
+                "key": "ent-review_sentiment-ctype",
+                "elements": [
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-review_sentiment-REVIEW_ID",
+                    "name": "REVIEW_ID",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 10
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-review_sentiment-SENTIMENT_SCORE",
+                    "name": "SENTIMENT_SCORE",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-NUMBER",
+                      "name": "NUMBER",
+                      "dtType": "NUMBER"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "opConfigValues": {
+            "configParamValues": {
+              "dataAssetParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_DATA_ASSET",
+                  "key": "da-adw-sales",
+                  "name": "ADW_SALES"
+                }
+              },
+              "connectionParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_CONNECTION",
+                  "key": "conn-adw-sales",
+                  "name": "ADW_SALES_CONN"
+                }
+              },
+              "schemaParam": {
+                "refValue": {
+                  "modelType": "SCHEMA",
+                  "key": "sch-sales_dw",
+                  "name": "SALES_DW"
+                }
+              }
+            }
+          },
+          "writeOperationConfig": {
+            "modelType": "WRITE_OPERATION_CONFIG",
+            "key": "TARGET_SENTIMENT-woc",
+            "writeMode": "APPEND"
+          },
+          "loadOrder": 1,
+          "isPredefinedShape": true,
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-enrich-sentiment-TARGET_SENTIMENT-in",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "key": "df-enrich-sentiment-TARGET_SENTIMENT-op",
+          "identifier": "TARGET_SENTIMENT",
+          "name": "TARGET_SENTIMENT",
+          "outputPorts": []
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-enrich-sentiment-il2",
+            "port": "df-enrich-sentiment-TARGET_SENTIMENT-in",
+            "fromLink": "df-enrich-sentiment-ol2"
+          }
+        ],
+        "outputLinks": []
+      }
+    ],
+    "parameters": []
+  }
+}

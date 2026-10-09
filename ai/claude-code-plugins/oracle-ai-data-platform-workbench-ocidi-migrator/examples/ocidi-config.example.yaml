@@ -1,0 +1,34 @@
+# ocidi2aidp configuration. Copy to ./ocidi-config.yaml (git-ignored) and fill in.
+# Every field is optional. Values shown are the defaults, except where a comment says "set". Identifiers can instead come
+# from OCIDI_* environment variables (see ocidi2aidp/config.py).
+
+aidp:
+  instance_name: ""                  # set: AIDP instance (DataLake) display name ...
+  instance_id: ""                    # ... or its OCID (wins over instance_name)
+  region: ""                         # set, e.g. us-ashburn-1 (default: the profile's region)
+  profile: DEFAULT                   # OCI config profile
+  auth: api_key                      # api_key | security_token
+  workspace_name: ocidi_migrated     # created by `provision --apply` if missing
+  workspace_key: ""                  # set to skip the lookup by name
+  cluster_key: ""                    # USER cluster in that workspace; jobs need one to run
+  notebook_root: /Workspace/ocidi
+
+di:                                  # only for `extract`
+  workspace_id: ""                   # set: ocid1.disworkspace...
+  region: ""                         # set: the DI workspace's region
+  profile: DEFAULT
+
+target:
+  catalog: ocidi_migrated            # INTERNAL catalog for the Delta targets
+  control_schema: ocidi_control      # watermark table lives here
+  schema_map:                        # DI schema / bucket name -> AIDP schema
+    # SALES_DW: sales_dw
+
+sources:                             # DI data asset name -> how AIDP reaches it
+  # ADW_SALES: {access: catalog, value: adw_sales}            # external catalog
+  # OS_LANDING: {access: path, value: "oci://{bucket}@mynamespace/"}
+  # PG_CRM: {access: jdbc, value: pg_crm}                      # AIDP credential name
+  # FUSION_ERP: {access: catalog, value: fusion_bronze}        # where BICC data was landed
+
+job_prefix: ""
+default_timezone: ""                 # IANA zone for schedules that carry none

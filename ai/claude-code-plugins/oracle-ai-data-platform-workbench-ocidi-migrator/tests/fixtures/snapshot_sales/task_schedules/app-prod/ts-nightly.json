@@ -1,0 +1,31 @@
+{
+  "modelType": "TASK_SCHEDULE",
+  "key": "ts-nightly",
+  "name": "TS_NIGHTLY",
+  "identifier": "TS_NIGHTLY",
+  "parentRef": {
+    "parent": "po-pt-nightly"
+  },
+  "scheduleRef": {
+    "modelType": "SCHEDULE",
+    "key": "sch-nightly",
+    "name": "SCH_NIGHTLY",
+    "identifier": "SCH_NIGHTLY",
+    "timezone": "America/Chicago",
+    "isDaylightAdjustmentEnabled": true,
+    "frequencyDetails": {
+      "modelType": "DAILY",
+      "frequency": "DAILY",
+      "interval": 1,
+      "time": {
+        "hour": 2,
+        "minute": 30,
+        "second": 0
+      }
+    }
+  },
+  "isEnabled": true,
+  "isConcurrentAllowed": false,
+  "retryAttempts": 0,
+  "startTimeMillis": 1767225600000
+}

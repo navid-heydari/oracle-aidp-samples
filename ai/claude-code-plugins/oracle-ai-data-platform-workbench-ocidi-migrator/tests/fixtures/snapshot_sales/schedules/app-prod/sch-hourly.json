@@ -1,0 +1,15 @@
+{
+  "modelType": "SCHEDULE",
+  "key": "sch-hourly",
+  "name": "SCH_EVERY_2H",
+  "identifier": "SCH_EVERY_2H",
+  "timezone": "UTC",
+  "frequencyDetails": {
+    "modelType": "HOURLY",
+    "frequency": "HOURLY",
+    "interval": 2,
+    "time": {
+      "minute": 15
+    }
+  }
+}

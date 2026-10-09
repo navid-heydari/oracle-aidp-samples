@@ -1,0 +1,10 @@
+{
+  "modelType": "ORACLE_ADWC_DATA_ASSET",
+  "key": "da-adw-sales",
+  "name": "ADW_SALES",
+  "identifier": "ADW_SALES",
+  "serviceName": "salesadw_low",
+  "defaultConnection": {
+    "key": "conn-adw-sales"
+  }
+}

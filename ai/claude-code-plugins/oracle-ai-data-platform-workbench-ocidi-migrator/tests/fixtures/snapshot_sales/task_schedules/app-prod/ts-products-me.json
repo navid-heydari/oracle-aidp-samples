@@ -1,0 +1,33 @@
+{
+  "modelType": "TASK_SCHEDULE",
+  "key": "ts-products-me",
+  "name": "TS_PRODUCTS_MONTH_END",
+  "identifier": "TS_PRODUCTS_MONTH_END",
+  "parentRef": {
+    "parent": "po-dl-products"
+  },
+  "scheduleRef": {
+    "modelType": "SCHEDULE",
+    "key": "sch-month-end",
+    "name": "SCH_LAST_FRIDAY",
+    "identifier": "SCH_LAST_FRIDAY",
+    "timezone": "Europe/London",
+    "frequencyDetails": {
+      "modelType": "MONTHLY_RULE",
+      "frequency": "MONTHLY",
+      "interval": 1,
+      "weekOfMonth": "LAST",
+      "dayOfWeek": "FRIDAY",
+      "time": {
+        "hour": 23,
+        "minute": 0
+      }
+    }
+  },
+  "isEnabled": true,
+  "isConcurrentAllowed": false,
+  "retryAttempts": 0,
+  "configProviderDelegate": {
+    "bindings": {}
+  }
+}

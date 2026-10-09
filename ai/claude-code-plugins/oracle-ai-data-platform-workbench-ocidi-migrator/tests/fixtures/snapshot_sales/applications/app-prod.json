@@ -1,0 +1,7 @@
+{
+  "modelType": "APPLICATION",
+  "key": "app-prod",
+  "name": "APP_PROD",
+  "identifier": "APP_PROD",
+  "lifecycleState": "ACTIVE"
+}

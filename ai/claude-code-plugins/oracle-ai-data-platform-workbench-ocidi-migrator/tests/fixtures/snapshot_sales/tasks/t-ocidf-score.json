@@ -1,0 +1,18 @@
+{
+  "modelType": "OCI_DATAFLOW_TASK",
+  "key": "t-ocidf-score",
+  "name": "OCIDF_SCORE",
+  "identifier": "OCIDF_SCORE",
+  "modelVersion": "20200430",
+  "objectVersion": 1,
+  "parentRef": {
+    "parent": "fld-marts"
+  },
+  "dataflowApplication": {
+    "applicationId": "ocid1.dataflowapplication.oc1.iad.example",
+    "compartmentId": "ocid1.compartment.oc1..example"
+  },
+  "driverShapeDetails": {
+    "shape": "VM.Standard.E4.Flex"
+  }
+}

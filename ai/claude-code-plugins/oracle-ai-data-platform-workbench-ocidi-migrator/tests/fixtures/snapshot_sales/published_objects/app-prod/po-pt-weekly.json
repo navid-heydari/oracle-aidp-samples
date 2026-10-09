@@ -1,0 +1,349 @@
+{
+  "modelType": "PIPELINE_TASK",
+  "key": "po-pt-weekly",
+  "name": "PT_WEEKLY",
+  "identifier": "PT_WEEKLY",
+  "modelVersion": "20200430",
+  "objectVersion": 1,
+  "parentRef": {
+    "parent": "app-prod"
+  },
+  "pipeline": {
+    "modelType": "PIPELINE",
+    "key": "pl-weekly",
+    "name": "PL_WEEKLY",
+    "identifier": "PL_WEEKLY",
+    "modelVersion": "20200430",
+    "objectVersion": 1,
+    "parentRef": {
+      "parent": "fld-marts"
+    },
+    "nodes": [
+      {
+        "modelType": "FLOW_NODE",
+        "key": "pl-weekly-START_1",
+        "name": "START_1",
+        "operator": {
+          "modelType": "START_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "pl-weekly-START_1-in",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "pl-weekly-START_1-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "key": "pl-weekly-START_1-op",
+          "identifier": "START_1",
+          "name": "START_1"
+        },
+        "inputLinks": [],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "pl-weekly-ol1",
+            "port": "pl-weekly-START_1-out",
+            "toLinks": [
+              "pl-weekly-il1"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "pl-weekly-ENRICH",
+        "name": "ENRICH",
+        "operator": {
+          "modelType": "TASK_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "pl-weekly-ENRICH-in",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "pl-weekly-ENRICH-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "taskType": "INTEGRATION_TASK",
+          "task": {
+            "modelType": "INTEGRATION_TASK",
+            "key": "t-enrich-sentiment",
+            "name": "IT_ENRICH_SENTIMENT",
+            "identifier": "IT_ENRICH_SENTIMENT"
+          },
+          "triggerRule": "ALL_SUCCESS",
+          "key": "pl-weekly-ENRICH-op",
+          "identifier": "ENRICH",
+          "name": "ENRICH"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "pl-weekly-il1",
+            "port": "pl-weekly-ENRICH-in",
+            "fromLink": "pl-weekly-ol1"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "pl-weekly-ol2",
+            "port": "pl-weekly-ENRICH-out",
+            "toLinks": [
+              "pl-weekly-il2"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "pl-weekly-DECISION_1",
+        "name": "DECISION_1",
+        "operator": {
+          "modelType": "DECISION_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "pl-weekly-DECISION_1-in",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "pl-weekly-dec-true",
+              "name": "TRUE",
+              "portType": "DATA",
+              "fields": []
+            },
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "pl-weekly-dec-false",
+              "name": "FALSE",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "triggerRule": "ALL_SUCCESS",
+          "opConfigValues": {
+            "configParamValues": {
+              "decisionCondition": {
+                "objectValue": {
+                  "modelType": "EXPRESSION",
+                  "exprString": "ENRICH.SYS.STATUS = 'SUCCESS'"
+                }
+              }
+            }
+          },
+          "key": "pl-weekly-DECISION_1-op",
+          "identifier": "DECISION_1",
+          "name": "DECISION_1"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "pl-weekly-il2",
+            "port": "pl-weekly-DECISION_1-in",
+            "fromLink": "pl-weekly-ol2"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "pl-weekly-ol3",
+            "port": "pl-weekly-dec-true",
+            "toLinks": [
+              "pl-weekly-il3"
+            ]
+          },
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "pl-weekly-ol4",
+            "port": "pl-weekly-dec-false",
+            "toLinks": [
+              "pl-weekly-il4"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "pl-weekly-CRM",
+        "name": "CRM",
+        "operator": {
+          "modelType": "TASK_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "pl-weekly-CRM-in",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "pl-weekly-CRM-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "taskType": "INTEGRATION_TASK",
+          "task": {
+            "modelType": "INTEGRATION_TASK",
+            "key": "t-crm-contacts",
+            "name": "IT_CRM_CONTACTS",
+            "identifier": "IT_CRM_CONTACTS"
+          },
+          "triggerRule": "ALL_SUCCESS",
+          "key": "pl-weekly-CRM-op",
+          "identifier": "CRM",
+          "name": "CRM"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "pl-weekly-il3",
+            "port": "pl-weekly-CRM-in",
+            "fromLink": "pl-weekly-ol3"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "pl-weekly-ol5",
+            "port": "pl-weekly-CRM-out",
+            "toLinks": [
+              "pl-weekly-il5"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "pl-weekly-SCORE",
+        "name": "SCORE",
+        "operator": {
+          "modelType": "TASK_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "pl-weekly-SCORE-in",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "pl-weekly-SCORE-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "taskType": "OCI_DATAFLOW_TASK",
+          "task": {
+            "modelType": "OCI_DATAFLOW_TASK",
+            "key": "t-ocidf-score",
+            "name": "OCIDF_SCORE",
+            "identifier": "OCIDF_SCORE"
+          },
+          "triggerRule": "ALL_SUCCESS",
+          "key": "pl-weekly-SCORE-op",
+          "identifier": "SCORE",
+          "name": "SCORE"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "pl-weekly-il4",
+            "port": "pl-weekly-SCORE-in",
+            "fromLink": "pl-weekly-ol4"
+          }
+        ],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "pl-weekly-ol6",
+            "port": "pl-weekly-SCORE-out",
+            "toLinks": [
+              "pl-weekly-il6"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "pl-weekly-END_1",
+        "name": "END_1",
+        "operator": {
+          "modelType": "END_OPERATOR",
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "pl-weekly-END_1-in",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "pl-weekly-END_1-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "triggerRule": "ALL_COMPLETE",
+          "key": "pl-weekly-END_1-op",
+          "identifier": "END_1",
+          "name": "END_1"
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "pl-weekly-il5",
+            "port": "pl-weekly-END_1-in",
+            "fromLink": "pl-weekly-ol5"
+          },
+          {
+            "modelType": "INPUT_LINK",
+            "key": "pl-weekly-il6",
+            "port": "pl-weekly-END_1-in",
+            "fromLink": "pl-weekly-ol6"
+          }
+        ],
+        "outputLinks": []
+      }
+    ],
+    "parameters": [],
+    "variables": []
+  }
+}
