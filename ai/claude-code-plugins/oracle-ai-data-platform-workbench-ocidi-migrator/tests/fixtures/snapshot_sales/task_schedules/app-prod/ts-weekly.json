@@ -1,0 +1,24 @@
+{
+  "modelType": "TASK_SCHEDULE",
+  "key": "ts-weekly",
+  "name": "TS_WEEKLY",
+  "identifier": "TS_WEEKLY",
+  "parentRef": {
+    "parent": "po-pt-weekly"
+  },
+  "scheduleRef": {
+    "modelType": "SCHEDULE",
+    "key": "sch-monday",
+    "name": "SCH_MONDAY",
+    "identifier": "SCH_MONDAY",
+    "timezone": "UTC",
+    "frequencyDetails": {
+      "modelType": "CUSTOM",
+      "frequency": "CUSTOM",
+      "customExpression": "0 6 * * 1"
+    }
+  },
+  "isEnabled": true,
+  "isConcurrentAllowed": false,
+  "retryAttempts": 0
+}

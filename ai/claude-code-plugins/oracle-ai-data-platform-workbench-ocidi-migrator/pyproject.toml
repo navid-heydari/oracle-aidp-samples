@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ocidi2aidp"
+version = "0.1.0"
+description = "Migrate OCI Data Integration workloads to Oracle AI Data Platform (notebooks, jobs, Delta targets)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Oracle AIDP Team"}]
+# The compiler, verify and the publish plan need nothing beyond the standard library.
+dependencies = ["tzdata"]
+
+[project.optional-dependencies]
+# extract (OCI-DI REST) and provision-by-instance-name (OCI Search)
+oci = ["oci>=2.120", "requests>=2.28"]
+# YAML config files (JSON always works)
+yaml = ["pyyaml>=6.0"]
+# fallback run --provider anthropic (headless LLM work orders)
+llm = ["anthropic>=1.0"]
+# Test-only: runs the generated notebooks on a local Spark + Delta and asserts
+# on result rows. Matches AIDP's Spark 3.5 line.
+spark = ["pyspark>=3.5,<3.6", "delta-spark>=3.2,<3.3"]
+dev = ["pytest>=7.0"]
+all = ["oci>=2.120", "requests>=2.28", "pyyaml>=6.0", "anthropic>=1.0", "pytest>=7.0"]
+
+[project.scripts]
+ocidi2aidp = "ocidi2aidp.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ocidi2aidp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short"

@@ -1,0 +1,27 @@
+{
+  "modelType": "TASK_SCHEDULE",
+  "key": "ts-enrich",
+  "name": "TS_ENRICH",
+  "identifier": "TS_ENRICH",
+  "parentRef": {
+    "parent": "po-enrich-sentiment"
+  },
+  "scheduleRef": {
+    "modelType": "SCHEDULE",
+    "key": "sch-hourly",
+    "name": "SCH_EVERY_2H",
+    "identifier": "SCH_EVERY_2H",
+    "timezone": "UTC",
+    "frequencyDetails": {
+      "modelType": "HOURLY",
+      "frequency": "HOURLY",
+      "interval": 2,
+      "time": {
+        "minute": 15
+      }
+    }
+  },
+  "isEnabled": false,
+  "isConcurrentAllowed": false,
+  "retryAttempts": 0
+}

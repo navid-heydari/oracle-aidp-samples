@@ -1,0 +1,26 @@
+{
+  "name": "oracle-ai-data-platform-workbench-ocidi-migrator",
+  "version": "0.1.0",
+  "description": "Migrate OCI Data Integration (OCI-DI) workspaces to Oracle AI Data Platform: data flows and Integration/Data Loader tasks become PySpark notebooks, pipelines and task schedules become AIDP jobs (PAUSED), and targets land as managed Delta tables. A deterministic compiler does the work; what it cannot convert safely becomes an LLM work order that Claude fills in-session, validated statically and marked for review -- never a silent guess.",
+  "author": {
+    "name": "Oracle AI Data Platform",
+    "url": "https://github.com/oracle-samples/oracle-aidp-samples"
+  },
+  "homepage": "https://github.com/oracle-samples/oracle-aidp-samples/tree/main/ai/claude-code-plugins/oracle-ai-data-platform-workbench-ocidi-migrator",
+  "repository": "https://github.com/oracle-samples/oracle-aidp-samples",
+  "license": "MIT",
+  "keywords": [
+    "aidp",
+    "oracle",
+    "oci",
+    "oci-data-integration",
+    "data-integration",
+    "migration",
+    "etl",
+    "pyspark",
+    "delta",
+    "notebooks",
+    "jobs"
+  ],
+  "commands": "./commands/"
+}

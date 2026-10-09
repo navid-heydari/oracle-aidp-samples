@@ -1,0 +1,31 @@
+{
+  "modelType": "USER_DEFINED_FUNCTION",
+  "key": "udf-fullname",
+  "name": "FULL_NAME",
+  "identifier": "FULL_NAME",
+  "parentRef": {
+    "parent": "lib-common"
+  },
+  "signatures": [
+    {
+      "modelType": "FUNCTION_SIGNATURE",
+      "key": "sig1",
+      "name": "FULL_NAME",
+      "retType": {
+        "name": "VARCHAR"
+      },
+      "arguments": [
+        {
+          "name": "FIRST"
+        },
+        {
+          "name": "LAST"
+        }
+      ]
+    }
+  ],
+  "expr": {
+    "modelType": "EXPRESSION",
+    "exprString": "CONCAT(FIRST, ' ', LAST)"
+  }
+}

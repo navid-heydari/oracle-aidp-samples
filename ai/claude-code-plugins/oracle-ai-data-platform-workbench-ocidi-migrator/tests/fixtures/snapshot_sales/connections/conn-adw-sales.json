@@ -1,0 +1,15 @@
+{
+  "modelType": "ORACLE_ADWC_CONNECTION",
+  "key": "conn-adw-sales",
+  "name": "ADW_SALES_CONN",
+  "username": "DI_USER",
+  "passwordSecret": {
+    "secretConfig": {
+      "modelType": "OCI_VAULT_SECRET_CONFIG",
+      "secretId": "ocid1.vaultsecret.oc1.iad.example"
+    }
+  },
+  "parentRef": {
+    "parent": "da-adw-sales"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "aidp-ocidi-migrator",
+  "owner": {
+    "name": "Oracle AI Data Platform",
+    "url": "https://github.com/oracle-samples/oracle-aidp-samples"
+  },
+  "description": "Oracle AIDP migration tooling for OCI Data Integration.",
+  "plugins": [
+    {
+      "name": "oracle-ai-data-platform-workbench-ocidi-migrator",
+      "source": "./",
+      "displayName": "Oracle AIDP Migrator for OCI Data Integration",
+      "description": "Migrate OCI Data Integration data flows, tasks, pipelines and schedules to Oracle AIDP."
+    }
+  ]
+}

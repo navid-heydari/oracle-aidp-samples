@@ -1,0 +1,622 @@
+{
+  "modelType": "DATA_FLOW",
+  "key": "df-load-customers",
+  "name": "DF_LOAD_CUSTOMERS",
+  "identifier": "DF_LOAD_CUSTOMERS",
+  "modelVersion": "20200430",
+  "objectVersion": 1,
+  "parentRef": {
+    "parent": "fld-ingest"
+  },
+  "nodes": [
+    {
+      "modelType": "FLOW_NODE",
+      "key": "df-load-customers-SOURCE_1",
+      "name": "SOURCE_1",
+      "operator": {
+        "modelType": "SOURCE_OPERATOR",
+        "entity": {
+          "modelType": "FILE_ENTITY",
+          "key": "ent-source_1",
+          "name": "customers/customers.csv",
+          "resourceName": "customers/customers.csv",
+          "shape": {
+            "modelType": "SHAPE",
+            "key": "ent-source_1-shape",
+            "type": {
+              "modelType": "COMPOSITE_TYPE",
+              "key": "ent-source_1-ctype",
+              "elements": [
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-load-customers-SOURCE_1-CUSTOMER_ID",
+                  "name": "CUSTOMER_ID",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-INTEGER",
+                    "name": "INTEGER",
+                    "dtType": "INTEGER"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-load-customers-SOURCE_1-FIRST_NAME",
+                  "name": "FIRST_NAME",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-VARCHAR2",
+                    "name": "VARCHAR2",
+                    "dtType": "VARCHAR2"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-load-customers-SOURCE_1-LAST_NAME",
+                  "name": "LAST_NAME",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-VARCHAR2",
+                    "name": "VARCHAR2",
+                    "dtType": "VARCHAR2"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-load-customers-SOURCE_1-EMAIL",
+                  "name": "EMAIL",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-VARCHAR2",
+                    "name": "VARCHAR2",
+                    "dtType": "VARCHAR2"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-load-customers-SOURCE_1-COUNTRY",
+                  "name": "COUNTRY",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-VARCHAR2",
+                    "name": "VARCHAR2",
+                    "dtType": "VARCHAR2"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-load-customers-SOURCE_1-UPDATED_AT",
+                  "name": "UPDATED_AT",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-TIMESTAMP",
+                    "name": "TIMESTAMP",
+                    "dtType": "TIMESTAMP"
+                  }
+                }
+              ]
+            }
+          },
+          "dataFormat": {
+            "type": "CSV",
+            "formatAttribute": {
+              "modelType": "CSV_FORMAT",
+              "hasHeader": true,
+              "delimiter": ","
+            }
+          }
+        },
+        "opConfigValues": {
+          "configParamValues": {
+            "dataAssetParam": {
+              "refValue": {
+                "modelType": "ORACLE_OBJECT_STORAGE_DATA_ASSET",
+                "key": "da-os-landing",
+                "name": "OS_LANDING"
+              }
+            },
+            "connectionParam": {
+              "refValue": {
+                "modelType": "ORACLE_OBJECT_STORAGE_CONNECTION",
+                "key": "conn-os-landing",
+                "name": "OS_LANDING_CONN"
+              }
+            },
+            "schemaParam": {
+              "refValue": {
+                "modelType": "SCHEMA",
+                "key": "sch-landing",
+                "name": "landing"
+              }
+            }
+          }
+        },
+        "outputPorts": [
+          {
+            "modelType": "OUTPUT_PORT",
+            "key": "df-load-customers-SOURCE_1-out",
+            "name": "OUTPUT1",
+            "portType": "DATA",
+            "fields": [
+              {
+                "modelType": "SHAPE_FIELD",
+                "key": "df-load-customers-SOURCE_1-CUSTOMER_ID",
+                "name": "CUSTOMER_ID",
+                "type": {
+                  "modelType": "DATA_TYPE",
+                  "key": "dt-INTEGER",
+                  "name": "INTEGER",
+                  "dtType": "INTEGER"
+                }
+              },
+              {
+                "modelType": "SHAPE_FIELD",
+                "key": "df-load-customers-SOURCE_1-FIRST_NAME",
+                "name": "FIRST_NAME",
+                "type": {
+                  "modelType": "DATA_TYPE",
+                  "key": "dt-VARCHAR2",
+                  "name": "VARCHAR2",
+                  "dtType": "VARCHAR2"
+                }
+              },
+              {
+                "modelType": "SHAPE_FIELD",
+                "key": "df-load-customers-SOURCE_1-LAST_NAME",
+                "name": "LAST_NAME",
+                "type": {
+                  "modelType": "DATA_TYPE",
+                  "key": "dt-VARCHAR2",
+                  "name": "VARCHAR2",
+                  "dtType": "VARCHAR2"
+                }
+              },
+              {
+                "modelType": "SHAPE_FIELD",
+                "key": "df-load-customers-SOURCE_1-EMAIL",
+                "name": "EMAIL",
+                "type": {
+                  "modelType": "DATA_TYPE",
+                  "key": "dt-VARCHAR2",
+                  "name": "VARCHAR2",
+                  "dtType": "VARCHAR2"
+                }
+              },
+              {
+                "modelType": "SHAPE_FIELD",
+                "key": "df-load-customers-SOURCE_1-COUNTRY",
+                "name": "COUNTRY",
+                "type": {
+                  "modelType": "DATA_TYPE",
+                  "key": "dt-VARCHAR2",
+                  "name": "VARCHAR2",
+                  "dtType": "VARCHAR2"
+                }
+              },
+              {
+                "modelType": "SHAPE_FIELD",
+                "key": "df-load-customers-SOURCE_1-UPDATED_AT",
+                "name": "UPDATED_AT",
+                "type": {
+                  "modelType": "DATA_TYPE",
+                  "key": "dt-TIMESTAMP",
+                  "name": "TIMESTAMP",
+                  "dtType": "TIMESTAMP"
+                }
+              }
+            ]
+          }
+        ],
+        "key": "df-load-customers-SOURCE_1-op",
+        "identifier": "SOURCE_1",
+        "name": "SOURCE_1",
+        "inputPorts": []
+      },
+      "inputLinks": [],
+      "outputLinks": [
+        {
+          "modelType": "OUTPUT_LINK",
+          "key": "df-load-customers-ol1",
+          "port": "df-load-customers-SOURCE_1-out",
+          "toLinks": [
+            "df-load-customers-il1"
+          ]
+        }
+      ]
+    },
+    {
+      "modelType": "FLOW_NODE",
+      "key": "df-load-customers-EXPRESSION_1",
+      "name": "EXPRESSION_1",
+      "operator": {
+        "modelType": "EXPRESSION_OPERATOR",
+        "inputPorts": [
+          {
+            "modelType": "INPUT_PORT",
+            "key": "df-load-customers-EXPRESSION_1-in0",
+            "name": "INPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "outputPorts": [
+          {
+            "modelType": "OUTPUT_PORT",
+            "key": "df-load-customers-EXPRESSION_1-out",
+            "name": "OUTPUT1",
+            "portType": "DATA",
+            "fields": [
+              {
+                "modelType": "DERIVED_FIELD",
+                "key": "ex1-full",
+                "name": "FULL_NAME",
+                "type": "VARCHAR",
+                "expr": {
+                  "modelType": "EXPRESSION",
+                  "key": "ex1-full-x",
+                  "exprString": "INITCAP(CONCAT(SOURCE_1.CUSTOMERS.FIRST_NAME, ' ', SOURCE_1.CUSTOMERS.LAST_NAME))"
+                }
+              },
+              {
+                "modelType": "DERIVED_FIELD",
+                "key": "ex1-email",
+                "name": "EMAIL_NORM",
+                "type": "VARCHAR",
+                "expr": {
+                  "modelType": "EXPRESSION",
+                  "key": "ex1-email-x",
+                  "exprString": "LOWER(TRIM(EXPRESSION_1.CUSTOMERS.EMAIL))"
+                }
+              },
+              {
+                "modelType": "DERIVED_FIELD",
+                "key": "ex1-seg",
+                "name": "SEGMENT",
+                "type": "VARCHAR",
+                "expr": {
+                  "modelType": "EXPRESSION",
+                  "key": "ex1-seg-x",
+                  "exprString": "DECODE(EXPRESSION_1.CUSTOMERS.COUNTRY, 'US', 'DOMESTIC', 'CA', 'DOMESTIC', 'INTERNATIONAL')"
+                }
+              }
+            ]
+          }
+        ],
+        "key": "df-load-customers-EXPRESSION_1-op",
+        "identifier": "EXPRESSION_1",
+        "name": "EXPRESSION_1"
+      },
+      "inputLinks": [
+        {
+          "modelType": "INPUT_LINK",
+          "key": "df-load-customers-il1",
+          "port": "df-load-customers-EXPRESSION_1-in0",
+          "fromLink": "df-load-customers-ol1"
+        }
+      ],
+      "outputLinks": [
+        {
+          "modelType": "OUTPUT_LINK",
+          "key": "df-load-customers-ol2",
+          "port": "df-load-customers-EXPRESSION_1-out",
+          "toLinks": [
+            "df-load-customers-il2"
+          ]
+        }
+      ]
+    },
+    {
+      "modelType": "FLOW_NODE",
+      "key": "df-load-customers-FILTER_1",
+      "name": "FILTER_1",
+      "operator": {
+        "modelType": "FILTER_OPERATOR",
+        "inputPorts": [
+          {
+            "modelType": "INPUT_PORT",
+            "key": "df-load-customers-FILTER_1-in0",
+            "name": "INPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "outputPorts": [
+          {
+            "modelType": "OUTPUT_PORT",
+            "key": "df-load-customers-FILTER_1-out",
+            "name": "OUTPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "filterCondition": {
+          "modelType": "EXPRESSION",
+          "exprString": "FILTER_1.CUSTOMERS.UPDATED_AT >= $P_SINCE AND EXPRESSION_1.CUSTOMERS.EMAIL_NORM IS NOT NULL"
+        },
+        "key": "df-load-customers-FILTER_1-op",
+        "identifier": "FILTER_1",
+        "name": "FILTER_1"
+      },
+      "inputLinks": [
+        {
+          "modelType": "INPUT_LINK",
+          "key": "df-load-customers-il2",
+          "port": "df-load-customers-FILTER_1-in0",
+          "fromLink": "df-load-customers-ol2"
+        }
+      ],
+      "outputLinks": [
+        {
+          "modelType": "OUTPUT_LINK",
+          "key": "df-load-customers-ol3",
+          "port": "df-load-customers-FILTER_1-out",
+          "toLinks": [
+            "df-load-customers-il3"
+          ]
+        }
+      ]
+    },
+    {
+      "modelType": "FLOW_NODE",
+      "key": "df-load-customers-TARGET_1",
+      "name": "TARGET_1",
+      "operator": {
+        "modelType": "TARGET_OPERATOR",
+        "entity": {
+          "modelType": "TABLE_ENTITY",
+          "key": "ent-dim_customer",
+          "name": "DIM_CUSTOMER",
+          "resourceName": "DIM_CUSTOMER",
+          "shape": {
+            "modelType": "SHAPE",
+            "key": "ent-dim_customer-shape",
+            "type": {
+              "modelType": "COMPOSITE_TYPE",
+              "key": "ent-dim_customer-ctype",
+              "elements": [
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "tgt-dim_customer-CUSTOMER_ID",
+                  "name": "CUSTOMER_ID",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-NUMBER",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-NUMBER",
+                      "name": "NUMBER",
+                      "dtType": "NUMBER"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "precision": {
+                          "intValue": 10
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "tgt-dim_customer-FULL_NAME",
+                  "name": "FULL_NAME",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-VARCHAR2",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-VARCHAR2",
+                      "name": "VARCHAR2",
+                      "dtType": "VARCHAR2"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "length": {
+                          "intValue": 200
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "tgt-dim_customer-EMAIL",
+                  "name": "EMAIL",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-VARCHAR2",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-VARCHAR2",
+                      "name": "VARCHAR2",
+                      "dtType": "VARCHAR2"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "length": {
+                          "intValue": 200
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "tgt-dim_customer-COUNTRY",
+                  "name": "COUNTRY",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-VARCHAR2",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-VARCHAR2",
+                      "name": "VARCHAR2",
+                      "dtType": "VARCHAR2"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "length": {
+                          "intValue": 2
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "tgt-dim_customer-SEGMENT",
+                  "name": "SEGMENT",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-VARCHAR2",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-VARCHAR2",
+                      "name": "VARCHAR2",
+                      "dtType": "VARCHAR2"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "length": {
+                          "intValue": 20
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "tgt-dim_customer-UPDATED_AT",
+                  "name": "UPDATED_AT",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-TIMESTAMP",
+                    "name": "TIMESTAMP",
+                    "dtType": "TIMESTAMP"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "opConfigValues": {
+          "configParamValues": {
+            "dataAssetParam": {
+              "refValue": {
+                "modelType": "ORACLE_ADWC_DATA_ASSET",
+                "key": "da-adw-sales",
+                "name": "ADW_SALES"
+              }
+            },
+            "connectionParam": {
+              "refValue": {
+                "modelType": "ORACLE_ADWC_CONNECTION",
+                "key": "conn-adw-sales",
+                "name": "ADW_SALES_CONN"
+              }
+            },
+            "schemaParam": {
+              "refValue": {
+                "modelType": "SCHEMA",
+                "key": "sch-sales_dw",
+                "name": "SALES_DW"
+              }
+            }
+          }
+        },
+        "writeOperationConfig": {
+          "modelType": "WRITE_OPERATION_CONFIG",
+          "key": "TARGET_1-woc",
+          "writeMode": "MERGE",
+          "mergeKey": {
+            "modelType": "UNIQUE_KEY",
+            "key": "TARGET_1-mk",
+            "name": "MK",
+            "attributeRefs": [
+              {
+                "position": 1,
+                "attribute": {
+                  "name": "CUSTOMER_ID"
+                }
+              }
+            ]
+          }
+        },
+        "loadOrder": 1,
+        "isPredefinedShape": true,
+        "inputPorts": [
+          {
+            "modelType": "INPUT_PORT",
+            "key": "df-load-customers-TARGET_1-in",
+            "name": "INPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "key": "df-load-customers-TARGET_1-op",
+        "identifier": "TARGET_1",
+        "name": "TARGET_1",
+        "outputPorts": []
+      },
+      "inputLinks": [
+        {
+          "modelType": "INPUT_LINK",
+          "key": "df-load-customers-il3",
+          "port": "df-load-customers-TARGET_1-in",
+          "fromLink": "df-load-customers-ol3",
+          "fieldMap": {
+            "modelType": "COMPOSITE_FIELD_MAP",
+            "key": "fm-dim-customer",
+            "fieldMaps": [
+              {
+                "modelType": "DIRECT_FIELD_MAP",
+                "key": "dfm0",
+                "sourceTypedObject": "df-load-customers-SOURCE_1-CUSTOMER_ID",
+                "targetTypedObject": "tgt-dim_customer-CUSTOMER_ID"
+              },
+              {
+                "modelType": "DIRECT_FIELD_MAP",
+                "key": "dfm1",
+                "sourceTypedObject": "ex1-full",
+                "targetTypedObject": "tgt-dim_customer-FULL_NAME"
+              },
+              {
+                "modelType": "DIRECT_FIELD_MAP",
+                "key": "dfm2",
+                "sourceTypedObject": "ex1-email",
+                "targetTypedObject": "tgt-dim_customer-EMAIL"
+              },
+              {
+                "modelType": "DIRECT_FIELD_MAP",
+                "key": "dfm3",
+                "sourceTypedObject": "df-load-customers-SOURCE_1-COUNTRY",
+                "targetTypedObject": "tgt-dim_customer-COUNTRY"
+              },
+              {
+                "modelType": "DIRECT_FIELD_MAP",
+                "key": "dfm4",
+                "sourceTypedObject": "ex1-seg",
+                "targetTypedObject": "tgt-dim_customer-SEGMENT"
+              },
+              {
+                "modelType": "DIRECT_FIELD_MAP",
+                "key": "dfm5",
+                "sourceTypedObject": "df-load-customers-SOURCE_1-UPDATED_AT",
+                "targetTypedObject": "tgt-dim_customer-UPDATED_AT"
+              }
+            ]
+          }
+        }
+      ],
+      "outputLinks": []
+    }
+  ],
+  "parameters": [
+    {
+      "modelType": "PARAMETER",
+      "key": "df-load-customers-p-P_SINCE",
+      "name": "P_SINCE",
+      "typeName": "TIMESTAMP",
+      "defaultValue": "2020-01-01 00:00:00"
+    }
+  ]
+}

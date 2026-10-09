@@ -1,0 +1,448 @@
+{
+  "modelType": "PIPELINE",
+  "key": "pl-nightly",
+  "name": "PL_NIGHTLY",
+  "identifier": "PL_NIGHTLY",
+  "modelVersion": "20200430",
+  "objectVersion": 1,
+  "parentRef": {
+    "parent": "fld-marts"
+  },
+  "nodes": [
+    {
+      "modelType": "FLOW_NODE",
+      "key": "pl-nightly-START_1",
+      "name": "START_1",
+      "operator": {
+        "modelType": "START_OPERATOR",
+        "inputPorts": [
+          {
+            "modelType": "INPUT_PORT",
+            "key": "pl-nightly-START_1-in",
+            "name": "INPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "outputPorts": [
+          {
+            "modelType": "OUTPUT_PORT",
+            "key": "pl-nightly-START_1-out",
+            "name": "OUTPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "key": "pl-nightly-START_1-op",
+        "identifier": "START_1",
+        "name": "START_1"
+      },
+      "inputLinks": [],
+      "outputLinks": [
+        {
+          "modelType": "OUTPUT_LINK",
+          "key": "pl-nightly-ol1",
+          "port": "pl-nightly-START_1-out",
+          "toLinks": [
+            "pl-nightly-il1"
+          ]
+        },
+        {
+          "modelType": "OUTPUT_LINK",
+          "key": "pl-nightly-ol2",
+          "port": "pl-nightly-START_1-out",
+          "toLinks": [
+            "pl-nightly-il2"
+          ]
+        }
+      ]
+    },
+    {
+      "modelType": "FLOW_NODE",
+      "key": "pl-nightly-LOAD_CUSTOMERS",
+      "name": "LOAD_CUSTOMERS",
+      "operator": {
+        "modelType": "TASK_OPERATOR",
+        "inputPorts": [
+          {
+            "modelType": "INPUT_PORT",
+            "key": "pl-nightly-LOAD_CUSTOMERS-in",
+            "name": "INPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "outputPorts": [
+          {
+            "modelType": "OUTPUT_PORT",
+            "key": "pl-nightly-LOAD_CUSTOMERS-out",
+            "name": "OUTPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "taskType": "INTEGRATION_TASK",
+        "task": {
+          "modelType": "INTEGRATION_TASK",
+          "key": "t-load-customers",
+          "name": "IT_LOAD_CUSTOMERS",
+          "identifier": "IT_LOAD_CUSTOMERS"
+        },
+        "triggerRule": "ALL_SUCCESS",
+        "key": "pl-nightly-LOAD_CUSTOMERS-op",
+        "identifier": "LOAD_CUSTOMERS",
+        "name": "LOAD_CUSTOMERS"
+      },
+      "inputLinks": [
+        {
+          "modelType": "INPUT_LINK",
+          "key": "pl-nightly-il1",
+          "port": "pl-nightly-LOAD_CUSTOMERS-in",
+          "fromLink": "pl-nightly-ol1"
+        }
+      ],
+      "outputLinks": [
+        {
+          "modelType": "OUTPUT_LINK",
+          "key": "pl-nightly-ol3",
+          "port": "pl-nightly-LOAD_CUSTOMERS-out",
+          "toLinks": [
+            "pl-nightly-il3"
+          ]
+        }
+      ]
+    },
+    {
+      "modelType": "FLOW_NODE",
+      "key": "pl-nightly-LOAD_PRODUCTS",
+      "name": "LOAD_PRODUCTS",
+      "operator": {
+        "modelType": "TASK_OPERATOR",
+        "inputPorts": [
+          {
+            "modelType": "INPUT_PORT",
+            "key": "pl-nightly-LOAD_PRODUCTS-in",
+            "name": "INPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "outputPorts": [
+          {
+            "modelType": "OUTPUT_PORT",
+            "key": "pl-nightly-LOAD_PRODUCTS-out",
+            "name": "OUTPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "taskType": "DATA_LOADER_TASK",
+        "task": {
+          "modelType": "DATA_LOADER_TASK",
+          "key": "t-dl-products",
+          "name": "DL_PRODUCTS",
+          "identifier": "DL_PRODUCTS"
+        },
+        "triggerRule": "ALL_SUCCESS",
+        "key": "pl-nightly-LOAD_PRODUCTS-op",
+        "identifier": "LOAD_PRODUCTS",
+        "name": "LOAD_PRODUCTS"
+      },
+      "inputLinks": [
+        {
+          "modelType": "INPUT_LINK",
+          "key": "pl-nightly-il2",
+          "port": "pl-nightly-LOAD_PRODUCTS-in",
+          "fromLink": "pl-nightly-ol2"
+        }
+      ],
+      "outputLinks": [
+        {
+          "modelType": "OUTPUT_LINK",
+          "key": "pl-nightly-ol4",
+          "port": "pl-nightly-LOAD_PRODUCTS-out",
+          "toLinks": [
+            "pl-nightly-il4"
+          ]
+        }
+      ]
+    },
+    {
+      "modelType": "FLOW_NODE",
+      "key": "pl-nightly-MERGE_1",
+      "name": "MERGE_1",
+      "operator": {
+        "modelType": "MERGE_OPERATOR",
+        "inputPorts": [
+          {
+            "modelType": "INPUT_PORT",
+            "key": "pl-nightly-MERGE_1-in",
+            "name": "INPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "outputPorts": [
+          {
+            "modelType": "OUTPUT_PORT",
+            "key": "pl-nightly-MERGE_1-out",
+            "name": "OUTPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "triggerRule": "ALL_SUCCESS",
+        "key": "pl-nightly-MERGE_1-op",
+        "identifier": "MERGE_1",
+        "name": "MERGE_1"
+      },
+      "inputLinks": [
+        {
+          "modelType": "INPUT_LINK",
+          "key": "pl-nightly-il3",
+          "port": "pl-nightly-MERGE_1-in",
+          "fromLink": "pl-nightly-ol3"
+        },
+        {
+          "modelType": "INPUT_LINK",
+          "key": "pl-nightly-il4",
+          "port": "pl-nightly-MERGE_1-in",
+          "fromLink": "pl-nightly-ol4"
+        }
+      ],
+      "outputLinks": [
+        {
+          "modelType": "OUTPUT_LINK",
+          "key": "pl-nightly-ol5",
+          "port": "pl-nightly-MERGE_1-out",
+          "toLinks": [
+            "pl-nightly-il5"
+          ]
+        }
+      ]
+    },
+    {
+      "modelType": "FLOW_NODE",
+      "key": "pl-nightly-ORDERS_DAILY",
+      "name": "ORDERS_DAILY",
+      "operator": {
+        "modelType": "TASK_OPERATOR",
+        "inputPorts": [
+          {
+            "modelType": "INPUT_PORT",
+            "key": "pl-nightly-ORDERS_DAILY-in",
+            "name": "INPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "outputPorts": [
+          {
+            "modelType": "OUTPUT_PORT",
+            "key": "pl-nightly-ORDERS_DAILY-out",
+            "name": "OUTPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "taskType": "INTEGRATION_TASK",
+        "task": {
+          "modelType": "INTEGRATION_TASK",
+          "key": "t-orders-daily",
+          "name": "IT_ORDERS_DAILY",
+          "identifier": "IT_ORDERS_DAILY"
+        },
+        "triggerRule": "ALL_SUCCESS",
+        "retryAttempts": 2,
+        "retryDelay": 5,
+        "retryDelayUnit": "MINUTES",
+        "key": "pl-nightly-ORDERS_DAILY-op",
+        "identifier": "ORDERS_DAILY",
+        "name": "ORDERS_DAILY"
+      },
+      "inputLinks": [
+        {
+          "modelType": "INPUT_LINK",
+          "key": "pl-nightly-il5",
+          "port": "pl-nightly-ORDERS_DAILY-in",
+          "fromLink": "pl-nightly-ol5"
+        }
+      ],
+      "outputLinks": [
+        {
+          "modelType": "OUTPUT_LINK",
+          "key": "pl-nightly-ol6",
+          "port": "pl-nightly-ORDERS_DAILY-out",
+          "toLinks": [
+            "pl-nightly-il6"
+          ]
+        },
+        {
+          "modelType": "OUTPUT_LINK",
+          "key": "pl-nightly-ol7",
+          "port": "pl-nightly-ORDERS_DAILY-out",
+          "toLinks": [
+            "pl-nightly-il7"
+          ]
+        }
+      ]
+    },
+    {
+      "modelType": "FLOW_NODE",
+      "key": "pl-nightly-REFRESH_STATS",
+      "name": "REFRESH_STATS",
+      "operator": {
+        "modelType": "TASK_OPERATOR",
+        "inputPorts": [
+          {
+            "modelType": "INPUT_PORT",
+            "key": "pl-nightly-REFRESH_STATS-in",
+            "name": "INPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "outputPorts": [
+          {
+            "modelType": "OUTPUT_PORT",
+            "key": "pl-nightly-REFRESH_STATS-out",
+            "name": "OUTPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "taskType": "SQL_TASK",
+        "task": {
+          "modelType": "SQL_TASK",
+          "key": "t-sql-stats",
+          "name": "SQL_REFRESH_STATS",
+          "identifier": "SQL_REFRESH_STATS"
+        },
+        "triggerRule": "ALL_SUCCESS",
+        "key": "pl-nightly-REFRESH_STATS-op",
+        "identifier": "REFRESH_STATS",
+        "name": "REFRESH_STATS"
+      },
+      "inputLinks": [
+        {
+          "modelType": "INPUT_LINK",
+          "key": "pl-nightly-il6",
+          "port": "pl-nightly-REFRESH_STATS-in",
+          "fromLink": "pl-nightly-ol6"
+        }
+      ],
+      "outputLinks": [
+        {
+          "modelType": "OUTPUT_LINK",
+          "key": "pl-nightly-ol8",
+          "port": "pl-nightly-REFRESH_STATS-out",
+          "toLinks": [
+            "pl-nightly-il8"
+          ]
+        }
+      ]
+    },
+    {
+      "modelType": "FLOW_NODE",
+      "key": "pl-nightly-NOTIFY_FAILURE",
+      "name": "NOTIFY_FAILURE",
+      "operator": {
+        "modelType": "TASK_OPERATOR",
+        "inputPorts": [
+          {
+            "modelType": "INPUT_PORT",
+            "key": "pl-nightly-NOTIFY_FAILURE-in",
+            "name": "INPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "outputPorts": [
+          {
+            "modelType": "OUTPUT_PORT",
+            "key": "pl-nightly-NOTIFY_FAILURE-out",
+            "name": "OUTPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "taskType": "REST_TASK",
+        "task": {
+          "modelType": "REST_TASK",
+          "key": "t-rest-notify",
+          "name": "REST_NOTIFY",
+          "identifier": "REST_NOTIFY"
+        },
+        "triggerRule": "ALL_FAILED",
+        "key": "pl-nightly-NOTIFY_FAILURE-op",
+        "identifier": "NOTIFY_FAILURE",
+        "name": "NOTIFY_FAILURE"
+      },
+      "inputLinks": [
+        {
+          "modelType": "INPUT_LINK",
+          "key": "pl-nightly-il7",
+          "port": "pl-nightly-NOTIFY_FAILURE-in",
+          "fromLink": "pl-nightly-ol7"
+        }
+      ],
+      "outputLinks": [
+        {
+          "modelType": "OUTPUT_LINK",
+          "key": "pl-nightly-ol9",
+          "port": "pl-nightly-NOTIFY_FAILURE-out",
+          "toLinks": [
+            "pl-nightly-il9"
+          ]
+        }
+      ]
+    },
+    {
+      "modelType": "FLOW_NODE",
+      "key": "pl-nightly-END_1",
+      "name": "END_1",
+      "operator": {
+        "modelType": "END_OPERATOR",
+        "inputPorts": [
+          {
+            "modelType": "INPUT_PORT",
+            "key": "pl-nightly-END_1-in",
+            "name": "INPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "outputPorts": [
+          {
+            "modelType": "OUTPUT_PORT",
+            "key": "pl-nightly-END_1-out",
+            "name": "OUTPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "triggerRule": "ALL_COMPLETE",
+        "key": "pl-nightly-END_1-op",
+        "identifier": "END_1",
+        "name": "END_1"
+      },
+      "inputLinks": [
+        {
+          "modelType": "INPUT_LINK",
+          "key": "pl-nightly-il8",
+          "port": "pl-nightly-END_1-in",
+          "fromLink": "pl-nightly-ol8"
+        },
+        {
+          "modelType": "INPUT_LINK",
+          "key": "pl-nightly-il9",
+          "port": "pl-nightly-END_1-in",
+          "fromLink": "pl-nightly-ol9"
+        }
+      ],
+      "outputLinks": []
+    }
+  ],
+  "parameters": [],
+  "variables": []
+}

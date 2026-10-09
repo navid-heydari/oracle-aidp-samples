@@ -1,0 +1,12 @@
+{
+  "modelType": "SCHEDULE",
+  "key": "sch-monday",
+  "name": "SCH_MONDAY",
+  "identifier": "SCH_MONDAY",
+  "timezone": "UTC",
+  "frequencyDetails": {
+    "modelType": "CUSTOM",
+    "frequency": "CUSTOM",
+    "customExpression": "0 6 * * 1"
+  }
+}

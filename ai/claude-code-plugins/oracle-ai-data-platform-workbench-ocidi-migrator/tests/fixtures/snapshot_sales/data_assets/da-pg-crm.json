@@ -1,0 +1,9 @@
+{
+  "modelType": "GENERIC_JDBC_DATA_ASSET",
+  "key": "da-pg-crm",
+  "name": "PG_CRM",
+  "identifier": "PG_CRM",
+  "host": "crm-db.internal.example",
+  "port": "5432",
+  "dataAssetType": "POSTGRESQL"
+}

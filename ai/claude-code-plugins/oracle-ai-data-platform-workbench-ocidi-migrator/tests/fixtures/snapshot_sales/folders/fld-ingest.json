@@ -1,0 +1,9 @@
+{
+  "modelType": "FOLDER",
+  "key": "fld-ingest",
+  "name": "Ingest",
+  "identifier": "INGEST",
+  "parentRef": {
+    "parent": "proj-sales"
+  }
+}

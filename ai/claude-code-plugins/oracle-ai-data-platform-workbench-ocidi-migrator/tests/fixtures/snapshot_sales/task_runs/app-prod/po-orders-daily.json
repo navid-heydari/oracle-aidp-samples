@@ -1,0 +1,9 @@
+{
+  "modelType": "TASK_RUN",
+  "key": "run-orders-1",
+  "name": "IT_ORDERS_DAILY_run",
+  "status": "SUCCESS",
+  "taskKey": "po-orders-daily",
+  "startTimeMillis": 1790834400000,
+  "endTimeMillis": 1790834700000
+}

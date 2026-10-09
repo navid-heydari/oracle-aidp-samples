@@ -1,0 +1,18 @@
+{
+  "modelType": "SCHEDULE",
+  "key": "sch-month-end",
+  "name": "SCH_LAST_FRIDAY",
+  "identifier": "SCH_LAST_FRIDAY",
+  "timezone": "Europe/London",
+  "frequencyDetails": {
+    "modelType": "MONTHLY_RULE",
+    "frequency": "MONTHLY",
+    "interval": 1,
+    "weekOfMonth": "LAST",
+    "dayOfWeek": "FRIDAY",
+    "time": {
+      "hour": 23,
+      "minute": 0
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "modelType": "REST_TASK",
+  "key": "t-rest-notify",
+  "name": "REST_NOTIFY",
+  "identifier": "REST_NOTIFY",
+  "modelVersion": "20200430",
+  "objectVersion": 1,
+  "parentRef": {
+    "parent": "fld-marts"
+  },
+  "methodType": "POST",
+  "endpoint": {
+    "modelType": "EXPRESSION",
+    "exprString": "https://hooks.example.com/etl/notify"
+  },
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "jsonData": "{\"pipeline\": \"nightly\", \"status\": \"FAILED\"}",
+  "authDetails": {
+    "modelType": "NO_AUTH_REST_DETAILS",
+    "key": "auth-none"
+  },
+  "apiCallMode": "SYNCHRONOUS"
+}

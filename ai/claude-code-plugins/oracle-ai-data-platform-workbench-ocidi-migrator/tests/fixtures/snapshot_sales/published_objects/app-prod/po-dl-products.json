@@ -1,0 +1,369 @@
+{
+  "modelType": "DATA_LOADER_TASK",
+  "key": "po-dl-products",
+  "name": "DL_PRODUCTS",
+  "identifier": "DL_PRODUCTS",
+  "modelVersion": "20200430",
+  "objectVersion": 1,
+  "parentRef": {
+    "parent": "app-prod"
+  },
+  "dataFlow": {
+    "modelType": "DATA_FLOW",
+    "key": "df-load-products",
+    "name": "DF_LOAD_PRODUCTS",
+    "identifier": "DF_LOAD_PRODUCTS",
+    "modelVersion": "20200430",
+    "objectVersion": 1,
+    "parentRef": {
+      "parent": "fld-ingest"
+    },
+    "nodes": [
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-load-products-SOURCE_PRODUCTS",
+        "name": "SOURCE_PRODUCTS",
+        "operator": {
+          "modelType": "SOURCE_OPERATOR",
+          "entity": {
+            "modelType": "TABLE_ENTITY",
+            "key": "ent-source_products",
+            "name": "PRODUCTS",
+            "resourceName": "PRODUCTS",
+            "shape": {
+              "modelType": "SHAPE",
+              "key": "ent-source_products-shape",
+              "type": {
+                "modelType": "COMPOSITE_TYPE",
+                "key": "ent-source_products-ctype",
+                "elements": [
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-load-products-SOURCE_PRODUCTS-PRODUCT_ID",
+                    "name": "PRODUCT_ID",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 10
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-load-products-SOURCE_PRODUCTS-CATEGORY",
+                    "name": "CATEGORY",
+                    "type": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-VARCHAR2",
+                      "name": "VARCHAR2",
+                      "dtType": "VARCHAR2"
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "df-load-products-SOURCE_PRODUCTS-LIST_PRICE",
+                    "name": "LIST_PRICE",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 12
+                          },
+                          "scale": {
+                            "intValue": 2
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "opConfigValues": {
+            "configParamValues": {
+              "dataAssetParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_DATA_ASSET",
+                  "key": "da-adw-sales",
+                  "name": "ADW_SALES"
+                }
+              },
+              "connectionParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_CONNECTION",
+                  "key": "conn-adw-sales",
+                  "name": "ADW_SALES_CONN"
+                }
+              },
+              "schemaParam": {
+                "refValue": {
+                  "modelType": "SCHEMA",
+                  "key": "sch-sales",
+                  "name": "SALES"
+                }
+              }
+            }
+          },
+          "outputPorts": [
+            {
+              "modelType": "OUTPUT_PORT",
+              "key": "df-load-products-SOURCE_PRODUCTS-out",
+              "name": "OUTPUT1",
+              "portType": "DATA",
+              "fields": [
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-load-products-SOURCE_PRODUCTS-PRODUCT_ID",
+                  "name": "PRODUCT_ID",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-NUMBER",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-NUMBER",
+                      "name": "NUMBER",
+                      "dtType": "NUMBER"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "precision": {
+                          "intValue": 10
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-load-products-SOURCE_PRODUCTS-CATEGORY",
+                  "name": "CATEGORY",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-VARCHAR2",
+                    "name": "VARCHAR2",
+                    "dtType": "VARCHAR2"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-load-products-SOURCE_PRODUCTS-LIST_PRICE",
+                  "name": "LIST_PRICE",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-NUMBER",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-NUMBER",
+                      "name": "NUMBER",
+                      "dtType": "NUMBER"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "precision": {
+                          "intValue": 12
+                        },
+                        "scale": {
+                          "intValue": 2
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ],
+          "key": "df-load-products-SOURCE_PRODUCTS-op",
+          "identifier": "SOURCE_PRODUCTS",
+          "name": "SOURCE_PRODUCTS",
+          "inputPorts": []
+        },
+        "inputLinks": [],
+        "outputLinks": [
+          {
+            "modelType": "OUTPUT_LINK",
+            "key": "df-load-products-ol1",
+            "port": "df-load-products-SOURCE_PRODUCTS-out",
+            "toLinks": [
+              "df-load-products-il1"
+            ]
+          }
+        ]
+      },
+      {
+        "modelType": "FLOW_NODE",
+        "key": "df-load-products-TARGET_PRODUCTS",
+        "name": "TARGET_PRODUCTS",
+        "operator": {
+          "modelType": "TARGET_OPERATOR",
+          "entity": {
+            "modelType": "TABLE_ENTITY",
+            "key": "ent-dim_product",
+            "name": "DIM_PRODUCT",
+            "resourceName": "DIM_PRODUCT",
+            "shape": {
+              "modelType": "SHAPE",
+              "key": "ent-dim_product-shape",
+              "type": {
+                "modelType": "COMPOSITE_TYPE",
+                "key": "ent-dim_product-ctype",
+                "elements": [
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-dim_product-PRODUCT_ID",
+                    "name": "PRODUCT_ID",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 10
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-dim_product-CATEGORY",
+                    "name": "CATEGORY",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-VARCHAR2",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-VARCHAR2",
+                        "name": "VARCHAR2",
+                        "dtType": "VARCHAR2"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "length": {
+                            "intValue": 50
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "modelType": "SHAPE_FIELD",
+                    "key": "tgt-dim_product-LIST_PRICE",
+                    "name": "LIST_PRICE",
+                    "type": {
+                      "modelType": "CONFIGURED_TYPE",
+                      "key": "ct-NUMBER",
+                      "wrappedType": {
+                        "modelType": "DATA_TYPE",
+                        "key": "dt-NUMBER",
+                        "name": "NUMBER",
+                        "dtType": "NUMBER"
+                      },
+                      "configValues": {
+                        "configParamValues": {
+                          "precision": {
+                            "intValue": 12
+                          },
+                          "scale": {
+                            "intValue": 2
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "opConfigValues": {
+            "configParamValues": {
+              "dataAssetParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_DATA_ASSET",
+                  "key": "da-adw-sales",
+                  "name": "ADW_SALES"
+                }
+              },
+              "connectionParam": {
+                "refValue": {
+                  "modelType": "ORACLE_ADWC_CONNECTION",
+                  "key": "conn-adw-sales",
+                  "name": "ADW_SALES_CONN"
+                }
+              },
+              "schemaParam": {
+                "refValue": {
+                  "modelType": "SCHEMA",
+                  "key": "sch-sales_dw",
+                  "name": "SALES_DW"
+                }
+              }
+            }
+          },
+          "writeOperationConfig": {
+            "modelType": "WRITE_OPERATION_CONFIG",
+            "key": "TARGET_PRODUCTS-woc",
+            "writeMode": "OVERWRITE"
+          },
+          "loadOrder": 1,
+          "isPredefinedShape": true,
+          "inputPorts": [
+            {
+              "modelType": "INPUT_PORT",
+              "key": "df-load-products-TARGET_PRODUCTS-in",
+              "name": "INPUT1",
+              "portType": "DATA",
+              "fields": []
+            }
+          ],
+          "key": "df-load-products-TARGET_PRODUCTS-op",
+          "identifier": "TARGET_PRODUCTS",
+          "name": "TARGET_PRODUCTS",
+          "outputPorts": []
+        },
+        "inputLinks": [
+          {
+            "modelType": "INPUT_LINK",
+            "key": "df-load-products-il1",
+            "port": "df-load-products-TARGET_PRODUCTS-in",
+            "fromLink": "df-load-products-ol1",
+            "fieldMap": {
+              "modelType": "RULE_BASED_FIELD_MAP",
+              "key": "rb-prod",
+              "mapType": "MAPBYNAME"
+            }
+          }
+        ],
+        "outputLinks": []
+      }
+    ],
+    "parameters": []
+  },
+  "isSingleLoad": true,
+  "parallelLoadLimit": 1
+}

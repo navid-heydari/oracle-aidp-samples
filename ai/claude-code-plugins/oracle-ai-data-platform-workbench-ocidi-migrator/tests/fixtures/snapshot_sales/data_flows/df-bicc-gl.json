@@ -1,0 +1,274 @@
+{
+  "modelType": "DATA_FLOW",
+  "key": "df-bicc-gl",
+  "name": "DF_BICC_GL",
+  "identifier": "DF_BICC_GL",
+  "modelVersion": "20200430",
+  "objectVersion": 1,
+  "parentRef": {
+    "parent": "fld-ingest"
+  },
+  "nodes": [
+    {
+      "modelType": "FLOW_NODE",
+      "key": "df-bicc-gl-SOURCE_GL",
+      "name": "SOURCE_GL",
+      "operator": {
+        "modelType": "SOURCE_OPERATOR",
+        "entity": {
+          "modelType": "TABLE_ENTITY",
+          "key": "ent-source_gl",
+          "name": "GlJournalExtractPVO",
+          "resourceName": "GlJournalExtractPVO",
+          "shape": {
+            "modelType": "SHAPE",
+            "key": "ent-source_gl-shape",
+            "type": {
+              "modelType": "COMPOSITE_TYPE",
+              "key": "ent-source_gl-ctype",
+              "elements": [
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-bicc-gl-SOURCE_GL-JE_HEADER_ID",
+                  "name": "JE_HEADER_ID",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-NUMBER",
+                    "name": "NUMBER",
+                    "dtType": "NUMBER"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "df-bicc-gl-SOURCE_GL-AMOUNT",
+                  "name": "AMOUNT",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-NUMBER",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-NUMBER",
+                      "name": "NUMBER",
+                      "dtType": "NUMBER"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "precision": {
+                          "intValue": 12
+                        },
+                        "scale": {
+                          "intValue": 2
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "opConfigValues": {
+          "configParamValues": {
+            "dataAssetParam": {
+              "refValue": {
+                "modelType": "FUSION_APP_DATA_ASSET",
+                "key": "da-fusion-erp",
+                "name": "FUSION_ERP"
+              }
+            },
+            "connectionParam": {
+              "refValue": {
+                "modelType": "BICC_CONNECTION",
+                "key": "conn-fusion-erp",
+                "name": "FUSION_ERP_CONN"
+              }
+            },
+            "schemaParam": {
+              "refValue": {
+                "modelType": "SCHEMA",
+                "key": "sch-fscmtopmodelam.finextractam",
+                "name": "FscmTopModelAM.FinExtractAM"
+              }
+            }
+          }
+        },
+        "outputPorts": [
+          {
+            "modelType": "OUTPUT_PORT",
+            "key": "df-bicc-gl-SOURCE_GL-out",
+            "name": "OUTPUT1",
+            "portType": "DATA",
+            "fields": [
+              {
+                "modelType": "SHAPE_FIELD",
+                "key": "df-bicc-gl-SOURCE_GL-JE_HEADER_ID",
+                "name": "JE_HEADER_ID",
+                "type": {
+                  "modelType": "DATA_TYPE",
+                  "key": "dt-NUMBER",
+                  "name": "NUMBER",
+                  "dtType": "NUMBER"
+                }
+              },
+              {
+                "modelType": "SHAPE_FIELD",
+                "key": "df-bicc-gl-SOURCE_GL-AMOUNT",
+                "name": "AMOUNT",
+                "type": {
+                  "modelType": "CONFIGURED_TYPE",
+                  "key": "ct-NUMBER",
+                  "wrappedType": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-NUMBER",
+                    "name": "NUMBER",
+                    "dtType": "NUMBER"
+                  },
+                  "configValues": {
+                    "configParamValues": {
+                      "precision": {
+                        "intValue": 12
+                      },
+                      "scale": {
+                        "intValue": 2
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "key": "df-bicc-gl-SOURCE_GL-op",
+        "identifier": "SOURCE_GL",
+        "name": "SOURCE_GL",
+        "inputPorts": []
+      },
+      "inputLinks": [],
+      "outputLinks": [
+        {
+          "modelType": "OUTPUT_LINK",
+          "key": "df-bicc-gl-ol1",
+          "port": "df-bicc-gl-SOURCE_GL-out",
+          "toLinks": [
+            "df-bicc-gl-il1"
+          ]
+        }
+      ]
+    },
+    {
+      "modelType": "FLOW_NODE",
+      "key": "df-bicc-gl-TARGET_GL",
+      "name": "TARGET_GL",
+      "operator": {
+        "modelType": "TARGET_OPERATOR",
+        "entity": {
+          "modelType": "TABLE_ENTITY",
+          "key": "ent-gl_journals",
+          "name": "GL_JOURNALS",
+          "resourceName": "GL_JOURNALS",
+          "shape": {
+            "modelType": "SHAPE",
+            "key": "ent-gl_journals-shape",
+            "type": {
+              "modelType": "COMPOSITE_TYPE",
+              "key": "ent-gl_journals-ctype",
+              "elements": [
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "tgt-gl_journals-JE_HEADER_ID",
+                  "name": "JE_HEADER_ID",
+                  "type": {
+                    "modelType": "DATA_TYPE",
+                    "key": "dt-NUMBER",
+                    "name": "NUMBER",
+                    "dtType": "NUMBER"
+                  }
+                },
+                {
+                  "modelType": "SHAPE_FIELD",
+                  "key": "tgt-gl_journals-AMOUNT",
+                  "name": "AMOUNT",
+                  "type": {
+                    "modelType": "CONFIGURED_TYPE",
+                    "key": "ct-NUMBER",
+                    "wrappedType": {
+                      "modelType": "DATA_TYPE",
+                      "key": "dt-NUMBER",
+                      "name": "NUMBER",
+                      "dtType": "NUMBER"
+                    },
+                    "configValues": {
+                      "configParamValues": {
+                        "precision": {
+                          "intValue": 12
+                        },
+                        "scale": {
+                          "intValue": 2
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "opConfigValues": {
+          "configParamValues": {
+            "dataAssetParam": {
+              "refValue": {
+                "modelType": "ORACLE_ADWC_DATA_ASSET",
+                "key": "da-adw-sales",
+                "name": "ADW_SALES"
+              }
+            },
+            "connectionParam": {
+              "refValue": {
+                "modelType": "ORACLE_ADWC_CONNECTION",
+                "key": "conn-adw-sales",
+                "name": "ADW_SALES_CONN"
+              }
+            },
+            "schemaParam": {
+              "refValue": {
+                "modelType": "SCHEMA",
+                "key": "sch-sales_dw",
+                "name": "SALES_DW"
+              }
+            }
+          }
+        },
+        "writeOperationConfig": {
+          "modelType": "WRITE_OPERATION_CONFIG",
+          "key": "TARGET_GL-woc",
+          "writeMode": "APPEND"
+        },
+        "loadOrder": 1,
+        "isPredefinedShape": true,
+        "inputPorts": [
+          {
+            "modelType": "INPUT_PORT",
+            "key": "df-bicc-gl-TARGET_GL-in",
+            "name": "INPUT1",
+            "portType": "DATA",
+            "fields": []
+          }
+        ],
+        "key": "df-bicc-gl-TARGET_GL-op",
+        "identifier": "TARGET_GL",
+        "name": "TARGET_GL",
+        "outputPorts": []
+      },
+      "inputLinks": [
+        {
+          "modelType": "INPUT_LINK",
+          "key": "df-bicc-gl-il1",
+          "port": "df-bicc-gl-TARGET_GL-in",
+          "fromLink": "df-bicc-gl-ol1"
+        }
+      ],
+      "outputLinks": []
+    }
+  ],
+  "parameters": []
+}

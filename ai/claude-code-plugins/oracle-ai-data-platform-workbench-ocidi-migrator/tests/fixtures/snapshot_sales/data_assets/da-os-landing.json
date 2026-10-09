@@ -1,0 +1,8 @@
+{
+  "modelType": "ORACLE_OBJECT_STORAGE_DATA_ASSET",
+  "key": "da-os-landing",
+  "name": "OS_LANDING",
+  "identifier": "OS_LANDING",
+  "namespace": "idxyzsample",
+  "ociRegion": "us-ashburn-1"
+}
