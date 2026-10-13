@@ -28,7 +28,9 @@ oracle-aidp-samples/
 │   ├── agent-hub/            # Agent Hub code-first agent samples
 │   │   └── agent-samples/
 │   ├── agent-flows/          # Agent orchestration and scheduling
-│   └── ml-datascience/       # ML, LLM, and AI service integrations
+│   ├── ml-datascience/       # ML, LLM, and AI service integrations
+│   └── skills/               # Agent Skills (SKILL.md packages) by product domain
+│       └── analytics/        # Oracle Analytics skills
 └── shared-utils/             # Reusable utilities and data generators
 ```
 
@@ -250,6 +252,15 @@ Python tool packages that extend agent flows with user-authored capabilities. Up
 | [Multi-MCP Chat Agent](ai/agent-flows/code-first/multi-mcp-chat-agent/README.md) | Natural-language chat agent that fans out across Oracle Autonomous Database (Select AI MCP), Oracle Analytics Cloud (Logical SQL MCP), and Oracle Integration Cloud (project-scoped MCP). Each integration can be enabled or disabled independently via config. |
 | [ReAct Agent with RAG Tool](ai/agent-flows/code-first/react-with-rag-tool/README.md) | Simple code-authored ReAct agent that uses a RAG tool over PDFs stored in an AIDP Knowledge Base — runs as a code-first agent flow with the standard playground/test loop. |
 | [Supply Chain Agent](ai/supply_chain_agent/README.md) | Multi-agent system for supply-chain operations using OCI Generative AI (Grok-4) over AIDP catalog tables — data generation, table provisioning, and agent configuration walkthrough included. |
+
+#### Agent Skills
+
+Agent Skills (`SKILL.md` packages) that give AI coding agents product-specific, source-backed workflows.
+
+| Skill | Description |
+|---|---|
+| [Oracle Analytics skills](ai/skills/analytics/SKILL.md) | Routing entry point for Oracle Analytics skills; directs workbook and visualization requests to the nested skill below. |
+| [Workbook Authoring](ai/skills/analytics/workbook-authoring/README.md) | Generate, validate, and make supported edits to Oracle Analytics Cloud workbook JSON from natural-language requirements: deterministic template-first composition, runtime validation against per-release compatibility profiles, and optional save/export through the Oracle Analytics MCP server. |
 
 ---
 
